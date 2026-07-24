@@ -267,25 +267,25 @@ describe('drainCodexRollout', () => {
     expect(r.events[0].text).toBe('done');
   });
 
-  it('treats phase-less assistant message as final (TRAE fork / pre-phase codex)', () => {
-    // TRAE 的 rollout 与 codex 同构，但 assistant message 完全不写 phase 字段
-    // （payload 只有 content/role/type）。此前按 phase === 'final_answer' 硬匹配
-    // 会让 TRAE 的兜底永远不触发（adopt 后模型回复从不回传飞书）。
+  it('skips assistant message with NO phase field (mid-turn; not a codex final)', () => {
+    // Guards the codex predicate against over-widening: a phase-less
+    // assistant message is NOT a codex final. TRAE emits these for every
+    // mid-turn step; treating them as final would close the bridge turn
+    // early and orphan the real answer. Codex finals are always tagged
+    // phase=final_answer, so the codex drainer must ignore phase-less ones.
     writeFileSync(path,
-      ev(userResponseItem('给我打个招呼')) +
+      ev(userResponseItem('hi')) +
       ev({
-        timestamp: '2026-07-14T17:11:24.582Z',
         type: 'response_item',
         payload: {
           type: 'message',
           role: 'assistant',
-          content: [{ type: 'output_text', text: '你好！有什么可以帮你的吗？' }],
+          content: [{ type: 'output_text', text: 'mid-turn note before a tool call' }],
         },
       }));
     const r = drainCodexRollout(path, 0);
-    expect(r.events).toHaveLength(2);
-    expect(r.events[1].kind).toBe('assistant_final');
-    expect(r.events[1].text).toBe('你好！有什么可以帮你的吗？');
+    expect(r.events).toHaveLength(1);
+    expect(r.events[0].kind).toBe('user');
   });
 
   it('skips reasoning / function_call / function_call_output / event_msg', () => {

@@ -63,7 +63,7 @@ import {
 } from './services/bridge-rotation-policy.js';
 import { CodexBridgeQueue } from './services/codex-bridge-queue.js';
 import { codexSessionIdFromRolloutPath, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn, type CodexBridgeEvent } from './services/codex-transcript.js';
-import { findTraexRolloutBySessionId, findTraexRolloutByPid } from './services/traex-transcript.js';
+import { findTraexRolloutBySessionId, findTraexRolloutByPid, drainTraexRollout } from './services/traex-transcript.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath } from './services/hermes-transcript.js';
 import { filterHermesEventsForBotmuxSession } from './services/hermes-session-filter.js';
@@ -1968,10 +1968,16 @@ function codexBridgeFallbackActive(): boolean {
   return isStructuredBridgeFallbackActive(lastInitConfig?.cliId, lastInitConfig?.adoptMode === true);
 }
 
-// Both Codex and TRAE share the same rollout JSONL layout (response_item
-// messages), so drainCodexRollout works for both.
+// Codex and TRAE share the same rollout JSONL container, but TRAE marks its
+// final answer differently (event_msg/task_complete rather than an assistant
+// message with phase=final_answer), so each has its own drainer. The rest of
+// the bridge machinery (queue, gate, split/absorb) is shared.
 function structuredBridgeIsCodex(): boolean {
   return lastInitConfig?.cliId === 'codex' || lastInitConfig?.cliId === 'traex';
+}
+
+function structuredBridgeIsTraex(): boolean {
+  return lastInitConfig?.cliId === 'traex';
 }
 
 function structuredBridgeIsHermes(): boolean {
@@ -1999,6 +2005,7 @@ function currentHermesBridgeDbPath(): string {
 }
 
 function structuredBridgeIngestPath(path: string, offset: number) {
+  if (structuredBridgeIsTraex()) return drainTraexRollout(path, offset);
   if (structuredBridgeIsCodex()) return drainCodexRollout(path, offset);
   if (codexBridgeIsCursor()) return drainCursorTranscript(path, offset);
   if (structuredBridgeIsPi()) return drainPiTranscript(path, offset);

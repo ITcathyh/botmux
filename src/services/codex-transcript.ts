@@ -10,9 +10,6 @@
  *   - role=user             → the user's prompt text (input_text content)
  *   - role=assistant +
  *     phase=final_answer    → the model's final reply (output_text content)
- *     (or NO phase field at all — TRAE's codex fork strips it, and some
- *     codex builds emit phase-less finals; mid-turn commentary is always
- *     explicitly phase=commentary, so "absent" safely means final)
  *
  * Why these and not `event_msg`:
  *   - `response_item` is the canonical transcript record; `event_msg` is a
@@ -284,10 +281,23 @@ function joinTextBlocks(content: unknown, kind: 'input_text' | 'output_text'): s
   return parts.join('');
 }
 
-/** Increment-read the rollout from `fromOffset`. Mirrors the byte-offset
- *  contract of claude-transcript.drainTranscript so callers can swap them
- *  out and reuse the existing fs.watch / poll wakeup machinery. */
-export function drainCodexRollout(path: string, fromOffset: number): CodexDrainResult {
+/** Classify one parsed rollout record into a bridge event, or undefined to
+ *  skip it. `lineStart` is the record's byte offset (for the synthetic uuid).
+ *  Codex and TRAE share the append-only JSONL container but disagree on which
+ *  record marks a final answer — see the two classifiers below. */
+type RolloutLineClassifier = (
+  obj: any,
+  lineStart: number,
+  path: string,
+) => CodexBridgeEvent | undefined;
+
+/** Increment-read the rollout from `fromOffset`, classifying each complete
+ *  line with `classify`. Mirrors the byte-offset contract of
+ *  claude-transcript.drainTranscript so callers can swap them out and reuse
+ *  the existing fs.watch / poll wakeup machinery. The container walk (offset
+ *  tracking, truncation handling, partial-tail hold-back, stable uuids) is
+ *  identical for Codex and TRAE; only the per-line classifier differs. */
+function drainRolloutLines(path: string, fromOffset: number, classify: RolloutLineClassifier): CodexDrainResult {
   if (!existsSync(path)) return { events: [], newOffset: 0, pendingTail: '' };
   let size: number;
   try { size = statSync(path).size; } catch { return { events: [], newOffset: fromOffset, pendingTail: '' }; }
@@ -321,27 +331,83 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
     cursor += lineByteLen;
     let obj: any;
     try { obj = JSON.parse(line); } catch { continue; }
-    if (obj?.type !== 'response_item') continue;
-    const p = obj.payload;
-    if (!p || typeof p !== 'object' || p.type !== 'message') continue;
-    const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
-    const timestampMs = Number.isFinite(ts) ? ts : Date.now();
-    if (p.role === 'user') {
-      const text = joinTextBlocks(p.content, 'input_text');
-      if (!text) continue;
-      events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'user', text });
-    } else if (p.role === 'assistant' && (p.phase === 'final_answer' || p.phase == null)) {
-      // phase absent ⇒ final: TRAE (codex fork) never writes the phase
-      // field, and pre-phase codex builds also omitted it on finals.
-      // Mid-turn status is always an explicit phase=commentary, so this
-      // widening cannot surface half-finished turns.
-      const text = joinTextBlocks(p.content, 'output_text');
-      if (!text) continue;
-      events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'assistant_final', text });
-    }
-    // Skip role=developer (instructions), phase=commentary (mid-turn
-    // status), and any reasoning / function_call* events — see file
-    // header for rationale.
+    const ev = classify(obj, lineStart, path);
+    if (ev) events.push(ev);
   }
   return { events, newOffset, pendingTail };
+}
+
+/** Codex classifier: user prompt and final answer both live in
+ *  `response_item.payload.type === 'message'`. The final answer is the
+ *  assistant message explicitly tagged `phase=final_answer`; mid-turn status
+ *  is `phase=commentary` and is skipped. role=developer (instructions),
+ *  reasoning, and function_call* are ignored — see file header. */
+function classifyCodexLine(obj: any, lineStart: number, path: string): CodexBridgeEvent | undefined {
+  if (obj?.type !== 'response_item') return undefined;
+  const p = obj.payload;
+  if (!p || typeof p !== 'object' || p.type !== 'message') return undefined;
+  const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
+  const timestampMs = Number.isFinite(ts) ? ts : Date.now();
+  if (p.role === 'user') {
+    const text = joinTextBlocks(p.content, 'input_text');
+    if (!text) return undefined;
+    return { uuid: `${path}:${lineStart}`, timestampMs, kind: 'user', text };
+  }
+  if (p.role === 'assistant' && p.phase === 'final_answer') {
+    const text = joinTextBlocks(p.content, 'output_text');
+    if (!text) return undefined;
+    return { uuid: `${path}:${lineStart}`, timestampMs, kind: 'assistant_final', text };
+  }
+  return undefined;
+}
+
+/** Increment-read a Codex rollout. See drainRolloutLines / classifyCodexLine. */
+export function drainCodexRollout(path: string, fromOffset: number): CodexDrainResult {
+  return drainRolloutLines(path, fromOffset, classifyCodexLine);
+}
+
+/** TRAE classifier: TRAE's codex fork writes assistant `response_item`
+ *  messages with NO `phase` field, and it emits one for every mid-turn step
+ *  before a tool call — 791 of 831 assistant messages in a real-machine
+ *  scan were followed by a function_call, i.e. were NOT final. So the Codex
+ *  rule (assistant message ⇒ final) would fire on mid-turn commentary and
+ *  close the bridge turn early, orphaning the true answer.
+ *
+ *  The reliable per-turn boundary is instead `event_msg` with
+ *  `payload.type === 'task_complete'`: TRAE writes exactly one at the end of
+ *  each turn, carrying the final text verbatim in `last_agent_message` (48
+ *  genuine completions vs 831 ambiguous assistant messages in that same
+ *  scan). We take the final answer from there and skip the assistant
+ *  `response_item` messages entirely. User prompts still come from
+ *  `response_item` (identical shape to Codex).
+ *
+ *  A `task_complete` with an empty/null `last_agent_message` marks a turn
+ *  that produced no textual answer (e.g. turn_aborted) — skipped, matching
+ *  the Codex behaviour of never emitting empty finals. */
+function classifyTraexLine(obj: any, lineStart: number, path: string): CodexBridgeEvent | undefined {
+  const ts = typeof obj?.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
+  const timestampMs = Number.isFinite(ts) ? ts : Date.now();
+  const p = obj?.payload;
+  if (obj?.type === 'response_item') {
+    if (!p || typeof p !== 'object' || p.type !== 'message') return undefined;
+    if (p.role === 'user') {
+      const text = joinTextBlocks(p.content, 'input_text');
+      if (!text) return undefined;
+      return { uuid: `${path}:${lineStart}`, timestampMs, kind: 'user', text };
+    }
+    // assistant / developer response_item messages are mid-turn or system —
+    // finals come from task_complete below.
+    return undefined;
+  }
+  if (obj?.type === 'event_msg' && p && typeof p === 'object' && p.type === 'task_complete') {
+    const text = typeof p.last_agent_message === 'string' ? p.last_agent_message : '';
+    if (!text) return undefined;
+    return { uuid: `${path}:${lineStart}`, timestampMs, kind: 'assistant_final', text };
+  }
+  return undefined;
+}
+
+/** Increment-read a TRAE rollout. See drainRolloutLines / classifyTraexLine. */
+export function drainTraexRollout(path: string, fromOffset: number): CodexDrainResult {
+  return drainRolloutLines(path, fromOffset, classifyTraexLine);
 }

@@ -2,21 +2,28 @@
  * Reader for TRAE CLI (traex / traecli) per-session rollout JSONL.
  *
  * TRAE is a Codex-family CLI:
- *   - Rollout content format is byte-identical to Codex (response_item with
- *     role=user / role=assistant+phase=final_answer message blocks).
+ *   - Rollout container format is byte-identical to Codex (append-only JSONL
+ *     of response_item / event_msg records). BUT the final-answer marker
+ *     differs: Codex tags its final assistant message `phase=final_answer`,
+ *     whereas TRAE's fork writes phase-less assistant messages for every
+ *     mid-turn step and only signals turn completion via an `event_msg`
+ *     `task_complete` record (final text in `last_agent_message`). The
+ *     TRAE-specific drainer therefore lives in codex-transcript.ts as
+ *     `drainTraexRollout`; do NOT re-use `drainCodexRollout` here.
  *   - Directory layout differs: sessions live under
  *     ~/.trae/cli/sessions/<YYYY>/<MM>/<DD>/rollout-<ts>-<uuid>.jsonl
  *     (note the extra `cli/` level vs Codex's ~/.codex/sessions/...).
  *
- * This module therefore re-exports drainCodexRollout and friends directly,
- * and only provides TRAE-specific path finders (by pid / by session id).
+ * This module therefore re-exports the TRAE drainer and the shared
+ * split/extract helpers, and only provides TRAE-specific path finders
+ * (by pid / by session id).
  */
 import { existsSync, statSync, readdirSync, readlinkSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 import { platform } from 'node:os';
 import { join } from 'node:path';
 import {
-  drainCodexRollout,
+  drainTraexRollout,
   splitCodexEventsByCutoff,
   extractLastCodexTurn,
   type CodexBridgeEvent,
@@ -25,7 +32,7 @@ import {
 } from './codex-transcript.js';
 import { traeSessionsRoot } from './traex-paths.js';
 
-export { drainCodexRollout as drainTraexRollout };
+export { drainTraexRollout };
 export { splitCodexEventsByCutoff as splitTraexEventsByCutoff };
 export { extractLastCodexTurn as extractLastTraexTurn };
 export type { CodexBridgeEvent as TraexBridgeEvent, CodexDrainResult as TraexDrainResult };
