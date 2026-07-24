@@ -249,9 +249,9 @@ export interface CliAdapter {
     readonly sessionStartCommand?: string;
   };
 
-  /** true = 该 CLI 通过 hook 接管 askUserQuestion（不再装 botmux-ask skill 兜底）。
-   *  注入机制由各 adapter 自行决定（Claude 走 --settings、OpenCode 走插件、
-   *  CoCo 走 ensureAskHook 装插件）。 */
+  /** true = 该 CLI 的 Hook 已接管 askUserQuestion（不再装 botmux-ask
+   *  skill 兜底）。注入机制由各 adapter 自行决定（Claude 走 --settings、
+   *  OpenCode 走插件、CoCo 走 ensureAskHook）。 */
   readonly asksViaHook?: boolean;
 
   /** 命令式 hook 安装钩子：适用于无法靠纯写文件完成、需要 spawn CLI 子命令的场景

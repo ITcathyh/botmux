@@ -147,4 +147,11 @@ describe.sequential('TRAE adapter submit verification', () => {
 
     expect(result).toEqual({ submitted: true, cliSessionId: SID_2 });
   });
+
+  it('keeps the botmux-ask fallback skill for non-RPC TraeX sessions', () => {
+    const adapter = createTraexAdapter('/bin/traex');
+
+    expect(adapter.asksViaHook).toBe(false);
+    expect(adapter.hookInstall).toBeUndefined();
+  });
 });

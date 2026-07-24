@@ -84,6 +84,29 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     expect(tid).toBe('thread-persisted-42');
     engine.stop();
   }, 20_000);
+
+  it('bridges requestUserInput server requests to the host callback', async () => {
+    let received: unknown;
+    let resolveReceived!: () => void;
+    const receivedPromise = new Promise<void>(resolve => { resolveReceived = resolve; });
+    const engine = makeEngine({
+      env: { ...process.env, FAKE_REQUEST_USER_INPUT: '1' },
+      appServerFeatures: ['default_mode_request_user_input'],
+      onRequestUserInput: async params => {
+        received = params;
+        resolveReceived();
+        return { answers: { choice: { answers: ['Yes'] } } };
+      },
+    });
+    await engine.start();
+    await engine.startThread();
+    await engine.sendTurn('ask me');
+    await receivedPromise;
+    expect(received).toMatchObject({
+      questions: [{ id: 'choice', question: 'Continue?' }],
+    });
+    engine.stop();
+  }, 20_000);
 });
 
 describe('CodexRpcEngine — failure/recovery paths', () => {

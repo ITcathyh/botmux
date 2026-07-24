@@ -328,6 +328,11 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       'DeepSeek-V4-Pro',
       'kimi-k2.6',
     ],
+    // RPC mode bridges native AskUserQuestion directly. Keep the normal
+    // botmux-ask skill available too: TraeX sessions can fail closed to a
+    // standard PTY when RPC is unavailable, where native questions cannot
+    // reach the card bridge.
+    asksViaHook: false,
   };
 }
 

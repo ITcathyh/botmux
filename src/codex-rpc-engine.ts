@@ -68,6 +68,11 @@ export interface CodexRpcEngineOpts {
   /** Optional model + reasoning effort forwarded to thread config (P1). */
   model?: string;
   reasoningEffort?: string;
+  /** Feature gates owned by the app-server process (the viewer TUI does not
+   *  execute model tools in RPC mode). */
+  appServerFeatures?: string[];
+  /** Bridge a native request_user_input server request to the host UI. */
+  onRequestUserInput?: (params: unknown) => Promise<unknown>;
   /** Override the per-request JSON-RPC timeout (default REQUEST_TIMEOUT_MS).
    *  Mainly for tests that assert the wedged-app-server recovery path. */
   requestTimeoutMs?: number;
@@ -123,7 +128,8 @@ export class CodexRpcEngine {
   async start(): Promise<void> {
     this.reapStaleAppServer();
     this.port = await findFreePort();
-    this.child = spawn(this.opts.cliBin, ['app-server', '--listen', `ws://127.0.0.1:${this.port}`], {
+    const featureArgs = (this.opts.appServerFeatures ?? []).flatMap(feature => ['--enable', feature]);
+    this.child = spawn(this.opts.cliBin, ['app-server', ...featureArgs, '--listen', `ws://127.0.0.1:${this.port}`], {
       cwd: this.opts.cwd,
       env: this.opts.env,
       stdio: ['ignore', 'ignore', 'pipe'],
@@ -490,8 +496,20 @@ export class CodexRpcEngine {
       else p.resolve(msg.result);
       return;
     }
-    // Server→client request (approvals / elicitations): auto-answer.
+    // Native user-input requests are the one server→client request that must
+    // wait for a human. In botmux this callback posts a Lark card and returns
+    // the protocol-shaped answers object. Keep all approval requests automatic.
     if (typeof msg.id === 'number' && typeof msg.method === 'string') {
+      if (msg.method === 'item/tool/requestUserInput' && this.opts.onRequestUserInput) {
+        void this.opts.onRequestUserInput(msg.params).then(
+          result => this.respond(msg.id, result),
+          err => {
+            this.log(`[codex-rpc] requestUserInput bridge failed: ${err instanceof Error ? err.message : String(err)}`);
+            this.respond(msg.id, { answers: {} });
+          },
+        );
+        return;
+      }
       this.respond(msg.id, autoApproval(msg.method));
       return;
     }

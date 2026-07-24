@@ -135,6 +135,58 @@ function removeBotmuxAskHookGroups(
   }
 }
 
+function isBotmuxTraexAskHookEntry(entry: unknown): boolean {
+  return !!entry
+    && typeof entry === 'object'
+    && (entry as ClaudeHookEntry).type === 'command'
+    && typeof (entry as ClaudeHookEntry).command === 'string'
+    && (entry as ClaudeHookEntry).command.includes('cli.js')
+    && (entry as ClaudeHookEntry).command.trimEnd().endsWith('hook traex');
+}
+
+/**
+ * TRAE now routes native user-input through its RPC app-server. Remove only
+ * legacy botmux `hook traex` entries so they cannot race the RPC bridge and
+ * emit a duplicate Ask card. A hook group may contain multiple commands, so
+ * strip only the botmux entry and preserve unrelated user hooks in that group.
+ */
+export function cleanupTraexAskHooks(configPaths: readonly string[]): void {
+  for (const candidatePath of configPaths) {
+    const configPath = expandHome(candidatePath);
+    const settings = readJsonFile<ClaudeSettings>(configPath);
+    if (!settings || !isRecord(settings.hooks)) continue;
+    const hooks = settings.hooks as Record<string, ClaudeHookGroup[]>;
+
+    let changed = false;
+    for (const eventName of ['PreToolUse', 'PermissionRequest']) {
+      const existing = hooks[eventName] ?? [];
+      if (!Array.isArray(existing)) continue;
+      const filtered: ClaudeHookGroup[] = [];
+      for (const group of existing) {
+        if (!group || !Array.isArray(group.hooks)) {
+          filtered.push(group);
+          continue;
+        }
+        const retainedEntries = group.hooks.filter((entry) => !isBotmuxTraexAskHookEntry(entry));
+        if (retainedEntries.length === group.hooks.length) {
+          filtered.push(group);
+        } else {
+          changed = true;
+          if (retainedEntries.length > 0) filtered.push({ ...group, hooks: retainedEntries });
+        }
+      }
+      if (!changed) continue;
+      if (filtered.length === 0) delete hooks[eventName];
+      else hooks[eventName] = filtered;
+    }
+    if (!changed) continue;
+
+    const content = JSON.stringify(settings, null, 2) + '\n';
+    writeIfChanged(configPath, content);
+    logger.info(`[hook] Removed legacy TRAE ask hook → ${configPath}`);
+  }
+}
+
 /**
  * 判断某 hook group 是否是 botmux SessionStart 就绪 hook（用于幂等替换）。
  * 同 ask hook：结构化识别（命令引用 botmux 的 cli.js 且尾部是 `session-ready`），

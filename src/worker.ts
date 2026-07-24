@@ -119,6 +119,7 @@ import {
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
 import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, type CodexBridgeEvent } from './services/codex-transcript.js';
 import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid } from './services/traex-transcript.js';
+import { parseTraexUserInputQuestions } from './services/traex-user-input.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath } from './services/hermes-transcript.js';
 import { filterHermesEventsForBotmuxSession } from './services/hermes-session-filter.js';
@@ -235,7 +236,8 @@ import {
   type HookInstallConfig,
 } from './adapters/hook-installer.js';
 import { hookCommandFor } from './adapters/hook-command.js';
-import { parseDaemonIpcPort } from './utils/daemon-discovery.js';
+import { findOnlineDaemon, parseDaemonIpcPort } from './utils/daemon-discovery.js';
+import { fetchDaemonIpc } from './core/daemon-ipc-auth.js';
 import { withCodexAppContext } from './utils/codex-app-context.js';
 import { resolveCodexAppFinalTurnIdentity } from './adapters/cli/codex-app-turn.js';
 import { RunnerControlDecoder } from './adapters/cli/runner-control-channel.js';
@@ -576,6 +578,57 @@ async function prepareCodexNativeTitleGeneration(
   if (threadId) await captureCodexResumeTitleBaseline(threadId, engine);
 }
 
+type RpcUserInputAnswer = { answers: Record<string, { answers: string[] }> };
+
+/** Bridge TRAE app-server's native request_user_input request to botmux's
+ * existing Lark ask broker. The app-server owns tool execution in RPC mode, so
+ * returning this response resumes the same turn without terminal key driving. */
+async function bridgeTraexUserInput(
+  cfg: Extract<DaemonToWorker, { type: 'init' }>,
+  params: unknown,
+): Promise<RpcUserInputAnswer> {
+  const empty: RpcUserInputAnswer = { answers: {} };
+  const parsed = parseTraexUserInputQuestions(params);
+  if (parsed.kind === 'unsupported') {
+    log(`TRAE RPC requestUserInput cannot be represented by an ask card (${parsed.reason}); returning empty answers`);
+    return empty;
+  }
+  const { questions } = parsed;
+  const daemon = findOnlineDaemon(cfg.larkAppId);
+  if (!daemon) throw new Error(`daemon not found for larkAppId=${cfg.larkAppId}`);
+
+  const response = await fetchDaemonIpc(daemon.ipcPort, '/api/asks', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      sessionId: cfg.sessionId,
+      chatId: cfg.chatId,
+      larkAppId: cfg.larkAppId,
+      rootMessageId: cfg.rootMessageId || null,
+      questions: questions.map(entry => entry.question),
+      timeoutMs: 3_600_000,
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(`ask broker HTTP ${response.status}: ${(await response.text()).slice(0, 200)}`);
+  }
+  const result = await response.json() as {
+    kind?: string;
+    answers?: ReadonlyArray<ReadonlyArray<string>>;
+    comment?: string | null;
+  };
+  if (result.kind !== 'answered') return empty;
+
+  const customText = result.comment?.trim() ?? '';
+  const answers: RpcUserInputAnswer['answers'] = {};
+  questions.forEach((entry, index) => {
+    const selected = result.answers?.[index] ?? [];
+    const values = selected.length > 0 ? [...selected] : customText ? [customText] : [];
+    if (values.length > 0) answers[entry.id] = { answers: values };
+  });
+  return { answers };
+}
+
 /** Stand up (or re-establish) the per-session codex app-server + botmux-owned
  *  thread and point remote{WsUrl,ThreadId} at it, so the next spawnCli launches
  *  `codex --remote <ws> resume <thread>` and input flows over JSON-RPC. Fully
@@ -601,7 +654,17 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     const engineEnv: NodeJS.ProcessEnv = { ...redactChildEnv(process.env) };
     engineEnv.PATH = `${join(homedir(), '.botmux', 'bin')}:${engineEnv.PATH ?? ''}`;
     engineEnv.BOTMUX_SESSION_ID = cfg.sessionId;
+    // In Codex/TraeX RPC mode the app-server, not the remote viewer TUI, runs
+    // model shell tools. Give that process the same non-secret route binding as
+    // spawnCli so `botmux ask` can post into the current Lark thread.
+    engineEnv.BOTMUX_CHAT_ID = cfg.chatId;
+    if (cfg.chatType) engineEnv.BOTMUX_CHAT_TYPE = cfg.chatType;
+    else delete engineEnv.BOTMUX_CHAT_TYPE;
     engineEnv.BOTMUX_LARK_APP_ID = cfg.larkAppId;
+    engineEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
+    engineEnv.BOTMUX_SESSION_SCOPE = cfg.rootMessageId?.startsWith('om_') ? 'thread' : 'chat';
+    if (cfg.ownerOpenId) engineEnv.BOTMUX_OWNER_OPEN_ID = cfg.ownerOpenId;
+    else delete engineEnv.BOTMUX_OWNER_OPEN_ID;
     // The app-server owns model execution in RPC mode. Its MCP gateway child
     // must inherit the trusted host socket just like a native CLI process does.
     if (sessionMcpGatewayHost) {
@@ -619,6 +682,10 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     engine = new CodexRpcEngine({
       cliBin, cwd: cfg.workingDir, env: engineEnv, sessionId: cfg.sessionId,
       model: cfg.model, log: (m: string) => log(m),
+      appServerFeatures: cfg.cliId === 'traex' ? ['default_mode_request_user_input'] : undefined,
+      onRequestUserInput: cfg.cliId === 'traex'
+        ? (params: unknown) => bridgeTraexUserInput(cfg, params)
+        : undefined,
       onDead: () => {
         if (codexRpcEngine === engine) {
           log('Codex RPC app-server died; replacing the tmux session and re-engaging the thread');

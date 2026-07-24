@@ -11,6 +11,7 @@ import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'n
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
+  cleanupTraexAskHooks,
   hasInstalledSessionReadyHook,
   installHook,
 } from '../src/adapters/hook-installer.js';
@@ -343,5 +344,71 @@ describe('installHook — opencode-plugin', () => {
     const afterSecond = readFileSync(configPath, 'utf-8');
 
     expect(afterSecond).toBe(afterFirst);
+  });
+});
+
+// ─── TRAE legacy hook cleanup ────────────────────────────────────────────────
+
+describe('cleanupTraexAskHooks', () => {
+  let tmpDir: string;
+  let configPath: string;
+
+  beforeEach(() => {
+    tmpDir = makeTmpDir();
+    configPath = join(tmpDir, '.trae', 'hooks.json');
+  });
+
+  it('removes only legacy botmux TraeX ask hooks and preserves unrelated hooks', () => {
+    const existing = {
+      version: 1,
+      hooks: {
+        UserPromptSubmit: [{ hooks: [{ type: 'command', command: 'era-cli ... UserPromptSubmit' }] }],
+        PostToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: 'era-cli ... PostToolUse' }] }],
+        Stop: [{ hooks: [{ type: 'command', command: 'era-cli ... Stop' }] }],
+        PreToolUse: [
+          {
+            matcher: '^(AskUserQuestion|request_user_input)$',
+            hooks: [
+              { type: 'command', command: '/repo/dist/cli.js hook traex' },
+              { type: 'command', command: 'era-cli ... PreToolUse' },
+            ],
+          },
+        ],
+        PermissionRequest: [
+          { hooks: [{ type: 'command', command: '/opt/botmux/dist/cli.js hook traex' }] },
+        ],
+      },
+    };
+    mkdirSync(join(tmpDir, '.trae'), { recursive: true });
+    writeFileSync(configPath, JSON.stringify(existing, null, 2) + '\n', 'utf-8');
+
+    cleanupTraexAskHooks([configPath]);
+
+    const settings = JSON.parse(readFileSync(configPath, 'utf-8'));
+    expect(settings.version).toBe(1);
+    expect(settings.hooks.UserPromptSubmit[0].hooks[0].command).toContain('UserPromptSubmit');
+    expect(settings.hooks.PostToolUse[0].hooks[0].command).toContain('PostToolUse');
+    expect(settings.hooks.Stop[0].hooks[0].command).toContain('Stop');
+    expect(settings.hooks.PreToolUse).toEqual([
+      {
+        matcher: '^(AskUserQuestion|request_user_input)$',
+        hooks: [{ type: 'command', command: 'era-cli ... PreToolUse' }],
+      },
+    ]);
+    expect(settings.hooks.PermissionRequest).toBeUndefined();
+  });
+
+  it('ignores malformed hook groups instead of blocking daemon startup', () => {
+    const existing = {
+      hooks: {
+        PreToolUse: 'not-an-array',
+        PermissionRequest: [{ hooks: [null, { type: 'command', command: 'not-botmux' }] }],
+      },
+    };
+    mkdirSync(join(tmpDir, '.trae'), { recursive: true });
+    writeFileSync(configPath, JSON.stringify(existing, null, 2) + '\n', 'utf-8');
+
+    expect(() => cleanupTraexAskHooks([configPath])).not.toThrow();
+    expect(JSON.parse(readFileSync(configPath, 'utf-8'))).toEqual(existing);
   });
 });

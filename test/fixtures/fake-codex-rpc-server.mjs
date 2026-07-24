@@ -19,6 +19,7 @@ const UPDATED_BEFORE = Number(process.env.FAKE_UPDATED_BEFORE ?? '100');
 const UPDATED_AFTER = Number(process.env.FAKE_UPDATED_AFTER ?? '101');
 let threadReadAttempt = 0;
 let currentThreadName;
+const REQUEST_USER_INPUT = process.env.FAKE_REQUEST_USER_INPUT === '1';
 
 const httpServer = createServer((req, res) => {
   if (req.url === '/readyz') { res.writeHead(200); res.end('ok'); return; }
@@ -26,8 +27,20 @@ const httpServer = createServer((req, res) => {
 });
 const wss = new WebSocketServer({ server: httpServer });
 wss.on('connection', (ws) => {
+  let pendingTurnReply;
   ws.on('message', (data) => {
     let msg; try { msg = JSON.parse(data.toString()); } catch { return; }
+    if (REQUEST_USER_INPUT && msg.id === 900 && msg.result !== undefined) {
+      if (!pendingTurnReply) return;
+      const accepted = msg.result?.answers?.choice?.answers?.[0] === 'Yes';
+      ws.send(JSON.stringify({
+        jsonrpc: '2.0',
+        id: pendingTurnReply,
+        ...(accepted ? { result: { accepted: true } } : { error: { message: 'missing user-input answer' } }),
+      }));
+      pendingTurnReply = undefined;
+      return;
+    }
     if (typeof msg.id !== 'number' || typeof msg.method !== 'string') return;
     const reply = (result) => ws.send(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result }));
     switch (msg.method) {
@@ -43,7 +56,25 @@ wss.on('connection', (ws) => {
           updatedAt: threadReadAttempt > UPDATED_DELAY_READS ? UPDATED_AFTER : UPDATED_BEFORE,
         } });
       case 'thread/name/set': currentThreadName = msg.params?.name; return reply({});
-      case 'turn/start': if (HANG_TURN) return; return reply({ accepted: true });
+      case 'turn/start': {
+        if (HANG_TURN) return;
+        if (REQUEST_USER_INPUT) {
+          pendingTurnReply = msg.id;
+          ws.send(JSON.stringify({
+            jsonrpc: '2.0',
+            id: 900,
+            method: 'item/tool/requestUserInput',
+            params: {
+              questions: [{
+                id: 'choice', header: 'Test', question: 'Continue?', multiSelect: false,
+                options: [{ label: 'Yes', description: '' }, { label: 'No', description: '' }],
+              }],
+            },
+          }));
+          return;
+        }
+        return reply({ accepted: true });
+      }
       default: return reply({});
     }
   });
