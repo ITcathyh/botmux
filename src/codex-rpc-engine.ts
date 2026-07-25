@@ -478,9 +478,30 @@ export class CodexRpcEngine {
     try { this.send({ jsonrpc: '2.0', id, result }); } catch { /* connection gone */ }
   }
 
-  /** Reply to a server→client request with a JSON-RPC error so the app-server
-   *  sees the request failed, instead of a benign {answers:{}} it would treat as
-   *  "no answer" and silently complete. -32000 = generic server error. */
+  /** Fail a native user-input request by INTERRUPTING its turn instead of
+   *  replying. Verified on real traex 0.200.19: replying with either empty
+   *  answers or a JSON-RPC error is normalized to `{answers:{}}` and the turn
+   *  still completes (the ask is silently skipped). `turn/interrupt` is the only
+   *  path that actually stops the turn (status → 'interrupted'); the pending
+   *  server request is cancelled along with it, so we do NOT also respond. */
+  private interruptTurnFor(id: number, params: unknown, reason: string): void {
+    const p = (params && typeof params === 'object') ? params as Record<string, unknown> : {};
+    const threadId = typeof p.threadId === 'string' ? p.threadId : undefined;
+    const turnId = typeof p.turnId === 'string' ? p.turnId : undefined;
+    if (!threadId || !turnId) {
+      // No turn coordinates to interrupt: fall back to a JSON-RPC error so at
+      // least the request does not hang the app-server waiting on a reply.
+      this.log(`[codex-rpc] requestUserInput failure without threadId/turnId; replying error (${reason})`);
+      this.respondError(id, reason);
+      return;
+    }
+    this.request('turn/interrupt', { threadId, turnId }, { timeoutMs: 10_000, fatalOnTimeout: false })
+      .then(() => this.log('[codex-rpc] turn interrupted after requestUserInput failure'))
+      .catch(err => this.log(`[codex-rpc] turn/interrupt failed: ${err instanceof Error ? err.message : String(err)}`));
+  }
+
+  /** Reply to a server→client request with a JSON-RPC error. Used only as a
+   *  last resort when a failed requestUserInput has no turn to interrupt. */
   private respondError(id: number, message: string): void {
     try { this.send({ jsonrpc: '2.0', id, error: { code: -32000, message } }); } catch { /* connection gone */ }
   }
@@ -508,16 +529,20 @@ export class CodexRpcEngine {
     // the protocol-shaped answers object. Keep all approval requests automatic.
     if (typeof msg.id === 'number' && typeof msg.method === 'string') {
       if (msg.method === 'item/tool/requestUserInput' && this.opts.onRequestUserInput) {
-        void this.opts.onRequestUserInput(msg.params).then(
+        const requestParams = msg.params;
+        void this.opts.onRequestUserInput(requestParams).then(
           result => this.respond(msg.id, result),
           err => {
-            // Fail VISIBLY, never silently: returning {answers:{}} makes the
-            // app-server treat the tool as "unanswered" and complete the turn,
-            // so unsupported/broker-failed asks would be silently skipped. A
-            // JSON-RPC error surfaces the failure on the tool call instead.
+            // Fail VISIBLY, never silently. Verified against real traex 0.200.19:
+            // ANY response to this request — empty answers OR a JSON-RPC error —
+            // is normalized by the app-server into `{answers:{}}` and the turn
+            // still COMPLETES, so unsupported/broker-failed asks would be
+            // silently skipped. Only `turn/interrupt` (threadId+turnId, both
+            // carried in this request's params) actually stops the turn
+            // (status → 'interrupted'). So fail by interrupting the turn.
             const message = err instanceof Error ? err.message : String(err);
-            this.log(`[codex-rpc] requestUserInput bridge failed: ${message}`);
-            this.respondError(msg.id, message);
+            this.log(`[codex-rpc] requestUserInput bridge failed: ${message}; interrupting turn`);
+            this.interruptTurnFor(msg.id, requestParams, message);
           },
         );
         return;

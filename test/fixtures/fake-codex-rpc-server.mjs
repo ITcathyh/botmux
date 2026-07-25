@@ -32,15 +32,18 @@ wss.on('connection', (ws) => {
     let msg; try { msg = JSON.parse(data.toString()); } catch { return; }
     if (REQUEST_USER_INPUT && msg.id === 900 && (msg.result !== undefined || msg.error !== undefined)) {
       if (!pendingTurnReply) return;
-      // Distinguish the three client behaviors so the engine test can assert
-      // which one happened: a JSON-RPC error (fail-visible), a "Yes" answer, or
-      // anything else (including the old empty {answers:{}}).
-      const outcome = msg.error !== undefined
-        ? { error: { message: `user-input request failed: ${msg.error?.message ?? 'error'}` } }
-        : msg.result?.answers?.choice?.answers?.[0] === 'Yes'
-          ? { result: { accepted: true } }
-          : { error: { message: 'missing user-input answer' } };
-      ws.send(JSON.stringify({ jsonrpc: '2.0', id: pendingTurnReply, ...outcome }));
+      // Real traex 0.200.19 normalizes ANY reply to requestUserInput (empty
+      // answers OR a JSON-RPC error) into {answers:{}} and COMPLETES the turn.
+      // Model that: a direct reply always completes the turn. Only an explicit
+      // `turn/interrupt` (below) ends it as interrupted. This keeps the fixture
+      // faithful to the verified product behavior instead of inventing an
+      // "error bubbles up" semantics that traex does not implement.
+      const accepted = msg.result?.answers?.choice?.answers?.[0] === 'Yes';
+      ws.send(JSON.stringify({
+        jsonrpc: '2.0',
+        id: pendingTurnReply,
+        result: { accepted, status: 'completed' },
+      }));
       pendingTurnReply = undefined;
       return;
     }
@@ -59,6 +62,21 @@ wss.on('connection', (ws) => {
           updatedAt: threadReadAttempt > UPDATED_DELAY_READS ? UPDATED_AFTER : UPDATED_BEFORE,
         } });
       case 'thread/name/set': currentThreadName = msg.params?.name; return reply({});
+      case 'turn/interrupt': {
+        // Verified real behavior: interrupt ends the in-flight turn as
+        // 'interrupted' and acks with {}. Resolve the pending turn/start as an
+        // interrupted turn so the engine test can assert the turn stopped
+        // instead of silently completing.
+        if (pendingTurnReply) {
+          ws.send(JSON.stringify({
+            jsonrpc: '2.0',
+            id: pendingTurnReply,
+            result: { turn: { status: 'interrupted' } },
+          }));
+          pendingTurnReply = undefined;
+        }
+        return reply({});
+      }
       case 'turn/start': {
         if (HANG_TURN) return;
         if (REQUEST_USER_INPUT) {
@@ -68,6 +86,9 @@ wss.on('connection', (ws) => {
             id: 900,
             method: 'item/tool/requestUserInput',
             params: {
+              threadId: msg.params?.threadId ?? 'thread-fake-1',
+              turnId: 'turn-fake-1',
+              itemId: 'item-fake-1',
               questions: [{
                 id: 'choice', header: 'Test', question: 'Continue?', multiSelect: false,
                 options: [{ label: 'Yes', description: '' }, { label: 'No', description: '' }],

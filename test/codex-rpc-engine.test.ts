@@ -108,20 +108,29 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     engine.stop();
   }, 20_000);
 
-  it('replies with a JSON-RPC error (not empty answers) when the input bridge rejects', async () => {
-    // The blocker fix: an unsupported/broker-failed ask must fail VISIBLY. When
-    // onRequestUserInput rejects, the engine must send a JSON-RPC error so the
-    // app-server sees the tool failed — not {answers:{}} it would silently skip.
+  it('interrupts the turn (not a benign reply) when the input bridge rejects', async () => {
+    // The blocker fix. Verified against real traex 0.200.19: replying to
+    // requestUserInput with empty answers OR a JSON-RPC error is normalized to
+    // {answers:{}} and the turn still COMPLETES, silently skipping the ask. Only
+    // `turn/interrupt` actually stops the turn. So on bridge rejection the engine
+    // must send turn/interrupt — asserted here via the engine log + the fixture
+    // resolving turn/start as an interrupted turn rather than a completed one.
+    const logs: string[] = [];
     const engine = makeEngine({
       env: { ...process.env, FAKE_REQUEST_USER_INPUT: '1' },
       appServerFeatures: ['default_mode_request_user_input'],
+      log: (m: string) => logs.push(m),
       onRequestUserInput: async () => { throw new Error('cannot represent as ask card'); },
     });
     await engine.start();
     await engine.startThread();
-    // The fixture turns our error response into a turn-level error, so the turn
-    // rejects instead of resolving as an unanswered success.
-    await expect(engine.sendTurn('ask me')).rejects.toThrow(/user-input request failed/);
+    // turn/start resolves (interrupted), so sendTurn does not throw here; the
+    // point is that the turn was stopped, not silently completed.
+    await engine.sendTurn('ask me');
+    // Give the async interrupt round-trip a moment to log its result.
+    await new Promise(resolve => setTimeout(resolve, 200));
+    expect(logs.some(l => l.includes('interrupting turn'))).toBe(true);
+    expect(logs.some(l => l.includes('turn interrupted after requestUserInput failure'))).toBe(true);
     engine.stop();
   }, 20_000);
 });
