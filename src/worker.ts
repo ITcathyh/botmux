@@ -587,11 +587,12 @@ async function bridgeTraexUserInput(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
   params: unknown,
 ): Promise<RpcUserInputAnswer> {
-  const empty: RpcUserInputAnswer = { answers: {} };
   const parsed = parseTraexUserInputQuestions(params);
   if (parsed.kind === 'unsupported') {
-    log(`TRAE RPC requestUserInput cannot be represented by an ask card (${parsed.reason}); returning empty answers`);
-    return empty;
+    // Returning empty answers makes TraeX silently complete the tool as if no
+    // one answered, dropping the whole batch. Throw instead so the RPC engine
+    // replies with a JSON-RPC error and the failure is visible on the turn.
+    throw new Error(`requestUserInput cannot be represented as an ask card: ${parsed.reason}`);
   }
   const { questions } = parsed;
   const daemon = findOnlineDaemon(cfg.larkAppId);
@@ -617,7 +618,11 @@ async function bridgeTraexUserInput(
     answers?: ReadonlyArray<ReadonlyArray<string>>;
     comment?: string | null;
   };
-  if (result.kind !== 'answered') return empty;
+  // Timeout/cancel/invalidated — surface as an error rather than an empty answer
+  // that TraeX would treat as "no one answered" and silently skip.
+  if (result.kind !== 'answered') {
+    throw new Error(`ask not answered (${result.kind ?? 'unknown'})`);
+  }
 
   const customText = result.comment?.trim() ?? '';
   const answers: RpcUserInputAnswer['answers'] = {};

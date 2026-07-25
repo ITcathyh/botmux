@@ -478,6 +478,13 @@ export class CodexRpcEngine {
     try { this.send({ jsonrpc: '2.0', id, result }); } catch { /* connection gone */ }
   }
 
+  /** Reply to a server→client request with a JSON-RPC error so the app-server
+   *  sees the request failed, instead of a benign {answers:{}} it would treat as
+   *  "no answer" and silently complete. -32000 = generic server error. */
+  private respondError(id: number, message: string): void {
+    try { this.send({ jsonrpc: '2.0', id, error: { code: -32000, message } }); } catch { /* connection gone */ }
+  }
+
   private send(msg: Json): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) throw new Error('app-server ws not open');
     this.ws.send(JSON.stringify(msg));
@@ -504,8 +511,13 @@ export class CodexRpcEngine {
         void this.opts.onRequestUserInput(msg.params).then(
           result => this.respond(msg.id, result),
           err => {
-            this.log(`[codex-rpc] requestUserInput bridge failed: ${err instanceof Error ? err.message : String(err)}`);
-            this.respond(msg.id, { answers: {} });
+            // Fail VISIBLY, never silently: returning {answers:{}} makes the
+            // app-server treat the tool as "unanswered" and complete the turn,
+            // so unsupported/broker-failed asks would be silently skipped. A
+            // JSON-RPC error surfaces the failure on the tool call instead.
+            const message = err instanceof Error ? err.message : String(err);
+            this.log(`[codex-rpc] requestUserInput bridge failed: ${message}`);
+            this.respondError(msg.id, message);
           },
         );
         return;

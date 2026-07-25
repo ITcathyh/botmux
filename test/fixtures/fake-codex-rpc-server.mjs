@@ -30,14 +30,17 @@ wss.on('connection', (ws) => {
   let pendingTurnReply;
   ws.on('message', (data) => {
     let msg; try { msg = JSON.parse(data.toString()); } catch { return; }
-    if (REQUEST_USER_INPUT && msg.id === 900 && msg.result !== undefined) {
+    if (REQUEST_USER_INPUT && msg.id === 900 && (msg.result !== undefined || msg.error !== undefined)) {
       if (!pendingTurnReply) return;
-      const accepted = msg.result?.answers?.choice?.answers?.[0] === 'Yes';
-      ws.send(JSON.stringify({
-        jsonrpc: '2.0',
-        id: pendingTurnReply,
-        ...(accepted ? { result: { accepted: true } } : { error: { message: 'missing user-input answer' } }),
-      }));
+      // Distinguish the three client behaviors so the engine test can assert
+      // which one happened: a JSON-RPC error (fail-visible), a "Yes" answer, or
+      // anything else (including the old empty {answers:{}}).
+      const outcome = msg.error !== undefined
+        ? { error: { message: `user-input request failed: ${msg.error?.message ?? 'error'}` } }
+        : msg.result?.answers?.choice?.answers?.[0] === 'Yes'
+          ? { result: { accepted: true } }
+          : { error: { message: 'missing user-input answer' } };
+      ws.send(JSON.stringify({ jsonrpc: '2.0', id: pendingTurnReply, ...outcome }));
       pendingTurnReply = undefined;
       return;
     }

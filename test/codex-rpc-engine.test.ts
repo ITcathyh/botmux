@@ -107,6 +107,23 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     });
     engine.stop();
   }, 20_000);
+
+  it('replies with a JSON-RPC error (not empty answers) when the input bridge rejects', async () => {
+    // The blocker fix: an unsupported/broker-failed ask must fail VISIBLY. When
+    // onRequestUserInput rejects, the engine must send a JSON-RPC error so the
+    // app-server sees the tool failed — not {answers:{}} it would silently skip.
+    const engine = makeEngine({
+      env: { ...process.env, FAKE_REQUEST_USER_INPUT: '1' },
+      appServerFeatures: ['default_mode_request_user_input'],
+      onRequestUserInput: async () => { throw new Error('cannot represent as ask card'); },
+    });
+    await engine.start();
+    await engine.startThread();
+    // The fixture turns our error response into a turn-level error, so the turn
+    // rejects instead of resolving as an unanswered success.
+    await expect(engine.sendTurn('ask me')).rejects.toThrow(/user-input request failed/);
+    engine.stop();
+  }, 20_000);
 });
 
 describe('CodexRpcEngine — failure/recovery paths', () => {
