@@ -497,7 +497,13 @@ export class CodexRpcEngine {
     }
     this.request('turn/interrupt', { threadId, turnId }, { timeoutMs: 10_000, fatalOnTimeout: false })
       .then(() => this.log('[codex-rpc] turn interrupted after requestUserInput failure'))
-      .catch(err => this.log(`[codex-rpc] turn/interrupt failed: ${err instanceof Error ? err.message : String(err)}`));
+      .catch(err => {
+        // If the interrupt itself errors or times out, the turn is still wedged
+        // and we have no other lever. Declare the engine dead so the worker
+        // replaces the pane (onDead → restartCliProcess) rather than leaking a
+        // permanently stuck turn — the whole point of this failure path.
+        this.failAll(new Error(`turn/interrupt failed: ${err instanceof Error ? err.message : String(err)}`));
+      });
   }
 
   /** Reply to a server→client request with a JSON-RPC error. Used only as a

@@ -133,6 +133,28 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     expect(logs.some(l => l.includes('turn interrupted after requestUserInput failure'))).toBe(true);
     engine.stop();
   }, 20_000);
+
+  it('declares the engine dead when turn/interrupt itself fails (no permanently wedged turn)', async () => {
+    // The interrupt is the last lever we have on bridge failure. If it errors or
+    // times out, the turn stays stuck — so the engine must fire onDead so the
+    // worker restarts the pane, rather than only logging and leaking the hang.
+    let deadCount = 0;
+    const engine = makeEngine({
+      sessionId: 'interrupt-fail',
+      env: { ...process.env, FAKE_REQUEST_USER_INPUT: '1', FAKE_INTERRUPT_ERROR: '1' },
+      appServerFeatures: ['default_mode_request_user_input'],
+      onRequestUserInput: async () => { throw new Error('cannot represent as ask card'); },
+      onDead: () => { deadCount++; },
+    });
+    await engine.start();
+    await engine.startThread();
+    // failAll rejects the still-pending turn/start, so sendTurn rejects here —
+    // that is the visible failure, not a silent hang. We only care that onDead fired.
+    await engine.sendTurn('ask me').catch(() => {});
+    await new Promise(resolve => setTimeout(resolve, 300));
+    expect(deadCount).toBe(1);
+    engine.stop();
+  }, 20_000);
 });
 
 describe('CodexRpcEngine — failure/recovery paths', () => {

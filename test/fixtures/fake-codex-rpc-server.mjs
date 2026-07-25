@@ -63,6 +63,16 @@ wss.on('connection', (ws) => {
         } });
       case 'thread/name/set': currentThreadName = msg.params?.name; return reply({});
       case 'turn/interrupt': {
+        // FAKE_INTERRUPT_ERROR=1 models an interrupt that itself fails: the
+        // app-server rejects turn/interrupt with a JSON-RPC error. The engine
+        // then has no lever left and must declare itself dead (onDead) rather
+        // than leaking a wedged turn.
+        if (process.env.FAKE_INTERRUPT_ERROR === '1') {
+          return ws.send(JSON.stringify({
+            jsonrpc: '2.0', id: msg.id,
+            error: { code: -32000, message: 'interrupt failed' },
+          }));
+        }
         // Verified real behavior: interrupt ends the in-flight turn as
         // 'interrupted' and acks with {}. Resolve the pending turn/start as an
         // interrupted turn so the engine test can assert the turn stopped
