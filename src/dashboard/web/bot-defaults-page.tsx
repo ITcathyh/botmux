@@ -57,6 +57,78 @@ type BotProfileRoleState = {
   items: BotProfileRoleItem[];
 };
 
+export type BotDefaultsTab = 'common' | 'sessions' | 'security' | 'cards' | 'advanced';
+
+export const BOT_DEFAULTS_TABS: readonly BotDefaultsTab[] = [
+  'common',
+  'sessions',
+  'security',
+  'cards',
+  'advanced',
+];
+
+export function BotDefaultsTabs(props: {
+  active: BotDefaultsTab;
+  onChange(tab: BotDefaultsTab): void;
+}) {
+  const tr = useT();
+  const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const labels: Record<BotDefaultsTab, string> = {
+    common: tr('botDefaults.tabCommon'),
+    sessions: tr('botDefaults.tabSessions'),
+    security: tr('botDefaults.tabSecurity'),
+    cards: tr('botDefaults.tabCards'),
+    advanced: tr('botDefaults.tabAdvanced'),
+  };
+
+  function selectAt(index: number): void {
+    const nextIndex = (index + BOT_DEFAULTS_TABS.length) % BOT_DEFAULTS_TABS.length;
+    const next = BOT_DEFAULTS_TABS[nextIndex]!;
+    props.onChange(next);
+    tabRefs.current[nextIndex]?.focus();
+  }
+
+  return (
+    <nav className="bd-tab-bar" aria-label={tr('botDefaults.tabNavigation')}>
+      <div className="bd-tabs" role="tablist">
+        {BOT_DEFAULTS_TABS.map((tab, index) => (
+          <button
+            ref={node => { tabRefs.current[index] = node; }}
+            key={tab}
+            id={`bd-tab-${tab}`}
+            type="button"
+            role="tab"
+            className={`bd-tab${props.active === tab ? ' active' : ''}`}
+            aria-selected={props.active === tab}
+            aria-controls={`bd-panel-${tab}`}
+            tabIndex={props.active === tab ? 0 : -1}
+            data-bd-tab={tab}
+            onClick={() => props.onChange(tab)}
+            onKeyDown={event => {
+              if (event.key === 'ArrowRight') {
+                event.preventDefault();
+                selectAt(index + 1);
+              } else if (event.key === 'ArrowLeft') {
+                event.preventDefault();
+                selectAt(index - 1);
+              } else if (event.key === 'Home') {
+                event.preventDefault();
+                selectAt(0);
+              } else if (event.key === 'End') {
+                event.preventDefault();
+                selectAt(BOT_DEFAULTS_TABS.length - 1);
+              }
+            }}
+          >
+            {labels[tab]}
+          </button>
+        ))}
+      </div>
+      <small className="bd-tab-hint">{tr('botDefaults.tabHint')}</small>
+    </nav>
+  );
+}
+
 function statusClass(status: StatusMessage, extra = ''): string {
   const suffix = status ? ` ${status.ok ? 'hint-ok' : 'hint-warn-inline'}` : '';
   return `oncall-status${extra ? ` ${extra}` : ''}${suffix}`;
@@ -288,6 +360,7 @@ export function BotDefaultsPage() {
   const [profileRoleVersion, setProfileRoleVersion] = useState(0);
   const [, setAvatarVersion] = useState(0);
   const [onboardingBusy, setOnboardingBusy] = useState(false);
+  const [activeTab, setActiveTab] = useState<BotDefaultsTab>('common');
 
   const refresh = useCallback(async (clearProfileRoles = false) => {
     if (clearProfileRoles) setProfileRoleVersion(version => version + 1);
@@ -382,6 +455,8 @@ export function BotDefaultsPage() {
         bot={selectedBot}
         cliState={cliState}
         patchBot={patchBot}
+        activeTab={activeTab}
+        onTabChange={setActiveTab}
       />
     );
   } else {
@@ -422,6 +497,12 @@ export function BotDefaultsPage() {
               onChange={event => setQuery(event.currentTarget.value)}
             />
           </form>
+          <div className="bd-roster-meta">
+            <span>{tr('botDefaults.rosterCount', { count: filtered.length })}</span>
+            {query.trim() && filtered.length !== bots.length ? (
+              <span>{tr('botDefaults.rosterFiltered', { total: bots.length })}</span>
+            ) : null}
+          </div>
           <div className="bd-roster-list">
             {!loadError && filtered.map(bot => (
               <RosterItem
@@ -467,7 +548,13 @@ function RosterItem(props: { bot: BotDefaultsRow; selected: boolean; onSelect():
   );
 }
 
-function BotDefaultsCard(props: { bot: BotDefaultsRow; cliState: CliOptionsState; patchBot: PatchBot }) {
+function BotDefaultsCard(props: {
+  bot: BotDefaultsRow;
+  cliState: CliOptionsState;
+  patchBot: PatchBot;
+  activeTab: BotDefaultsTab;
+  onTabChange(tab: BotDefaultsTab): void;
+}) {
   const tr = useT();
   const { bot, cliState, patchBot } = props;
   const name = bot.botName ?? bot.larkAppId;
@@ -500,55 +587,108 @@ function BotDefaultsCard(props: { bot: BotDefaultsRow; cliState: CliOptionsState
 
   return (
     <article className="bd-card bd-profile" data-appid={bot.larkAppId}>
-      <header className="bd-profile-head">
-        <BotAvatarControl bot={bot} name={name} patchBot={patchBot} />
-        <div className="bd-profile-main">
-          <BotProfileIdentity
-            bot={bot}
-            cli={cli}
-            patchBot={patchBot}
-            meta={(
-              <>
-                <small className="bd-meta-ok">● {tr('botDefaults.metaOnline')}</small>
-                <small data-oncall-since>{tr('botDefaults.lastEnabled')}: {fmtSince(def.since ?? 0)}</small>
-                <small>{tr('botDefaults.autobound', { count: bot.autoboundChatCount ?? 0 })}</small>
-              </>
-            )}
-          />
-        </div>
-      </header>
-      <div className="bd-body bd-grid">
-        <div className="bd-column">
-          <section className="bd-tile">
-            <BotAgentSection bot={bot} sessionFallback={cli} cliState={cliState} patchBot={patchBot} />
-            <WorkingDirSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} />
-            {/* riff 在远端沙箱执行、本地无 CLI 进程，文件沙盒对它无意义（worker 侧已旁路）。 */}
-            {bot.cliId !== 'riff' && <SandboxSection bot={bot} patchBot={patchBot} />}
-            {bot.cliId !== 'riff' && bot.sandbox === true && <SandboxPathsSection bot={bot} patchBot={patchBot} />}
+      <div className="bd-profile-chrome">
+        <header className="bd-profile-head">
+          <BotAvatarControl bot={bot} name={name} patchBot={patchBot} />
+          <div className="bd-profile-main">
+            <BotProfileIdentity
+              bot={bot}
+              cli={cli}
+              patchBot={patchBot}
+              meta={(
+                <>
+                  <small className="bd-meta-ok">● {tr('botDefaults.metaOnline')}</small>
+                  {(def.since ?? 0) > 0 ? <small data-oncall-since>{tr('botDefaults.lastEnabled')}: {fmtSince(def.since ?? 0)}</small> : null}
+                  {(bot.autoboundChatCount ?? 0) > 0 ? <small>{tr('botDefaults.autobound', { count: bot.autoboundChatCount ?? 0 })}</small> : null}
+                </>
+              )}
+            />
+          </div>
+        </header>
+        <BotDefaultsTabs active={props.activeTab} onChange={props.onTabChange} />
+      </div>
+      <div className="bd-body bd-tab-panels">
+        <div
+          id="bd-panel-common"
+          role="tabpanel"
+          aria-labelledby="bd-tab-common"
+          className="bd-tab-panel"
+          hidden={props.activeTab !== 'common'}
+        >
+          <div className="bd-tab-grid">
+            <section className="bd-tile">
+              <BotAgentSection bot={bot} sessionFallback={cli} cliState={cliState} patchBot={patchBot} />
+            </section>
+            <section className="bd-tile">
+              <WorkingDirSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} />
+            </section>
             {/* riff：backendType 与 CLI 选择 1:1 绑定（spawn 层强制配对），
                 手动切 pty/tmux 只会制造坏组合，隐藏该区块。 */}
-            {bot.cliId !== 'riff' && <BackendTypeSection bot={bot} patchBot={patchBot} />}
-          </section>
-          <section className="bd-tile">
-            <RuntimeEnvironmentSection bot={bot} patchBot={patchBot} />
-          </section>
-          <section className="bd-tile"><GrantSection bot={bot} patchBot={patchBot} /></section>
-          <section className="bd-tile"><SlashCommandPermissionsSection bot={bot} patchBot={patchBot} /></section>
+            {bot.cliId !== 'riff' ? (
+              <section className="bd-tile"><BackendTypeSection bot={bot} patchBot={patchBot} /></section>
+            ) : null}
+          </div>
         </div>
-        <div className="bd-column">
-          <section className="bd-tile">
-            <SessionModeSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} />
-            <SubstituteModeSection bot={bot} patchBot={patchBot} />
-            <CrossBotSection bot={bot} putCardPref={putCardPref} />
-            <SessionCapSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} />
-          </section>
-          <section className="bd-tile">
-            <CardBehaviorSection bot={bot} putCardPref={putCardPref} />
-            <CodexAppDisplaySection bot={bot} putCardPref={putCardPref} />
-            <SummaryTriggerSection bot={bot} patchBot={patchBot} />
-            <BrandSection bot={bot} patchBot={patchBot} />
-          </section>
-          <section className="bd-tile"><RoleSection bot={bot} patchBot={patchBot} /></section>
+        <div
+          id="bd-panel-sessions"
+          role="tabpanel"
+          aria-labelledby="bd-tab-sessions"
+          className="bd-tab-panel"
+          hidden={props.activeTab !== 'sessions'}
+        >
+          <div className="bd-tab-grid">
+            <section className="bd-tile"><SessionModeSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
+            <section className="bd-tile"><SubstituteModeSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile">
+              <CrossBotSection bot={bot} putCardPref={putCardPref} />
+              <SessionCapSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} />
+            </section>
+          </div>
+        </div>
+        <div
+          id="bd-panel-security"
+          role="tabpanel"
+          aria-labelledby="bd-tab-security"
+          className="bd-tab-panel"
+          hidden={props.activeTab !== 'security'}
+        >
+          <div className="bd-tab-grid">
+            {/* riff 在远端沙箱执行、本地无 CLI 进程，文件沙盒对它无意义（worker 侧已旁路）。 */}
+            {bot.cliId !== 'riff' ? (
+              <section className="bd-tile"><SandboxSection bot={bot} patchBot={patchBot} /></section>
+            ) : null}
+            {bot.cliId !== 'riff' && bot.sandbox === true ? (
+              <section className="bd-tile bd-tile-wide"><SandboxPathsSection bot={bot} patchBot={patchBot} /></section>
+            ) : null}
+            <section className="bd-tile"><GrantSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile"><SlashCommandPermissionsSection bot={bot} patchBot={patchBot} /></section>
+          </div>
+        </div>
+        <div
+          id="bd-panel-cards"
+          role="tabpanel"
+          aria-labelledby="bd-tab-cards"
+          className="bd-tab-panel"
+          hidden={props.activeTab !== 'cards'}
+        >
+          <div className="bd-tab-grid">
+            <section className="bd-tile"><CardBehaviorSection bot={bot} putCardPref={putCardPref} /></section>
+            <section className="bd-tile"><CodexAppDisplaySection bot={bot} putCardPref={putCardPref} /></section>
+            <section className="bd-tile"><SummaryTriggerSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile"><BrandSection bot={bot} patchBot={patchBot} /></section>
+          </div>
+        </div>
+        <div
+          id="bd-panel-advanced"
+          role="tabpanel"
+          aria-labelledby="bd-tab-advanced"
+          className="bd-tab-panel"
+          hidden={props.activeTab !== 'advanced'}
+        >
+          <div className="bd-tab-grid">
+            <section className="bd-tile"><RuntimeEnvironmentSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile"><RoleSection bot={bot} patchBot={patchBot} /></section>
+          </div>
         </div>
       </div>
     </article>

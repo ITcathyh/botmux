@@ -2,10 +2,61 @@ import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { describe, expect, it, vi } from 'vitest';
 import { displayCliId } from '../src/dashboard/web/bot-defaults.js';
-import { BotAgentSection, CardBehaviorSection, CodexAppDisplaySection } from '../src/dashboard/web/bot-defaults-page.js';
+import {
+  BOT_DEFAULTS_TABS,
+  BotAgentSection,
+  BotDefaultsTabs,
+  CardBehaviorSection,
+  CodexAppDisplaySection,
+  type BotDefaultsTab,
+} from '../src/dashboard/web/bot-defaults-page.js';
 import { isOnboardingSubmitDisabled } from '../src/dashboard/web/bot-onboarding.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+
+describe('bot defaults task tabs', () => {
+  it('renders five accessible categories and supports pointer selection', () => {
+    const onChange = vi.fn();
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(BotDefaultsTabs, {
+        active: 'common' satisfies BotDefaultsTab,
+        onChange,
+      }));
+    });
+
+    const tabs = renderer.root.findAllByProps({ role: 'tab' });
+    expect(BOT_DEFAULTS_TABS).toEqual(['common', 'sessions', 'security', 'cards', 'advanced']);
+    expect(tabs).toHaveLength(5);
+    expect(tabs[0]!.props['aria-selected']).toBe(true);
+    expect(tabs[1]!.props.tabIndex).toBe(-1);
+
+    act(() => tabs[2]!.props.onClick());
+    expect(onChange).toHaveBeenCalledWith('security');
+  });
+
+  it('wraps arrow-key navigation and supports Home / End', () => {
+    const onChange = vi.fn();
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(BotDefaultsTabs, {
+        active: 'common' satisfies BotDefaultsTab,
+        onChange,
+      }));
+    });
+    const tabs = renderer.root.findAllByProps({ role: 'tab' });
+    const event = (key: string) => ({ key, preventDefault: vi.fn() });
+
+    act(() => tabs[0]!.props.onKeyDown(event('ArrowLeft')));
+    expect(onChange).toHaveBeenLastCalledWith('advanced');
+    act(() => tabs[4]!.props.onKeyDown(event('ArrowRight')));
+    expect(onChange).toHaveBeenLastCalledWith('common');
+    act(() => tabs[2]!.props.onKeyDown(event('Home')));
+    expect(onChange).toHaveBeenLastCalledWith('common');
+    act(() => tabs[2]!.props.onKeyDown(event('End')));
+    expect(onChange).toHaveBeenLastCalledWith('advanced');
+  });
+});
 
 describe('bot defaults cli label', () => {
   it('prefers /api/bots cliId before session fallback', () => {
