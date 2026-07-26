@@ -405,7 +405,10 @@ async function handleRun(id: number | string, p: RunParams): Promise<void> {
     const tid = await ensureThread(p.cwd, p.model, p.threadId);
     turn = { agentText: '', finalText: '', done: false };
     // Dispatch the turn but DO NOT await its completion — ack now, results later.
-    server.request('turn/start', { threadId: tid, input: { text: p.prompt } })
+    // `input` MUST be a sequence of content items, NOT a map — the codex
+    // app-server rejects `{text}` with "invalid type: map, expected a sequence".
+    // Matches botmux's own codex-app-turn.ts and riff's native app-server adapter.
+    server.request('turn/start', { threadId: tid, input: [{ type: 'text', text: p.prompt, text_elements: [] }] })
       .then(r => { if (turn) turn.nativeTurnId = r?.turn?.id ?? turn.nativeTurnId; })
       .catch(err => finishTurn({ ok: false, errorCode: 'turn_start_failed', error: String(err?.message ?? err) }));
     // ACK: the turn is accepted/started. Terminal outcome arrives via completed/failed.

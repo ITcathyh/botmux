@@ -43,6 +43,12 @@ process.stdin.on('data', async (c) => {
       send({ jsonrpc:'2.0', id: msg.id, result:{ thread:{ id:'thr_1' } } }); continue;
     }
     if (msg.method === 'turn/start'){
+      // Contract: real codex app-server requires input to be a SEQUENCE of
+      // content items, not a map. Reject a map exactly like real codex does.
+      if (!Array.isArray(msg.params?.input)) {
+        send({ jsonrpc:'2.0', id: msg.id, error:{ code:-32602, message:'Invalid request: invalid type: map, expected a sequence' } });
+        continue;
+      }
       send({ jsonrpc:'2.0', id: msg.id, result:{ turn:{ id:'turn_1' } } });
       notify('turn/started', { threadId:'thr_1', turn:{ id:'turn_1' } });
       if (mode === 'interaction'){
