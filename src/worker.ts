@@ -4177,7 +4177,10 @@ async function flushPendingInjections(): Promise<void> {
       // The detector's settle await can span a restart's tmux jitter window
       // (cliRestartInProgress true, old backend still alive). Re-check the fence
       // before shift()/write so a queued injection never lands in a CLI already
-      // being torn down; the queue is preserved for the replacement generation.
+      // being torn down. The pending injections are then handled by killCli's
+      // restart policy — which drops them (barrier /cd is already durable in
+      // workingDir; non-barrier injects are best-effort and not replayed
+      // cross-process), unlike pendingMessages which killCli preserves.
       if (cliRestartInProgress) return;
       const item = pendingInjections.shift()!;
       const cmd = item.command;
