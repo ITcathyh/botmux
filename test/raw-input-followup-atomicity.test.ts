@@ -60,6 +60,33 @@ describe('worker raw_input handler', () => {
     expect(gate).toContain('injectionFlushing');
     expect(gate).toContain('shouldDeferUserFlush(pendingInjections)');
   });
+
+  it('also defers across the bounded launch-settle window and after a confirmed bare-shell block', () => {
+    // PR #570 二审阻塞项：detectBareShellLaunch() 采到裸 shell 后 await
+    // settleLaunchComm() 让出事件循环最长 2s；IPC handler 不串行，raw_input
+    // 若在此窗口放行会打进尚未 `exec <cli>` 的临时 shell。isFlushing 挡不住它
+    // （raw_input 刻意保留 busy 直送）——须用专用 bareShellCheckInProgress latch
+    // 覆盖"检查进行中"，并用 bareShellLaunchBlocked 覆盖"已确认失败"。
+    const gate = region.slice(
+      region.indexOf('if (cliRestartInProgress'),
+      region.indexOf('pendingRawInputs.push(msg)'),
+    );
+    expect(gate).toContain('bareShellCheckInProgress');
+    expect(gate).toContain('bareShellLaunchBlocked');
+
+    // The latch must be held ACROSS the settle await (set before, cleared in a
+    // finally), otherwise the raw gate's check races the window it guards.
+    const detect = caseRegion(workerSrc, 'async function detectBareShellLaunch()', 1400);
+    const set = detect.indexOf('bareShellCheckInProgress = true');
+    const await_ = detect.indexOf('await settleLaunchComm(', set);
+    const clear = detect.indexOf('bareShellCheckInProgress = false', await_);
+    const finallyIdx = detect.lastIndexOf('finally', clear);
+    expect(set).toBeGreaterThanOrEqual(0);
+    expect(await_).toBeGreaterThan(set);
+    expect(clear).toBeGreaterThan(await_);
+    expect(finallyIdx).toBeGreaterThan(await_);
+    expect(finallyIdx).toBeLessThan(clear);
+  });
 });
 
 describe('worker raw_input delivery', () => {

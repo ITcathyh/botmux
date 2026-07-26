@@ -922,6 +922,17 @@ let bareShellLaunchBlocked = false;
  *  one-shot so it also covers a reattach onto a pane that degraded to a bare
  *  shell. Reset per spawn in spawnCli. */
 let bareShellChecked = false;
+/** True only while detectBareShellLaunch() is inside its async launch-settle
+ *  window (settleLaunchComm's bounded ≤2s poll for a wrapper's final `exec
+ *  <cli>`). The message/injection flush paths already hold the isFlushing /
+ *  injectionFlushing mutexes across that await, but raw_input (passthrough
+ *  slash commands: /compact, /model, /btw) deliberately bypasses those to
+ *  preserve busy-delivery — so it would otherwise type into a pane whose leaf
+ *  is still the transient shell (or a shell already about to be blocked). This
+ *  latch lets raw_input defer for exactly that window without borrowing the
+ *  general isFlushing mutex (which would wrongly also block busy-delivery when
+ *  no settle is in progress). Reset per spawn in spawnCli. */
+let bareShellCheckInProgress = false;
 /** Ready-gate (Claude-family): holds the first prompt until the SessionStart
  *  hook proves a cjadk-style startup selector is behind us. Claude then needs
  *  fresh post-hook prompt evidence because sibling hooks may still be running.
@@ -4891,10 +4902,20 @@ async function detectBareShellLaunch(): Promise<boolean> {
   if (bareShellLaunchBlocked) return true;
   if (lastInitConfig?.adoptMode) return false;       // observing an existing pane, not launching
   if (lastInitConfig?.wrapperCli) return false;      // launcher legitimately wraps the CLI (transient shell shim)
-  const comm = await settleLaunchComm(() => {
-    const pid = backend?.getChildPid?.();
-    return pid ? readComm(pid) : undefined;
-  });
+  // Hold the raw_input passthrough latch across the bounded settle poll: the
+  // await below yields the event loop for up to 2s, and a concurrent raw_input
+  // IPC handler (which bypasses isFlushing to preserve busy-delivery) must not
+  // type into the pane while its leaf is still the unsettled shell.
+  bareShellCheckInProgress = true;
+  let comm: string | undefined;
+  try {
+    comm = await settleLaunchComm(() => {
+      const pid = backend?.getChildPid?.();
+      return pid ? readComm(pid) : undefined;
+    });
+  } finally {
+    bareShellCheckInProgress = false;
+  }
   if (!isBareShellComm(comm)) return false;          // CLI (rust/go/node) is running — healthy launch
 
   // Bare shell is the pane leaf → the CLI never launched. Tier the message on
@@ -6270,6 +6291,7 @@ async function spawnCli(
   // diagnostic instead of having the prompt typed into it.
   bareShellLaunchBlocked = false;
   bareShellChecked = false;
+  bareShellCheckInProgress = false;
 
   // ── Resume pre-flight check + two-tier fallback ──────────────────────────
   // Tier 1 (adapter probe): adapter.checkResumeTargetExists returns false
@@ -9395,8 +9417,16 @@ process.on('message', async (raw: unknown) => {
       // barrier（shouldDeferUserFlush——/cd 未落地前任何用户输入都不得写入，
       // 否则 passthrough 会执行在旧 cwd 的 CLI 里）时入队。注入排空后由
       // flushPendingInjections 的 finally 补踢 flushPending 送达。
+      // 第四个例外是启动稳定窗口：detectBareShellLaunch() 采到裸 shell 时会
+      // await settleLaunchComm() 最长 2s 等 wrapper 完成 `exec <cli>`——这段
+      // await 让出事件循环，而 IPC handler 不串行（见 raw-input-followup-
+      // atomicity.test.ts），若此刻放行 passthrough 就会打进尚未 exec 的临时
+      // shell。bareShellCheckInProgress 覆盖"检查进行中"、bareShellLaunchBlocked
+      // 覆盖"已确认裸 shell 启动失败"两种状态,一并入队。裸 shell 确认失败后
+      // 这些 pending 不会再被 flush（与 pendingMessages 同款处理），符合预期。
       if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight
-        || injectionFlushing || shouldDeferUserFlush(pendingInjections)) {
+        || injectionFlushing || shouldDeferUserFlush(pendingInjections)
+        || bareShellCheckInProgress || bareShellLaunchBlocked) {
         pendingRawInputs.push(msg);
         log(`Deferred passthrough slash command until CLI input gate settles: ${msg.content}`);
       } else {
