@@ -79,10 +79,10 @@ interface Harness {
   waitFor: (pred: (m: any) => boolean, ms?: number) => Promise<any>;
 }
 
-function startBin(fakeCodex: string, cwd: string, mode?: string): Harness {
+function startBin(fakeCodex: string, cwd: string, mode?: string, extraEnv?: Record<string, string>): Harness {
   const child = spawn(process.execPath, ['--import', 'tsx', RUNNER], {
     cwd: resolve('.'),
-    env: { ...process.env, RIFF_CODEX_BIN: fakeCodex, ...(mode ? { FAKE_MODE: mode } : {}) },
+    env: { ...process.env, RIFF_CODEX_BIN: fakeCodex, ...(mode ? { FAKE_MODE: mode } : {}), ...(extraEnv ?? {}) },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   live.add(child);
@@ -134,11 +134,28 @@ describe('riff-codex-runner protocol', () => {
     }
   });
 
-  it('awaiting_input → answer → resumes → completed', async () => {
+  it('v1 default: in-turn interaction is auto-skipped → turn completes, no awaiting_input', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'riff-runner-skip-'));
+    try {
+      const fake = writeFakeCodex(dir);
+      const h = startBin(fake, dir, 'interaction'); // fake fires requestUserInput
+      h.send({ jsonrpc: '2.0', id: 1, method: 'run', params: { prompt: 'deploy', cwd: dir } });
+      await h.waitFor(m => m.id === 1 && m.result);
+      // Auto-skip: bin answers codex's requestUserInput with {answers:{}}, the fake
+      // then completes the turn. We must reach completed, and never see awaiting_input.
+      const completed = await h.waitFor(m => m.method === 'completed');
+      expect(completed.params.content).toContain('picked:');
+      expect(h.lines().some(m => m.method === 'awaiting_input')).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('v2 opt-in (RIFF_CODEX_INTERACTIVE=1): awaiting_input → answer → resumes → completed', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'riff-runner-int-'));
     try {
       const fake = writeFakeCodex(dir);
-      const h = startBin(fake, dir, 'interaction');
+      const h = startBin(fake, dir, 'interaction', { RIFF_CODEX_INTERACTIVE: '1' });
       h.send({ jsonrpc: '2.0', id: 1, method: 'run', params: { prompt: 'deploy', cwd: dir } });
       await h.waitFor(m => m.id === 1 && m.result);
       const ai = await h.waitFor(m => m.method === 'awaiting_input');

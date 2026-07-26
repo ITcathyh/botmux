@@ -28,6 +28,21 @@ in the sandbox — the bin never sets them.
 
 ## 2. Clarification round-trip (awaiting_input → answer → completed)
 
+> **v1 default: OFF.** In-turn `requestUserInput`/`elicitation` are turn-scoped
+> blocking requests in codex — answering them requires a same-turn respond, which
+> would hang the turn (and the bin + codex process) waiting for a human. That
+> conflicts with riff's turn-ending model + sandbox recovery, and riff's own
+> codex path never uses it (clarifications are turn-ending: the model emits the
+> question as its final message, the turn completes, riff does a follow-up run).
+> So by default the bin **auto-skips** in-turn interactions (answers codex with an
+> empty/cancel result) and the turn runs to `completed`/`failed` — you never see
+> `awaiting_input`. Clarifications surface as ordinary completed content, and you
+> answer via a follow-up `run { threadId, prompt: <answer> }`.
+>
+> The exchange below only happens under **`RIFF_CODEX_INTERACTIVE=1`** (v2 opt-in;
+> also needs a suspended-turn + recovery design on the caller side). The parsing
+> is documented for when v2 lands, but v1 adapters can ignore `awaiting_input`.
+
 ```
 >>> {"jsonrpc":"2.0","id":1,"method":"run","params":{"prompt":"Deploy the service","cwd":"/workspace/proj"}}
 <<< {"jsonrpc":"2.0","id":1,"result":{"ok":true,"threadId":"thr_abc"}}

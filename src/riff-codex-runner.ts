@@ -193,6 +193,15 @@ function interactionRespondPayload(method: string, text: string): unknown {
   return { action: 'accept', content: { answer: text }, _meta: null };
 }
 
+/** v1 auto-skip payload for an in-turn interaction: tell codex "no answer /
+ *  cancel this ask" so the turn proceeds to completion without blocking. Matches
+ *  the original auto-response shape the app-server expects per method. */
+function interactionSkipResult(method: string): unknown {
+  if (method === 'item/tool/requestUserInput') return { answers: {} };
+  // elicitation
+  return { action: 'cancel', content: null, _meta: null };
+}
+
 // ─── Turn state ──────────────────────────────────────────────────────────────
 
 interface TurnState {
@@ -232,6 +241,25 @@ function handleServerRequest(msg: Json): void {
   if (!kind) {
     const auto = autoApprovalResult(method);
     if (auto !== undefined) server?.respond(msg.id, auto);
+    return;
+  }
+  // In-turn interaction (requestUserInput / elicitation).
+  //
+  // v1 (default): AUTO-SKIP. codex's requestUserInput/elicitation are turn-scoped
+  // blocking JSON-RPC requests — the only faithful answer is a same-turn respond,
+  // which would force the turn (and this bin + codex process) to hang waiting for
+  // a human, defeating riff's turn-ending model and sandbox recoverability. riff's
+  // own codex path (codex_app_server, trusted project) never uses this path either
+  // — its clarifications are turn-ending (the model emits the question as its final
+  // message and the turn completes). So we skip the in-turn request (turn keeps
+  // running to completion) and let clarifications surface the turn-ending way.
+  //
+  // v2 (opt-in, RIFF_CODEX_INTERACTIVE=1): surface `awaiting_input` and HOLD the
+  // request id open for a cross-boundary `answer`. Kept wired but off by default;
+  // enabling it also needs the suspended-turn + recovery design on riff's side.
+  if (process.env.RIFF_CODEX_INTERACTIVE !== '1') {
+    const skip = interactionSkipResult(method);
+    if (skip !== undefined) server?.respond(msg.id, skip);
     return;
   }
   // Human-facing interaction: surface it to riff and HOLD the app-server request
