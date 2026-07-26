@@ -38,7 +38,10 @@ process.stdin.on('data', async (c) => {
     const msg = JSON.parse(line);
     if (msg.method === 'initialize'){ send({ jsonrpc:'2.0', id: msg.id, result:{ ok:true } }); continue; }
     if (msg.method === 'initialized') continue;
-    if (msg.method === 'thread/start'){ send({ jsonrpc:'2.0', id: msg.id, result:{ thread:{ id:'thr_1' } } }); continue; }
+    if (msg.method === 'thread/start'){
+      if (process.env.THREAD_CONFIG_OUT) { try { (await import('node:fs')).writeFileSync(process.env.THREAD_CONFIG_OUT, JSON.stringify(msg.params?.config ?? {})); } catch {} }
+      send({ jsonrpc:'2.0', id: msg.id, result:{ thread:{ id:'thr_1' } } }); continue;
+    }
     if (msg.method === 'turn/start'){
       send({ jsonrpc:'2.0', id: msg.id, result:{ turn:{ id:'turn_1' } } });
       notify('turn/started', { threadId:'thr_1', turn:{ id:'turn_1' } });
@@ -129,6 +132,25 @@ describe('riff-codex-runner protocol', () => {
       const completed = await h.waitFor(m => m.method === 'completed');
       expect(completed.params.content).toContain('Hello world');
       expect(completed.params.usage).toEqual({ inputTokens: 11, outputTokens: 22, cacheReadTokens: 3, cacheCreateTokens: 4 });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('thread/start config carries model but NEVER model_reasoning_effort / shell_environment_policy', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'riff-runner-cfg-'));
+    const cfgOut = join(dir, 'cfg.json');
+    try {
+      const fake = writeFakeCodex(dir);
+      const h = startBin(fake, dir, undefined, { THREAD_CONFIG_OUT: cfgOut });
+      // reasoningEffort is sent by the caller but MUST be ignored by the bin.
+      h.send({ jsonrpc: '2.0', id: 1, method: 'run', params: { prompt: 'hi', cwd: dir, model: 'gpt-5-codex', reasoningEffort: 'xhigh' } });
+      await h.waitFor(m => m.method === 'completed');
+      const cfg = JSON.parse((await import('node:fs')).readFileSync(cfgOut, 'utf8'));
+      expect(cfg.model).toBe('gpt-5-codex');
+      expect(cfg.model_reasoning_effort).toBeUndefined(); // effort → config.toml single source
+      expect(cfg.shell_environment_policy).toBeUndefined(); // codex default, matches riff A path
+      expect(cfg.model_provider).toBeUndefined();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

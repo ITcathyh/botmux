@@ -29,11 +29,16 @@
  *     - does NOT set CODEX_HOME (unless run.codexHome is explicitly given), so
  *       codex reads the default ~/.codex/config.toml;
  *     - does NOT pass -c model_provider / base_url / model_providers / any token;
- *     - only selects the model (thread/start config.model) and reasoning effort
- *       (thread/start config.model_reasoning_effort).
- *   i.e. the bin decides WHAT model/effort to drive codex with; WHERE codex
- *   connects and WHO gets billed is 100% riff's config.toml. It also does NOT set
- *   shell_environment_policy (codex default) — matching riff's codex_app_server
+ *     - selects ONLY the model (thread/start config.model), which is per-turn and
+ *       is what riff's own codex_app_server adapter also passes to thread/start;
+ *     - does NOT set model_reasoning_effort: reasoning effort is a single source
+ *       of truth in riff's config.toml (already clamped per-model). Setting it on
+ *       thread/start would override that clamped value and bypass the clamp, so B
+ *       would diverge from riff's codex path. `run.reasoningEffort` is therefore
+ *       accepted for protocol compatibility but intentionally IGNORED.
+ *   i.e. the bin decides only WHICH model; WHERE codex connects, WHO gets billed,
+ *   and the reasoning-effort tier are 100% riff's config.toml. It also does NOT
+ *   set shell_environment_policy (codex default) — matching riff's codex_app_server
  *   adapter, keeping the sandbox env surface identical to riff's own path.
  *
  * Zero botmux-daemon / Feishu / bot-registry dependencies by design: only Node
@@ -321,23 +326,29 @@ function finishTurn(outcome: { ok: true; content: string; usage?: Json } | { ok:
 
 // ─── codex thread bootstrap ──────────────────────────────────────────────────
 
-function threadConfig(model?: string, effort?: ReasoningEffort): Json {
-  // INVARIANT: only model + reasoning effort. Never provider/base_url/token, and
-  // NOT shell_environment_policy (codex default) — see file header.
+function threadConfig(model?: string): Json {
+  // INVARIANT: model ONLY. Never provider/base_url/token, never
+  // model_reasoning_effort, never shell_environment_policy — see file header.
+  //
+  // reasoning effort is deliberately NOT set here: it is a single source of
+  // truth in the caller's ~/.codex/config.toml (riff writes it there, already
+  // clamped per-model, e.g. downgrading unsupported xhigh). Setting it on
+  // thread/start would override that clamped value and bypass the clamp, so B
+  // would diverge from riff's own codex path. Model, by contrast, IS per-turn
+  // (riff passes it to thread/start too), so it stays here.
   const cfg: Json = {};
   if (model && model.trim()) cfg.model = model.trim();
-  if (effort) cfg.model_reasoning_effort = effort;
   return cfg;
 }
 
-async function ensureThread(cwd: string, model?: string, effort?: ReasoningEffort, resumeThreadId?: string): Promise<string> {
+async function ensureThread(cwd: string, model?: string, resumeThreadId?: string): Promise<string> {
   if (threadId) return threadId;
   const s = server!;
   if (resumeThreadId) {
     try {
       const r = await s.request('thread/resume', {
         threadId: resumeThreadId, cwd, approvalPolicy: 'never', sandbox: 'danger-full-access',
-        config: threadConfig(model, effort), excludeTurns: true, persistExtendedHistory: true,
+        config: threadConfig(model), excludeTurns: true, persistExtendedHistory: true,
       });
       threadId = String(r.thread.id);
       return threadId;
@@ -345,7 +356,7 @@ async function ensureThread(cwd: string, model?: string, effort?: ReasoningEffor
   }
   const started = await s.request('thread/start', {
     cwd, approvalPolicy: 'never', sandbox: 'danger-full-access',
-    config: threadConfig(model, effort), serviceName: 'riff-codex-runner',
+    config: threadConfig(model), serviceName: 'riff-codex-runner',
     ephemeral: false, persistExtendedHistory: true,
   });
   threadId = String(started.thread.id);
@@ -391,7 +402,7 @@ async function handleRun(id: number | string, p: RunParams): Promise<void> {
     }
   }
   try {
-    const tid = await ensureThread(p.cwd, p.model, p.reasoningEffort, p.threadId);
+    const tid = await ensureThread(p.cwd, p.model, p.threadId);
     turn = { agentText: '', finalText: '', done: false };
     // Dispatch the turn but DO NOT await its completion — ack now, results later.
     server.request('turn/start', { threadId: tid, input: { text: p.prompt } })

@@ -25,6 +25,10 @@ in the sandbox — the bin never sets them.
   The final answer is NOT in it; it arrives later as `completed`.
 - `output` notifications are incremental agent text (may be zero or many).
 - `completed.usage` may be absent if codex's transcript carries no usage.
+- `run.model` selects the per-turn model (passed to codex thread/start). `run.reasoningEffort`
+  is accepted for protocol compatibility but **ignored** — reasoning effort is a single
+  source of truth in the caller's `~/.codex/config.toml` (already clamped per-model);
+  the bin never sets `model_reasoning_effort` so it cannot override / bypass that clamp.
 
 ## 2. Clarification round-trip (awaiting_input → answer → completed)
 
