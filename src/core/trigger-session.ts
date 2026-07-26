@@ -542,6 +542,16 @@ export async function triggerSessionTurn(
   session.lastMessageAt = new Date(now).toISOString();
   session.workingDir = wd.workingDir;
   session.cliId = bot.config.cliId;
+  // Per-turn model / reasoning effort overrides from the trigger options. Model
+  // falls back to the bot default (undefined here → agent-config freeze applies
+  // bot.config.model); reasoningEffort has no bot-config equivalent, so an unset
+  // trigger option keeps the CLI/profile default.
+  if (typeof req.options?.model === 'string' && req.options.model.trim()) {
+    session.model = req.options.model.trim();
+  }
+  if (req.options?.reasoningEffort) {
+    session.reasoningEffort = req.options.reasoningEffort;
+  }
   sessionStore.updateSession(session);
 
   messageQueue.ensureQueue(anchor);

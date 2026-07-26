@@ -60,6 +60,29 @@ describe('trigger request contract', () => {
     expect(v.ok).toBe(true);
   });
 
+  it('accepts per-turn model + reasoningEffort in options', () => {
+    const req = request();
+    req.options = { asyncReturnSessionId: true, model: 'gpt-5-codex', reasoningEffort: 'high' };
+    const v = validateTriggerRequest(req);
+    expect(v.ok).toBe(true);
+  });
+
+  it('rejects an invalid reasoningEffort enum', () => {
+    const req = request();
+    req.options = { asyncReturnSessionId: true, reasoningEffort: 'ultra' as any };
+    const v = validateTriggerRequest(req);
+    expect(v.ok).toBe(false);
+    if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
+  });
+
+  it('rejects a non-string model', () => {
+    const req = request();
+    req.options = { asyncReturnSessionId: true, model: 123 as any };
+    const v = validateTriggerRequest(req);
+    expect(v.ok).toBe(false);
+    if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
+  });
+
   it('accepts a rootMessageId turn target when chatId is also present', () => {
     const req = request();
     req.target.rootMessageId = 'om_root';

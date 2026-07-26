@@ -41,7 +41,7 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
       return [(cachedCodexBin ??= resolveCommand(rawCodexBin))];
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, botName, botOpenId, locale }) {
+    buildArgs({ sessionId, resume, resumeSessionId, workingDir, botName, botOpenId, locale, model, reasoningEffort }) {
       const args = [
         runnerPath(),
         '--session-id', sessionId,
@@ -52,6 +52,10 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
       pushOpt(args, '--bot-name', botName);
       pushOpt(args, '--bot-open-id', botOpenId);
       pushOpt(args, '--locale', locale);
+      // Per-turn model / reasoning effort are applied inside the app-server
+      // thread config (thread/start|resume), so forward them to the runner.
+      pushOpt(args, '--model', model && model.trim() ? model.trim() : undefined);
+      pushOpt(args, '--reasoning-effort', reasoningEffort);
       return args;
     },
 

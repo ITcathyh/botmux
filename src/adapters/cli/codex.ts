@@ -145,7 +145,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.codex'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass, readIsolation, remoteWsUrl, remoteThreadId }) {
+    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, reasoningEffort, disableCliBypass, readIsolation, remoteWsUrl, remoteThreadId }) {
       // Hybrid RPC input mode: attach this TUI to the botmux-owned app-server
       // thread. User input is delivered out-of-band via JSON-RPC (turn/start,
       // see codex-rpc-engine + worker), so the pane is a pure viewer — no paste
@@ -192,6 +192,13 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       if (model && model.trim()) {
         // Codex 接受 `--model <id>` / `-m <id>`，写全名最稳，错的会在 codex 自己启动时报。
         baseArgs.push('--model', model.trim());
+      }
+      // Per-turn/session reasoning effort → codex `model_reasoning_effort`
+      // config key. codex validates the enum itself at startup; we only pass the
+      // four botmux-contract values (low|medium|high|xhigh), already validated at
+      // the trigger boundary. Undefined keeps codex/profile default.
+      if (reasoningEffort) {
+        baseArgs.push('-c', `model_reasoning_effort=${JSON.stringify(reasoningEffort)}`);
       }
       // Codex app-server can keep its own cwd at $HOME; -C pins fresh agent roots.
       // NOTE: canonicalization of workingDir for the file sandbox is done ONCE in

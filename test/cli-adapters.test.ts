@@ -438,6 +438,19 @@ describe('codex buildArgs', () => {
     expect(args[idx + 1]).toBe('gpt-5-codex');
   });
 
+  it('passes reasoningEffort as -c model_reasoning_effort', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-eff', resume: false, reasoningEffort: 'high' });
+    // find the -c pair carrying model_reasoning_effort
+    const pair = args.findIndex((a, i) => a === '-c' && String(args[i + 1] ?? '').startsWith('model_reasoning_effort='));
+    expect(pair).toBeGreaterThanOrEqual(0);
+    expect(args[pair + 1]).toBe('model_reasoning_effort="high"');
+  });
+
+  it('omits model_reasoning_effort when reasoningEffort is unset', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-noeff', resume: false });
+    expect(args.some(a => String(a).startsWith('model_reasoning_effort='))).toBe(false);
+  });
+
   it('installs built-in skills into Codex\'s CODEX_HOME/skills dir', () => {
     // Codex has no per-session skill injection (no --plugin-dir equivalent), so
     // botmux installs into Codex's global scan root, which lives under CODEX_HOME

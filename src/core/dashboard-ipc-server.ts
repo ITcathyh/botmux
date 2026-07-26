@@ -135,6 +135,7 @@ import { validateRoleLibraryPath } from './role-library.js';
 import { repinSessionWorkingDir } from './session-cwd.js';
 import { authorizeSessionScopedIpc } from './daemon-ipc-session-auth.js';
 import type { CliId } from '../adapters/cli/types.js';
+import { getSessionTokenUsage } from './cost-calculator.js';
 import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
@@ -767,6 +768,30 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
   const memTriggerId = triggerId || ds?.latestAsyncTriggerId;
   const memResult = ds && memTriggerId ? ds.asyncTriggerResults?.get(memTriggerId) : undefined;
 
+  // Only read token usage from the transcript when the turn is actually
+  // completed — otherwise every running-state poll would pay a transcript
+  // parse. Ownership is already enforced above (stored/persisted are ours).
+  const isCompleted = memResult?.status === 'completed' || persisted?.result.status === 'completed';
+  let usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreateTokens: number } | undefined;
+  if (isCompleted) {
+    const rec = stored ?? ds?.session;
+    try {
+      const u = getSessionTokenUsage({
+        cliId: (rec?.cliId ?? ds?.session.cliId ?? 'unknown') as CliId | 'unknown',
+        sessionId,
+        cliSessionId: rec?.cliSessionId ?? ds?.session.cliSessionId,
+        cwd: rec?.workingDir ?? ds?.workingDir,
+        fresh: true,
+      });
+      if (u) usage = {
+        inputTokens: u.inputTokens,
+        outputTokens: u.outputTokens,
+        cacheReadTokens: u.cacheReadTokens,
+        cacheCreateTokens: u.cacheCreateTokens,
+      };
+    } catch { /* usage is best-effort; never fail the lookup on a parse error */ }
+  }
+
   return resolveAsyncTriggerState({
     sessionId,
     liveActive: !!ds,
@@ -777,6 +802,7 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
     storedStatus: stored ? (stored.status === 'closed' ? 'closed' : 'open') : undefined,
     closedAt: stored?.closedAt,
     requestedTriggerId: triggerId,
+    usage,
   });
 }
 

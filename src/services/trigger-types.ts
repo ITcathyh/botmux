@@ -8,6 +8,8 @@ export type LegacyWorkflowRetirementReason =
   | 'changed_after_migration'
   | 'identity_conflict';
 
+export type ReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh';
+
 export interface TriggerRequest {
   source: {
     type: TriggerSourceType;
@@ -47,6 +49,13 @@ export interface TriggerRequest {
     waitForFinalOutput?: boolean;
     asyncReturnSessionId?: boolean;
     timeoutMs?: number;
+    /** Per-turn model override for this trigger's session. Empty/undefined keeps
+     *  the bot-configured default. Only adapters whose CLI accepts a model flag
+     *  (codex / codex-app / claude-code / …) honor it; others ignore it. */
+    model?: string;
+    /** Per-turn reasoning effort (codex `model_reasoning_effort`). Undefined
+     *  keeps the CLI/bot default. Adapters without the concept ignore it. */
+    reasoningEffort?: ReasoningEffort;
   };
 }
 
@@ -105,6 +114,15 @@ export interface TriggerResponse {
   promptPreview?: string;
   output?: {
     content: string;
+  };
+  /** Token usage for the completed turn (async trigger-result completed state).
+   *  Parsed from the CLI transcript; absent when the transcript has no usage
+   *  (e.g. CLI without token accounting, or turn not yet complete). */
+  usage?: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheCreateTokens: number;
   };
   async?: {
     status: TriggerAsyncStatus;
@@ -173,6 +191,13 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
     if (typeof options.timeoutMs !== 'number' || !Number.isFinite(options.timeoutMs) || options.timeoutMs < 1000 || options.timeoutMs > 300_000) {
       return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.timeoutMs must be between 1000 and 300000' } };
     }
+  }
+  if (options.model !== undefined && (typeof options.model !== 'string' || options.model.length > 200)) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.model must be a string (<=200 chars)' } };
+  }
+  if (options.reasoningEffort !== undefined
+    && !['low', 'medium', 'high', 'xhigh'].includes(options.reasoningEffort as string)) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: "options.reasoningEffort must be one of low|medium|high|xhigh" } };
   }
   return { ok: true, request: raw as unknown as TriggerRequest };
 }

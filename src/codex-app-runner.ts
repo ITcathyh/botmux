@@ -21,6 +21,8 @@ interface Args {
   botName?: string;
   botOpenId?: string;
   locale?: string;
+  model?: string;
+  reasoningEffort?: string;
 }
 
 interface PendingRequest {
@@ -70,6 +72,8 @@ function parseArgs(argv: string[]): Args {
     else if (key === '--bot-name' && val !== undefined) { out.botName = val; i++; }
     else if (key === '--bot-open-id' && val !== undefined) { out.botOpenId = val; i++; }
     else if (key === '--locale' && val !== undefined) { out.locale = val; i++; }
+    else if (key === '--model' && val !== undefined) { out.model = val; i++; }
+    else if (key === '--reasoning-effort' && val !== undefined) { out.reasoningEffort = val; i++; }
   }
   if (!out.sessionId) throw new Error('--session-id is required');
   return out;
@@ -387,6 +391,17 @@ function handleNotification(msg: JsonObject): void {
   }
 }
 
+/** Thread config for thread/start & thread/resume. Base keeps codex's shell env
+ *  inheritance; a per-session model / reasoning effort (from the trigger's
+ *  options, forwarded via runner args) is layered on when present. codex
+ *  validates the model id / effort enum itself at turn time. */
+function threadConfig(): Record<string, unknown> {
+  const cfg: Record<string, unknown> = { shell_environment_policy: { inherit: 'all' } };
+  if (args.model && args.model.trim()) cfg.model = args.model.trim();
+  if (args.reasoningEffort) cfg.model_reasoning_effort = args.reasoningEffort;
+  return cfg;
+}
+
 async function ensureThread(): Promise<string> {
   if (threadReady && threadId) return threadId;
 
@@ -397,7 +412,7 @@ async function ensureThread(): Promise<string> {
         cwd: args.cwd,
         approvalPolicy: 'never',
         sandbox: 'danger-full-access',
-        config: { shell_environment_policy: { inherit: 'all' } },
+        config: threadConfig(),
         developerInstructions: appDeveloperInstructions(args),
         excludeTurns: true,
         // Keep Codex App's rich history in sync with turns created by this
@@ -420,7 +435,7 @@ async function ensureThread(): Promise<string> {
     cwd: args.cwd,
     approvalPolicy: 'never',
     sandbox: 'danger-full-access',
-    config: { shell_environment_policy: { inherit: 'all' } },
+    config: threadConfig(),
     serviceName: 'botmux',
     developerInstructions: appDeveloperInstructions(args),
     ephemeral: false,

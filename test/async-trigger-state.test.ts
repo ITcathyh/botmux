@@ -82,6 +82,20 @@ describe('resolveAsyncTriggerState — completed', () => {
     expect(r.triggerId).toBe('trg_a');
   });
 
+  it('emits usage on completed when provided, omits it otherwise', () => {
+    const withUsage = resolveAsyncTriggerState({
+      sessionId: 's1', liveActive: true, storedStatus: 'open',
+      memResult: { status: 'completed', content: 'x', completedAt: 5000 }, memTriggerId: 'trg_a',
+      usage: { inputTokens: 10, outputTokens: 20, cacheReadTokens: 3, cacheCreateTokens: 4 },
+    });
+    expect(withUsage.usage).toEqual({ inputTokens: 10, outputTokens: 20, cacheReadTokens: 3, cacheCreateTokens: 4 });
+    const noUsage = resolveAsyncTriggerState({
+      sessionId: 's1', liveActive: true, storedStatus: 'open',
+      memResult: { status: 'completed', content: 'x', completedAt: 5000 }, memTriggerId: 'trg_a',
+    });
+    expect(noUsage.usage).toBeUndefined();
+  });
+
   it('rebuilt from durable result after restart (no live session)', () => {
     // Simulates daemon restart: no live ds, in-memory Map gone, but the
     // session record is closed and the durable result says completed.

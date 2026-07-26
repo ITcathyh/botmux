@@ -2249,6 +2249,7 @@ export function forkWorker(
     wrapperCli: agentCfg.wrapperCli,
     launchShell: botCfg.launchShell,
     model: agentCfg.model,
+    reasoningEffort: ds.session.reasoningEffort,
     disableCliBypass: botCfg.disableCliBypass === true,
     codexRpcInput: botCfg.codexRpcInput === true || config.codexRpcInputDefault,
     // Startup commands run on every fresh spawn (incl. resume) so session-only
