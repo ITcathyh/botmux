@@ -218,6 +218,24 @@ export interface DaemonSession {
     content?: string;
   }>;
   latestAsyncTriggerId?: string;
+  /** Pending structured interactions (codex-app requestUserInput / elicitation)
+   *  a live turn is blocked on, keyed by interactionId. The worker relays these
+   *  from the runner; a POST /answer resolves one. Surfaced as the
+   *  `awaiting_input` trigger-result state. Cleared on answer / turn end. */
+  pendingInteractions?: Map<string, {
+    interactionId: string;
+    turnId: string;
+    kind: 'clarification' | 'confirmation' | 'authentication';
+    question: string;
+    details?: string;
+    authChallenge?: {
+      links?: Array<{ url: string; label?: string }>;
+      userCode?: string;
+      instructions?: string;
+      expiresAt?: string;
+    };
+    createdAt: number;
+  }>;
   /** Stable turn ids whose automatic transcript fallback is capture/discard.
    *  turn_terminal clears the entry; bounded in trigger-session for crash
    *  paths that never produce a terminal. */

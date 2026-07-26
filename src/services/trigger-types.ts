@@ -80,14 +80,43 @@ export type TriggerErrorCode =
   | 'no_output'
   | 'workflow_trigger_not_implemented';
 
-/** Four-state async lifecycle for `GET /api/sessions/:id/trigger-result`.
+/** Async lifecycle for `GET /api/sessions/:id/trigger-result`.
  *  Programmatic callers (task runners) branch on this instead of ok/action:
- *  - running:   turn still in flight — keep polling
- *  - completed: final output captured (see output.content)
- *  - failed:    session terminated without a captured output (soft terminal —
- *               may be a genuine failure OR a caller-initiated close/cancel)
- *  - not_found: no session record on disk (never existed / invalid id) */
-export type AsyncTriggerState = 'running' | 'completed' | 'failed' | 'not_found';
+ *  - running:        turn still in flight — keep polling
+ *  - awaiting_input: turn is blocked on a structured interaction (codex-app
+ *                    requestUserInput / elicitation); see `interaction`. Answer
+ *                    via POST /answer, then keep polling — same session/turn
+ *                    resumes to running and eventually completed. NON-terminal.
+ *  - completed:      final output captured (see output.content)
+ *  - failed:         session terminated without a captured output (soft terminal —
+ *                    may be a genuine failure OR a caller-initiated close/cancel)
+ *  - not_found:      no session record on disk (never existed / invalid id) */
+export type AsyncTriggerState = 'running' | 'awaiting_input' | 'completed' | 'failed' | 'not_found';
+
+/** Interaction kind a codex-app structured request maps to, aligned with the
+ *  task runner's own interaction model. */
+export type InteractionKind = 'clarification' | 'confirmation' | 'authentication';
+
+/** Structured challenge for an authentication-kind interaction (login link /
+ *  device code). Mirrors the task runner's authChallenge shape. */
+export interface InteractionAuthChallenge {
+  links?: Array<{ url: string; label?: string }>;
+  userCode?: string;
+  instructions?: string;
+  expiresAt?: string;
+}
+
+/** Pending interaction surfaced on an `awaiting_input` trigger-result. The
+ *  caller answers with POST /api/sessions/:id/answer carrying interactionId +
+ *  turnId + a free-text answer. */
+export interface TriggerInteraction {
+  interactionId: string;
+  turnId: string;
+  kind: InteractionKind;
+  question: string;
+  details?: string;
+  authChallenge?: InteractionAuthChallenge;
+}
 
 export interface TriggerResponse {
   ok: boolean;
@@ -98,6 +127,8 @@ export interface TriggerResponse {
   state?: AsyncTriggerState;
   /** ISO8601 completion/termination time. Present on completed/failed states. */
   finishedAt?: string;
+  /** Pending structured interaction. Present only on `state:'awaiting_input'`. */
+  interaction?: TriggerInteraction;
   target?: {
     kind: TriggerTargetKind;
     sessionId?: string;

@@ -5,7 +5,8 @@
   "type": "module",
   "main": "dist/index-daemon.js",
   "bin": {
-    "botmux": "dist/cli.js"
+    "botmux": "dist/cli.js",
+    "riff-codex-runner": "dist/riff-codex-runner.js"
   },
   "files": [
     "dist/",
