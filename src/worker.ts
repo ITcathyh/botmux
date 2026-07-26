@@ -4174,6 +4174,11 @@ async function flushPendingInjections(): Promise<void> {
         bareShellChecked = true;
         if (await detectBareShellLaunch()) return;  // finally{} releases the mutex; queue stays
       }
+      // The detector's settle await can span a restart's tmux jitter window
+      // (cliRestartInProgress true, old backend still alive). Re-check the fence
+      // before shift()/write so a queued injection never lands in a CLI already
+      // being torn down; the queue is preserved for the replacement generation.
+      if (cliRestartInProgress) return;
       const item = pendingInjections.shift()!;
       const cmd = item.command;
       isPromptReady = false;
@@ -4916,6 +4921,15 @@ async function detectBareShellLaunch(): Promise<boolean> {
   } finally {
     bareShellCheckInProgress = false;
   }
+  // A restart can begin while we're suspended in the settle await: tmux staggers
+  // teardown behind a 250–1999ms jitter, so cliRestartInProgress is already true
+  // but the old backend is still alive. Do NOT classify that torn-down pane as a
+  // failed launch — it would set the persistent bareShellLaunchBlocked and emit a
+  // misdiagnosis card for a CLI that's about to be replaced. Return healthy; the
+  // caller's own post-await restart fence keeps the queue intact for the
+  // replacement generation (whose spawnCli resets bareShellChecked and re-runs
+  // this check).
+  if (cliRestartInProgress) return false;
   if (!isBareShellComm(comm)) return false;          // CLI (rust/go/node) is running — healthy launch
 
   // Bare shell is the pane leaf → the CLI never launched. Tier the message on
@@ -5070,6 +5084,14 @@ async function flushPending(): Promise<void> {
         return;  // finally{} releases the mutex; pendingMessages stay queued, untouched
       }
     }
+    // detectBareShellLaunch() awaits a bounded settle poll; a restart can begin
+    // during that yield (tmux staggers teardown behind a 250–1999ms jitter, so
+    // cliRestartInProgress flips true while the old backend is still alive). Do
+    // not write startup commands / rename / user prompts into a CLI already
+    // promised to teardown — re-check the restart fence now, before any shift or
+    // write. The queue is untouched; the replacement generation's markPromptReady
+    // re-invokes flushPending.
+    if (cliRestartInProgress) return;  // finally{} releases the mutex; queue stays
     // One-shot per spawn: type the bot's startup commands (e.g. `/effort
     // ultracode`) into the CLI before the first user prompt drains. Both ready
     // paths funnel through flushPending — the ready-gate settle for Claude-family

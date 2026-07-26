@@ -183,3 +183,52 @@ describe('daemon prompt_ready dispatch', () => {
     expect(region).not.toContain("type: 'message'");
   });
 });
+
+describe('post-settle restart fence', () => {
+  // PR #570 三审阻塞项:detectBareShellLaunch() 的 settle await 会让出事件循环
+  // 最长 2s;tmux restart 的 250–1999ms jitter 期间 cliRestartInProgress 已 true
+  // 而旧 backend 仍存活。两条持锁 flush(message / injection)在 await 返回后只
+  // 复查 backend(jitter 内非 null),不复查 restart fence,会把输入写进即将销毁的
+  // 旧 CLI。改前 detector 同步、入口 restart check 与写入间无让出,故是本次
+  // async 化扩出的第二个窗口。三处 source-level 顺序断言钉死修复。
+
+  it('flushPending re-checks cliRestartInProgress AFTER the awaited detector, BEFORE any write', () => {
+    const flush = caseRegion(workerSrc, 'async function flushPending()', 15000);
+    const detector = flush.indexOf('if (await detectBareShellLaunch())');
+    const fence = flush.indexOf('if (cliRestartInProgress) return;', detector);
+    const startup = flush.indexOf('await runStartupCommands()', detector);
+    const rawShift = flush.indexOf('pendingRawInputs.shift()', detector);
+    const writeInput = flush.indexOf('cliAdapter.writeInput(backend', detector);
+    expect(detector).toBeGreaterThanOrEqual(0);
+    expect(fence).toBeGreaterThan(detector);
+    // Fence must precede every downstream write/shift the settle await exposed.
+    expect(startup).toBeGreaterThan(fence);
+    expect(rawShift).toBeGreaterThan(fence);
+    expect(writeInput).toBeGreaterThan(fence);
+  });
+
+  it('flushPendingInjections re-checks cliRestartInProgress AFTER the awaited detector, BEFORE the shift', () => {
+    const inj = caseRegion(workerSrc, 'async function flushPendingInjections()', 3000);
+    const detector = inj.indexOf('if (await detectBareShellLaunch()) return');
+    const fence = inj.indexOf('if (cliRestartInProgress) return;', detector);
+    const shift = inj.indexOf('pendingInjections.shift()', detector);
+    expect(detector).toBeGreaterThanOrEqual(0);
+    expect(fence).toBeGreaterThan(detector);
+    expect(shift).toBeGreaterThan(fence);
+  });
+
+  it('detectBareShellLaunch skips bare-shell classification when a restart began during settle', () => {
+    const detect = caseRegion(workerSrc, 'async function detectBareShellLaunch()', 2400);
+    const settle = detect.indexOf('await settleLaunchComm(');
+    const restartCheck = detect.indexOf('if (cliRestartInProgress) return false;', settle);
+    const classify = detect.indexOf('isBareShellComm(comm)', restartCheck);
+    const block = detect.indexOf('bareShellLaunchBlocked = true', restartCheck);
+    expect(settle).toBeGreaterThanOrEqual(0);
+    // The restart short-circuit must sit after the await and before the
+    // bare-shell verdict / persistent block, so a torn-down pane isn't
+    // misdiagnosed as a failed launch.
+    expect(restartCheck).toBeGreaterThan(settle);
+    expect(classify).toBeGreaterThan(restartCheck);
+    expect(block).toBeGreaterThan(restartCheck);
+  });
+});
