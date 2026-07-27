@@ -25,6 +25,14 @@ describe('bot defaults focused layout', () => {
     expect(css).toMatch(/@media \(max-width: 980px\)[\s\S]*?\.bot-defaults-page \.bd-roster-list\s*\{[\s\S]*?grid-template-columns:\s*repeat\(auto-fit,\s*minmax\(180px,\s*1fr\)\);[\s\S]*?overflow-y:\s*auto;/);
   });
 
+  it('gives the mobile roster list a real scrollport instead of clipping', () => {
+    // Grid auto rows keep max-content height, so the list row must be
+    // forced into the remaining space (minmax(0,1fr) + min-height:0) or
+    // overflow-y:auto never produces a scrollport and long rosters clip.
+    expect(css).toMatch(/@media \(max-width: 980px\)[\s\S]*?\.bot-defaults-page \.bd-roster\s*\{[\s\S]*?grid-template-rows:\s*auto auto minmax\(0,\s*1fr\);/);
+    expect(css).toMatch(/@media \(max-width: 980px\)[\s\S]*?\.bot-defaults-page \.bd-roster-list\s*\{[\s\S]*?min-height:\s*0;[\s\S]*?overflow-y:\s*auto;/);
+  });
+
   it('ships localized labels for every task category', () => {
     for (const key of ['tabCommon', 'tabSessions', 'tabSecurity', 'tabCards', 'tabAdvanced']) {
       expect(i18n.match(new RegExp(`'botDefaults\\.${key}'`, 'g'))).toHaveLength(2);
