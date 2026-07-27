@@ -39,6 +39,33 @@ registration, no Feishu.
   context reloaded from the CLI's on-disk transcript. This is X lifecycle
   (one task per process) — no long-lived daemon. Mirrors codex's `threadId`.
 
+## 2b. Live web terminal (run.webTerminal:true)
+
+Opt in per run with `webTerminal: true`. The runner sets the worker to bind
+loopback only (`BOTMUX_WORKER_HTTP_HOST=127.0.0.1`), lets the worker pick a free
+port, and emits a `web_terminal` notification **as soon as the worker's HTTP
+server is ready (before `completed`)** so the caller can open it live:
+
+```
+>>> {"jsonrpc":"2.0","id":1,"method":"run","params":{"cliId":"claude-code","cwd":"/workspace/proj","prompt":"Refactor X","webTerminal":true}}
+<<< {"jsonrpc":"2.0","id":1,"result":{"ok":true,"sessionId":"..."}}
+<<< {"jsonrpc":"2.0","method":"web_terminal","params":{"url":"http://127.0.0.1:54321/?viewToken=<token>","port":54321}}
+<<< {"jsonrpc":"2.0","method":"status","params":{"state":"running"}}
+<<< {"jsonrpc":"2.0","method":"output","params":{"content":"..."}}
+<<< {"jsonrpc":"2.0","method":"completed","params":{"content":"...","sessionId":"cs_..."}}
+```
+
+- `url` is the ready-to-use terminal URL (bin pre-bakes the `viewToken`; the
+  caller passes it through opaquely). **127.0.0.1 only** — reachable from the
+  sandbox's own browser (VNC), not from outside.
+- Lifecycle: valid from `web_terminal` until the turn ends (`completed`/`failed`);
+  the worker + its HTTP server are torn down when the turn finishes (X lifecycle,
+  one task per process). Grey out the caller's "open terminal" entry on terminal.
+- PTY-class only for now (claude-code renders via scrollback replay — no tmux
+  needed). Codex-visible-terminal (tmux + codex-RPC) is a separate later step.
+- If `webTerminal` is omitted/false, no `web_terminal` notification is emitted
+  and the worker skips the web server.
+
 ## 3. Cancel (idempotent ack)
 
 ```

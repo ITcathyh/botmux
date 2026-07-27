@@ -25,11 +25,12 @@ process.on('message', (msg) => {
   if (msg.type === 'init') {
     // Record whether this is a resume so the test can assert follow-up wiring.
     const resume = !!msg.resume;
-    // Announce ready + composer up.
-    process.send({ type: 'ready', port: 0, token: 't' });
+    // Announce ready + composer up. When a web terminal was requested (init has
+    // webPort), report an actual listening port + viewToken like the real worker.
+    const ready = { type: 'ready', port: 0, token: 't' };
+    if (msg.webPort !== undefined) { ready.port = 54321; ready.viewToken = 'vtok'; }
+    process.send(ready);
     process.send({ type: 'prompt_ready' });
-    // The runner will now send a { type:'message', content, turnId }.
-    // (handled below)
     globalThis.__resume = resume;
     globalThis.__cliSessionId = msg.cliSessionId || ('cs_' + msg.sessionId.slice(0,8));
   }
@@ -98,6 +99,40 @@ describe('riff-cli-runner protocol (headless PTY runner)', () => {
       const completed = await h.waitFor(m => m.method === 'completed');
       expect(completed.params.content).toBe('did: hello');
       expect(completed.params.sessionId).toBeTruthy(); // resume key echoed back
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('web_terminal: run{webTerminal:true} → emits web_terminal{url} on ready (before completed)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'riff-cli-web-'));
+    try {
+      const fake = writeFakeWorker(dir);
+      const h = startRunner(fake, dir);
+      h.send({ jsonrpc: '2.0', id: 1, method: 'run', params: { cliId: 'claude-code', cwd: dir, prompt: 'hello', webTerminal: true } });
+      await h.waitFor(m => m.id === 1 && m.result);
+      const wt = await h.waitFor(m => m.method === 'web_terminal');
+      expect(wt.params.url).toBe('http://127.0.0.1:54321/?viewToken=vtok');
+      expect(wt.params.port).toBe(54321);
+      // web_terminal must arrive before completed (live viewing).
+      const completedIdx = h.lines().findIndex(m => m.method === 'completed');
+      const wtIdx = h.lines().findIndex(m => m.method === 'web_terminal');
+      expect(wtIdx).toBeGreaterThanOrEqual(0);
+      expect(wtIdx).toBeLessThan(completedIdx === -1 ? Infinity : completedIdx);
+      await h.waitFor(m => m.method === 'completed');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('no web_terminal notification when webTerminal is not requested', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'riff-cli-noweb-'));
+    try {
+      const fake = writeFakeWorker(dir);
+      const h = startRunner(fake, dir);
+      h.send({ jsonrpc: '2.0', id: 1, method: 'run', params: { cliId: 'claude-code', cwd: dir, prompt: 'hi' } });
+      await h.waitFor(m => m.method === 'completed');
+      expect(h.lines().some(m => m.method === 'web_terminal')).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

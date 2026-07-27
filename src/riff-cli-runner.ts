@@ -93,6 +93,8 @@ interface RunState {
   dispatched: boolean;
   done: boolean;
   prompt: string;
+  webTerminal: boolean;
+  webTerminalEmitted: boolean;
 }
 
 let current: RunState | undefined;
@@ -133,6 +135,15 @@ function onWorkerMessage(msg: Json): void {
   switch (msg.type) {
     case 'ready':
       current.ready = true;
+      // Emit the web-terminal URL as soon as the worker's HTTP server is up
+      // (not waiting for completed) so the caller can open it live. The worker
+      // returns the ACTUAL listening port; read access needs the viewToken.
+      if (current.webTerminal && !current.webTerminalEmitted && typeof msg.port === 'number' && msg.port > 0) {
+        current.webTerminalEmitted = true;
+        const vt = typeof msg.viewToken === 'string' ? msg.viewToken : undefined;
+        const url = `http://127.0.0.1:${msg.port}/${vt ? `?viewToken=${encodeURIComponent(vt)}` : ''}`;
+        emit('web_terminal', { url, port: msg.port });
+      }
       maybeDispatch();
       return;
     case 'prompt_ready':
@@ -179,6 +190,7 @@ interface RunParams {
   model?: string;
   sessionId?: string;
   codexHome?: string;
+  webTerminal?: boolean;
 }
 
 function handleRun(id: number | string, p: RunParams): void {
@@ -194,11 +206,15 @@ function handleRun(id: number | string, p: RunParams): void {
   const resume = !!p.sessionId;
   const sessionId = p.sessionId || syntheticSessionUuid(`riff-${Date.now()}-${Math.round(process.hrtime()[1])}`);
   const turnId = `trn_${sessionId}_${resume ? 'f' : '0'}`;
+  const webTerminal = p.webTerminal === true;
 
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     BOTMUX_WORKFLOW: '1', // suppress chat cards / screen analyzer / session-store writes
     ...(p.codexHome ? { CODEX_HOME: p.codexHome } : {}),
+    // Sandbox-internal only: confine the worker's web terminal to loopback so it
+    // is reachable from the sandbox's own browser (VNC) but never exposed.
+    ...(webTerminal ? { BOTMUX_WORKER_HTTP_HOST: '127.0.0.1' } : {}),
   };
 
   let worker: ChildProcess;
@@ -216,6 +232,7 @@ function handleRun(id: number | string, p: RunParams): void {
     cliSessionId: resume ? p.sessionId : undefined,
     agentText: '', ready: false, promptReady: false, dispatched: false, done: false,
     prompt: p.prompt,
+    webTerminal, webTerminalEmitted: false,
   };
 
   worker.on('message', (m: unknown) => onWorkerMessage(m as Json));
@@ -235,6 +252,10 @@ function handleRun(id: number | string, p: RunParams): void {
     ...(p.model ? { model: p.model } : {}),
     disableCliBypass: false,
     backendType: 'pty',
+    // webPort:0 → worker picks a free port and returns the actual one in `ready`.
+    // Only set when a web terminal is requested (else the worker skips its HTTP
+    // server / uses its own default).
+    ...(webTerminal ? { webPort: 0 } : {}),
     prompt: '',
     resume,
     ...(resume ? { cliSessionId: p.sessionId, originalSessionId: p.sessionId } : {}),
