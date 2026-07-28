@@ -5,12 +5,12 @@ import {
   assertOwnerWhenChatGroups,
   botProcessEnv,
   botProcessName,
+  canonicalMobileKey,
   entryNeedsContactResolve,
   findInvalidAllowedUserEntries,
   hasOwnerEntry,
   isMobileEntry,
   isValidAllowedUserEntry,
-  mobileMatchKeys,
   normalizeBotConfig,
   normalizeMobileEntry,
   parseBotConfigsJson,
@@ -152,19 +152,21 @@ describe('mobile allowedUsers entries', () => {
     expect(entryNeedsContactResolve('')).toBe(false);
   });
 
-  it('mobileMatchKeys reconciles +/no-+ and CN bare↔+86 symmetrically', () => {
-    // Overseas E.164: with or without a leading + must share a key so the API
-    // echo matches regardless of whether Feishu echoes the +.
-    expect(mobileMatchKeys('+14155550123')).toContain('14155550123');
-    expect(mobileMatchKeys('14155550123')).toContain('14155550123');
-    // Request '+14155550123' and echo '14155550123' (+ dropped) intersect:
-    const req = new Set(mobileMatchKeys('+14155550123'));
-    expect(mobileMatchKeys('14155550123').some(k => req.has(k))).toBe(true);
-    // CN bare 11-digit ↔ 86-prefixed both directions:
-    expect(mobileMatchKeys('13011112222')).toContain('8613011112222');
-    expect(mobileMatchKeys('+8613011112222')).toContain('13011112222');
-    const cnBare = new Set(mobileMatchKeys('13011112222'));
-    expect(mobileMatchKeys('+8613011112222').some(k => cnBare.has(k))).toBe(true);
+  it('canonicalMobileKey reconciles CN bare↔+86 WITHOUT colliding US +1 numbers', () => {
+    const key = (n: string) => canonicalMobileKey(normalizeMobileEntry(n));
+    // CN bare 11-digit and its +86 form fold to the same key (both directions).
+    expect(key('13011112222')).toBe(key('+8613011112222'));
+    expect(key('13011112222')).toBe(key('8613011112222'));
+    // Overseas E.164 with + is trusted as-is (country code preserved).
+    expect(key('+14155550123')).toBe('14155550123');
+    // CRITICAL anti-collision: a US +1 3XX number must NOT fold to the same key
+    // as a CN bare 13X number (both are 11 digits starting with 1). The old
+    // strip-+-then-assume-CN key SET collided these and bound the owner to the
+    // wrong person / evicted a co-owner on map overwrite.
+    expect(key('+13011112222')).not.toBe(key('13011112222'));
+    // Different real numbers never share a key.
+    expect(key('+14155550123')).not.toBe(key('+14155550999'));
+    expect(key('13011112222')).not.toBe(key('13111112222'));
   });
 });
 

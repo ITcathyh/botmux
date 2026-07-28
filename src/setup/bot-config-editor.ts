@@ -117,21 +117,27 @@ export function isMobileEntry(entry: string): boolean {
 }
 
 /**
- * 手机号「匹配键集」：把一个已归一化的手机号展开成一组等价键，用于把飞书
- * `batch_get_id` 响应里回带的号码对回本地请求的号码。**对称设计**——请求侧和
- * 响应侧都用本函数生成键集，任一键相交即视为同一号码，避免依赖「飞书是否逐字
- * echo」这种未承诺的行为：
- *   - **先剥前导 `+`**：飞书对海外 E.164 号可能回带也可能不回带 `+`，两侧都剥掉
- *     `+` 后比较，海外号不再因 `+` 有无而漏配（否则判 definitive → owner 自锁）。
- *   - **中国大陆号双向和解**：本地可填 11 位裸号，飞书可能回 `86` 前缀（反之亦然），
- *     故 `8613…`↔`13…` 两种形式都进键集。
+ * 手机号规范化匹配键：把一个已归一化的手机号折叠成**唯一**的 E.164 数字键，用于
+ * 把飞书 `batch_get_id` 响应里回带的号码对回本地请求的号码。请求侧和响应侧都过
+ * 本函数，键相等即同一号码。
+ *
+ * 规则（**不能像早期实现那样无脑剥 `+` 再一律当中国裸号**——那会让美国 `+1 3XX…`
+ * 与中国裸号 `13X…` 折叠成同键，把 owner 绑到错的人 / 顶掉另一个 owner）：
+ *   - `+` 开头：`+` 是权威国家码，直接剥掉 `+` 得到「国家码+号码」的 E.164 数字串
+ *     （`+8613011112222`→`8613011112222`，`+14155550123`→`14155550123`）。
+ *   - 无 `+` 的纯 11 位、以 1 开头：按配置契约（MOBILE_RE：裸号只接受中国 11 位）
+ *     判定为中国大陆号，补 `86`（`13011112222`→`8613011112222`），从而与带 `+86`
+ *     的请求/响应对齐。
+ *   - 其它（已带 `86` 前缀等）：原样。
+ *
+ * 安全取舍：若飞书对海外号回带时**丢掉了 `+`**，海外裸号会被误判成中国号而与请求
+ * 不等 → 判 definitive miss（owner 用邮箱/union_id 兜底），这是 fail-closed 的**漏配**；
+ * 绝不会把两个不同的人折叠成同一 owner（那才是危险的错配）。宁可漏配不可错配。
  */
-export function mobileMatchKeys(normalized: string): string[] {
-  const bare = normalized.replace(/^\+/, '');
-  const keys = new Set<string>([bare]);
-  if (/^86\d{11}$/.test(bare)) keys.add(bare.slice(2)); // 8613… → 13…（大陆去区号）
-  if (/^1\d{10}$/.test(bare)) keys.add('86' + bare);     // 13…   → 8613…（大陆加区号）
-  return [...keys];
+export function canonicalMobileKey(normalized: string): string {
+  if (normalized.startsWith('+')) return normalized.slice(1);
+  if (/^1\d{10}$/.test(normalized)) return '86' + normalized; // 中国大陆裸号 → 补国家码
+  return normalized;
 }
 
 /**
