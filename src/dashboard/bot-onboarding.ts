@@ -1798,10 +1798,10 @@ export class BotOnboardingManager {
     const entries = rawEntries.map(e => e.trim()).filter(Boolean);
     const invalid = findInvalidAllowedUserEntries(entries);
     if (invalid.length > 0) {
-      return { ok: false, error: 'invalid_entries', message: `不是完整邮箱、union_id(on_) 或 open_id(ou_)：${invalid.join(', ')}` };
+      return { ok: false, error: 'invalid_entries', message: `不是完整邮箱、手机号（大陆 11 位 / 海外带 + 国家码）、union_id(on_) 或 open_id(ou_)：${invalid.join(', ')}` };
     }
     if (!hasOwnerEntry(entries)) {
-      return { ok: false, error: 'no_owner', message: '至少需要一个完整邮箱、union_id(on_) 或 open_id(ou_) 作为 owner。' };
+      return { ok: false, error: 'no_owner', message: '至少需要一个完整邮箱、手机号（大陆 11 位 / 海外带 + 国家码）、union_id(on_) 或 open_id(ou_) 作为 owner。' };
     }
 
     const appId = typeof pending.larkAppId === 'string' ? pending.larkAppId : '';
@@ -1813,7 +1813,7 @@ export class BotOnboardingManager {
       return {
         ok: false,
         error: 'unusable_owner',
-        message: `以下身份在当前应用里无法解析（可能是其他应用的 open_id，或邮箱不在本企业）：${unusable.join(', ')}。请改用本企业邮箱或 union_id(on_)。`,
+        message: `以下身份在当前应用里无法解析（可能是其他应用的 open_id，或邮箱/手机号不在本企业）：${unusable.join(', ')}。请改用本企业邮箱、手机号或 union_id(on_)。`,
       };
     }
 

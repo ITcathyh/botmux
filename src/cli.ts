@@ -1051,11 +1051,11 @@ async function promptRequiredOwner(rl: ReturnType<typeof createInterface>): Prom
     }
     const invalid = findInvalidAllowedUserEntries(entries);
     if (invalid.length > 0) {
-      console.log(`   ❌ 以下不是完整邮箱、union_id 或 open_id（邮箱前缀不接受）: ${invalid.join(', ')}`);
+      console.log(`   ❌ 以下不是完整邮箱、手机号（大陆 11 位 / 海外带 + 国家码）、union_id 或 open_id（邮箱前缀不接受）: ${invalid.join(', ')}`);
       continue;
     }
     if (!hasOwnerEntry(entries)) {
-      console.log('   ❌ 至少需要一个完整邮箱、union_id 或 open_id 作为 owner。');
+      console.log('   ❌ 至少需要一个完整邮箱、手机号、union_id 或 open_id 作为 owner。');
       continue;
     }
     return entries;
