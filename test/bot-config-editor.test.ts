@@ -5,10 +5,12 @@ import {
   assertOwnerWhenChatGroups,
   botProcessEnv,
   botProcessName,
+  entryNeedsContactResolve,
   findInvalidAllowedUserEntries,
   hasOwnerEntry,
   isMobileEntry,
   isValidAllowedUserEntry,
+  mobileMatchKeys,
   normalizeBotConfig,
   normalizeMobileEntry,
   parseBotConfigsJson,
@@ -125,6 +127,44 @@ describe('mobile allowedUsers entries', () => {
     expect(isValidAllowedUserEntry('13011112222')).toBe(true);
     expect(isValidAllowedUserEntry('+14155550123')).toBe(true);
     expect(findInvalidAllowedUserEntries(['13011112222', 'alice'])).toEqual(['alice']);
+  });
+
+  it('isMobileEntry accepts the full 15-digit E.164 upper bound', () => {
+    // E.164 caps the national+country number at 15 digits. The old /\+\d{6,14}/
+    // bound rejected the max-length case; guard against that regression.
+    expect(isMobileEntry('+123456789012345')).toBe(true);   // 15 digits — max E.164
+    expect(isMobileEntry('+12345678901234')).toBe(true);    // 14 digits
+    expect(isMobileEntry('+1234567890123456')).toBe(false); // 16 digits — over spec
+  });
+
+  it('entryNeedsContactResolve covers every addressable form incl. bare mobile', () => {
+    // This shared predicate is the SINGLE gate the daemon startup / throw-fallback
+    // / allowed-users-apply all consult. A bare mobile MUST return true, else a
+    // mobile-only owner is never resolved to an ou_ and gets fail-closed locked
+    // out on every cold start (the P1 this fix closes).
+    expect(entryNeedsContactResolve('13011112222')).toBe(true);      // CN bare mobile
+    expect(entryNeedsContactResolve('+14155550123')).toBe(true);     // E.164 mobile
+    expect(entryNeedsContactResolve('+8613011112222')).toBe(true);   // CN +86
+    expect(entryNeedsContactResolve('alice@example.com')).toBe(true);// email
+    expect(entryNeedsContactResolve('on_abc')).toBe(true);           // union_id
+    expect(entryNeedsContactResolve('ou_abc')).toBe(true);           // literal ou_ (diag)
+    expect(entryNeedsContactResolve('alice')).toBe(false);           // bare prefix — unaddressable
+    expect(entryNeedsContactResolve('')).toBe(false);
+  });
+
+  it('mobileMatchKeys reconciles +/no-+ and CN bare↔+86 symmetrically', () => {
+    // Overseas E.164: with or without a leading + must share a key so the API
+    // echo matches regardless of whether Feishu echoes the +.
+    expect(mobileMatchKeys('+14155550123')).toContain('14155550123');
+    expect(mobileMatchKeys('14155550123')).toContain('14155550123');
+    // Request '+14155550123' and echo '14155550123' (+ dropped) intersect:
+    const req = new Set(mobileMatchKeys('+14155550123'));
+    expect(mobileMatchKeys('14155550123').some(k => req.has(k))).toBe(true);
+    // CN bare 11-digit ↔ 86-prefixed both directions:
+    expect(mobileMatchKeys('13011112222')).toContain('8613011112222');
+    expect(mobileMatchKeys('+8613011112222')).toContain('13011112222');
+    const cnBare = new Set(mobileMatchKeys('13011112222'));
+    expect(mobileMatchKeys('+8613011112222').some(k => cnBare.has(k))).toBe(true);
   });
 });
 

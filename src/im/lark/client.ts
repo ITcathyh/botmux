@@ -13,7 +13,7 @@ import { listObservedBots } from '../../services/observed-bots-store.js';
 import { getBotCapability } from '../../services/bot-profile-store.js';
 import { resolveTeamRoleFile } from '../../core/role-resolver.js';
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
-import { isMobileEntry, normalizeMobileEntry } from '../../setup/bot-config-editor.js';
+import { isMobileEntry, mobileMatchKeys, normalizeMobileEntry } from '../../setup/bot-config-editor.js';
 
 type LarkRequestParams = Record<string, string | number | boolean | undefined>;
 
@@ -1184,19 +1184,32 @@ export async function resolveAllowedUsersWithMap(
           logger.warn(`Failed to resolve mobiles to open_ids: ${res.msg} (code: ${res.code})`);
         } else {
           const userList: any[] = res.data?.user_list ?? [];
-          // Build normalized(mobile) → user_id, then backfill each raw entry.
-          const byNorm = new Map<string, string>();
+          // Build a match index from the API echo. The API may echo a mobile
+          // with or without country code / leading `+`, and Feishu does NOT
+          // promise a byte-identical echo — so index each echoed number under
+          // its full symmetric key set (see mobileMatchKeys) rather than a
+          // single literal form.
+          const byKey = new Map<string, string>();
           for (const item of userList) {
-            if (item.user_id && item.mobile) byNorm.set(normalizeMobileEntry(String(item.mobile)), item.user_id);
-            else if (!item.user_id) logger.warn(`Could not resolve mobile: ${item.mobile}`);
+            if (item.user_id && item.mobile) {
+              for (const key of mobileMatchKeys(normalizeMobileEntry(String(item.mobile)))) {
+                byKey.set(key, item.user_id);
+              }
+            } else if (!item.user_id) {
+              logger.warn(`Could not resolve mobile: ${item.mobile}`);
+            }
           }
           for (const norm of mobiles) {
             const rawEntry = mobileRawByNorm.get(norm) ?? norm;
-            // API may echo the mobile with/without country code; try the exact
-            // normalized form first, then a +86-stripped / -added CN variant.
-            const uid = byNorm.get(norm)
-              ?? byNorm.get(norm.replace(/^\+86/, ''))
-              ?? (norm.startsWith('1') ? byNorm.get('+86' + norm) : undefined);
+            // Symmetric match: try every equivalent key of the REQUESTED number
+            // against the echo index. Covers +/no-+ (overseas E.164) and the CN
+            // bare-11 ↔ 86-prefixed variance in both directions, without relying
+            // on the API to echo the exact string we sent.
+            let uid: string | undefined;
+            for (const key of mobileMatchKeys(norm)) {
+              uid = byKey.get(key);
+              if (uid) break;
+            }
             if (uid) {
               map.set(rawEntry, uid);
               entryStatus.set(rawEntry, 'resolved');

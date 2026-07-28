@@ -91,6 +91,7 @@ import { checkAllowedChatGroupsConfig } from './services/allowed-chat-groups.js'
 import type { Session, VcMeetingImTurnOrigin } from './types.js';
 import { ensureCjkFontsInstalled } from './utils/font-installer.js';
 import { scrubTmuxServerGlobalEnv } from './setup/ensure-tmux.js';
+import { entryNeedsContactResolve } from './setup/bot-config-editor.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { validateWorkingDir } from './core/working-dir.js';
 import type { DaemonToWorker, LarkMessage } from './types.js';
@@ -17783,7 +17784,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // schedule retries. The cache is a persistent sidecar — NOT the dashboard
       // descriptor, which is overwritten early in boot and deleted on shutdown.
       const configured = bot.config.allowedUsers ?? bot.resolvedAllowedUsers;
-      const needsResolve = configured.some(u => u.includes('@') || u.startsWith('on_') || u.startsWith('ou_'));
+      const needsResolve = configured.some(entryNeedsContactResolve);
       if (needsResolve) {
         const previousResolvedMap = readAllowedUsersCache(cfg.larkAppId);
         try {
@@ -17813,7 +17814,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           // entry transient so the pure fn can recover each from cache.
           const throwStatus = new Map<string, EntryResolveStatus>();
           for (const e of configured) {
-            if (e.includes('@') || e.startsWith('on_') || e.startsWith('ou_')) throwStatus.set(e, 'transient');
+            if (entryNeedsContactResolve(e)) throwStatus.set(e, 'transient');
           }
           const applied = applyAllowedUsersResolve({
             rawEntries: configured,

@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { readBotsJsonOrEmpty, writeBotsJsonAtomic } from '../setup/bots-store.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { logger } from '../utils/logger.js';
-import { normalizeBotConfig, findInvalidAllowedUserEntries, hasOwnerEntry } from '../setup/bot-config-editor.js';
+import { normalizeBotConfig, findInvalidAllowedUserEntries, hasOwnerEntry, isMobileEntry, normalizeMobileEntry } from '../setup/bot-config-editor.js';
 import { tryRegisterApp, type RegisterAppOptions, type RegisterAppResult } from '../setup/register-app.js';
 import {
   validateCredentials,
@@ -2131,6 +2131,19 @@ async function detectUnusableOwnerEntries(
       } else if (entry.startsWith('on_')) {
         // union_id：无确凿的跨 app 否定信号, 放行。
         continue;
+      } else if (isMobileEntry(entry)) {
+        // 手机号走 batch_get_id 的 `mobiles` 字段（与运行时 resolver 同口径），
+        // 不能落到下面的 emails 分支——否则手机号被当邮箱查, code 0 + 空 user_list
+        // 会把合法手机号误判为「不在本企业」而拒绝（P2）。判定同 email：成功响应
+        // 里没有任何带 user_id 的条目 → 确凿不在本企业。
+        const res = await client.contact.v3.user.batchGetId({
+          params: { user_id_type: 'open_id' },
+          data: { mobiles: [normalizeMobileEntry(entry)], include_resigned: false },
+        });
+        if (res?.code === 0) {
+          const list: any[] = res.data?.user_list ?? [];
+          if (!list.some(u => u?.user_id)) unusable.push(entry);
+        }
       } else {
         const res = await client.contact.v3.user.batchGetId({
           params: { user_id_type: 'open_id' },

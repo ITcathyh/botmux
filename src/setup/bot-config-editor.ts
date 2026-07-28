@@ -99,11 +99,12 @@ const FULL_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
  * 手机号 allowedUsers 条目。飞书 batch_get_id 的 `mobiles` 字段：中国大陆号
  * 可直接填 11 位（无需 +86）；非大陆号必须带 `+` 国家/地区码。为避免把邮箱
  * 前缀/随手输入误判成手机号，规则收紧为二选一：
- *   - `+` 开头的 E.164：`+` 后跟 6–14 位数字（如 +14155550123、+8613011112222）
+ *   - `+` 开头的 E.164：`+` 后跟 6–15 位数字（E.164 规范上限 15 位，如
+ *     +14155550123、+8613011112222、+123456789012345）
  *   - 纯 11 位大陆号，以 1 开头（如 13011112222）
  * 允许中间出现空格/连字符，判定前先归一化掉。
  */
-const MOBILE_RE = /^(?:\+\d{6,14}|1\d{10})$/;
+const MOBILE_RE = /^(?:\+\d{6,15}|1\d{10})$/;
 
 /** 去掉手机号里的空格与连字符（用户可能填 "+86 130-1111-2222"），便于校验/解析。 */
 export function normalizeMobileEntry(entry: string): string {
@@ -113,6 +114,39 @@ export function normalizeMobileEntry(entry: string): string {
 /** 是否是手机号形式的 allowedUsers 条目（已归一化空格/连字符后判定）。 */
 export function isMobileEntry(entry: string): boolean {
   return MOBILE_RE.test(normalizeMobileEntry(entry));
+}
+
+/**
+ * 手机号「匹配键集」：把一个已归一化的手机号展开成一组等价键，用于把飞书
+ * `batch_get_id` 响应里回带的号码对回本地请求的号码。**对称设计**——请求侧和
+ * 响应侧都用本函数生成键集，任一键相交即视为同一号码，避免依赖「飞书是否逐字
+ * echo」这种未承诺的行为：
+ *   - **先剥前导 `+`**：飞书对海外 E.164 号可能回带也可能不回带 `+`，两侧都剥掉
+ *     `+` 后比较，海外号不再因 `+` 有无而漏配（否则判 definitive → owner 自锁）。
+ *   - **中国大陆号双向和解**：本地可填 11 位裸号，飞书可能回 `86` 前缀（反之亦然），
+ *     故 `8613…`↔`13…` 两种形式都进键集。
+ */
+export function mobileMatchKeys(normalized: string): string[] {
+  const bare = normalized.replace(/^\+/, '');
+  const keys = new Set<string>([bare]);
+  if (/^86\d{11}$/.test(bare)) keys.add(bare.slice(2)); // 8613… → 13…（大陆去区号）
+  if (/^1\d{10}$/.test(bare)) keys.add('86' + bare);     // 13…   → 8613…（大陆加区号）
+  return [...keys];
+}
+
+/**
+ * 单个 allowedUsers 条目是否需要「启动/刷新时经飞书 contact API 解析成本 app
+ * 的 open_id」。运行时权限（canTalk/canOperate）只认原生 ou_，故 email / union_id
+ * (on_) / 手机号 / 甚至字面 ou_（要做跨 app 诊断）都要走一次解析；只有无法寻址
+ * 的裸串（邮箱前缀等）不需要。
+ *
+ * 这是解析闸的**唯一真源**——daemon 启动闸、throw 兜底、allowed-users-apply 的
+ * needsContactResolve 全都调它，避免「新增一种身份格式后各处平行谓词漏改」导致
+ * 该格式在入口校验通过、却在某个解析闸被静默跳过（手机号 owner 冷启动自锁即
+ * 此类 bug）。新增身份格式时**只改这里**。
+ */
+export function entryNeedsContactResolve(entry: string): boolean {
+  return entry.includes('@') || entry.startsWith('on_') || entry.startsWith('ou_') || isMobileEntry(entry);
 }
 
 /**
