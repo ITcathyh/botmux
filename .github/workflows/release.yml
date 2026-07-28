@@ -277,6 +277,15 @@ jobs:
           body: ${{ steps.changelog.outputs.body }}
           prerelease: ${{ steps.dist_tag.outputs.prerelease == 'true' }}
 
+      - name: Note — desktop assets pending
+        # Make the npm-first window visible in the run log: npm + Release are
+        # live now; the macOS .dmg/.zip attach in the parallel attach-desktop-assets
+        # job after signing. If signing is rejected/fails/cancelled, recover by
+        # re-running this workflow via workflow_dispatch with this release_tag.
+        run: |
+          echo "npm ${GITHUB_REF_NAME#v} published and GitHub Release ${GITHUB_REF_NAME} created."
+          echo "macOS desktop assets (.dmg/.zip) attach asynchronously in attach-desktop-assets after signing."
+          echo "If signing is rejected/fails/cancelled, re-run this workflow via workflow_dispatch with release_tag=${GITHUB_REF_NAME} to rebuild+sign and attach."
   attach-desktop-assets:
     # npm-first tail: once the parallel `desktop` job has signed+notarized the
     # macOS build AND the `release` job has created the GitHub Release, upload
@@ -284,6 +293,17 @@ jobs:
     # workflow_dispatch refresh path is handled by `refresh-desktop-assets`).
     # `needs: [desktop, release]` both must succeed: desktop for the artifact,
     # release so the GitHub Release exists to upload onto.
+    #
+    # FAILURE MODE (accepted trade-off of npm-first): the `desktop` job sits
+    # behind the macos-signing environment approval, which can wait up to 30
+    # days and may be rejected / the build may fail / the run may be cancelled.
+    # In any of those cases npm + the GitHub Release are already live but this
+    # job never runs, so the Release keeps npm-only (no .dmg/.zip). There is no
+    # auto-retry here on purpose — signing needs a human approval, so retrying
+    # would just re-block. Recovery is manual and idempotent: re-run this
+    # workflow via workflow_dispatch with release_tag=vX.Y.Z; that rebuilds+signs
+    # macOS (fresh artifact, so the 7-day retention is irrelevant) and
+    # `refresh-desktop-assets` --clobber-attaches to the existing Release.
     if: github.event_name == 'push' && needs.desktop.result == 'success' && needs.release.result == 'success'
     needs: [desktop, release]
     runs-on: ubuntu-latest
