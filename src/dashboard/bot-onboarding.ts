@@ -1712,11 +1712,19 @@ export class BotOnboardingManager {
     // 关键顺序：先确认 owner, 再决定是否落盘 + 终态。completed 必须意味着「bots.json
     // 里这个 bot 带着至少一个 owner」, 绝不产出空 allowedUsers 的可启动 bot。
     let ownerEntry: string | undefined;
+    // Native ou_ to persist as the resolve-independent fail-safe recipient —
+    // only when the scanner path verifies it belongs to THIS app (below).
+    let ownerOpenId: string | undefined;
     if (result.userOpenId) {
       // registerApp 返回的 open_id 来自扫码链路; 用新 app 自身凭证验证, 失败不
       // fallback 写入该 (常为跨 app 的) ou_——避免把其他 app 视角的 open_id 固化
       // 成 owner, 导致 /grant 和授权卡片一直判 non-owner。
       ownerEntry = await resolveScannerAllowedUser(result.appId, result.appSecret, result.userOpenId, result.brand);
+      // Verified against this app (ownerEntry set) → the native open_id is a
+      // trustworthy owner anchor; store it raw so a boot-time contact-API blip
+      // can't strip our only DM recipient. (Skip on the email path below: no
+      // native open_id there, only an on_/email that still needs resolving.)
+      if (ownerEntry) ownerOpenId = result.userOpenId;
     }
     if (!ownerEntry && sessionEmail) {
       // Web 主路径：创建应用的登录账号邮箱就是 owner（表单第一步已展示并确认），
@@ -1727,7 +1735,7 @@ export class BotOnboardingManager {
     }
 
     if (ownerEntry) {
-      const addedBotIndex = this.persistBot({ ...bot, allowedUsers: [ownerEntry] });
+      const addedBotIndex = this.persistBot({ ...bot, allowedUsers: [ownerEntry], ...(ownerOpenId ? { ownerOpenId } : {}) });
       if (!activationPending) {
         await this.runLiveStart(id, result.appId);
       }

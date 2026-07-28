@@ -1035,8 +1035,8 @@ async function resolveScannerAllowedUser(
 async function promptRequiredOwner(rl: ReturnType<typeof createInterface>): Promise<string[]> {
   printInputHelp('管理员 (owner)', [
     '必填。至少一个能操作机器人的管理员，多个值用逗号分隔。',
-    '推荐格式（优先级高到低）：完整邮箱（alice@example.com）> union_id（on_xxx，跨应用稳定）> open_id（ou_xxx，仅限同一应用）。',
-    '注意：必须是完整邮箱，邮箱前缀（如 alice）无法解析、不接受。',
+    '推荐格式（优先级高到低）：完整邮箱（alice@example.com）> union_id（on_xxx，跨应用稳定）> 手机号（大陆号直填 11 位，海外号带 + 区号）> open_id（ou_xxx，仅限同一应用）。',
+    '注意：邮箱必须完整，邮箱前缀（如 alice）无法解析、不接受。没有企业邮箱可用手机号。',
   ]);
   for (;;) {
     const raw = (await ask(rl, '管理员 (owner): ')).trim();
@@ -1169,6 +1169,11 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
     const owner = await resolveScannerAllowedUser(creds.appId, creds.appSecret, creds.userOpenId, creds.brand);
     if (owner) {
       bot.allowedUsers = [owner];
+      // Persist the native ou_ too. allowedUsers may hold the cross-app-stable
+      // on_ (union_id) form that needs a contact-API resolve every boot; this
+      // raw open_id never does, so it stays a valid fail-safe DM recipient even
+      // when that resolve is the very thing failing (cold-start race).
+      bot.ownerOpenId = creds.userOpenId;
     } else {
       console.log('⚠️  无法确认扫码人的 open_id 属于当前新应用，请手动填写 owner。');
       bot.allowedUsers = await promptRequiredOwner(rl);
@@ -1355,8 +1360,8 @@ async function promptEditBotConfig(
   }
 
   printInputHelp('允许的用户', [
-    '可选。限制哪些飞书用户可以操作机器人，支持完整邮箱（如 alice@example.com）、union_id（on_xxx）或 open_id（ou_xxx），多个值用逗号分隔。',
-    '注意：必须是完整邮箱，邮箱前缀（如 alice）无法解析、会被丢弃。',
+    '可选。限制哪些飞书用户可以操作机器人，支持完整邮箱（如 alice@example.com）、union_id（on_xxx）、手机号（大陆号直填，海外带 + 区号）或 open_id（ou_xxx），多个值用逗号分隔。',
+    '注意：邮箱必须完整，邮箱前缀（如 alice）无法解析、会被丢弃。',
     '留空保留当前值；输入 - 清空限制。',
   ]);
   input.allowedUsers = await ask(rl, `允许的用户 [${formatOptionalValue(bot.allowedUsers)}]: `);
