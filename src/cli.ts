@@ -330,6 +330,13 @@ function pm2Capture(args: string[], home: string = PM2_HOME, timeoutMs = 10_000)
     env: pm2Env(home),
     shell: pm2.shell ?? false,
     timeout: timeoutMs,
+    // `pm2 jlist` serializes EVERY process's full env + metadata, so its stdout
+    // grows ~linearly with the bot count. Node's default spawnSync maxBuffer is
+    // 1 MiB — a box with ~30+ bots blows past it and spawnSync fails with
+    // ENOBUFS, which surfaced as `start-bot` (dashboard "bring one bot online")
+    // dying before it could launch anything. Lift the cap well above any real
+    // fleet size. (ps/git captures elsewhere already do the same.)
+    maxBuffer: 64 * 1024 * 1024,
   });
   if (r.status !== 0) {
     const detail = r.error?.message
