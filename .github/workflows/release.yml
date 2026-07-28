@@ -22,27 +22,37 @@ jobs:
       RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v6
-        # Push builds the tagged commit (github.ref = refs/tags/vX.Y.Z). But
-        # workflow_dispatch's default checkout is the dispatch's selected ref
-        # (typically master), NOT release_tag — so the recovery path would sign
-        # "current master code + old version number" and --clobber it onto the
-        # old Release, making the desktop assets diverge from the npm tarball /
-        # git tag. Pin the checkout to the tag ref in both cases so the signed
-        # app is always built from exactly the released commit.
+        # Build from the EXACT released commit in both trigger paths:
+        #   - push: use github.sha (the immutable commit the tag pointed at when
+        #     the event fired), NOT github.ref. Passing the ref name would make
+        #     checkout re-resolve the tag at checkout time — and desktop runs
+        #     behind a manual approval that can lag up to 30 days, during which
+        #     the tag could be moved (repo ruleset excludes canary/beta/rc from
+        #     tag-update protection). If tag moves A→B after `release` already
+        #     published npm from A, a ref-name checkout would sign B → assets
+        #     diverge from the npm tarball. A pinned SHA cannot move.
+        #   - workflow_dispatch: no event SHA for the tag, so resolve the tag ref
+        #     explicitly (default checkout would be the dispatch ref = master).
+        # The Verify step below then fail-closes if the tag no longer points at
+        # the commit we built (tag moved), so mismatched assets never attach.
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.sha }}
 
       - name: Verify HEAD is the tagged commit
-        # Defensive: prove the checkout landed on the tag's commit (not master),
-        # so a mis-resolved ref can never sign the wrong source into a Release.
+        # Prove the built commit still equals what the tag points at. On push,
+        # HEAD is github.sha; if the tag was moved during the approval wait, the
+        # current tag commit won't match HEAD → fail-closed (never attach assets
+        # built from a commit the tag no longer names). On workflow_dispatch this
+        # also catches a mis-resolved ref (e.g. accidental master checkout).
         run: |
           git fetch origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}" --force --quiet 2>/dev/null || true
           TAG_SHA=$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")
           HEAD_SHA=$(git rev-parse HEAD)
-          echo "tag ${RELEASE_TAG} → $TAG_SHA ; HEAD → $HEAD_SHA"
+          echo "tag ${RELEASE_TAG} → $TAG_SHA ; HEAD (built) → $HEAD_SHA"
           if [ "$TAG_SHA" != "$HEAD_SHA" ]; then
-            echo "REFUSING: desktop build checked out $HEAD_SHA but tag ${RELEASE_TAG} is $TAG_SHA."
-            echo "Signed assets must be built from the exact released commit. Aborting to avoid attaching mismatched assets."
+            echo "REFUSING: built commit $HEAD_SHA is not what tag ${RELEASE_TAG} now points at ($TAG_SHA)."
+            echo "The tag was likely moved after npm was published from the original commit."
+            echo "Signed assets must match the released commit; aborting to avoid attaching mismatched assets."
             exit 1
           fi
 
