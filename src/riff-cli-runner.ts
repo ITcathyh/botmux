@@ -95,7 +95,14 @@ interface RunState {
   prompt: string;
   webTerminal: boolean;
   webTerminalEmitted: boolean;
+  rpcMode: boolean;
 }
+
+/** codex-family CLIs drive their visible terminal via the codex app-server RPC
+ *  path, which REQUIRES a tmux backend (codex-rpc-lifecycle restricts --remote
+ *  pane management to tmux). Everything else is a plain PTY CLI. Kept here so the
+ *  caller only passes cliId — the runner infers backend + RPC. */
+const RPC_CLIS = new Set(['codex', 'traex']);
 
 let current: RunState | undefined;
 
@@ -118,11 +125,15 @@ function finish(outcome: { ok: true; content: string; usage?: Json } | { ok: fal
   setTimeout(() => { try { if (w.exitCode === null) w.kill('SIGKILL'); } catch { /* */ } }, 1500);
 }
 
-/** Dispatch the actual turn once the worker is ready + composer is up. */
+/** Dispatch the actual turn once the worker is ready + composer is up. In RPC
+ *  mode the first prompt was baked into init (codex-RPC eligibility requires a
+ *  non-empty init.prompt), and the worker drives it via the app-server thread —
+ *  so we only emit `running`, never a `message` (that would double-send). */
 function maybeDispatch(): void {
   if (!current || current.dispatched || !current.ready || !current.promptReady) return;
   current.dispatched = true;
   emit('status', { state: 'running' });
+  if (current.rpcMode) return; // prompt already delivered via init; nothing to send
   try {
     current.worker.send({ type: 'message', content: current.prompt, turnId: current.turnId } as never);
   } catch (err: any) {
@@ -207,6 +218,12 @@ function handleRun(id: number | string, p: RunParams): void {
   const sessionId = p.sessionId || syntheticSessionUuid(`riff-${Date.now()}-${Math.round(process.hrtime()[1])}`);
   const turnId = `trn_${sessionId}_${resume ? 'f' : '0'}`;
   const webTerminal = p.webTerminal === true;
+  // codex/traex → tmux + codex-RPC (visible pane via app-server --remote). The
+  // eligibility gate (codex-rpc-lifecycle.ts) additionally requires a non-empty
+  // init.prompt, so RPC mode bakes the first prompt into init rather than
+  // dispatching it via a later `message`. Everything else is plain PTY.
+  const rpcMode = RPC_CLIS.has(p.cliId);
+  const backendType = rpcMode ? 'tmux' : 'pty';
 
   const env: NodeJS.ProcessEnv = {
     ...process.env,
@@ -233,6 +250,7 @@ function handleRun(id: number | string, p: RunParams): void {
     agentText: '', ready: false, promptReady: false, dispatched: false, done: false,
     prompt: p.prompt,
     webTerminal, webTerminalEmitted: false,
+    rpcMode,
   };
 
   worker.on('message', (m: unknown) => onWorkerMessage(m as Json));
@@ -251,12 +269,17 @@ function handleRun(id: number | string, p: RunParams): void {
     cliId: p.cliId,
     ...(p.model ? { model: p.model } : {}),
     disableCliBypass: false,
-    backendType: 'pty',
+    backendType,
     // webPort:0 → worker picks a free port and returns the actual one in `ready`.
     // Only set when a web terminal is requested (else the worker skips its HTTP
     // server / uses its own default).
     ...(webTerminal ? { webPort: 0 } : {}),
-    prompt: '',
+    // RPC mode: engage codex-RPC (codexRpcInput) and bake the first prompt into
+    // init + carry turnId (codexRpcEligible requires a non-empty prompt). PTY
+    // mode keeps prompt empty and dispatches via a later `message`.
+    ...(rpcMode
+      ? { codexRpcInput: true, prompt: p.prompt, turnId }
+      : { prompt: '' }),
     resume,
     ...(resume ? { cliSessionId: p.sessionId, originalSessionId: p.sessionId } : {}),
     larkAppId: PLACEHOLDER_LARK_APP_ID,

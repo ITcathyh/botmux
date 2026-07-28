@@ -20,19 +20,24 @@ const live = new Set<ChildProcessWithoutNullStreams>();
 function writeFakeWorker(dir: string): string {
   const path = join(dir, 'fake-worker.mjs');
   writeFileSync(path, `#!/usr/bin/env node
+import { writeFileSync as __wf } from 'node:fs';
 const mode = process.env.FAKE_WORKER_MODE ?? 'ok';
 process.on('message', (msg) => {
   if (msg.type === 'init') {
-    // Record whether this is a resume so the test can assert follow-up wiring.
+    if (process.env.INIT_OUT) { try { __wf(process.env.INIT_OUT, JSON.stringify(msg)); } catch {} }
     const resume = !!msg.resume;
-    // Announce ready + composer up. When a web terminal was requested (init has
-    // webPort), report an actual listening port + viewToken like the real worker.
     const ready = { type: 'ready', port: 0, token: 't' };
     if (msg.webPort !== undefined) { ready.port = 54321; ready.viewToken = 'vtok'; }
     process.send(ready);
     process.send({ type: 'prompt_ready' });
     globalThis.__resume = resume;
     globalThis.__cliSessionId = msg.cliSessionId || ('cs_' + msg.sessionId.slice(0,8));
+    // RPC mode: prompt baked into init + codexRpcInput set; runner sends no
+    // later message. Complete the turn straight from init.prompt.
+    if (msg.codexRpcInput && msg.prompt) {
+      process.send({ type: 'cli_session_id', cliSessionId: globalThis.__cliSessionId });
+      process.send({ type: 'final_output', sessionId: msg.sessionId, content: 'rpc: ' + msg.prompt, turnId: msg.turnId });
+    }
   }
   if (msg.type === 'message') {
     // Emit the persisted CLI session id, then stream output + final_output.
@@ -58,10 +63,10 @@ interface Harness {
   waitFor: (pred: (m: any) => boolean, ms?: number) => Promise<any>;
 }
 
-function startRunner(fakeWorker: string, cwd: string, mode?: string): Harness {
+function startRunner(fakeWorker: string, cwd: string, mode?: string, extraEnv?: Record<string, string>): Harness {
   const child = spawn(process.execPath, ['--import', 'tsx', RUNNER], {
     cwd: resolve('.'),
-    env: { ...process.env, RIFF_WORKER_PATH: fakeWorker, ...(mode ? { FAKE_WORKER_MODE: mode } : {}) },
+    env: { ...process.env, RIFF_WORKER_PATH: fakeWorker, ...(mode ? { FAKE_WORKER_MODE: mode } : {}), ...(extraEnv ?? {}) },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   live.add(child);
@@ -99,6 +104,43 @@ describe('riff-cli-runner protocol (headless PTY runner)', () => {
       const completed = await h.waitFor(m => m.method === 'completed');
       expect(completed.params.content).toBe('did: hello');
       expect(completed.params.sessionId).toBeTruthy(); // resume key echoed back
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('codex → RPC mode: init carries backendType:tmux + codexRpcInput + prompt-in-init; completes from init', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'riff-cli-rpc-'));
+    const initOut = join(dir, 'init.json');
+    try {
+      const fake = writeFakeWorker(dir);
+      const h = startRunner(fake, dir, undefined, { INIT_OUT: initOut });
+      h.send({ jsonrpc: '2.0', id: 1, method: 'run', params: { cliId: 'codex', cwd: dir, prompt: 'ping' } });
+      await h.waitFor(m => m.id === 1 && m.result);
+      const completed = await h.waitFor(m => m.method === 'completed');
+      expect(completed.params.content).toBe('rpc: ping'); // finished from init.prompt, not a message
+      const init = JSON.parse((await import('node:fs')).readFileSync(initOut, 'utf8'));
+      expect(init.backendType).toBe('tmux');
+      expect(init.codexRpcInput).toBe(true);
+      expect(init.prompt).toBe('ping'); // baked into init (codexRpcEligible needs non-empty prompt)
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('claude-code → PTY mode: init is pty + no codexRpcInput + empty prompt (dispatched via message)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'riff-cli-pty-'));
+    const initOut = join(dir, 'init.json');
+    try {
+      const fake = writeFakeWorker(dir);
+      const h = startRunner(fake, dir, undefined, { INIT_OUT: initOut });
+      h.send({ jsonrpc: '2.0', id: 1, method: 'run', params: { cliId: 'claude-code', cwd: dir, prompt: 'hey' } });
+      const completed = await h.waitFor(m => m.method === 'completed');
+      expect(completed.params.content).toBe('did: hey'); // via message dispatch
+      const init = JSON.parse((await import('node:fs')).readFileSync(initOut, 'utf8'));
+      expect(init.backendType).toBe('pty');
+      expect(init.codexRpcInput).toBeUndefined();
+      expect(init.prompt).toBe(''); // pty mode: empty init, prompt via message
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
