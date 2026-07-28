@@ -22,6 +22,29 @@ jobs:
       RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v6
+        # Push builds the tagged commit (github.ref = refs/tags/vX.Y.Z). But
+        # workflow_dispatch's default checkout is the dispatch's selected ref
+        # (typically master), NOT release_tag — so the recovery path would sign
+        # "current master code + old version number" and --clobber it onto the
+        # old Release, making the desktop assets diverge from the npm tarball /
+        # git tag. Pin the checkout to the tag ref in both cases so the signed
+        # app is always built from exactly the released commit.
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
+
+      - name: Verify HEAD is the tagged commit
+        # Defensive: prove the checkout landed on the tag's commit (not master),
+        # so a mis-resolved ref can never sign the wrong source into a Release.
+        run: |
+          git fetch origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}" --force --quiet 2>/dev/null || true
+          TAG_SHA=$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")
+          HEAD_SHA=$(git rev-parse HEAD)
+          echo "tag ${RELEASE_TAG} → $TAG_SHA ; HEAD → $HEAD_SHA"
+          if [ "$TAG_SHA" != "$HEAD_SHA" ]; then
+            echo "REFUSING: desktop build checked out $HEAD_SHA but tag ${RELEASE_TAG} is $TAG_SHA."
+            echo "Signed assets must be built from the exact released commit. Aborting to avoid attaching mismatched assets."
+            exit 1
+          fi
 
       - uses: actions/setup-node@v6
         with:
@@ -268,10 +291,14 @@ jobs:
       - name: Create GitHub Release (desktop assets attached asynchronously)
         # npm-first: the Release is created right after npm publish, WITHOUT the
         # macOS assets — those are uploaded later by `attach-desktop-assets` once
-        # signing/notarization finishes. So there is a short window where a
-        # stable Release exists with npm already live but no .dmg/.zip yet; the
-        # desktop bundle lands within the same run (minutes). softprops keeps the
-        # release editable so the later --clobber upload just adds the files.
+        # signing/notarization finishes. So the Release exists with npm already
+        # live but no .dmg/.zip yet. Normally the desktop bundle lands within the
+        # same run (a few minutes) once macOS signing completes — but signing is
+        # behind a human approval gate that can wait up to 30 days, or be
+        # rejected / fail / be cancelled; in those cases the Release stays
+        # npm-only until the manual recovery re-run (see attach-desktop-assets).
+        # softprops keeps the release editable so the later --clobber upload just
+        # adds the files.
         uses: softprops/action-gh-release@v3
         with:
           body: ${{ steps.changelog.outputs.body }}
