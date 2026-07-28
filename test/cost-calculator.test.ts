@@ -500,6 +500,25 @@ describe('getSessionTokenUsage', () => {
     expect(findCodexRolloutBySessionId).toHaveBeenCalledWith('codex-sid');
   });
 
+  it('resolves codex-app via the codex rollout fold (B-mode usage, not null)', () => {
+    // Regression for the trigger-result #3 gap: codex-app must resolve the codex
+    // rollout so usage is real, not a silent null on the B-mode target.
+    vi.mocked(findCodexSessionIdByBotmuxSessionId).mockReturnValue('codex-sid');
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue('/home/testuser/.codex/sessions/rollout-codex-sid.jsonl');
+    setupJsonl(JSON.stringify({
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: { total_token_usage: { input_tokens: 120, cached_input_tokens: 20, output_tokens: 40 } },
+      },
+    }));
+
+    const usage = getSessionTokenUsage({ cliId: 'codex-app', sessionId: 'botmux-sid' });
+    expect(usage).not.toBeNull();
+    expect(usage).toMatchObject({ inputTokens: 100, outputTokens: 40, cacheReadTokens: 20, cacheCreateTokens: 0 });
+    expect(findCodexRolloutBySessionId).toHaveBeenCalledWith('codex-sid');
+  });
+
   it('reports TraeX rollouts via the codex fold, capturing the turn_context model', () => {
     vi.mocked(findTraexRolloutBySessionId).mockReturnValue('/home/testuser/.trae/cli/sessions/2026/06/30/rollout-traex-sid.jsonl');
     // Real TRAE rollout shapes: codex-format turn_context carries the model;

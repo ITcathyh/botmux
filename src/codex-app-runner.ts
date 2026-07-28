@@ -21,6 +21,8 @@ interface Args {
   botName?: string;
   botOpenId?: string;
   locale?: string;
+  model?: string;
+  reasoningEffort?: string;
 }
 
 interface PendingRequest {
@@ -70,6 +72,8 @@ function parseArgs(argv: string[]): Args {
     else if (key === '--bot-name' && val !== undefined) { out.botName = val; i++; }
     else if (key === '--bot-open-id' && val !== undefined) { out.botOpenId = val; i++; }
     else if (key === '--locale' && val !== undefined) { out.locale = val; i++; }
+    else if (key === '--model' && val !== undefined) { out.model = val; i++; }
+    else if (key === '--reasoning-effort' && val !== undefined) { out.reasoningEffort = val; i++; }
   }
   if (!out.sessionId) throw new Error('--session-id is required');
   return out;
@@ -551,7 +555,14 @@ async function ensureThread(): Promise<string> {
     cwd: args.cwd,
     approvalPolicy: 'never',
     sandbox: 'danger-full-access',
-    config: { shell_environment_policy: { inherit: 'all' } },
+    config: {
+      shell_environment_policy: { inherit: 'all' },
+      // model_reasoning_effort is a codex config key (no top-level thread field).
+      // 'xhigh' collapses to codex's max 'high'.
+      ...(args.reasoningEffort ? { model_reasoning_effort: args.reasoningEffort === 'xhigh' ? 'high' : args.reasoningEffort } : {}),
+    },
+    // Per-turn model override → thread-level model (app-server's documented spot).
+    ...(args.model && args.model.trim() ? { model: args.model.trim() } : {}),
     serviceName: 'botmux',
     developerInstructions: appDeveloperInstructions(args),
     ephemeral: false,

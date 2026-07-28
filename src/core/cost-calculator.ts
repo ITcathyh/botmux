@@ -162,6 +162,7 @@ function usageKindForCli(cliId: SessionTokenUsageQuery['cliId']): UsageKind {
     case 'relay':
       return 'claude';
     case 'codex':
+    case 'codex-app':
     // TRAE rollouts are byte-identical to Codex (see traex-transcript.ts):
     // token_count events carry the cumulative totals, and the active model
     // rides on turn_context/session_meta payloads. The generic fold picked up

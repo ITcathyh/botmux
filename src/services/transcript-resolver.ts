@@ -112,7 +112,10 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
       const path = q.cwd ? getClaudeSessionJsonlPath(sid, q.cwd, claudeForkDataDir(q.cliId)) : null;
       return path ? { path, kind: 'claude' } : null;
     }
-    case 'codex': {
+    case 'codex':
+    case 'codex-app': {
+      // codex-app drives the codex app-server, which persists the same rollout
+      // format under the same store as plain codex — so resolution is identical.
       const path = cachedTranscriptPathLookup(`codex:${q.sessionId}:${q.cliSessionId ?? ''}`, null, () => {
         const codexSid = q.cliSessionId || findCodexSessionIdByBotmuxSessionId(q.sessionId) || q.sessionId;
         return findCodexRolloutBySessionId(codexSid) ?? null;
