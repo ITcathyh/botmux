@@ -283,19 +283,20 @@ interface PendingInteraction {
 const pendingInteractions = new Map<string, PendingInteraction>();
 let interactionSeq = 0;
 
-/** codex-app can hand a keyed `answers` schema; v1 collapses to a single free
- *  text field per the botmux↔riff contract (align to A's plain-text model). When
- *  the schema is multi-field we still send one text and log, so a multi-required
- *  schema surfaces in the runner log rather than silently dropping fields. */
-function mapAnswerToRequestUserInput(params: any, answerText: string): { answers: Record<string, unknown> } {
+/** codex-app's requestUserInput answer schema (Codex 0.145 generated types) is
+ *  `{ answers: { [questionId]: { answers: string[] } } }` — a per-question map,
+ *  each holding a string array. v1 collapses the single free-text reply (per the
+ *  botmux↔riff plain-text contract) into the FIRST question's answers array; a
+ *  multi-question schema is logged so it surfaces rather than silently dropping. */
+function mapAnswerToRequestUserInput(params: any, answerText: string): { answers: Record<string, { answers: string[] }> } {
   const fieldIds: string[] = Array.isArray(params?.questions)
     ? params.questions.map((q: any) => q?.id).filter((x: any) => typeof x === 'string')
     : [];
   if (fieldIds.length > 1) {
-    writeLine(`[codex-app] requestUserInput has ${fieldIds.length} fields; collapsing single text answer to first field (id=${fieldIds[0]})`);
+    writeLine(`[codex-app] requestUserInput has ${fieldIds.length} questions; single text answer maps to first (id=${fieldIds[0]})`);
   }
   const key = fieldIds[0] ?? 'answer';
-  return { answers: { [key]: answerText } };
+  return { answers: { [key]: { answers: [answerText] } } };
 }
 
 /** Best-effort question text from a codex-app interaction request. The exact
