@@ -86,8 +86,12 @@ jobs:
           retention-days: 7
 
   release:
-    if: always() && github.event_name == 'push' && (needs.desktop.result == 'success' || needs.desktop.result == 'skipped')
-    needs: desktop
+    # npm-first: no longer `needs: desktop`. npm publish + GitHub Release run
+    # immediately on the tag push, WITHOUT waiting for the manually-gated
+    # (macos-signing environment) macOS build. The signed desktop assets are
+    # attached asynchronously afterwards by `attach-desktop-assets`. This keeps
+    # `npm i -g botmux` unblocked when macOS signing is slow / awaiting approval.
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -123,10 +127,18 @@ jobs:
           echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
           echo "Publishing $VERSION → npm dist-tag=$NPM_TAG, prerelease=$PRERELEASE"
 
-      - name: Require signed macOS assets for stable releases
-        if: steps.dist_tag.outputs.tag == 'latest' && needs.desktop.result != 'success'
+      - name: Require deepcoldy authority for stable (latest) releases
+        # npm-first removed the transitive authority gate that used to come via
+        # `needs: desktop` (desktop only runs for deepcoldy; the old "Require
+        # signed macOS assets" step then failed non-deepcoldy stable tags). With
+        # release decoupled from desktop, re-assert it explicitly: only deepcoldy
+        # may publish the `latest` dist-tag that every `npm i botmux` user gets.
+        # canary/beta/rc/next go to side dist-tags and stay open for branch
+        # gray-release by anyone.
+        if: steps.dist_tag.outputs.tag == 'latest' && (github.actor != 'deepcoldy' || github.triggering_actor != 'deepcoldy')
         run: |
-          echo "REFUSING: stable releases require macOS signing by deepcoldy."
+          echo "REFUSING: stable (latest) releases may only be published by deepcoldy."
+          echo "actor=${{ github.actor }} triggering_actor=${{ github.triggering_actor }}"
           exit 1
 
       - name: Guard against downgrading npm latest
@@ -253,28 +265,57 @@ jobs:
             echo 'CHANGELOG_EOF'
           } >> "$GITHUB_OUTPUT"
 
-      - name: Download macOS release assets
-        if: needs.desktop.result == 'success'
+      - name: Create GitHub Release (desktop assets attached asynchronously)
+        # npm-first: the Release is created right after npm publish, WITHOUT the
+        # macOS assets — those are uploaded later by `attach-desktop-assets` once
+        # signing/notarization finishes. So there is a short window where a
+        # stable Release exists with npm already live but no .dmg/.zip yet; the
+        # desktop bundle lands within the same run (minutes). softprops keeps the
+        # release editable so the later --clobber upload just adds the files.
+        uses: softprops/action-gh-release@v3
+        with:
+          body: ${{ steps.changelog.outputs.body }}
+          prerelease: ${{ steps.dist_tag.outputs.prerelease == 'true' }}
+
+  attach-desktop-assets:
+    # npm-first tail: once the parallel `desktop` job has signed+notarized the
+    # macOS build AND the `release` job has created the GitHub Release, upload
+    # the .dmg/.zip onto that Release. Runs on the tag-push path (the
+    # workflow_dispatch refresh path is handled by `refresh-desktop-assets`).
+    # `needs: [desktop, release]` both must succeed: desktop for the artifact,
+    # release so the GitHub Release exists to upload onto.
+    if: github.event_name == 'push' && needs.desktop.result == 'success' && needs.release.result == 'success'
+    needs: [desktop, release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Download macOS build artifact
         uses: actions/download-artifact@v4
         with:
           name: botmux-macos
           path: release-assets
 
-      - name: Create GitHub Release with macOS assets
-        if: needs.desktop.result == 'success'
-        uses: softprops/action-gh-release@v3
-        with:
-          body: ${{ steps.changelog.outputs.body }}
-          prerelease: ${{ steps.dist_tag.outputs.prerelease == 'true' }}
-          files: release-assets/*
-          fail_on_unmatched_files: true
+      - name: Attach macOS assets to the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$RELEASE_TAG" release-assets/* --clobber --repo "$GITHUB_REPOSITORY"
 
-      - name: Create GitHub prerelease without macOS assets
-        if: needs.desktop.result == 'skipped' && steps.dist_tag.outputs.prerelease == 'true'
-        uses: softprops/action-gh-release@v3
-        with:
-          body: ${{ steps.changelog.outputs.body }}
-          prerelease: true
+      - name: Verify uploaded release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir downloaded-assets
+          gh release download "$RELEASE_TAG" \
+            --pattern 'Botmux-*.dmg' \
+            --pattern 'Botmux-*.zip' \
+            --dir downloaded-assets \
+            --repo "$GITHUB_REPOSITORY"
+          for file in release-assets/*; do
+            cmp "$file" "downloaded-assets/$(basename "$file")"
+          done
 
   refresh-desktop-assets:
     if: github.event_name == 'workflow_dispatch'
