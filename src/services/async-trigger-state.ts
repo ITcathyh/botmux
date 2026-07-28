@@ -91,6 +91,16 @@ export interface AsyncStateInputs {
     cacheReadTokens: number;
     cacheCreateTokens: number;
   };
+  /** A held structured interaction (codex-app awaiting_input). When present on a
+   *  live/open session it takes precedence over `running`. */
+  awaiting?: {
+    interactionId: string;
+    turnId?: string;
+    kind: 'clarification' | 'confirmation' | 'authentication';
+    question: string;
+    details?: string;
+    authChallenge?: { links: { url: string; label?: string }[]; userCode?: string; instructions?: string; expiresAt?: string };
+  };
 }
 
 export function resolveAsyncTriggerState(inp: AsyncStateInputs): TriggerResponse {
@@ -157,6 +167,21 @@ export function resolveAsyncTriggerState(inp: AsyncStateInputs): TriggerResponse
       error: '会话已终止但未捕获最终产出（可能失败或被取消）',
       finishedAt: inp.closedAt ?? undefined,
       message: 'async trigger terminated without output',
+    };
+  }
+
+  // Awaiting input: a live session holding a structured interaction open. Takes
+  // precedence over plain `running` so the caller can suspend and answer. Only
+  // meaningful while the session is live/open (a closed session was handled above).
+  if (inp.awaiting && (inp.liveActive || inp.storedStatus === 'open')) {
+    return {
+      ok: true,
+      state: 'awaiting_input',
+      triggerId: inp.persisted?.triggerId ?? inp.requestedTriggerId,
+      target: { kind: 'turn', sessionId, chatId },
+      interaction: inp.awaiting,
+      async: { status: 'pending', sessionId },
+      message: 'async trigger awaiting user input',
     };
   }
 

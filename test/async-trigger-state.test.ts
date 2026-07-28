@@ -66,6 +66,57 @@ describe('decideAsyncOwnership — fail-closed cross-bot isolation (P1-1)', () =
   });
 });
 
+describe('resolveAsyncTriggerState — awaiting_input (#2)', () => {
+  const interaction = {
+    interactionId: 'cai_s1_1', turnId: 'trg_a', kind: 'clarification' as const, question: 'Which env?',
+  };
+
+  it('live session holding an interaction → awaiting_input, carries interaction (with turnId)', () => {
+    const r = resolveAsyncTriggerState({
+      sessionId: 's1', liveActive: true, storedStatus: 'open', awaiting: interaction,
+    });
+    expect(r.state).toBe('awaiting_input');
+    expect(r.interaction).toEqual(interaction);
+    expect(r.interaction?.turnId).toBe('trg_a');
+  });
+
+  it('awaiting takes precedence over plain running', () => {
+    const r = resolveAsyncTriggerState({
+      sessionId: 's1', liveActive: true, storedStatus: 'open',
+      memResult: { status: 'pending' }, memTriggerId: 't', awaiting: interaction,
+    });
+    expect(r.state).toBe('awaiting_input');
+  });
+
+  it('completed still wins over awaiting (turn finished)', () => {
+    const r = resolveAsyncTriggerState({
+      sessionId: 's1', liveActive: true, storedStatus: 'open',
+      memResult: { status: 'completed', content: 'done', completedAt: 1 }, memTriggerId: 't',
+      awaiting: interaction,
+    });
+    expect(r.state).toBe('completed');
+    expect(r.interaction).toBeUndefined();
+  });
+
+  it('closed session ignores a stale awaiting → failed, not awaiting_input', () => {
+    const r = resolveAsyncTriggerState({
+      sessionId: 's1', liveActive: false, storedStatus: 'closed', awaiting: interaction,
+    });
+    expect(r.state).toBe('failed');
+  });
+
+  it('authentication interaction passes authChallenge through', () => {
+    const auth = {
+      interactionId: 'cai_s1_2', kind: 'authentication' as const, question: 'Log in',
+      authChallenge: { links: [{ url: 'https://login', label: 'Sign in' }], userCode: 'ABC-123' },
+    };
+    const r = resolveAsyncTriggerState({ sessionId: 's1', liveActive: true, storedStatus: 'open', awaiting: auth });
+    expect(r.state).toBe('awaiting_input');
+    expect(r.interaction?.authChallenge?.links[0].url).toBe('https://login');
+    expect(r.interaction?.authChallenge?.userCode).toBe('ABC-123');
+  });
+});
+
 describe('resolveAsyncTriggerState — completed', () => {
   it('from live in-memory result', () => {
     const r = resolveAsyncTriggerState({

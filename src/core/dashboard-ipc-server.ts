@@ -887,6 +887,17 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
     closedAt: stored?.closedAt,
     requestedTriggerId: triggerId,
     usage,
+    // A held interaction only exists on the live in-memory session (not persisted).
+    awaiting: ds?.awaitingInteraction
+      ? {
+          interactionId: ds.awaitingInteraction.interactionId,
+          turnId: ds.awaitingInteraction.turnId,
+          kind: ds.awaitingInteraction.kind,
+          question: ds.awaitingInteraction.question,
+          details: ds.awaitingInteraction.details,
+          authChallenge: ds.awaitingInteraction.authChallenge,
+        }
+      : undefined,
   });
 }
 
@@ -1077,6 +1088,38 @@ ipcRoute('GET', '/api/sessions/:sessionId/trigger-result', (req, res, params) =>
   // resolved state including not_found — task state lives in `result.state`,
   // not the HTTP status. Only a malformed lookup (ok:false) maps to non-200.
   jsonRes(res, result.ok ? 200 : 400, result);
+});
+
+// Answer a held structured interaction (codex-app awaiting_input). The caller
+// (task runner) polls trigger-result, sees state 'awaiting_input' + interaction,
+// and POSTs the user's answer text here. Body: { interactionId, answer:{text} }
+// (turnId/kind may also be sent by the caller for its own bookkeeping — we only
+// require interactionId + answer.text). Resolves by forwarding to the worker,
+// which writes it into the codex-app runner (→ codex-app respond). owner-only via
+// the dashboard proxy's write-cookie gate; the daemon IPC is loopback-trusted.
+ipcRoute('POST', '/api/sessions/:sessionId/answer', async (req, res, params) => {
+  let body: { interactionId?: unknown; answer?: { text?: unknown } };
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const interactionId = typeof body.interactionId === 'string' ? body.interactionId : '';
+  const text = typeof body.answer?.text === 'string' ? body.answer.text : '';
+  if (!interactionId) return jsonRes(res, 400, { ok: false, error: 'interactionId_required' });
+  const ds = findActiveBySessionId(params.sessionId);
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  if (!ds.awaitingInteraction || ds.awaitingInteraction.interactionId !== interactionId) {
+    // Stale/unknown interaction — the turn may have moved on. Report cleanly so
+    // the caller re-polls rather than retrying a dead id.
+    return jsonRes(res, 409, { ok: false, error: 'interaction_not_pending' });
+  }
+  if (!ds.worker || ds.worker.killed) return jsonRes(res, 409, { ok: false, error: 'no_live_worker' });
+  try {
+    ds.worker.send({ type: 'answer_interaction', interactionId, text } as DaemonToWorker);
+  } catch {
+    return jsonRes(res, 502, { ok: false, error: 'worker_send_failed' });
+  }
+  // Optimistically clear the pending marker; final_output will also clear it, and
+  // a re-poll before the turn resumes just won't find it pending (409 above).
+  ds.awaitingInteraction = undefined;
+  jsonRes(res, 200, { ok: true, sessionId: params.sessionId, interactionId });
 });
 
 // 会话 insight：只读解析本会话的 transcript，产出动作 span / 失败聚合 / 规则建议

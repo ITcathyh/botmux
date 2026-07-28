@@ -48,6 +48,13 @@ export function encodeRunnerInput(content: string, codexAppInput?: CodexAppTurnI
   return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64');
 }
 
+/** Encode a structured-interaction answer (resolves a held awaiting_input in the
+ *  codex-app runner) rather than a new turn message. */
+export function encodeRunnerAnswer(interactionId: string, text: string): string {
+  const payload = { type: 'answer', interactionId, text };
+  return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64');
+}
+
 /** Split an ASCII string into <=maxBytes pieces. Safe because the caller only
  *  ever passes `marker + base64`, which is single-byte throughout. */
 export function chunkAscii(line: string, maxBytes: number): string[] {
@@ -85,7 +92,24 @@ export async function writeRunnerInput(
   content: string,
   codexAppInput?: CodexAppTurnInput,
 ): Promise<{ submitted: boolean }> {
-  const line = `${markerPrefix}${encodeRunnerInput(content, codexAppInput)}`;
+  return writeRunnerEncodedLine(pty, `${markerPrefix}${encodeRunnerInput(content, codexAppInput)}`);
+}
+
+/** Send a pre-encoded runner control line (e.g. an interaction answer). Shares
+ *  the same chunked/throttled + pre-flush submit path as writeRunnerInput. */
+export async function writeRunnerAnswer(
+  pty: PtyHandle,
+  markerPrefix: string,
+  interactionId: string,
+  text: string,
+): Promise<{ submitted: boolean }> {
+  return writeRunnerEncodedLine(pty, `${markerPrefix}${encodeRunnerAnswer(interactionId, text)}`);
+}
+
+async function writeRunnerEncodedLine(
+  pty: PtyHandle,
+  line: string,
+): Promise<{ submitted: boolean }> {
 
   // Non-tmux fallback (raw PTY): a single write is fine — there's no send-keys
   // process to time out, and the PTY write isn't bounded the same way.

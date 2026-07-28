@@ -219,6 +219,15 @@ export interface CliAdapter {
     recheck?: () => SubmitRecheckResult | Promise<SubmitRecheckResult>;
   }>;
 
+  /** Optional: resolve a held awaiting_input interaction (structured
+   *  clarification / elicitation) with answer text. Only adapters running a
+   *  structured runner that can hold interactions open (codex-app) implement it. */
+  writeInteractionAnswer?(
+    pty: PtyHandle,
+    interactionId: string,
+    text: string,
+  ): Promise<{ submitted: boolean }>;
+
   /** Optional: absolute path (with ~ expansion handled by caller) to the CLI's
    *  skill directory.  When set, `ensureSkills` will write/refresh skill files
    *  into `{skillsDir}/<skillName>/SKILL.md`.  Undefined = this CLI does not

@@ -240,6 +240,18 @@ export interface DaemonSession {
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   /** message_id of the TUI prompt interactive card (if active) */
   tuiPromptCardId?: string;
+  /** Structured awaiting_input interaction currently held open by a codex-app
+   *  runner (programmatic API path). Surfaced via trigger-result state
+   *  `awaiting_input` and cleared when the turn completes or is answered. */
+  awaitingInteraction?: {
+    interactionId: string;
+    turnId?: string;
+    kind: 'clarification' | 'confirmation' | 'authentication';
+    question: string;
+    details?: string;
+    authChallenge?: { links: { url: string; label?: string }[]; userCode?: string; instructions?: string; expiresAt?: string };
+    at: number;
+  };
   /** turnId of the last stuck_warning posted — dedup so we don't spam the
    *  thread with repeated warnings for the same unresolved turn. */
   stuckWarningTurnId?: string;

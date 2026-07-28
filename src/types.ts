@@ -621,6 +621,7 @@ export type DaemonToWorker =
   // 白名单 TUI 命令注入（/slash 路由）。cwd 移动不走注入——角色切换用
   // restart+updateWorkingDir 的 respawn，避免绕过 cd 路由的角色库硬校验。
   | { type: 'inject_command'; command: string }
+  | { type: 'answer_interaction'; interactionId: string; text: string }
   | { type: 'tui_text_input'; keys: string[]; text: string }
   // CoCo AskUserQuestion 作答：daemon 在 ask 结算后下发，worker 等原生 picker 渲染后
   // 用 navKeys 驱动它选择+导航。needsReviewSubmit=true（多题）时 navKeys 停在 Review
@@ -667,6 +668,7 @@ export type WorkerToDaemon =
   | { type: 'bridge_source_session'; bridge: 'hermes'; sourceSessionId: string }
   | { type: 'tui_prompt'; description: string; options: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>; multiSelect?: boolean; turnId?: string; dispatchAttempt?: number }
   | { type: 'tui_prompt_resolved'; selectedText?: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'awaiting_input'; interactionId: string; turnId?: string; kind: 'clarification' | 'confirmation' | 'authentication'; question: string; details?: string; authChallenge?: { links: { url: string; label?: string }[]; userCode?: string; instructions?: string; expiresAt?: string } }
   | { type: 'stuck_warning'; elapsedMs: number; snapshot: string; matchedPattern?: string; turnId?: string; dispatchAttempt?: number; cliLifetime?: number }
   | { type: 'stuck_warning_expired'; nonce: number; turnId?: string; dispatchAttempt?: number }
   | { type: 'tui_keys_delivered'; nonce: number; turnId?: string; dispatchAttempt?: number }

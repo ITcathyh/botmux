@@ -267,6 +267,113 @@ let codexVersionChecked = false;
 let codexVersion: CodexVersion | undefined;
 let cleanVersionWarningShown = false;
 
+/** Structured interaction requests (requestUserInput / elicitation) that are
+ *  held open awaiting a human/programmatic answer instead of being auto-declined.
+ *  Keyed by a botmux-minted interactionId. `finish` maps the answer text to the
+ *  codex-app protocol-shaped respond payload and replies to the app-server. */
+interface PendingInteraction {
+  interactionId: string;
+  kind: 'clarification' | 'confirmation' | 'authentication';
+  finish: (answerText: string) => void;
+}
+const pendingInteractions = new Map<string, PendingInteraction>();
+let interactionSeq = 0;
+
+/** codex-app can hand a keyed `answers` schema; v1 collapses to a single free
+ *  text field per the botmux↔riff contract (align to A's plain-text model). When
+ *  the schema is multi-field we still send one text and log, so a multi-required
+ *  schema surfaces in the runner log rather than silently dropping fields. */
+function mapAnswerToRequestUserInput(params: any, answerText: string): { answers: Record<string, unknown> } {
+  const fieldIds: string[] = Array.isArray(params?.questions)
+    ? params.questions.map((q: any) => q?.id).filter((x: any) => typeof x === 'string')
+    : [];
+  if (fieldIds.length > 1) {
+    writeLine(`[codex-app] requestUserInput has ${fieldIds.length} fields; collapsing single text answer to first field (id=${fieldIds[0]})`);
+  }
+  const key = fieldIds[0] ?? 'answer';
+  return { answers: { [key]: answerText } };
+}
+
+/** Best-effort question text from a codex-app interaction request. The exact
+ *  param shape varies by codex version; try the common carriers and fall back
+ *  to the caller's default. */
+function extractInteractionQuestion(params: any): string | undefined {
+  if (!params || typeof params !== 'object') return undefined;
+  const candidates = [
+    params.message,
+    params.prompt,
+    params.question,
+    Array.isArray(params.questions) ? params.questions[0]?.prompt ?? params.questions[0]?.question ?? params.questions[0]?.label : undefined,
+  ];
+  for (const c of candidates) {
+    if (typeof c === 'string' && c.trim()) return c.trim();
+  }
+  return undefined;
+}
+
+function extractInteractionDetails(params: any): string | undefined {
+  if (!params || typeof params !== 'object') return undefined;
+  const d = params.details ?? params.description ?? params.context;
+  return typeof d === 'string' && d.trim() ? d.trim() : undefined;
+}
+
+/** Map an elicitation carrying OAuth/login links into the riff authChallenge
+ *  shape. Returns undefined when no link-bearing structure is present (→ the
+ *  interaction is treated as a plain clarification). */
+function extractAuthChallenge(params: any): { links: { url: string; label?: string }[]; userCode?: string; instructions?: string; expiresAt?: string } | undefined {
+  if (!params || typeof params !== 'object') return undefined;
+  const rawLinks = params.links ?? params.authLinks ?? (params.url ? [{ url: params.url }] : undefined);
+  if (!Array.isArray(rawLinks)) return undefined;
+  const links = rawLinks
+    .map((l: any) => (typeof l === 'string' ? { url: l } : (l && typeof l.url === 'string' ? { url: l.url, label: typeof l.label === 'string' ? l.label : undefined } : undefined)))
+    .filter((l: any): l is { url: string; label?: string } => !!l);
+  if (!links.length) return undefined;
+  return {
+    links,
+    userCode: typeof params.userCode === 'string' ? params.userCode : undefined,
+    instructions: typeof params.instructions === 'string' ? params.instructions : undefined,
+    expiresAt: typeof params.expiresAt === 'string' ? params.expiresAt : undefined,
+  };
+}
+
+/** Register a held interaction and emit the awaiting_input marker to the worker
+ *  (→ daemon → trigger-result). turnId is the runner's active botmux turn so the
+ *  caller can correlate its answer. */
+function beginInteraction(input: {
+  kind: 'clarification' | 'confirmation' | 'authentication';
+  question: string;
+  details?: string;
+  authChallenge?: { links: { url: string; label?: string }[]; userCode?: string; instructions?: string; expiresAt?: string };
+  finish: (answerText: string) => void;
+}): void {
+  const interactionId = `cai_${args.sessionId}_${++interactionSeq}`;
+  pendingInteractions.set(interactionId, { interactionId, kind: input.kind, finish: input.finish });
+  emitMarker('awaiting_input', {
+    interactionId,
+    turnId: activeTurn?.nativeTurnId ?? undefined,
+    kind: input.kind,
+    question: input.question,
+    ...(input.details ? { details: input.details } : {}),
+    ...(input.authChallenge ? { authChallenge: input.authChallenge } : {}),
+  });
+}
+
+/** Resolve a held interaction with answer text (from the runner input channel).
+ *  Unknown/stale ids are ignored (the turn may have moved on). */
+function answerInteraction(interactionId: string, text: string): void {
+  const pending = pendingInteractions.get(interactionId);
+  if (!pending) {
+    writeLine(`[codex-app] answer for unknown interaction ${interactionId} (ignored)`);
+    return;
+  }
+  pendingInteractions.delete(interactionId);
+  try {
+    pending.finish(text);
+  } catch (err: any) {
+    writeLine(`[codex-app] failed to deliver interaction answer: ${err?.message ?? err}`);
+  }
+}
+
 function detectedCodexVersion(): CodexVersion | undefined {
   if (codexVersionChecked) return codexVersion;
   codexVersionChecked = true;
@@ -313,11 +420,35 @@ function handleServerRequest(msg: JsonObject): boolean {
     return true;
   }
   if (method === 'item/tool/requestUserInput') {
-    client.respond(msg.id, { answers: {} });
+    // Structured clarification: hold the request open and surface it as an
+    // awaiting_input interaction. The answer text arrives later via the runner
+    // input channel and is mapped back to codex-app's keyed `answers` shape.
+    const params: any = msg.params ?? {};
+    const question = extractInteractionQuestion(params)
+      ?? 'The agent needs additional input to continue.';
+    const details = extractInteractionDetails(params);
+    beginInteraction({
+      kind: 'clarification',
+      question,
+      details,
+      finish: (text) => client.respond(msg.id, mapAnswerToRequestUserInput(params, text)),
+    });
     return true;
   }
   if (method === 'mcpServer/elicitation/request') {
-    client.respond(msg.id, { action: 'cancel', content: null, _meta: null });
+    const params: any = msg.params ?? {};
+    const question = extractInteractionQuestion(params)
+      ?? (typeof params.message === 'string' ? params.message : 'The agent is requesting input.');
+    const authChallenge = extractAuthChallenge(params);
+    beginInteraction({
+      kind: authChallenge ? 'authentication' : 'clarification',
+      question,
+      details: extractInteractionDetails(params),
+      authChallenge,
+      // v1: any answered text = accept + single-field content; cancel is only
+      // used on timeout/no-answer (handled daemon-side, not here).
+      finish: (text) => client.respond(msg.id, { action: 'accept', content: { answer: text }, _meta: null }),
+    });
     return true;
   }
   if (method === 'item/tool/call') {
@@ -549,6 +680,12 @@ function enqueueLine(line: string): void {
     const encoded = trimmed.slice('::botmux-codex-app:'.length);
     try {
       const decoded = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
+      if (decoded?.type === 'answer' && typeof decoded.interactionId === 'string') {
+        // Programmatic/human answer to a held structured interaction — resolve
+        // the codex-app request rather than enqueue a new turn.
+        answerInteraction(decoded.interactionId, typeof decoded.text === 'string' ? decoded.text : '');
+        return;
+      }
       if (decoded?.type === 'message' && typeof decoded.content === 'string') {
         const codexAppInput = isCodexAppTurnInput(decoded.codexAppInput)
           ? decoded.codexAppInput

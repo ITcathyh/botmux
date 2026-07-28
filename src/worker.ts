@@ -4832,6 +4832,22 @@ function handleCodexAppMarker(body: string): void {
     return;
   }
 
+  if (kind === 'awaiting_input' && typeof payload.interactionId === 'string' && typeof payload.question === 'string') {
+    // codex-app is holding a structured clarification/elicitation open. Surface
+    // it to the daemon so trigger-result/getMeta can report awaiting_input and
+    // the caller can answer via POST /api/sessions/:id/answer.
+    send({
+      type: 'awaiting_input',
+      interactionId: payload.interactionId,
+      turnId: typeof payload.turnId === 'string' ? payload.turnId : currentBotmuxTurnId,
+      kind: payload.kind === 'confirmation' || payload.kind === 'authentication' ? payload.kind : 'clarification',
+      question: payload.question,
+      ...(typeof payload.details === 'string' ? { details: payload.details } : {}),
+      ...(payload.authChallenge && typeof payload.authChallenge === 'object' ? { authChallenge: payload.authChallenge } : {}),
+    } as WorkerToDaemon);
+    return;
+  }
+
   if (kind === 'final' && typeof payload.content === 'string') {
     const startedAtMs = typeof payload.startedAtMs === 'number' ? payload.startedAtMs : undefined;
     const completedAtMs = typeof payload.completedAtMs === 'number' ? payload.completedAtMs : Date.now();
@@ -10239,6 +10255,20 @@ process.on('message', async (raw: unknown) => {
 
     case 'tui_text_input': {
       handleTuiTextInput(msg.keys, msg.text);
+      break;
+    }
+
+    case 'answer_interaction': {
+      // Resolve a held codex-app awaiting_input interaction with answer text.
+      // Only the structured runner (codex-app) implements writeInteractionAnswer;
+      // other CLIs never emit awaiting_input so this never reaches them.
+      if (backend && cliAdapter?.writeInteractionAnswer) {
+        void cliAdapter.writeInteractionAnswer(backend as unknown as PtyHandle, msg.interactionId, msg.text)
+          .then(r => { if (!r.submitted) log(`answer_interaction ${msg.interactionId} not submitted`); })
+          .catch(err => log(`answer_interaction failed: ${err?.message ?? err}`));
+      } else {
+        log(`answer_interaction ignored — no live backend / adapter lacks writeInteractionAnswer`);
+      }
       break;
     }
 

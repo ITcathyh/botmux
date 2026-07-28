@@ -3187,6 +3187,23 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'awaiting_input': {
+        // codex-app is holding a structured clarification/elicitation open.
+        // Record it so trigger-result reports state 'awaiting_input' and
+        // getMeta shows the needs-you signal; cleared on final_output / answer.
+        ds.awaitingInteraction = {
+          interactionId: msg.interactionId,
+          turnId: msg.turnId,
+          kind: msg.kind,
+          question: msg.question,
+          ...(msg.details ? { details: msg.details } : {}),
+          ...(msg.authChallenge ? { authChallenge: msg.authChallenge } : {}),
+          at: Date.now(),
+        };
+        logger.info(`[${t}] awaiting_input interaction ${msg.interactionId} (${msg.kind})`);
+        break;
+      }
+
       case 'tui_prompt_resolved': {
         // TUI prompt is no longer showing — update card if it exists
         logger.info(`[${t}] TUI prompt resolved${msg.selectedText ? `: ${msg.selectedText}` : ''}`);
@@ -3712,6 +3729,10 @@ function setupWorkerHandlers(
       }
 
       case 'final_output': {
+        // A completed turn clears any held awaiting_input interaction — the
+        // clarification either got answered (turn resumed → completed) or the
+        // turn ended; either way it's no longer pending.
+        ds.awaitingInteraction = undefined;
         // Adopt-bridge: worker harvested the assistant turn from Claude Code's
         // transcript JSONL and forwarded it to us. Dedup with a session-scoped
         // key so a re-drain can't re-send the same answer or cross-suppress

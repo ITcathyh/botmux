@@ -3696,6 +3696,25 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // 回答一个 awaiting_input 结构化交互（codex-app）。调用方轮询 trigger-result
+    // 拿到 state:awaiting_input 后，把用户答复文本 POST 到这里。写操作，非 GET —
+    // decideDashboardAuth 已要求管理 cookie，未授权在前面就被 401。代理到 owner daemon。
+    if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/answer$/))) {
+      const sid = decodeURIComponent(m[1]);
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/answer`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: Buffer.concat(chunks).toString('utf8'),
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // 会话 insight（只读 trace 分析：动作 span / 失败聚合 / 规则建议）。
     // owner-only：不在公开读白名单 → decideDashboardAuth 已对只读访客 401，
     // 公开/联邦访客看不到 tab 也拿不到 span。代理到 owner daemon 的同名 IPC。

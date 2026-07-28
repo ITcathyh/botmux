@@ -3,7 +3,7 @@ import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { resolveCommand } from './registry.js';
 import type { CliAdapter, PtyHandle } from './types.js';
-import { writeRunnerInput } from './runner-input.js';
+import { writeRunnerInput, writeRunnerAnswer } from './runner-input.js';
 
 function runnerPath(): string {
   const here = dirname(fileURLToPath(import.meta.url));
@@ -76,6 +76,12 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
       // fallback. The runner uses the sidecar only on supported app-server
       // versions and never reverse-parses the XML-ish legacy envelope.
       return writeRunnerInput(pty, '::botmux-codex-app:', content, codexAppInput);
+    },
+
+    async writeInteractionAnswer(pty, interactionId, text) {
+      // Resolve a held awaiting_input interaction (structured clarification /
+      // elicitation) — same control channel as input, distinct payload type.
+      return writeRunnerAnswer(pty, '::botmux-codex-app:', interactionId, text);
     },
 
     completionPattern: undefined,

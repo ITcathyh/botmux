@@ -89,7 +89,7 @@ export type TriggerErrorCode =
  *  - failed:    session terminated without a captured output (soft terminal —
  *               may be a genuine failure OR a caller-initiated close/cancel)
  *  - not_found: no session record on disk (never existed / invalid id) */
-export type AsyncTriggerState = 'running' | 'completed' | 'failed' | 'not_found';
+export type AsyncTriggerState = 'running' | 'completed' | 'failed' | 'not_found' | 'awaiting_input';
 
 export interface TriggerResponse {
   ok: boolean;
@@ -125,6 +125,16 @@ export interface TriggerResponse {
     outputTokens: number;
     cacheReadTokens: number;
     cacheCreateTokens: number;
+  };
+  /** Present only on `state:'awaiting_input'` — the held structured interaction
+   *  the caller must answer via POST /api/sessions/:id/answer. */
+  interaction?: {
+    interactionId: string;
+    turnId?: string;
+    kind: 'clarification' | 'confirmation' | 'authentication';
+    question: string;
+    details?: string;
+    authChallenge?: { links: { url: string; label?: string }[]; userCode?: string; instructions?: string; expiresAt?: string };
   };
   async?: {
     status: TriggerAsyncStatus;
