@@ -1301,13 +1301,15 @@ let isSettlingFirstFlush = false;
  *  later markPromptReady call would return early with the first prompt stranded. */
 let promptReadyDetectedDuringSettle = false;
 /** While the ready-gate is holding, the IdleDetector may still fire on a real
- *  readyPattern (e.g. Hermes's ❯) — proving the input box exists — but
+ *  readyPattern (e.g. grok's ❯) — proving the input box exists — but
  *  markPromptReady() returns early because the gate is armed. Record that the
  *  pattern was seen so the gate's timeout-fallback settle can mark the prompt
  *  ready immediately instead of delivering into a !isPromptReady state that
- *  flushPending() rejects for non-type-ahead adapters. Without this, a Hermes
- *  spawn that renders ❯ but never fires BOTMUX_READY_COMMAND waits the full
- *  hard timeout (and previously never delivered at all). */
+ *  flushPending() rejects for non-type-ahead adapters. Without this, a ready-
+ *  gated spawn that renders ❯ but never fires its SessionStart signal waits the
+ *  full hard timeout (and previously never delivered at all). (Hermes used to be
+ *  the example here; it no longer arms the gate — see hermes.ts — because the
+ *  shipped binary never emitted BOTMUX_READY_COMMAND.) */
 let readyPatternSeenDuringHold = false;
 /** Claude's SessionStart hooks run in parallel. Its botmux hook proves the
  * startup selector is behind us, but sibling project hooks may still be
@@ -8209,7 +8211,11 @@ async function spawnCli(
   lastPtyOutputAtMs = Date.now();
   const readyHookAvailable = effectiveReadyHookInstall
     ? hasInstalledSessionReadyHook(effectiveReadyHookInstall)
-    : true; // Hermes emits BOTMUX_READY_COMMAND directly instead of a config hook.
+    : true; // No config-file hook to verify → assume a direct ready-command
+            // integration (env-injected BOTMUX_READY_COMMAND). No current adapter
+            // takes this branch: claude-code and grok both ship a hookInstall
+            // config. (Hermes formerly did, on a BOTMUX_READY_COMMAND contract the
+            // shipped binary never honored — it no longer sets injectsReadyHook.)
   const isolatedReadyTransportRequired = sandboxRequested || credentialBoundaryActive;
   const readyPortAvailable = !isolatedReadyTransportRequired
     || parseDaemonIpcPort(childEnv.BOTMUX_DAEMON_IPC_PORT) !== undefined;

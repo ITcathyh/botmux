@@ -1060,8 +1060,15 @@ describe('hermes buildArgs', () => {
     expect(adapter.passesInitialPromptViaArgs).toBeFalsy();
   });
 
-  it('uses explicit ready signal gate without type-ahead', () => {
-    expect(adapter.injectsReadyHook).toBe(true);
+  it('relies on ❯ readyPattern without ready-gate or type-ahead', () => {
+    // #353 armed the ready-gate via injectsReadyHook on the premise that Hermes
+    // shell-executes BOTMUX_READY_COMMAND at composer-ready. The shipped Hermes
+    // never honored that contract (no composer-ready hook exists), so the gate
+    // always fell through its 45s timeout, delaying the first cold-start message.
+    // Hermes must NOT arm the gate; its ❯ readyPattern (input box up in ~3.6s) is
+    // the earliest reliable readiness signal.
+    expect(adapter.injectsReadyHook).toBeFalsy();
+    expect(adapter.readyPattern?.source).toBe('❯');
     expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
     expect(adapter.supportsTypeAhead).toBeFalsy();
   });
