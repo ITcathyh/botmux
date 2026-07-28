@@ -145,7 +145,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.codex'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass, readIsolation, remoteWsUrl, remoteThreadId }) {
+    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, reasoningEffort, disableCliBypass, readIsolation, remoteWsUrl, remoteThreadId }) {
       // Hybrid RPC input mode: attach this TUI to the botmux-owned app-server
       // thread. User input is delivered out-of-band via JSON-RPC (turn/start,
       // see codex-rpc-engine + worker), so the pane is a pure viewer — no paste
@@ -192,6 +192,13 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       if (model && model.trim()) {
         // Codex 接受 `--model <id>` / `-m <id>`，写全名最稳，错的会在 codex 自己启动时报。
         baseArgs.push('--model', model.trim());
+      }
+      if (reasoningEffort) {
+        // Per-turn reasoning effort → codex 的 model_reasoning_effort 配置项。
+        // 走 `-c` 进程级覆盖（不动用户全局 config）；codex 只接受 low/medium/high，
+        // botmux 的 'xhigh' 档位向下收敛到 'high'（codex 无更高档）。
+        const codexEffort = reasoningEffort === 'xhigh' ? 'high' : reasoningEffort;
+        baseArgs.push('-c', `model_reasoning_effort=${JSON.stringify(codexEffort)}`);
       }
       // Codex app-server can keep its own cwd at $HOME; -C pins fresh agent roots.
       // NOTE: canonicalization of workingDir for the file sandbox is done ONCE in

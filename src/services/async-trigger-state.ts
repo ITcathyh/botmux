@@ -83,6 +83,14 @@ export interface AsyncStateInputs {
   closedAt?: string;
   /** triggerId from the request query, if the caller pinned one. */
   requestedTriggerId?: string;
+  /** Optional token usage for the completed turn (computed by the caller from
+   *  the CLI transcript). Emitted only on the `completed` state. */
+  usage?: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheCreateTokens: number;
+  };
 }
 
 export function resolveAsyncTriggerState(inp: AsyncStateInputs): TriggerResponse {
@@ -127,6 +135,7 @@ export function resolveAsyncTriggerState(inp: AsyncStateInputs): TriggerResponse
       action: 'completed',
       target: { kind: 'turn', sessionId, chatId },
       output: completed.content !== undefined ? { content: completed.content } : undefined,
+      ...(inp.usage ? { usage: inp.usage } : {}),
       finishedAt,
       async: { status: 'completed', sessionId, completedAt: finishedAt },
       message: 'async trigger completed',

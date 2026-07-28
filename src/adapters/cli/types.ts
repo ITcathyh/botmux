@@ -94,6 +94,10 @@ export interface CliAdapter {
      *  `--model` flag (or equivalent) inject it here; adapters whose CLI has no
      *  such concept simply ignore the field. Empty / undefined → CLI default. */
     model?: string;
+    /** Optional per-turn reasoning effort (codex `model_reasoning_effort`).
+     *  Only codex/codex-app adapters honor it; others ignore. Empty/undefined →
+     *  CLI/config default. */
+    reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
     /** When true, do not add adapter-default flags that bypass CLI approvals or disable sandboxing. */
     disableCliBypass?: boolean;
     /** Optional session-scoped skill plugin/root prepared by botmux. */

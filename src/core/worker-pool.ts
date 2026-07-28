@@ -451,7 +451,7 @@ function sessionCliId(ds: DaemonSession, botCfg: { cliId: CliId }): CliId {
 function sessionAgentConfig(
   ds: DaemonSession,
   botCfg: { cliId: CliId; cliPathOverride?: string; wrapperCli?: string; model?: string },
-): { cliId: CliId; cliPathOverride?: string; wrapperCli?: string; model?: string } {
+): { cliId: CliId; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' } {
   // Freeze the agent launch config (cli / cliPath / wrapper / model) onto the
   // session the first time a worker forks, so later bot-level edits never
   // retroactively change a live session — same discipline as `sandbox`.
@@ -478,6 +478,7 @@ function sessionAgentConfig(
     cliPathOverride: ds.session.cliPathOverride,
     wrapperCli: ds.session.wrapperCli,
     model: ds.session.model,
+    reasoningEffort: ds.session.reasoningEffort,
   };
 }
 
@@ -2250,6 +2251,7 @@ export function forkWorker(
     wrapperCli: agentCfg.wrapperCli,
     launchShell: botCfg.launchShell,
     model: agentCfg.model,
+    reasoningEffort: ds.session.reasoningEffort,
     disableCliBypass: botCfg.disableCliBypass === true,
     codexRpcInput: botCfg.codexRpcInput === true || config.codexRpcInputDefault,
     // Startup commands run on every fresh spawn (incl. resume) so session-only

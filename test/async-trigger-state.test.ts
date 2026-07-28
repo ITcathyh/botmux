@@ -82,6 +82,30 @@ describe('resolveAsyncTriggerState — completed', () => {
     expect(r.triggerId).toBe('trg_a');
   });
 
+  it('emits usage on completed when provided, omits it when absent', () => {
+    const withUsage = resolveAsyncTriggerState({
+      sessionId: 's1', liveActive: true, storedStatus: 'open',
+      memResult: { status: 'completed', content: 'x', completedAt: 1 }, memTriggerId: 't',
+      usage: { inputTokens: 10, outputTokens: 20, cacheReadTokens: 5, cacheCreateTokens: 2 },
+    });
+    expect(withUsage.usage).toEqual({ inputTokens: 10, outputTokens: 20, cacheReadTokens: 5, cacheCreateTokens: 2 });
+
+    const noUsage = resolveAsyncTriggerState({
+      sessionId: 's1', liveActive: true, storedStatus: 'open',
+      memResult: { status: 'completed', content: 'x', completedAt: 1 }, memTriggerId: 't',
+    });
+    expect(noUsage.usage).toBeUndefined();
+  });
+
+  it('usage is not emitted on non-completed states', () => {
+    const running = resolveAsyncTriggerState({
+      sessionId: 's1', liveActive: true, storedStatus: 'open',
+      usage: { inputTokens: 10, outputTokens: 20, cacheReadTokens: 5, cacheCreateTokens: 2 },
+    });
+    expect(running.state).toBe('running');
+    expect(running.usage).toBeUndefined();
+  });
+
   it('rebuilt from durable result after restart (no live session)', () => {
     // Simulates daemon restart: no live ds, in-memory Map gone, but the
     // session record is closed and the durable result says completed.

@@ -11,6 +11,8 @@ import { listenWithProbe } from '../utils/listen-with-probe.js';
 import { dashboardSecretPath } from './dashboard-secret.js';
 import * as sessionStore from '../services/session-store.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
+import { getSessionTokenUsage } from './cost-calculator.js';
+import type { CliId } from '../adapters/cli/types.js';
 import { resolveAsyncTriggerState, decideAsyncOwnership } from '../services/async-trigger-state.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as groupsStore from '../services/groups-store.js';
@@ -857,6 +859,23 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
   const memTriggerId = triggerId || ds?.latestAsyncTriggerId;
   const memResult = ds && memTriggerId ? ds.asyncTriggerResults?.get(memTriggerId) : undefined;
 
+  // Only pay the transcript read when a completed result exists (mem or durable)
+  // — that's the sole state that emits usage. Best-effort: a null lookup (CLI
+  // unsupported / transcript gone after restart) just omits the usage field.
+  const isCompleted = memResult?.status === 'completed' || persisted?.result.status === 'completed';
+  let usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreateTokens: number } | undefined;
+  if (isCompleted && stored) {
+    try {
+      const u = getSessionTokenUsage({
+        cliId: (stored.cliId ?? 'claude-code') as CliId,
+        sessionId: stored.sessionId,
+        cliSessionId: stored.cliSessionId,
+        cwd: stored.workingDir,
+      });
+      if (u) usage = { inputTokens: u.inputTokens, outputTokens: u.outputTokens, cacheReadTokens: u.cacheReadTokens, cacheCreateTokens: u.cacheCreateTokens };
+    } catch { /* best-effort: omit usage on any read failure */ }
+  }
+
   return resolveAsyncTriggerState({
     sessionId,
     liveActive: !!ds,
@@ -867,6 +886,7 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
     storedStatus: stored ? (stored.status === 'closed' ? 'closed' : 'open') : undefined,
     closedAt: stored?.closedAt,
     requestedTriggerId: triggerId,
+    usage,
   });
 }
 
