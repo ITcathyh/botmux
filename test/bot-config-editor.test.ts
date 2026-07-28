@@ -7,8 +7,10 @@ import {
   botProcessName,
   findInvalidAllowedUserEntries,
   hasOwnerEntry,
+  isMobileEntry,
   isValidAllowedUserEntry,
   normalizeBotConfig,
+  normalizeMobileEntry,
   parseBotConfigsJson,
   parseBotSelection,
   removeBotConfig,
@@ -94,6 +96,35 @@ describe('parseBotSelection', () => {
   it('rejects unknown selections', () => {
     expect(parseBotSelection('botmux-9', bots)).toBeUndefined();
     expect(parseBotSelection('missing', bots)).toBeUndefined();
+  });
+});
+
+describe('mobile allowedUsers entries', () => {
+  it('normalizeMobileEntry strips spaces and dashes', () => {
+    expect(normalizeMobileEntry('+86 130-1111-2222')).toBe('+8613011112222');
+    expect(normalizeMobileEntry(' 130 1111 2222 ')).toBe('13011112222');
+  });
+
+  it('isMobileEntry accepts CN bare 11-digit and + country-code E.164', () => {
+    expect(isMobileEntry('13011112222')).toBe(true);        // CN, no +86
+    expect(isMobileEntry('+8613011112222')).toBe(true);      // CN with code
+    expect(isMobileEntry('+14155550123')).toBe(true);        // US
+    expect(isMobileEntry('+86 130-1111-2222')).toBe(true);   // spaced/dashed
+  });
+
+  it('isMobileEntry rejects things that are not phone numbers', () => {
+    expect(isMobileEntry('alice')).toBe(false);              // bare prefix
+    expect(isMobileEntry('alice@example.com')).toBe(false);  // email
+    expect(isMobileEntry('12345')).toBe(false);              // too short / not CN
+    expect(isMobileEntry('2011112222')).toBe(false);         // 10-digit non-CN, no +
+    expect(isMobileEntry('ou_abc')).toBe(false);             // open_id
+    expect(isMobileEntry('+123')).toBe(false);               // too short for E.164
+  });
+
+  it('isValidAllowedUserEntry treats a valid mobile as valid', () => {
+    expect(isValidAllowedUserEntry('13011112222')).toBe(true);
+    expect(isValidAllowedUserEntry('+14155550123')).toBe(true);
+    expect(findInvalidAllowedUserEntries(['13011112222', 'alice'])).toEqual(['alice']);
   });
 });
 
@@ -195,6 +226,13 @@ describe('applyBotConfigEdits', () => {
       larkAppId: 'app', larkAppSecret: 'secret', cliId: 'claude-code',
     }, { allowedUsers: 'alice@example.com, ou_abc' });
     expect(edited.allowedUsers).toEqual(['alice@example.com', 'ou_abc']);
+  });
+
+  it('accepts mobile numbers in allowedUsers (CN bare 11-digit + E.164)', () => {
+    const edited = applyBotConfigEdits({
+      larkAppId: 'app', larkAppSecret: 'secret', cliId: 'claude-code',
+    }, { allowedUsers: '13011112222, +14155550123, on_x' });
+    expect(edited.allowedUsers).toEqual(['13011112222', '+14155550123', 'on_x']);
   });
 
   it('keeps fields unchanged on empty input and clears optional fields with dash', () => {

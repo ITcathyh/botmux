@@ -999,6 +999,19 @@ export interface BotConfig {
   workingDir?: string;
   workingDirs?: string[];
   allowedUsers?: string[];
+  /**
+   * Owner's native app-scoped `open_id` (`ou_…`), captured at setup from the
+   * device-flow scanner identity. UNLIKE `allowedUsers` (which may hold `on_`/
+   * email entries needing a contact-API resolve every boot), this is stored raw
+   * and never resolved — so it survives a contact-API outage. Two uses:
+   *   1. a fail-safe DM recipient for allowedUsers-resolve failure notices, so
+   *      the owner is reachable even when the resolve that would have produced
+   *      their open_id is the very thing that failed (cold-start race);
+   *   2. an always-available owner anchor for runtime permission checks.
+   * Optional: bots created before this field, or via paths without a scanner
+   * identity, simply have none and fall back to the resolved allowlist.
+   */
+  ownerOpenId?: string;
   allowedChatGroups?: string[];
   /** Oncall bindings: chat_id → default workingDir. Any group member can talk; allowedUsers still gates card buttons / daemon commands. */
   oncallChats?: OncallChat[];
@@ -2121,6 +2134,12 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       workingDir: workingDirs?.[0] ?? entry.workingDir,
       workingDirs,
       allowedUsers: entry.allowedUsers,
+      // Only a well-formed native open_id is trusted; anything else (stray on_/
+      // email/garbage) is dropped so the fail-safe recipient can never be a
+      // value that itself needs resolving.
+      ownerOpenId: typeof entry.ownerOpenId === 'string' && entry.ownerOpenId.startsWith('ou_')
+        ? entry.ownerOpenId
+        : undefined,
       allowedChatGroups,
       oncallChats,
       defaultOncall,

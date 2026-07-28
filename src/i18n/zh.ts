@@ -735,7 +735,7 @@ export const messages: Record<string, string> = {
   'setup.supported_clis': '支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex  5) cursor  6) gemini  7) opencode  8) antigravity  9) mtr  10) hermes  11) codex-app  12) mira  13) seed  14) traex  15) pi  16) copilot  17) oh-my-pi  18) relay',
   'setup.prompt_cli_choice': 'CLI 适配器 [1]: ',
   'setup.prompt_working_dir': '默认工作目录 [~]: ',
-  'setup.prompt_allowed_users': '允许的用户 (邮箱或 open_id，逗号分隔，留空=不限制): ',
+  'setup.prompt_allowed_users': '允许的用户 (邮箱/手机号/open_id，逗号分隔，留空=不限制): ',
   'setup.prompt_lang': 'UI 语言 / UI language [zh/en, 默认 zh]: ',
   'setup.section_lark_app_config': '── 飞书应用配置 ──',
   'setup.section_reconfigure': '── 重新配置 ──',

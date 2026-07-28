@@ -3092,9 +3092,23 @@ function notifyAllowedUsersResolveFailure(
 ): void {
   logger.error(`[${larkAppId}] ${notice}`);
   const unique = [...new Set(recipients.filter(u => typeof u === 'string' && u.startsWith('ou_')))];
+  // Fail-safe recipient: on a cold start the resolve that would have produced
+  // the owner's open_id is the very thing that just failed, so `recipients` is
+  // empty and the owner would hear nothing. Fall back to the static ownerOpenId
+  // captured at setup — a raw ou_ that never needs resolving, so it survives
+  // the contact-API outage. Appended (not replacing) so a partial resolve still
+  // reaches every recovered owner too.
+  let staticOwner: string | undefined;
+  try {
+    staticOwner = getBot(larkAppId).config.ownerOpenId;
+  } catch { /* bot gone mid-flight — nothing to fall back to */ }
+  if (staticOwner && staticOwner.startsWith('ou_') && !unique.includes(staticOwner)) {
+    unique.push(staticOwner);
+  }
   if (unique.length === 0) {
     logger.error(
-      `[${larkAppId}] allowedUsers resolve failed with no open_id recipient available for DM; ` +
+      `[${larkAppId}] allowedUsers resolve failed with no open_id recipient available for DM ` +
+      `(no resolved owner and no static ownerOpenId in bots.json); ` +
       `check daemon logs and Feishu contact API, then restart this bot.`,
     );
     return;
@@ -3125,7 +3139,27 @@ function notifyAllowedUsersResolveFailure(
 }
 
 function scheduleAllowedUsersResolveRetry(larkAppId: string, attempt = 1): void {
-  if (attempt > 3) return;
+  if (attempt > 3) {
+    // Retries exhausted (startup + 3 retries all degraded). Don't just fall
+    // silent — the owner has been locked out for ~7.5 min and auto-recovery
+    // won't try again. Emit a terminal notice so they know to intervene. Only
+    // when the allowlist is still actually broken: a config change or a bot
+    // teardown mid-retry is not an exhaustion worth alarming on.
+    try {
+      const bot = getBot(larkAppId);
+      const stillConfigured = (bot.config.allowedUsers ?? []).length > 0;
+      const stillEmpty = (bot.resolvedAllowedUsers ?? []).length === 0;
+      if (stillConfigured && stillEmpty) {
+        notifyAllowedUsersResolveFailure(
+          larkAppId,
+          `allowedUsers 自动解析在启动后重试 3 次仍失败，运行时白名单为空 —— 期间包括你在内的所有人都会被拒。` +
+          `请检查网络 / 飞书 contact API 后执行 \`botmux restart\` 重新解析。`,
+          bot.resolvedAllowedUsers ?? [],
+        );
+      }
+    } catch { /* bot gone — nothing to report */ }
+    return;
+  }
   const delayMs = attempt === 1 ? 30_000 : attempt === 2 ? 120_000 : 300_000;
   const timer = setTimeout(() => {
     void (async () => {
