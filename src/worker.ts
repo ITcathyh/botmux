@@ -9292,6 +9292,82 @@ function _showReadonlyToast(){
 }
 document.getElementById('terminal').addEventListener('contextmenu',function(e){e.preventDefault()});
 
+// ── iOS third-party IME fix (keyCode=229 + composed insertText dead-path) ──
+// Some iOS third-party keyboards (Doubao/豆包 for every char, WeChat/微信 for
+// spaces & trailing single chars) deliver text as: keydown(keyCode=229) →
+// input(inputType=insertText, composed=true) with NO composition events. xterm
+// 5.x drops these:
+//   • _inputEvent bails because its guard is (!ev.composed || !_keyDownSeen) —
+//     here composed=true AND a 229 keydown set _keyDownSeen, so both are false.
+//   • the only fallback (CompositionHelper._handleAnyTextareaChanges) uses a
+//     setTimeout + String.replace(oldValue,'') diff that miscomputes under fast
+//     consecutive input, so characters are silently lost.
+//
+// Voice-input correction (Doubao 语音) exposes a SECOND bug: one physical
+// Backspace fires MANY deleteContentBackward events in the textarea (it wants to
+// delete a whole run), but xterm emits only ONE \x7f per Backspace keydown — so
+// the terminal deletes 1 char while the textarea deleted N, leaving N-1 stale
+// chars that reappear when Doubao then re-inserts the corrected sentence
+// (the "everything repeats" symptom). We must forward EACH delete event.
+//
+// Diagnosed from real-device iOS event traces. Upstream: xterm.js #5835 / #5836.
+//
+// Strategy — take over ONLY these dead/lossy paths, nothing else:
+//   1. attachCustomKeyEventHandler returns false to CLAIM a key so xterm skips
+//      it (no broken 229 fallback; no single-\x7f Backspace) — this is also what
+//      prevents double-emit. We claim: keydown 229 (not composing), AND
+//      Backspace ONLY WHEN the textarea is non-empty (an IME edit is pending).
+//      An empty textarea means a normal terminal Backspace (delete the CLI line)
+//      → we DON'T claim it, so xterm sends its standard \x7f. This is critical:
+//      claiming an empty-textarea Backspace would swallow it (no input event).
+//   2. our textarea 'input' listener forwards each event: insertText → the data,
+//      each delete* → one \x7f, so N textarea deletes become N terminal deletes.
+//   3. composition input (WeChat Chinese) is untouched — it already works — so
+//      we never interfere while _composing is true.
+// term.input(data,true) routes through onData like real typing (NOT paste — it
+// must not bracketed-paste-wrap per-char input nor clear the textarea), so the
+// readonly gating in onData still applies.
+if(hasToken && !/[?&]imefix=0\\b/.test(location.search)){(function(){
+  var _claim=false;     // current key is claimed (229 dead-path or IME Backspace)
+  var _composing=false; // a real composition (compositionstart..end) is active
+  var _ta=term.textarea;
+  try{
+    term.attachCustomKeyEventHandler(function(e){
+      if(e.type==='keydown'&&!_composing){
+        if(e.keyCode===229){ _claim=true; return false; }
+        // Backspace: claim ONLY when an IME edit is pending (textarea non-empty),
+        // so one physical backspace's N delete events all reach the terminal.
+        // Empty textarea → normal terminal backspace, let xterm send its \x7f.
+        if(e.keyCode===8 && _ta && _ta.value.length>0){ _claim=true; return false; }
+      }
+      return true;
+    });
+  }catch(_e){}
+  if(_ta){
+    // compositionstart/end bound the reliable path; never take over inside it.
+    _ta.addEventListener('compositionstart',function(){_composing=true;_claim=false;},{capture:true,passive:true});
+    _ta.addEventListener('compositionend',function(){_composing=false;_claim=false;},{capture:true,passive:true});
+    // A single claimed keydown can fire MULTIPLE input events, e.g. the
+    // consecutive-space→。 conversion (delete THEN insertText) or a voice-input
+    // correction (many deletes). So DON'T clear _claim per-input — forward every
+    // input in this cycle and only close the cycle on keyup / compositionstart.
+    _ta.addEventListener('input',function(e){
+      if(!_claim||_composing)return;   // only inside a claimed cycle
+      var it=e.inputType||'';
+      if(it.indexOf('delete')===0){
+        // Each textarea delete → one terminal backspace, so N deletes (whole-run
+        // erase) map 1:1 instead of collapsing to a single \x7f.
+        try{term.input('\\x7f',true)}catch(_e){}
+        return;
+      }
+      // insertText / insertReplacementText etc. carrying the final char(s)
+      if(e.data){try{term.input(e.data,true)}catch(_e){}}
+    },{capture:true,passive:true});
+    // Close the cycle on keyup (the claimed keydown's matching keyup).
+    _ta.addEventListener('keyup',function(){_claim=false;},{capture:true,passive:true});
+  }
+})();}
+
 // ── WebSocket ──
 var ws_=null,el=document.getElementById('status');
 term.onData(function(d){
