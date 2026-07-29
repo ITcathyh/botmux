@@ -19,18 +19,45 @@ describe('bot defaults focused layout', () => {
     expect(page).toContain('<RuntimeEnvironmentSection');
   });
 
-  it('uses content-width-driven cards and a bounded mobile roster', () => {
-    expect(css).toContain('container-type: inline-size');
-    expect(css).toMatch(/\.bot-defaults-page \.bd-tab-grid\s*\{[\s\S]*?repeat\(auto-fit,\s*minmax\(min\(100%, 500px\), 1fr\)\)/);
-    expect(css).toMatch(/@media \(max-width: 980px\)[\s\S]*?\.bot-defaults-page \.bd-roster-list\s*\{[\s\S]*?grid-template-columns:\s*repeat\(auto-fit,\s*minmax\(180px,\s*1fr\)\);[\s\S]*?overflow-y:\s*auto;/);
+  it('lays task tiles out as a two-column waterfall so short tiles do not strand a gap', () => {
+    // A row-major grid locks each row to its tallest tile, leaving dead space
+    // under a short tile next to a tall one. BdTabGrid measures every tile and
+    // greedily drops it into the shortest column over a fine 1px row track;
+    // the wide tile spans all columns. Two columns only above the container
+    // threshold, else a single auto-row column (no overlap).
+    expect(page).toContain('function BdTabGrid');
+    expect(page).toContain('colBottom'); // shortest-column bookkeeping
+    // every panel uses the masonry wrapper, none keep a raw grid div
+    expect(page).not.toContain('<div className="bd-tab-grid">');
+    expect((page.match(/<BdTabGrid>/g) ?? []).length).toBe(5);
+    // CSS: single column + auto rows by default, 2 cols + 1px row track in the container query
+    expect(css).toMatch(/\.bot-defaults-page \.bd-tab-grid\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\);[\s\S]*?grid-auto-rows:\s*auto;/);
+    expect(css).toMatch(/@container \(min-width: 1024px\)\s*\{[\s\S]*?\.bot-defaults-page \.bd-tab-grid\s*\{[\s\S]*?grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\);[\s\S]*?grid-auto-rows:\s*1px;/);
+    expect(css).toMatch(/\.bot-defaults-page \.bd-tab-grid > \.bd-tile-wide\s*\{[\s\S]*?grid-column:\s*1 \/ -1;/);
   });
 
-  it('gives the mobile roster list a real scrollport instead of clipping', () => {
+  it('keeps the mobile roster bounded with a real scrollport instead of clipping', () => {
     // Grid auto rows keep max-content height, so the list row must be
     // forced into the remaining space (minmax(0,1fr) + min-height:0) or
     // overflow-y:auto never produces a scrollport and long rosters clip.
     expect(css).toMatch(/@media \(max-width: 980px\)[\s\S]*?\.bot-defaults-page \.bd-roster\s*\{[\s\S]*?grid-template-rows:\s*auto auto minmax\(0,\s*1fr\);/);
     expect(css).toMatch(/@media \(max-width: 980px\)[\s\S]*?\.bot-defaults-page \.bd-roster-list\s*\{[\s\S]*?min-height:\s*0;[\s\S]*?overflow-y:\s*auto;/);
+  });
+
+  it('lets long roster names scroll on hover instead of hard-clipping', () => {
+    expect(page).toMatch(/<b><OverflowText text=\{name\}[^>]*\/><\/b>/);
+  });
+
+  it('files backend / session-cap under the advanced category', () => {
+    // 申晗 asked to move 会话后端 + 会话常驻上限(含机器过载告警) into 高级.
+    const advanced = page.slice(page.indexOf('id="bd-panel-advanced"'));
+    expect(advanced).toContain('<BackendTypeSection');
+    expect(advanced).toContain('<SessionCapSection');
+    // and they no longer live in common / sessions
+    const common = page.slice(page.indexOf('id="bd-panel-common"'), page.indexOf('id="bd-panel-sessions"'));
+    const sessions = page.slice(page.indexOf('id="bd-panel-sessions"'), page.indexOf('id="bd-panel-security"'));
+    expect(common).not.toContain('<BackendTypeSection');
+    expect(sessions).not.toContain('<SessionCapSection');
   });
 
   it('ships localized labels for every task category', () => {

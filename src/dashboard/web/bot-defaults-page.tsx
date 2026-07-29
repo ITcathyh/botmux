@@ -27,6 +27,7 @@ import {
   Html,
   InfoTip as BaseInfoTip,
   LoadingState,
+  OverflowText,
   RefreshIconButton,
   dropdownLabel,
 } from './dashboard-components.js';
@@ -126,6 +127,109 @@ export function BotDefaultsTabs(props: {
       </div>
       <small className="bd-tab-hint">{tr('botDefaults.tabHint')}</small>
     </nav>
+  );
+}
+
+// Two-column waterfall (masonry) for the task panels. A plain row-major grid
+// locks each row to its tallest tile, stranding a short tile beside a tall one
+// with a dead gap below. This lays tiles out by greedily dropping each into the
+// currently shortest column and writing back an inline grid-column /
+// grid-row-start over the CSS 1px row track. Tiles stay direct grid children —
+// never reparented into per-column wrappers — so their unsaved form drafts
+// (the whole point of the focused editor) never remount. Degrades to the plain
+// auto-fill grid when there is only one column (mobile / narrow) or before the
+// first measure.
+const BD_GRID_ROW_PX = 1; // must match grid-auto-rows in style.css
+const BD_GRID_GAP_PX = 14; // must match .bd-tab-grid gap
+
+export function BdTabGrid(props: { children: ReactNode; className?: string }) {
+  const ref = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const grid = ref.current;
+    if (!grid || typeof window === 'undefined') return undefined;
+
+    const clearPlacement = (tiles: HTMLElement[]) => {
+      for (const tile of tiles) {
+        tile.style.gridColumn = '';
+        tile.style.gridRowStart = '';
+        tile.style.gridRowEnd = '';
+      }
+    };
+
+    const layout = () => {
+      const tiles = Array.from(grid.children).filter(
+        (n): n is HTMLElement => n instanceof HTMLElement,
+      );
+      if (!tiles.length) return;
+
+      // A hidden panel (display:none) reports 0 width — skip; the ResizeObserver
+      // re-fires with real geometry the moment the tab becomes visible.
+      const gridWidth = grid.clientWidth;
+      if (gridWidth <= 0) return;
+
+      // Decide the column count from the SAME width the CSS @container rule keys
+      // off (the .bd-detail container), instead of parsing
+      // getComputedStyle().gridTemplateColumns — that value contains spaces
+      // inside minmax(...) and, once we write an inline grid-column, can report a
+      // stale/implicit extra track, which previously produced a rogue 3rd column.
+      // Reading the container keeps JS placement and the CSS track count in lockstep.
+      const container = grid.closest<HTMLElement>('.bd-detail');
+      const decideWidth = container?.clientWidth ?? gridWidth;
+      const columns = decideWidth >= 1024 ? 2 : 1;
+
+      // Single column (mobile / narrow): normal flow already stacks with no gap.
+      if (columns < 2) { clearPlacement(tiles); return; }
+
+      const rowStep = BD_GRID_ROW_PX + BD_GRID_GAP_PX;
+      const colBottom = new Array<number>(columns).fill(0); // running bottom, row units
+
+      for (const tile of tiles) {
+        const spanRows = Math.max(
+          1,
+          Math.ceil((tile.getBoundingClientRect().height + BD_GRID_GAP_PX) / rowStep),
+        );
+        if (tile.classList.contains('bd-tile-wide')) {
+          // full-width tile: start below the tallest column, then level every
+          // column to its bottom so following tiles pack beneath it evenly.
+          const start = Math.max(...colBottom);
+          tile.style.gridColumn = '1 / -1';
+          tile.style.gridRowStart = String(start + 1);
+          tile.style.gridRowEnd = String(start + 1 + spanRows);
+          colBottom.fill(start + spanRows);
+          continue;
+        }
+        // drop into the currently shortest column (true waterfall)
+        let target = 0;
+        for (let c = 1; c < columns; c++) if (colBottom[c]! < colBottom[target]!) target = c;
+        const start = colBottom[target]!;
+        tile.style.gridColumn = String(target + 1);
+        tile.style.gridRowStart = String(start + 1);
+        tile.style.gridRowEnd = String(start + 1 + spanRows);
+        colBottom[target] = start + spanRows;
+      }
+    };
+
+    // Measure after paint; re-run on any tile resize (content toggles, textarea
+    // growth, async loads, tab becoming visible) and on viewport resize.
+    const raf = window.requestAnimationFrame(layout);
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(() => layout()) : null;
+    if (ro) {
+      ro.observe(grid);
+      for (const child of Array.from(grid.children)) ro.observe(child);
+    }
+    window.addEventListener('resize', layout);
+    return () => {
+      window.cancelAnimationFrame(raf);
+      ro?.disconnect();
+      window.removeEventListener('resize', layout);
+    };
+  });
+
+  return (
+    <div ref={ref} className={props.className ? `bd-tab-grid ${props.className}` : 'bd-tab-grid'}>
+      {props.children}
+    </div>
   );
 }
 
@@ -540,7 +644,7 @@ function RosterItem(props: { bot: BotDefaultsRow; selected: boolean; onSelect():
     >
       <Html html={botAvatarHtml({ name, larkAppId: bot.larkAppId, size: 'sm' })} />
       <div className="bd-roster-tx">
-        <b>{name}</b>
+        <b><OverflowText text={name} showPopover={false} textClassName="bd-roster-name" /></b>
         <span>{cli || bot.larkAppId.slice(0, 14)}</span>
       </div>
       {bot.defaultOncall?.enabled ? <span className="bd-roster-flag">oncall</span> : null}
@@ -615,19 +719,14 @@ function BotDefaultsCard(props: {
           className="bd-tab-panel"
           hidden={props.activeTab !== 'common'}
         >
-          <div className="bd-tab-grid">
+          <BdTabGrid>
             <section className="bd-tile">
               <BotAgentSection bot={bot} sessionFallback={cli} cliState={cliState} patchBot={patchBot} />
             </section>
             <section className="bd-tile">
               <WorkingDirSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} />
             </section>
-            {/* riff：backendType 与 CLI 选择 1:1 绑定（spawn 层强制配对），
-                手动切 pty/tmux 只会制造坏组合，隐藏该区块。 */}
-            {bot.cliId !== 'riff' ? (
-              <section className="bd-tile"><BackendTypeSection bot={bot} patchBot={patchBot} /></section>
-            ) : null}
-          </div>
+          </BdTabGrid>
         </div>
         <div
           id="bd-panel-sessions"
@@ -636,14 +735,13 @@ function BotDefaultsCard(props: {
           className="bd-tab-panel"
           hidden={props.activeTab !== 'sessions'}
         >
-          <div className="bd-tab-grid">
+          <BdTabGrid>
             <section className="bd-tile"><SessionModeSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
             <section className="bd-tile"><SubstituteModeSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile">
               <CrossBotSection bot={bot} putCardPref={putCardPref} />
-              <SessionCapSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} />
             </section>
-          </div>
+          </BdTabGrid>
         </div>
         <div
           id="bd-panel-security"
@@ -652,7 +750,7 @@ function BotDefaultsCard(props: {
           className="bd-tab-panel"
           hidden={props.activeTab !== 'security'}
         >
-          <div className="bd-tab-grid">
+          <BdTabGrid>
             {/* riff 在远端沙箱执行、本地无 CLI 进程，文件沙盒对它无意义（worker 侧已旁路）。 */}
             {bot.cliId !== 'riff' ? (
               <section className="bd-tile"><SandboxSection bot={bot} patchBot={patchBot} /></section>
@@ -662,7 +760,7 @@ function BotDefaultsCard(props: {
             ) : null}
             <section className="bd-tile"><GrantSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><SlashCommandPermissionsSection bot={bot} patchBot={patchBot} /></section>
-          </div>
+          </BdTabGrid>
         </div>
         <div
           id="bd-panel-cards"
@@ -671,12 +769,12 @@ function BotDefaultsCard(props: {
           className="bd-tab-panel"
           hidden={props.activeTab !== 'cards'}
         >
-          <div className="bd-tab-grid">
+          <BdTabGrid>
             <section className="bd-tile"><CardBehaviorSection bot={bot} putCardPref={putCardPref} /></section>
             <section className="bd-tile"><CodexAppDisplaySection bot={bot} putCardPref={putCardPref} /></section>
             <section className="bd-tile"><SummaryTriggerSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><BrandSection bot={bot} patchBot={patchBot} /></section>
-          </div>
+          </BdTabGrid>
         </div>
         <div
           id="bd-panel-advanced"
@@ -685,10 +783,16 @@ function BotDefaultsCard(props: {
           className="bd-tab-panel"
           hidden={props.activeTab !== 'advanced'}
         >
-          <div className="bd-tab-grid">
+          <BdTabGrid>
+            {/* riff：backendType 与 CLI 选择 1:1 绑定（spawn 层强制配对），
+                手动切 pty/tmux 只会制造坏组合，隐藏该区块。 */}
+            {bot.cliId !== 'riff' ? (
+              <section className="bd-tile"><BackendTypeSection bot={bot} patchBot={patchBot} /></section>
+            ) : null}
+            <section className="bd-tile"><SessionCapSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
             <section className="bd-tile"><RuntimeEnvironmentSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><RoleSection bot={bot} patchBot={patchBot} /></section>
-          </div>
+          </BdTabGrid>
         </div>
       </div>
     </article>

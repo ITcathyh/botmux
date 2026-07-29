@@ -9773,7 +9773,8 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 30%, transparent);
 }
 .bd-roster-tx { min-width: 0; flex: 1; }
-.bd-roster-tx b { display: block; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bd-roster-tx b { display: block; font-size: 13px; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bd-roster-tx b .ui-overflow-text { display: block; font-weight: 600; }
 .bd-roster-tx span { display: block; color: var(--faint); font-size: 10.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .bd-roster-flag {
   flex: none;
@@ -10074,20 +10075,6 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   color: var(--success);
 }
 
-/* 配置 tile 两栏 */
-.bd-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px;
-  align-items: start;
-  margin-top: 14px;
-}
-.bd-column {
-  display: grid;
-  align-content: start;
-  gap: 14px;
-  min-width: 0;
-}
 .bd-tile {
   border-radius: var(--radius-xl);
   border: 1px solid var(--border-soft);
@@ -12078,7 +12065,6 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   .bd-layout { grid-template-columns: 1fr; }
   .bd-roster { position: static; display: flex; overflow-x: auto; }
   .bd-roster-item { flex: 0 0 auto; }
-  .bd-grid { grid-template-columns: 1fr; }
   .bd-profile-head { grid-template-columns: auto minmax(0, 1fr); }
   .bd-profile-meta {
     grid-column: 1 / -1;
@@ -21925,13 +21911,38 @@ dialog select[multiple]:hover:not(:disabled) {
 }
 
 .bot-defaults-page .bd-tab-grid {
+  /* Two-column waterfall (masonry). A plain row-major grid locks each row to
+     the tallest tile, so a short tile beside a tall one leaves a dead vertical
+     gap below it. At ≥2 columns the JS in the BdTabGrid component measures every
+     tile and greedily assigns each to the currently shortest column via inline
+     grid-column / grid-row over a fine 1px row track, so a short tile packs
+     directly under its neighbour. Tiles stay direct grid children (never
+     reparented into per-column wrappers) so their unsaved form drafts survive.
+     Default is a single column with normal auto rows (no 1px track, or
+     auto-placed tiles would collapse onto 1px rows and overlap); the fine row
+     track is only switched on inside the 2-column container query below. */
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 500px), 1fr));
+  grid-template-columns: minmax(0, 1fr);
+  grid-auto-rows: auto;
   gap: 14px;
   align-items: start;
 }
 
+/* Two columns only once the detail pane is wide enough that each column stays
+   comfortable (~500px); below that, one column — avoids the cramped narrow
+   cards. Threshold matches the column-count decision in the BdTabGrid JS so CSS
+   tracks and JS placement never disagree. Uses the .bd-detail container query
+   (container-type: inline-size). The 1px auto-row track that the JS masonry
+   spans over is scoped here so the single-column fallback keeps auto rows. */
+@container (min-width: 1024px) {
+  .bot-defaults-page .bd-tab-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-auto-rows: 1px;
+  }
+}
+
 .bot-defaults-page .bd-tab-grid > .bd-tile-wide {
+  /* full-bleed tile (e.g. sandbox paths) spans every column */
   grid-column: 1 / -1;
 }
 
