@@ -21,6 +21,7 @@ import {
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
 import { store } from './store.js';
+import type { RoleInjectMode } from './roles.js';
 import {
   CreateActionButton,
   DropdownMenu,
@@ -726,6 +727,7 @@ function BotDefaultsCard(props: {
             <section className="bd-tile">
               <WorkingDirSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} />
             </section>
+            <section className="bd-tile"><RoleSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
         </div>
         <div
@@ -743,6 +745,7 @@ function BotDefaultsCard(props: {
             </section>
             <section className="bd-tile"><SessionCapSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
             <section className="bd-tile"><StartupCommandsSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile"><SummaryTriggerSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
         </div>
         <div
@@ -773,8 +776,6 @@ function BotDefaultsCard(props: {
         >
           <BdTabGrid>
             <section className="bd-tile"><CardBehaviorSection bot={bot} putCardPref={putCardPref} /></section>
-            <section className="bd-tile"><CodexAppDisplaySection bot={bot} putCardPref={putCardPref} /></section>
-            <section className="bd-tile"><SummaryTriggerSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><BrandSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
         </div>
@@ -791,8 +792,12 @@ function BotDefaultsCard(props: {
             {bot.cliId !== 'riff' ? (
               <section className="bd-tile"><BackendTypeSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
+            {/* Codex App 历史显示只对 codex-app agent 有意义（其它 CLI 无此渲染通道），
+                选了别的 agent 就隐藏，避免无效开关。 */}
+            {bot.cliId === 'codex-app' ? (
+              <section className="bd-tile"><CodexAppDisplaySection bot={bot} putCardPref={putCardPref} /></section>
+            ) : null}
             <section className="bd-tile"><RuntimeEnvironmentSection bot={bot} patchBot={patchBot} /></section>
-            <section className="bd-tile"><RoleSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
         </div>
       </div>
@@ -1980,6 +1985,7 @@ function RoleSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const { bot, patchBot } = props;
   const [loaded, setLoaded] = useState(typeof bot.teamRole === 'string');
   const [role, setRole] = useState(typeof bot.teamRole === 'string' ? bot.teamRole : '');
+  const [injectMode, setInjectMode] = useState<RoleInjectMode>('every');
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
 
@@ -2005,6 +2011,7 @@ function RoleSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
         if (r.ok && body.ok) {
           const next = body.role ?? '';
           setRole(next);
+          setInjectMode(body.injectMode === 'once' ? 'once' : 'every');
           setLoaded(true);
           patchBot(bot.larkAppId, { teamRole: next });
         } else {
@@ -2017,15 +2024,31 @@ function RoleSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
     return () => { active = false; };
   }, [bot.larkAppId, bot.teamRole, patchBot, tr]);
 
-  async function putRole(nextRole: string, deleted: boolean): Promise<void> {
+  // injectMode isn't cached on the bot row, so when the team role is already
+  // resolved (cache hit above skips the GET) fetch just the mode once per bot.
+  useEffect(() => {
+    let active = true;
+    if (typeof bot.teamRole !== 'string') return () => { active = false; };
+    void (async () => {
+      try {
+        const r = await fetch(`/api/team/local-bots/${encodeURIComponent(bot.larkAppId)}/role`);
+        const body = await r.json().catch(() => ({}));
+        if (active && r.ok && body.ok) setInjectMode(body.injectMode === 'once' ? 'once' : 'every');
+      } catch { /* keep default 'every' */ }
+    })();
+    return () => { active = false; };
+  }, [bot.larkAppId]);
+
+  async function putRole(nextRole: string, deleted: boolean, mode: RoleInjectMode = injectMode): Promise<void> {
     if (!loaded) return;
     setStatus(null);
     setBusy(true);
     try {
-      const res = await sendJson('PUT', `/api/team/local-bots/${encodeURIComponent(bot.larkAppId)}/role`, { role: nextRole });
+      const res = await sendJson('PUT', `/api/team/local-bots/${encodeURIComponent(bot.larkAppId)}/role`, { role: nextRole, injectMode: mode });
       if (res.ok && res.body.ok) {
         const stored = nextRole.trim();
         setRole(stored);
+        if (res.body.injectMode === 'once' || res.body.injectMode === 'every') setInjectMode(res.body.injectMode);
         patchBot(bot.larkAppId, { teamRole: stored });
         setStatus({ text: `✓ ${deleted ? tr('botDefaults.roleDeleted') : tr('botDefaults.roleSaved')}`, ok: true });
       } else {
@@ -2038,6 +2061,11 @@ function RoleSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
     }
   }
 
+  const injectOptions: Array<{ value: RoleInjectMode; label: string }> = [
+    { value: 'every', label: tr('roles.injectModeEvery') },
+    { value: 'once', label: tr('roles.injectModeOnce') },
+  ];
+
   return (
     <section className="bd-section">
       <h3 className="bd-section-title"><FieldTitle help={tr('botDefaults.roleHelp')}>{tr('botDefaults.sectionRole')}</FieldTitle></h3>
@@ -2049,6 +2077,19 @@ function RoleSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
         value={role}
         onChange={event => setRole(event.currentTarget.value)}
       />
+      <div className="bd-role-inject">
+        <span className="bd-subsection-title"><FieldTitle help={tr('roles.injectModeHint')}>{tr('roles.injectModeLabel')}</FieldTitle></span>
+        <DropdownMenu<RoleInjectMode>
+          id={`bd-role-inject-${bot.larkAppId}`}
+          className="bd-role-inject-menu"
+          ariaLabel={tr('roles.injectModeLabel')}
+          disabled={!loaded || busy}
+          label={dropdownLabel(injectOptions, injectMode)}
+          value={injectMode}
+          options={injectOptions}
+          onChange={mode => { const next = mode === 'once' ? 'once' : 'every'; setInjectMode(next); void putRole(role, role.trim() === '', next); }}
+        />
+      </div>
       <div className="actions">
         <button type="button" className="primary" data-action="save-role" disabled={!loaded || busy} onClick={() => void putRole(role, role.trim() === '')}>{tr('botDefaults.roleSave')}</button>
         <StatusSpan status={status} attr={{ 'data-role-status': '' }} />

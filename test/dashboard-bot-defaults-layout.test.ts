@@ -52,11 +52,19 @@ describe('bot defaults focused layout', () => {
     const panelStart = (id: string) => page.indexOf(`id="bd-panel-${id}"`);
     const common = page.slice(panelStart('common'), panelStart('sessions'));
     const sessions = page.slice(panelStart('sessions'), panelStart('security'));
+    const cards = page.slice(panelStart('cards'), panelStart('advanced'));
     const advanced = page.slice(panelStart('advanced'));
 
-    // 会话常驻上限(含机器过载告警) + 启动命令 live under 会话.
+    // 会话常驻上限(含机器过载告警) + 启动命令 + /summary 总结范围 live under 会话.
     expect(sessions).toContain('<SessionCapSection');
     expect(sessions).toContain('<StartupCommandsSection');
+    expect(sessions).toContain('<SummaryTriggerSection');
+    // 默认角色 moved to 常用.
+    expect(common).toContain('<RoleSection');
+    expect(advanced).not.toContain('<RoleSection');
+    // Codex App 历史显示 moved to 高级 and is gated on the codex-app agent.
+    expect(advanced).toMatch(/bot\.cliId === 'codex-app'[\s\S]*?<CodexAppDisplaySection/);
+    expect(cards).not.toContain('<CodexAppDisplaySection');
     // 会话后端 stays under 高级; 启动环境(Shell+env) stays under 高级 too.
     expect(advanced).toContain('<BackendTypeSection');
     expect(advanced).toContain('<RuntimeEnvironmentSection');

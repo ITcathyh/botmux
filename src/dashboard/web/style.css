@@ -22340,6 +22340,24 @@ dialog select[multiple]:hover:not(:disabled) {
   border-top: 0;
 }
 
+/* Default-role injection mode selector (once / every) — a compact labelled row
+   between the role textarea and its save button. */
+.bot-defaults-page .bd-role-inject {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.bot-defaults-page .bd-role-inject > .bd-subsection-title {
+  margin: 0;
+}
+
+.bot-defaults-page .bd-role-inject-menu {
+  min-width: 148px;
+}
+
 .bot-defaults-page .bd-tile :where(input[type="text"], input[type="number"], textarea) {
   box-sizing: border-box;
   width: 100%;
