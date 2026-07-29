@@ -217,6 +217,24 @@ describe('agentbuddy skill install', () => {
     expect(readSkillRegistry().skills.deploy).toBeUndefined();
   });
 
+  it('fails fast even when a shim grandchild (npx-style) holds the pipes open', async () => {
+    // Reproduces the real deploy shape: BOTMUX_AGENTBUDDY_CMD is a shim
+    // (`npx agentbuddy@latest …`) whose grandchild is the real CLI. Killing only
+    // the direct child leaves the grandchild alive holding stdout/stderr, so
+    // 'close' never fires — the runner must kill the whole process group and
+    // settle on 'exit'. The shim runs the login-hang fake WITHOUT exec, so node
+    // is a true grandchild that would outlive a direct-child-only kill.
+    const shim = join(mkdtempSync(join(tmpdir(), 'botmux-ab-shim-')), 'shim.sh');
+    writeFileSync(shim, `#!/bin/bash\nnode ${fakeBin} "$@"\n`, { mode: 0o755 });
+    vi.stubEnv('BOTMUX_AGENTBUDDY_CMD', shim);
+    vi.stubEnv('FAKE_AB_LOGIN_HANG', '1');
+    vi.stubEnv('BOTMUX_AGENTBUDDY_TIMEOUT_MS', '30000');
+    const started = performance.now();
+    await expect(installAgentbuddySkillAsync({ group: 'g/h', skill: 'deploy' })).rejects.toThrow(/agentbuddy_login_required/);
+    expect(performance.now() - started).toBeLessThan(8000);
+    expect(readSkillRegistry().skills.deploy).toBeUndefined();
+  });
+
   it('serializes concurrent same-identifier installs (no staging clobber)', async () => {
     vi.stubEnv('FAKE_AB_DELAY_MS', '150'); // hold the staging so the two would overlap unlocked
     const opts = { group: 'g/h', skill: 'deploy' };

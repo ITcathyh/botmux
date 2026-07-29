@@ -1131,7 +1131,11 @@ async function runAgentbuddyCliAsync(args: string[], cwd: string, failCode: stri
   return new Promise<void>((resolve, reject) => {
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn(bin, [...prefixArgs, ...args], { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+      // detached → own process group, so we can SIGKILL the WHOLE tree. The
+      // configured command is usually a shim (`npx agentbuddy@latest …`), so the
+      // real agentbuddy is a grandchild; killing only the direct child would
+      // leave it alive holding the pipes and polling the auth server.
+      child = spawn(bin, [...prefixArgs, ...args], { cwd, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
     } catch (err: any) {
       reject(err?.code === 'ENOENT' ? new Error('agentbuddy_not_found') : err);
       return;
@@ -1139,7 +1143,12 @@ async function runAgentbuddyCliAsync(args: string[], cwd: string, failCode: stri
     let out = '';
     let settled = false;
     let killedForLogin = false;
-    const timer = setTimeout(() => { if (!settled) { killedForLogin = false; child.kill('SIGKILL'); } }, agentbuddyTimeoutMs());
+    let timedOut = false;
+    const killTree = () => {
+      try { if (child.pid) process.kill(-child.pid, 'SIGKILL'); } catch { /* group gone */ }
+      try { child.kill('SIGKILL'); } catch { /* already dead */ }
+    };
+    const timer = setTimeout(() => { if (!settled) { timedOut = true; killTree(); } }, agentbuddyTimeoutMs());
     const finish = (fn: () => void) => { if (settled) return; settled = true; clearTimeout(timer); fn(); };
     const onData = (chunk: Buffer) => {
       out += chunk.toString('utf-8');
@@ -1147,18 +1156,20 @@ async function runAgentbuddyCliAsync(args: string[], cwd: string, failCode: stri
       // server, not stdin, so it would otherwise hang until the timeout.
       if (!killedForLogin && isAgentbuddyLoginPrompt(out)) {
         killedForLogin = true;
-        child.kill('SIGKILL');
+        killTree();
       }
     };
     child.stdout?.on('data', onData);
     child.stderr?.on('data', onData);
     child.on('error', (err: any) => finish(() => reject(err?.code === 'ENOENT' ? new Error('agentbuddy_not_found') : err)));
-    child.on('close', (code) => finish(() => {
+    // Settle on 'exit' (direct child terminated), NOT 'close' (all stdio EOF):
+    // a killed shim can leave a grandchild holding the pipes so 'close' never
+    // fires. Detecting login → killTree → 'exit' → reject login_required.
+    child.on('exit', (code) => finish(() => {
       if (killedForLogin || isAgentbuddyLoginPrompt(out)) { reject(new Error('agentbuddy_login_required')); return; }
+      if (timedOut) { reject(new Error(`${failCode}: timed out after ${agentbuddyTimeoutMs()}ms`)); return; }
       if (code === 0) { resolve(); return; }
-      const trimmed = out.trim();
-      if (child.killed) { reject(new Error(`${failCode}: timed out after ${agentbuddyTimeoutMs()}ms`)); return; }
-      reject(new Error(`${failCode}: ${trimmed || `exit ${code}`}`));
+      reject(new Error(`${failCode}: ${out.trim() || `exit ${code}`}`));
     }));
   });
 }
