@@ -21793,16 +21793,22 @@ dialog select[multiple]:hover:not(:disabled) {
 }
 
 .bot-defaults-page .bd-name-edit {
-  width: 32px;
-  min-width: 32px;
+  width: 28px;
+  min-width: 28px;
+  height: 28px;
+  min-height: 28px;
   padding: 0;
   overflow: hidden;
+  /* icon-only button: hide the text label, render ✎ via ::before centered */
   font-size: 0;
+  line-height: 0;
 }
 
 .bot-defaults-page .bd-name-edit::before {
   content: "✎";
-  font-size: 13px;
+  display: block;
+  font-size: 14px;
+  line-height: 1;
 }
 
 .bot-defaults-page .bd-tab-bar {
@@ -21976,6 +21982,16 @@ dialog select[multiple]:hover:not(:disabled) {
 
 .bot-defaults-page .bd-tab-grid .bd-subsection-title {
   font-size: 12px;
+}
+
+/* A .bd-subsection carries a dashed top border to divide it from a sibling
+   subsection WITHIN a section. When it is promoted to be a tile's own content
+   (e.g. 会话常驻上限 / 启动命令 as standalone tiles), that top divider is
+   spurious — the tile border already frames it. Drop it. */
+.bot-defaults-page .bd-tab-grid > .bd-tile > .bd-subsection:first-child {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
 }
 
 .bot-defaults-page .bd-profile-head > .bd-profile-meta {
@@ -22221,6 +22237,15 @@ dialog select[multiple]:hover:not(:disabled) {
   display: grid;
   gap: 8px;
   margin: 12px 0 0;
+}
+
+/* .bd-row (display:grid) and .toggle-row (display:flex) both override the UA
+   [hidden] { display:none }, so rows the React code marks hidden (e.g. the
+   working-dir 目录 input in repo-picker "off" mode, or the auto-worktree toggle
+   outside "default" mode) stayed visible. Restore [hidden] for these rows. */
+.bot-defaults-page .bd-body .bd-row[hidden],
+.bot-defaults-page .bd-body .toggle-row[hidden] {
+  display: none;
 }
 
 .bot-defaults-page .bd-body .bd-row + .bd-row,
