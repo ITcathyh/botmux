@@ -48,16 +48,25 @@ describe('bot defaults focused layout', () => {
     expect(page).toMatch(/<b><OverflowText text=\{name\}[^>]*\/><\/b>/);
   });
 
-  it('files backend / session-cap under the advanced category', () => {
-    // 申晗 asked to move 会话后端 + 会话常驻上限(含机器过载告警) into 高级.
-    const advanced = page.slice(page.indexOf('id="bd-panel-advanced"'));
+  it('files each section under its category per 申晗 IA', () => {
+    const panelStart = (id: string) => page.indexOf(`id="bd-panel-${id}"`);
+    const common = page.slice(panelStart('common'), panelStart('sessions'));
+    const sessions = page.slice(panelStart('sessions'), panelStart('security'));
+    const advanced = page.slice(panelStart('advanced'));
+
+    // 会话常驻上限(含机器过载告警) + 启动命令 live under 会话.
+    expect(sessions).toContain('<SessionCapSection');
+    expect(sessions).toContain('<StartupCommandsSection');
+    // 会话后端 stays under 高级; 启动环境(Shell+env) stays under 高级 too.
     expect(advanced).toContain('<BackendTypeSection');
-    expect(advanced).toContain('<SessionCapSection');
-    // and they no longer live in common / sessions
-    const common = page.slice(page.indexOf('id="bd-panel-common"'), page.indexOf('id="bd-panel-sessions"'));
-    const sessions = page.slice(page.indexOf('id="bd-panel-sessions"'), page.indexOf('id="bd-panel-security"'));
+    expect(advanced).toContain('<RuntimeEnvironmentSection');
+    // and the moved sections no longer sit in their old homes
+    expect(advanced).not.toContain('<SessionCapSection');
     expect(common).not.toContain('<BackendTypeSection');
-    expect(sessions).not.toContain('<SessionCapSection');
+    // 启动命令 was pulled out of the 启动环境 composite (Shell + env stay there).
+    const runtimeEnv = page.slice(page.indexOf('function RuntimeEnvironmentSection'), page.indexOf('function RuntimeEnvironmentSection') + 400);
+    expect(runtimeEnv).not.toContain('<StartupCommandsSection');
+    expect(runtimeEnv).toContain('<LaunchShellSection');
   });
 
   it('ships localized labels for every task category', () => {

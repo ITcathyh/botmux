@@ -741,6 +741,8 @@ function BotDefaultsCard(props: {
             <section className="bd-tile">
               <CrossBotSection bot={bot} putCardPref={putCardPref} />
             </section>
+            <section className="bd-tile"><SessionCapSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
+            <section className="bd-tile"><StartupCommandsSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
         </div>
         <div
@@ -789,7 +791,6 @@ function BotDefaultsCard(props: {
             {bot.cliId !== 'riff' ? (
               <section className="bd-tile"><BackendTypeSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
-            <section className="bd-tile"><SessionCapSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
             <section className="bd-tile"><RuntimeEnvironmentSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><RoleSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
@@ -804,7 +805,6 @@ function RuntimeEnvironmentSection(props: { bot: BotDefaultsRow; patchBot: Patch
   return (
     <section className="bd-section bd-runtime-env">
       <h3 className="bd-section-title">{tr('botDefaults.sectionRuntimeEnv')}</h3>
-      <StartupCommandsSection bot={props.bot} patchBot={props.patchBot} />
       <LaunchShellSection bot={props.bot} patchBot={props.patchBot} />
       <EnvSection bot={props.bot} patchBot={props.patchBot} />
     </section>
