@@ -17540,7 +17540,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Publish self-descriptor for the dashboard registry. The dashboard sibling
   // process discovers running daemons by scanning <resolvedDataDir>/dashboard-daemons/
   // and watching for mtime updates (heartbeat) / file removal (shutdown).
-  const ipcPort = config.dashboard.ipcBasePort + idx;
+  //
+  // Core-only (in-sandbox, single service): riff's task-runner is handed ONE
+  // fixed port and dials 127.0.0.1:<port> directly, so the port must be exactly
+  // BOTMUX_API_PORT and must NOT drift via the fleet's upward EADDRINUSE probe —
+  // a silent drift would leave the client dialing a dead port. Fleet daemons
+  // keep the ipcBasePort+idx scheme + probe (a port race must not crash boot).
+  const coreOnlyApiPort = process.env.BOTMUX_CORE_ONLY === '1'
+    ? Number(process.env.BOTMUX_API_PORT) || 0
+    : 0;
+  const ipcPort = coreOnlyApiPort || config.dashboard.ipcBasePort + idx;
   // Worker/CLI descendants use this only to reach the current daemon's
   // agent-facing, live-origin-gated endpoints. Internal control endpoints use
   // a separate daemon-to-daemon credential and never trust this port marker.
@@ -17737,10 +17746,22 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   loadOrCreateDashboardSecret(
     join(homedir(), '.botmux', '.dashboard-secret'),
   );
+  const coreOnly = process.env.BOTMUX_CORE_ONLY === '1';
+  // Core-only default: no trusted-host HMAC. It's a single-tenant, loopback-only
+  // service in riff's sandbox — there are NO sibling daemons/bots to protect (the
+  // `.dashboard-secret` boundary exists for multi-bot co-location, absent here),
+  // and the in-sandbox task-runner IS the trusted driver dialing plain 127.0.0.1.
+  // The blast radius of the co-resident CLI reaching the port is one tenant's own
+  // turns (no cross-bot reach). Opt back in with BOTMUX_API_REQUIRE_AUTH=1.
+  const coreOnlyAuth = coreOnly && process.env.BOTMUX_API_REQUIRE_AUTH === '1';
   const ipcHandle = await startIpcServer({
     port: ipcPort,
     host: '127.0.0.1',
-    authRequired: true,
+    authRequired: coreOnly ? coreOnlyAuth : true,
+    // Fleet: probe upward so a port race can't crash boot. Core-only: BIND-OR-FAIL
+    // on the exact BOTMUX_API_PORT — riff was handed that port and the service must
+    // never silently drift to another (client would dial a dead port).
+    ...(coreOnly ? { maxProbe: 0 } : {}),
   });
   // startIpcServer probes upward on EADDRINUSE (e.g. a second botmux instance on
   // this host already holds ipcBasePort+idx), so the bound port may differ from
@@ -17749,6 +17770,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   desc.ipcPort = ipcHandle.port;
   process.env.BOTMUX_DAEMON_IPC_PORT = String(ipcHandle.port);
   logger.info(`[dashboard-ipc] listening on 127.0.0.1:${ipcHandle.port} (bot ${idx})`);
+  if (coreOnly) {
+    // Machine-parseable ready line for riff's sandbox launcher: spawn → await this
+    // line (or poll GET /healthz) → point the task-runner client at the port.
+    // Exact text is a locked contract (regex ^\[core-only\] listening on ).
+    // eslint-disable-next-line no-console
+    console.log(`[core-only] listening on 127.0.0.1:${ipcHandle.port} (bot ${cfg.larkAppId}, cli ${cfg.cliId})`);
+  }
 
   // Single reverse-proxy port that fronts every session's web terminal under
   // /s/{sessionId}, so dev-machine users forward one port (proxyBasePort+idx)

@@ -401,6 +401,63 @@ function ensureUniqueBotProcessNames(bots: any[]): void {
   }
 }
 
+/**
+ * `botmux serve --api-only` — run a single-process, headless core-only service
+ * in the FOREGROUND (stdio inherited so a launcher can watch the ready line and
+ * the process lifetime IS the service). No pm2, no dashboard, no bots.json, no
+ * Feishu credentials. See src/index-core-only.ts for the full contract.
+ */
+async function cmdServe(args: string[]): Promise<void> {
+  const apiOnly = args.includes('--api-only');
+  if (!apiOnly) {
+    console.error('Usage: botmux serve --api-only [--port <PORT>] [--bot <local_slug>] [--cli <cliId>]');
+    console.error('  Only core-only (--api-only) serving is supported. It runs a headless HTTP');
+    console.error('  control-API service with no Feishu credentials (for riff sandbox / embedding).');
+    process.exit(2);
+  }
+  const getOpt = (flag: string): string | undefined => {
+    const i = args.indexOf(flag);
+    return i >= 0 && i + 1 < args.length ? args[i + 1] : undefined;
+  };
+  const port = getOpt('--port') ?? process.env.BOTMUX_API_PORT;
+  if (!port || !/^\d+$/.test(port) || Number(port) < 1 || Number(port) > 65535) {
+    console.error(`botmux serve --api-only: --port (or BOTMUX_API_PORT) must be a valid port; got: ${port ?? '(unset)'}`);
+    process.exit(2);
+  }
+  const bot = getOpt('--bot') ?? process.env.BOTMUX_API_ONLY_BOT;
+  const cli = getOpt('--cli') ?? process.env.BOTMUX_CORE_CLI;
+  const workingDir = getOpt('--working-dir') ?? process.env.BOTMUX_CORE_WORKING_DIR;
+
+  const coreScript = join(PKG_ROOT, 'dist', 'index-core-only.js');
+  const child = spawn(process.execPath, [coreScript], {
+    stdio: 'inherit',
+    env: {
+      ...process.env,
+      BOTMUX_CORE_ONLY: '1',
+      BOTMUX_API_PORT: port,
+      ...(bot ? { BOTMUX_API_ONLY_BOT: bot } : {}),
+      ...(cli ? { BOTMUX_CORE_CLI: cli } : {}),
+      ...(workingDir ? { BOTMUX_CORE_WORKING_DIR: workingDir } : {}),
+    },
+  });
+  // Foreground lifetime tracks the child: forward termination signals and exit
+  // with the child's code so a launcher/supervisor sees an honest status.
+  const forward = (sig: NodeJS.Signals) => { try { child.kill(sig); } catch { /* */ } };
+  process.on('SIGTERM', () => forward('SIGTERM'));
+  process.on('SIGINT', () => forward('SIGINT'));
+  await new Promise<void>((resolve) => {
+    child.on('exit', (code, signal) => {
+      if (signal) { process.exitCode = 1; } else { process.exitCode = code ?? 0; }
+      resolve();
+    });
+    child.on('error', (err) => {
+      console.error(`[core-only] failed to spawn service: ${err.message}`);
+      process.exitCode = 1;
+      resolve();
+    });
+  });
+}
+
 function ecosystemConfig(activationAppId?: string): string {
   const daemonScript = join(PKG_ROOT, 'dist', 'index-daemon.js');
   const bots = loadBotsJson();
@@ -10109,6 +10166,7 @@ switch (command) {
     break;
   }
   case 'start':   await cmdStart(); break;
+  case 'serve':   await cmdServe(process.argv.slice(3)); break;
   case 'start-bot': await cmdStartBot(process.argv.slice(3)); break;
   case 'stop-bot': await cmdStopBot(process.argv.slice(3)); break;
   case 'stop':    await cmdStop(); break;

@@ -381,8 +381,9 @@ function tokenRouteAuthorized(req: IncomingMessage, bind?: string): boolean {
 }
 
 function routeHasPublicAccess(method: string, pathname: string): boolean {
-  // Liveness contains no data and performs no mutation.
-  return method === 'GET' && pathname === '/__health';
+  // Liveness contains no data and performs no mutation. /healthz is the
+  // core-only public alias of /__health (riff's sandbox launcher polls it).
+  return method === 'GET' && (pathname === '/__health' || pathname === '/healthz');
 }
 
 function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean {
@@ -444,6 +445,12 @@ function trustedHostAuthorized(
 }
 
 ipcRoute('GET', '/__health', (_req, res) => {
+  jsonRes(res, 200, { ok: true });
+});
+// Public alias for core-only: riff's sandbox launcher polls GET /healthz to know
+// the service is up (friendlier name than the internal /__health). Same 200
+// {ok:true}; both are in the public-route allowlist so no auth is needed.
+ipcRoute('GET', '/healthz', (_req, res) => {
   jsonRes(res, 200, { ok: true });
 });
 
@@ -3619,6 +3626,12 @@ export function startIpcServer(opts: {
    * deliberate secret repair cannot strand a daemon on a stale cached key.
    * Tests that omit this option retain the lightweight in-process server. */
   authRequired?: boolean;
+  /** Upward-probe span on EADDRINUSE. Default DEFAULT_PROBE_SPAN (fleet daemons
+   * step to the next free port so a port race can't crash boot). Core-only
+   * (single in-sandbox service) sets 0 to BIND-OR-FAIL on the exact requested
+   * port — riff's task-runner is told a fixed port and must not have the service
+   * silently drift to another one. */
+  maxProbe?: number;
 }): Promise<IpcServerHandle> {
   let boundPort = opts.port;
   const server: Server = createServer(async (req, res) => {
@@ -3662,6 +3675,7 @@ export function startIpcServer(opts: {
     server,
     port: opts.port,
     host: opts.host,
+    maxProbe: opts.maxProbe,
     log: (m) => logger.warn(`[dashboard-ipc] ${m}`),
   }).then((port) => {
     boundPort = port;

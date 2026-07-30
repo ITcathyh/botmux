@@ -809,6 +809,85 @@ describe('parseBotConfigsFromText — apiOnly', () => {
   });
 });
 
+// ─── core-only synthesis (BOTMUX_CORE_ONLY) ─────────────────────────────────
+
+describe('loadBotConfigs — core-only synthesis (BOTMUX_CORE_ONLY=1)', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+  let fsMock: { existsSync: ReturnType<typeof vi.fn>; readFileSync: ReturnType<typeof vi.fn>; statSync: ReturnType<typeof vi.fn> };
+  const saved: Record<string, string | undefined> = {};
+  const CORE_KEYS = ['BOTMUX_CORE_ONLY', 'BOTS_CONFIG', 'BOTMUX_API_ONLY_BOT', 'BOTMUX_CORE_CLI', 'BOTMUX_CORE_WORKING_DIR', 'BOTMUX_CORE_MODEL'];
+
+  beforeEach(async () => {
+    mod = await freshImport();
+    fsMock = (await import('node:fs')) as any;
+    for (const k of CORE_KEYS) { saved[k] = process.env[k]; delete process.env[k]; }
+  });
+  afterEach(() => {
+    for (const k of CORE_KEYS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+  });
+
+  it('synthesizes ONE apiOnly bot from env with no bots.json / no creds', () => {
+    fsMock.existsSync.mockReturnValue(false); // no ~/.botmux/bots.json on disk
+    process.env.BOTMUX_CORE_ONLY = '1';
+    process.env.BOTMUX_API_ONLY_BOT = 'local_riff';
+    process.env.BOTMUX_CORE_CLI = 'codex-app';
+    const cfgs = mod.loadBotConfigs();
+    expect(cfgs).toHaveLength(1);
+    expect(cfgs[0].larkAppId).toBe('local_riff');
+    expect(cfgs[0].apiOnly).toBe(true);
+    expect(cfgs[0].cliId).toBe('codex-app');
+    expect(cfgs[0].larkAppSecret).toBe(''); // never a real Feishu secret
+  });
+
+  it('is AUTHORITATIVE: ignores an ambient ~/.botmux/bots.json (never boots a real fleet bot)', () => {
+    // The bug the smoke test caught: core-only on a host WITH a real bots.json
+    // must NOT fall through and load the real (transport-enabled) fleet bot.
+    fsMock.existsSync.mockReturnValue(true); // a real bots.json exists on disk...
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([
+      { larkAppId: 'cli_real_fleet', larkAppSecret: 'REAL_SECRET', cliId: 'claude-code' },
+    ]));
+    process.env.BOTMUX_CORE_ONLY = '1';
+    process.env.BOTMUX_API_ONLY_BOT = 'local_riff';
+    const cfgs = mod.loadBotConfigs();
+    expect(cfgs).toHaveLength(1);
+    expect(cfgs[0].larkAppId).toBe('local_riff'); // synthetic, NOT cli_real_fleet
+    expect(cfgs[0].apiOnly).toBe(true);
+    expect(cfgs[0].larkAppSecret).toBe(''); // the REAL_SECRET is never read
+  });
+
+  it('defers to an EXPLICIT BOTS_CONFIG override (deliberate operator file)', () => {
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([
+      { larkAppId: 'local_fromfile', apiOnly: true, cliId: 'codex-app' },
+    ]));
+    process.env.BOTMUX_CORE_ONLY = '1';
+    process.env.BOTS_CONFIG = '/tmp/explicit-core.json';
+    const cfgs = mod.loadBotConfigs();
+    expect(cfgs[0].larkAppId).toBe('local_fromfile'); // from the explicit file
+  });
+
+  it('defaults the synthetic id to local_riff and cli to codex-app', () => {
+    fsMock.existsSync.mockReturnValue(false);
+    process.env.BOTMUX_CORE_ONLY = '1';
+    const [cfg] = mod.loadBotConfigs();
+    expect(cfg.larkAppId).toBe('local_riff');
+    expect(cfg.cliId).toBe('codex-app');
+  });
+
+  it('rejects a non-local_ synthetic id (identity must be a synthetic local slug)', () => {
+    fsMock.existsSync.mockReturnValue(false);
+    process.env.BOTMUX_CORE_ONLY = '1';
+    process.env.BOTMUX_API_ONLY_BOT = 'cli_pretending_real';
+    expect(() => mod.loadBotConfigs()).toThrow(/must match local_<slug>/);
+  });
+
+  it('does nothing when BOTMUX_CORE_ONLY is unset (normal file path)', () => {
+    fsMock.existsSync.mockReturnValue(false); // no file → normal path throws
+    expect(() => mod.loadBotConfigs()).toThrow(/No bot configuration found/);
+  });
+});
+
+
 // ─── getBot / getBotClient ────────────────────────────────────────────────
 
 describe('getBot / getBotClient', () => {

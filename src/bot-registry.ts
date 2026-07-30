@@ -1736,9 +1736,55 @@ export function getBotTuiSlashAllow(larkAppId: string): string[] | undefined {
  * Load bot configurations from one of (in priority order):
  * 1. BOTS_CONFIG env var — path to a JSON file
  * 2. ~/.botmux/bots.json — default config path
+ * 3. Core-only (BOTMUX_CORE_ONLY=1) with NEITHER of the above present:
+ *    synthesize a single apiOnly bot from env — no bots.json / no Feishu creds
+ *    (riff's in-sandbox headless service).
  */
 export function loadBotConfigs(): BotConfig[] {
+  const synthetic = maybeSynthesizeCoreOnlyConfig();
+  if (synthetic) return synthetic;
   return parseBotConfigFile(resolveBotConfigPath());
+}
+
+/**
+ * Core-only headless config: when BOTMUX_CORE_ONLY=1, synthesize ONE apiOnly bot
+ * from env so the daemon boots with zero Feishu credentials and no on-disk config.
+ *
+ * Core-only is AUTHORITATIVE about identity: it ignores any ambient
+ * ~/.botmux/bots.json entirely. Otherwise a core-only service started on a host
+ * that happens to have a real fleet config would silently boot a REAL,
+ * transport-enabled Feishu bot (WSClient, real credentials) instead of the
+ * headless apiOnly one — the exact opposite of "no Feishu". The only way to feed
+ * a real config file in this mode is an EXPLICIT BOTS_CONFIG env (a deliberate
+ * operator override, still parsed + validated normally). Returns null when not in
+ * core-only mode, or when BOTS_CONFIG is explicitly set (defer to that file).
+ *
+ * The synthesized `loadedConfigPath` is pinned to the DEFAULT ~/.botmux/bots.json
+ * path (even though the file is absent/ignored) so the no-transport fs-policy sees
+ * the config as living INSIDE the default botmux authority root — never an external
+ * path or a carve-out, which would trip buildFsPolicy's fail-closed checks.
+ */
+function maybeSynthesizeCoreOnlyConfig(): BotConfig[] | null {
+  if (process.env.BOTMUX_CORE_ONLY !== '1') return null;
+  // Explicit BOTS_CONFIG is a deliberate override — respect the file path.
+  if (process.env.BOTS_CONFIG) return null;
+
+  const larkAppId = process.env.BOTMUX_API_ONLY_BOT || 'local_riff';
+  if (!/^local_[A-Za-z0-9._-]+$/.test(larkAppId)) {
+    throw new Error(
+      `Core-only BOTMUX_API_ONLY_BOT must match local_<slug> (letters/digits/._-), got: ${larkAppId}`,
+    );
+  }
+  const cliId = process.env.BOTMUX_CORE_CLI || 'codex-app';
+  const entry: Record<string, unknown> = { larkAppId, apiOnly: true, cliId };
+  if (process.env.BOTMUX_CORE_WORKING_DIR) entry.workingDir = process.env.BOTMUX_CORE_WORKING_DIR;
+  if (process.env.BOTMUX_CORE_MODEL) entry.model = process.env.BOTMUX_CORE_MODEL;
+  // Route through the normal parser so the synthesized entry gets identical
+  // validation + normalization as a file-loaded one (apiOnly secret exemption,
+  // cliId check, defaults). Pin loadedConfigPath to the default in-root path.
+  const configs = parseBotConfigsFromText(JSON.stringify([entry]));
+  loadedConfigPath = resolve(homedir(), '.botmux', 'bots.json');
+  return configs;
 }
 
 function resolveBotConfigPath(): string {
