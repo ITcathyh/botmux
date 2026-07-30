@@ -783,6 +783,8 @@ function setupBotState(opts?: {
   botOpenId?: string | undefined;
   chatGrants?: Record<string, string[]>;
   globalGrants?: string[];
+  /** 整群 talk 授权（owner 在群里裸 `/grant` 写入的 chat_id 列表）。 */
+  allowedChatGroups?: string[];
   allowedUsers?: string[];
   /** 原始配置里的 allowedUsers（默认镜像 allowedUsers）。用于构造「配了 owner 但解析为空」的场景。 */
   configAllowedUsers?: string[];
@@ -813,6 +815,7 @@ function setupBotState(opts?: {
       allowedUsers: opts?.configAllowedUsers ?? opts?.allowedUsers,
       chatGrants: opts?.chatGrants,
       globalGrants: opts?.globalGrants,
+      allowedChatGroups: opts?.allowedChatGroups,
       restrictGrantCommands: opts?.restrictGrantCommands,
       regularGroupReplyMode: opts?.regularGroupReplyMode,
       regularGroupMentionMode: opts?.regularGroupMentionMode,
@@ -1677,6 +1680,66 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
 
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(mockReplyMessage).toHaveBeenCalledWith(
+      MY_APP_ID,
+      'msg-001',
+      expect.stringContaining(OTHER_BOT_OPEN_ID),
+      'interactive',
+    );
+  });
+
+  it('routes an unknown external bot @mention when the chat is 整群授权 (allowedChatGroups)', async () => {
+    // owner 在群里裸 `/grant` → allowedChatGroups += chatId（chat 维度、sender 无关的
+    // talk-open，与 oncall 同一安全模型）。人侧 evaluateTalk 早就按 `reason:'allowedChatGroup'`
+    // 放行了，bot 侧 vetting gate 必须对齐——否则 owner 明明整群授权过，外部 bot 一 @
+    // 仍弹授权卡，得再点一次「本群」写 chatGrants 才通（线上实测 #grant-whole-chat）。
+    setupBotState({ allowedUsers: ['ou_owner'], allowedChatGroups: ['chat-001'] });
+    mockGetOwnerOpenId.mockReturnValue('ou_owner');
+    mockGetChatMode.mockResolvedValueOnce('group');
+    mockReadFileSync.mockReturnValue('{}');  // empty cross-ref → unknown peer
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({
+        zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] },
+      }),
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-001',
+      larkAppId: MY_APP_ID,
+    }));
+  });
+
+  it('still cards an unknown external bot in a chat OUTSIDE allowedChatGroups', async () => {
+    // 整群授权是严格 chat 作用域：别的群配了不代表本群放行（与 evaluateTalk 同语义）。
+    setupBotState({ allowedUsers: ['ou_owner'], allowedChatGroups: ['chat-other'] });
+    mockGetOwnerOpenId.mockReturnValue('ou_owner');
+    mockGetChatMode.mockResolvedValueOnce('group');
+    mockReadFileSync.mockReturnValue('{}');
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({
+        zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] },
+      }),
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
     expect(mockReplyMessage).toHaveBeenCalledWith(
       MY_APP_ID,
       'msg-001',

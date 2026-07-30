@@ -1218,6 +1218,12 @@ function hasGlobalGrant(larkAppId: string, openId: string | undefined): boolean 
   return !!openId && !!getBot(larkAppId).config.globalGrants?.includes(openId);
 }
 
+/** 整群 talk 授权命中判断（裸 `/grant` 写入的 allowedChatGroups）。chat 维度、sender 无关，
+ *  与 oncall 同一个安全模型：只放行 canTalk / bot 路由闸，canOperate 绝不读它。 */
+function hasAllowedChatGroup(larkAppId: string, chatId: string | undefined): boolean {
+  return !!chatId && !!getBot(larkAppId).config.allowedChatGroups?.includes(chatId);
+}
+
 /**
  * 是否配置了任何白名单（限制态）。判定用 **原始** config.allowedUsers, 不用
  * resolvedAllowedUsers——否则「配了 owner 但启动时邮箱/union 解析失败 → resolved 为空」
@@ -1286,7 +1292,7 @@ export function evaluateTalk(
   if (memberUnionId && isPlatformTeamMemberChat(config.session.dataDir, chatId, memberUnionId)) {
     return { allowed: true, reason: 'teamMember' };
   }
-  if (chatId && bot.config.allowedChatGroups?.includes(chatId)) return { allowed: true, reason: 'allowedChatGroup' };
+  if (hasAllowedChatGroup(larkAppId, chatId)) return { allowed: true, reason: 'allowedChatGroup' };
 
   // p2pOpen：私聊维度的 talk-open，与 oncall（群维度）同一个安全模型——放行 canTalk，
   // canOperate 一行不读它（管理仍限 allowedUsers）。谁能私聊由飞书应用「可用范围」控制。
@@ -2315,6 +2321,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           ? (handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? false)
           : false;
         const canFoldForeignBotThread = findOncallChat(larkAppId, chatId)
+          || hasAllowedChatGroup(larkAppId, chatId)
           || isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)
           || isTrustedTeamBotSender(config.session.dataDir, chatId, senderUnionId)
           || hasChatGrant(larkAppId, chatId, senderOpenId)
@@ -2364,7 +2371,17 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // 外部 bot @ 仍被丢弃，必须真人先 @ 一次建 session 才救活。
         // 补上 hasConfiguredAllowlist 短路后两条路径统一：一旦配了任一 allowlist，
         // 立刻恢复「限制态」设闸，安全边界不变。
+        //
+        // 整群授权（allowedChatGroups，owner 在群里裸 `/grant` 写入）与 oncall 同为
+        // 「chat 维度、sender 无关的 talk-open」，故与 oncall 同级短路：人侧 evaluateTalk
+        // 早就按 `reason:'allowedChatGroup'` 放行了，bot 侧漏掉这一腿会让 owner 明明
+        // 整群授权过、外部 bot 一 @ 仍弹卡，必须再点一次卡上的「本群」写 chatGrants
+        // 才通（线上实测：同一群裸 /grant 十几分钟后，外部 bot @ 仍触发授权卡）。
+        // 更反直觉的是 allowedChatGroups 本身会让 hasConfiguredAllowlist 转真，
+        // 于是对原本 open 模式的 bot，裸 `/grant` 反而**制造**出这道拦截。
+        // 安全边界不变：仍是 talk-only，canOperate 一行不读它。
         if (!findOncallChat(larkAppId, chatId)
+            && !hasAllowedChatGroup(larkAppId, chatId)
             && hasConfiguredAllowlist(getBot(larkAppId))) {
           if (!isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)
               && !isTrustedTeamBotSender(config.session.dataDir, chatId, senderUnionId)
