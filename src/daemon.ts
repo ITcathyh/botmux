@@ -97,7 +97,7 @@ import { validateWorkingDir } from './core/working-dir.js';
 import type { DaemonToWorker, LarkMessage } from './types.js';
 export type { DaemonSession } from './core/types.js';
 import type { DaemonSession } from './core/types.js';
-import { activeSessionKey, sessionKey, sessionAnchorId, storedSessionAnchorId } from './core/types.js';
+import { activeSessionKey, sessionKey, sessionAnchorId, storedSessionAnchorId, larkTransportEnabled } from './core/types.js';
 import { buildTerminalUrl, setTerminalProxyPort, setTerminalExternalPort } from './core/terminal-url.js';
 import { startTerminalProxy, type TerminalProxyHandle } from './core/terminal-proxy.js';
 import type { CliId } from './adapters/cli/types.js';
@@ -2699,6 +2699,22 @@ async function sessionReply(
   }
   const appId = larkAppId ?? ds?.larkAppId ?? getAllBots()[0]?.config.larkAppId;
   if (!appId) throw new Error('No bot configured');
+  // Central Lark-transport gate (fail-closed): a core-only (apiOnly) bot or an
+  // HTTP virtual session (http_async_* / http_wait_*) has no real Feishu chat,
+  // so every auxiliary-UI / reply that funnels through sessionReply must be a
+  // no-op instead of dialing sendMessage on a synthetic id. Gating HERE covers
+  // ready/screen_update/tui_prompt/stuck_warning/startup+exit UI by construction
+  // — final_output for HTTP sessions is already intercepted upstream in
+  // deliverFinalOutput and never reaches here. Returns the anchor as a benign
+  // "delivered" sentinel so callers that store a message id keep working.
+  const transportAllowed = larkTransportEnabled({
+    chatId: ds?.chatId ?? anchor,
+    apiOnly: getBot(appId).config.apiOnly,
+  });
+  if (!transportAllowed) {
+    logger.debug(`[lark-transport] suppressed reply for no-transport session (app=${appId} anchor=${anchor.substring(0, 16)})`);
+    return anchor;
+  }
   const hookContext = ds ? {
     sessionId: ds.session.sessionId,
     scope: ds.scope,
@@ -4709,6 +4725,18 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
       ok: false,
       error: 'managed_action_required',
       detail: 'meeting receiver asks are not an idempotent managed action',
+    });
+  }
+  // No-transport session (apiOnly bot or HTTP virtual chat): `botmux ask` posts
+  // an interactive Lark card and blocks the turn on a human click — impossible
+  // without a real Feishu chat. Fail fast with `unsupported` instead of letting
+  // it fall into the Lark dispatcher and hang the agent on a card that can never
+  // render. (Structured HTTP awaiting_input is a separate, future capability.)
+  if (askSession && !larkTransportEnabled({ chatId: askSession.chatId, apiOnly: getBot(askSession.larkAppId).config.apiOnly })) {
+    return jsonRes(res, 400, {
+      ok: false,
+      error: 'unsupported',
+      detail: 'botmux ask requires a Feishu chat; this session has no Lark transport (apiOnly / HTTP virtual session)',
     });
   }
 
@@ -17794,8 +17822,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // Refresh CLI version per bot's cliId
     refreshCliVersion(cfg.cliId, cfg.cliPathOverride);
 
-    // Resolve allowed users per bot
-    if ((bot.config.allowedUsers?.length ?? 0) > 0 || bot.resolvedAllowedUsers.length > 0) {
+    // Resolve allowed users per bot. Skipped for apiOnly (core-only) bots:
+    // their HTTP control-API triggers authenticate via the dashboard token, not
+    // allowedUsers, and resolving email/union_id entries would call the Feishu
+    // contact API — a network round-trip a no-Feishu bot must never make.
+    if (!cfg.apiOnly && ((bot.config.allowedUsers?.length ?? 0) > 0 || bot.resolvedAllowedUsers.length > 0)) {
       // 含邮箱或 union_id(on_) 都要重解析成本 app 的 open_id —— 否则 canTalk/canOperate
       // 拿 sender 的 ou_ 对不上 on_，owner 会被自己的 bot 锁死（PR#72）。
       // literal ou_ 也走 best-effort 校验，用于诊断把其他 app 视角 open_id
@@ -18081,17 +18112,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   try { sweepGlobalBotmuxSkills(); }
   catch (err) { logger.warn(`[skills] post-restore global sweep failed: ${err instanceof Error ? err.message : String(err)}`); }
 
-  // 文档订阅恢复：重启后订阅可能已失效，给仍活跃的会话重订阅；会话没恢复
-  // （已关/丢失）的订阅则退订 + 清表，避免「命中订阅但无会话」的孤儿。
-  await restoreDocSubscriptions(activeSessions);
+  // 文档订阅恢复 + 评论轮询：都是主动调飞书文档 API 的路径。apiOnly（core-only）
+  // bot 从不连飞书，且其合成身份不会有真实文档订阅——整块跳过，否则非 pristine
+  // dataDir 上的遗留订阅会让「无飞书连接」的 bot 每 5 秒主动打飞书。
+  let docCommentPollTimer: ReturnType<typeof setInterval> | undefined;
+  if (!cfg.apiOnly) {
+    // 文档订阅恢复：重启后订阅可能已失效，给仍活跃的会话重订阅；会话没恢复
+    // （已关/丢失）的订阅则退订 + 清表，避免「命中订阅但无会话」的孤儿。
+    await restoreDocSubscriptions(activeSessions);
 
-  // `drive.notice.comment_add_v1` 只可靠推送 @Bot 通知；--all 通过应用身份轮询
-  // 评论列表补齐普通评论。先立即建/续基线，之后每 5 秒增量检查。
-  const docCommentPollTimer = setInterval(() => {
+    // `drive.notice.comment_add_v1` 只可靠推送 @Bot 通知；--all 通过应用身份轮询
+    // 评论列表补齐普通评论。先立即建/续基线，之后每 5 秒增量检查。
+    docCommentPollTimer = setInterval(() => {
+      void pollWatchedDocComments(cfg.larkAppId);
+    }, 5_000);
+    docCommentPollTimer.unref?.();
     void pollWatchedDocComments(cfg.larkAppId);
-  }, 5_000);
-  docCommentPollTimer.unref?.();
-  void pollWatchedDocComments(cfg.larkAppId);
+  }
 
   // Sweep orphan sandbox trees left by a previous run's crash/kill: any
   // <dataDir>/sandboxes/<sid> whose session is no longer active gets its

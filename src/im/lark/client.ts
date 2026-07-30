@@ -91,12 +91,20 @@ let allBotClients: Array<{ appId: string; cliId: string; client: InstanceType<ty
 let allBotClientsFingerprint: string | null = null;
 
 function loadAllBotClientConfigs(): Array<{ larkAppId: string; larkAppSecret: string; cliId: string; brand?: string }> {
+  // Exclude apiOnly (core-only) bots from every Lark-client consumer: they have
+  // a synthetic appId + (possibly empty) secret and never connect to Feishu, so
+  // instantiating a Client for them is useless AND actively harmful — a NORMAL
+  // bot's roster probe (getAvailableBots → is_in_chat over getAllBotClients)
+  // would otherwise auth-fail against the synthetic app, adding latency+noise to
+  // the healthy bot path. Filtering here covers both discovery and the strict
+  // stable-App resolver from one place.
+  const notApiOnly = (c: { apiOnly?: boolean }) => c.apiOnly !== true;
   try {
-    return loadBotConfigs();
+    return loadBotConfigs().filter(notApiOnly);
   } catch {
     // riff sandbox：没有 bots.json，只有经 env 合成注册进 registry 的 bot——
     // 降级用注册表里的配置，`botmux bots list` 等只读探测照常可用。
-    return getAllBots().map((b) => b.config);
+    return getAllBots().map((b) => b.config).filter(notApiOnly);
   }
 }
 

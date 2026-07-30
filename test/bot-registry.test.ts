@@ -768,6 +768,16 @@ describe('parseBotConfigsFromText — apiOnly', () => {
     expect(cfg.larkAppSecret).toBe('kept');
   });
 
+  it('throws if an apiOnly bot provides a non-string larkAppSecret (type hole guard)', () => {
+    // "may be omitted; if present must be a string" — a number/object/array/false
+    // must NOT slip into the string-typed field via the exemption.
+    for (const bad of [42, {}, [], false] as const) {
+      expect(() => mod.parseBotConfigsFromText(JSON.stringify([
+        { larkAppId: 'local_x', apiOnly: true, larkAppSecret: bad },
+      ])), `secret=${JSON.stringify(bad)}`).toThrow(/larkAppSecret must be a string when provided/);
+    }
+  });
+
   it('STILL throws for a normal (non-apiOnly) bot missing larkAppSecret', () => {
     // Guard: the secret exemption must be scoped to apiOnly only. A normal
     // Feishu bot with no secret is a misconfig, not a headless bot.
