@@ -8245,6 +8245,9 @@ botmux create-group — 用一组机器人新建飞书群
 `);
     return;
   }
+  // create-group builds a real Feishu group (cross-bot). A no-transport turn
+  // (apiOnly bot or HTTP virtual session) may not originate one — central gate.
+  assertTurnTransportOrExit('create-group');
 
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
 
@@ -10024,6 +10027,32 @@ async function runPluginCommandByName(rawCommand: string, commandArgs: string[])
   if (typeof result === 'string') console.log(result);
   if (typeof result === 'number') process.exitCode = result;
   return true;
+}
+
+// ─── Central root-dispatch transport gate ──────────────────────────────────
+// A MANAGED no-transport turn (a CLI turn the daemon spawned for an apiOnly bot
+// or an HTTP virtual session — identified by the injected BOTMUX_SESSION_ID
+// marker) must not run ANY Lark-facing command, regardless of which subcommand.
+// Gating here at the root — rather than per-command — covers every Feishu-facing
+// verb (send/dispatch/create-group/grant/history/quoted/bots/…) by construction,
+// so a new command can't silently reopen the hole. A BARE host-operator shell
+// (human running `botmux` directly, no managed-turn marker) is intentionally NOT
+// gated: the operator keeps full access. Per-command gates remain as
+// defense-in-depth + friendlier messages.
+const LARK_FACING_COMMANDS = new Set([
+  'send', 'dispatch', 'create-group', 'history', 'quoted', 'bots', 'grant', 'react', 'thread',
+]);
+if (LARK_FACING_COMMANDS.has(command) && process.env.BOTMUX_SESSION_ID && currentTurnHasNoTransport()) {
+  const chatId = process.env.BOTMUX_CHAT_ID ?? '';
+  const why = chatId.startsWith('http_async_') || chatId.startsWith('http_wait_')
+    ? 'this managed turn runs in an HTTP control-API session (no Feishu chat)'
+    : 'this is a core-only (apiOnly) bot with no Feishu connection';
+  console.error(
+    `botmux ${command} is unavailable: ${why}.\n` +
+    `Feishu read/write is not possible for this turn — it communicates only over the HTTP\n` +
+    `control API (input via trigger, output via trigger-result). Produce your normal answer.`,
+  );
+  process.exit(2);
 }
 
 switch (command) {
