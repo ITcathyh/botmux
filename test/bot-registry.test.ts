@@ -740,6 +740,65 @@ describe('parseBotConfigsFromText — brand', () => {
   });
 });
 
+// ─── parseBotConfigsFromText — apiOnly (core-only / headless) ──────────────
+
+describe('parseBotConfigsFromText — apiOnly', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+
+  beforeEach(async () => {
+    mod = await freshImport();
+  });
+
+  it('allows an apiOnly bot to omit larkAppSecret (no Feishu connection)', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'local_riff', apiOnly: true, cliId: 'codex-app' },
+    ]));
+    expect(cfg.apiOnly).toBe(true);
+    expect(cfg.larkAppId).toBe('local_riff');
+    // Secret falls back to '' so downstream env plumbing stays a string.
+    expect(cfg.larkAppSecret).toBe('');
+    expect(cfg.cliId).toBe('codex-app');
+  });
+
+  it('preserves an explicit secret on an apiOnly bot if provided', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'local_x', larkAppSecret: 'kept', apiOnly: true },
+    ]));
+    expect(cfg.apiOnly).toBe(true);
+    expect(cfg.larkAppSecret).toBe('kept');
+  });
+
+  it('STILL throws for a normal (non-apiOnly) bot missing larkAppSecret', () => {
+    // Guard: the secret exemption must be scoped to apiOnly only. A normal
+    // Feishu bot with no secret is a misconfig, not a headless bot.
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'app_normal' },
+    ]))).toThrow(/larkAppSecret is required/);
+  });
+
+  it('still throws for an apiOnly bot missing larkAppId', () => {
+    // larkAppId stays mandatory in every mode — it is the daemon identity,
+    // dashboard routing key, and cachedLarkAppId gate.
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([
+      { apiOnly: true, cliId: 'codex-app' },
+    ]))).toThrow(/larkAppId is required/);
+  });
+
+  it('leaves apiOnly undefined (not false) for normal bots — keeps bots.json clean', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's' },
+    ]));
+    expect(cfg.apiOnly).toBeUndefined();
+  });
+
+  it('coerces a truthy-but-non-true apiOnly to undefined (strict === true)', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', apiOnly: 'yes' },
+    ]));
+    expect(cfg.apiOnly).toBeUndefined();
+  });
+});
+
 // ─── getBot / getBotClient ────────────────────────────────────────────────
 
 describe('getBot / getBotClient', () => {
