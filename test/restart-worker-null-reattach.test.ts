@@ -72,8 +72,9 @@ describe('P1 requestSessionRestart wiring', () => {
     expect(fn).toBeGreaterThanOrEqual(0);
     const body = workerPoolSource.slice(fn, workerPoolSource.indexOf('\n}', fn) + 2);
 
-    // Live-worker branch still sends the in-worker restart IPC (unchanged).
-    expect(body).toContain("ds.worker.send({ type: 'restart', attemptId }");
+    // Live-worker branch still sends the in-worker restart IPC — now also
+    // carrying the latest per-bot env (dashboard edits apply on /restart).
+    expect(body).toContain("ds.worker.send({ type: 'restart', attemptId, env: latestPerBotEnvForRestart(ds) }");
 
     // No-worker branch: pane teardown MUST precede forkWorker.
     const destroy = body.indexOf('destroyLivePaneBeforeRestart(ds)');

@@ -180,7 +180,8 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
 
     // First 3 auto-restart in place; the 4th asks the worker to park a
     // diagnostic shell (deferred park) and keeps it alive (no close).
-    expect(worker.send).toHaveBeenCalledWith({ type: 'restart' });
+    // auto-restart 捎带最新 per-bot env（本 fixture 的 mock getBot 无 env → null）。
+    expect(worker.send).toHaveBeenCalledWith({ type: 'restart', env: null });
     expect(worker.send).toHaveBeenCalledWith({ type: 'park_diagnostic' });
     expect(worker.send).not.toHaveBeenCalledWith({ type: 'close' });
     // Survives daemon restart: lazy cold-resume + idle, restart counter reset.

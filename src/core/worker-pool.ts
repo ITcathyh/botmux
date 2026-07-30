@@ -1460,6 +1460,24 @@ function destroyLivePaneBeforeRestart(ds: DaemonSession): void {
   }
 }
 
+/**
+ * Live-worker /restart 携带的最新 per-bot env（bots.json `env`）。worker 收到
+ * restart 时在 respawn 前全量覆盖 lastInitConfig.env —— 否则 live-worker 重启
+ * 一直用 fork 时刻的旧快照，dashboard 改完 env（如切 provider 的
+ * ANTHROPIC_BASE_URL/TOKEN）后 /restart 并不会生效（只有 refork 路径生效）。
+ * 三分态返回：对象 = 最新 env；null = 明确清空（dashboard 已删）；
+ * undefined = 取不到（bot 已注销等异常），让 worker 保持快照不动（=旧行为）。
+ * 只热更 env 一个字段：sandbox/backendType 是刻意 freeze-once 的设计（见
+ * forkWorker init 注释），cliId 换 CLI 会踩 resume transcript 对齐，均不带。
+ */
+export function latestPerBotEnvForRestart(ds: DaemonSession): Record<string, string> | null | undefined {
+  try {
+    return getBot(ds.larkAppId).config.env ?? null;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Join or start one correlated physical restart for a session. */
 export function requestSessionRestart(
   ds: DaemonSession,
@@ -1467,7 +1485,7 @@ export function requestSessionRestart(
 ): { attemptId: string; joined: boolean } {
   return restartCoordinator.request(ds.session.sessionId, observer, attemptId => {
     if (ds.worker && !ds.worker.killed) {
-      ds.worker.send({ type: 'restart', attemptId } as DaemonToWorker);
+      ds.worker.send({ type: 'restart', attemptId, env: latestPerBotEnvForRestart(ds) } as DaemonToWorker);
       return;
     }
     // No live worker but the persistent pane may still be alive (e.g. after a
@@ -3634,10 +3652,12 @@ function setupWorkerHandlers(
           break;
         }
 
-        // Auto-restart CLI within the same worker
+        // Auto-restart CLI within the same worker. 捎带最新 per-bot env：崩溃
+        // 往往正是旧 env 配的错（如过期 token / 失效 proxy），用户改完 env 后
+        // 下一轮 auto-restart 直接用新值恢复，不必再手工 /close。
         if (ds.worker && !ds.worker.killed) {
           logger.info(`[${t}] Auto-restarting ${getCliDisplayName(effectiveCliId)}...`);
-          ds.worker.send({ type: 'restart' } as DaemonToWorker);
+          ds.worker.send({ type: 'restart', env: latestPerBotEnvForRestart(ds) } as DaemonToWorker);
         }
         break;
       }
