@@ -2287,9 +2287,14 @@ export function forkWorker(
   const familyAdapter = createCliAdapterSync(agentCfg.cliId, agentCfg.cliPathOverride);
   if (familyAdapter.claudeStateJsonPath) ensureClaudeFolderTrust(cwd, familyAdapter.claudeStateJsonPath);
 
-  // Prepend ~/.botmux/bin to PATH so CLIs can call `botmux send` etc.
-  // The wrapper script there is written by the daemon at startup.
-  const botmuxBinDir = join(homedir(), '.botmux', 'bin');
+  // Prepend the botmux wrapper bin dir to PATH so CLIs can call `botmux send` etc.
+  // The wrapper script there is written by the daemon at startup. Core-only writes
+  // its wrapper into a DEDICATED bin dir under its state root (not the shared
+  // ~/.botmux/bin), so match that here or the worker's PATH would miss it and a
+  // stale/fleet wrapper could shadow it (codex P1: shared-HOME wrapper contamination).
+  const botmuxBinDir = process.env.BOTMUX_CORE_ONLY === '1'
+    ? join(config.session.dataDir, 'bin')
+    : join(homedir(), '.botmux', 'bin');
   const pathWithBotmux = prependBotmuxBin(botmuxBinDir, process.env.PATH);
 
   const forkEnv = workerForkEnv(process.env);

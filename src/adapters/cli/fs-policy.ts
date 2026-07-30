@@ -633,6 +633,11 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
       `${ctx.sessionDataDir}/bots-info.json`,               // display names for <available_bots> (public-ish)
       `${ctx.sessionDataDir}/sessions-${ctx.currentAppId}.json`,
       `${ctx.sessionDataDir}/bot-openids-${ctx.currentAppId}.json`,
+      // Core-only writes its `botmux` wrapper into <dataDir>/bin (dedicated, NOT
+      // the shared ~/.botmux/bin) and prepends it to the worker PATH — read-only
+      // so the sandboxed `botmux send` hook can exec it. Under the state root, so
+      // no separate authority-root concern.
+      `${ctx.sessionDataDir}/bin`,
     ], 'readOnly', 'internal');
     if (ctx.sessionId) push([`${ctx.sessionDataDir}/turn-sends/${ctx.sessionId}.jsonl`], 'readWrite', 'internal');
     // NOTE: dashboard-daemons (sibling IPC port table) and .dashboard-secret/-token

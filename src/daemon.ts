@@ -2980,8 +2980,17 @@ function getPidFile(): string {
 }
 
 /** Path to the wrapper bin directory — injected into worker PATH so CLIs
- *  can call `botmux send` / `botmux schedule` without a global npm install. */
-const BOTMUX_BIN_DIR = join(homedir(), '.botmux', 'bin');
+ *  can call `botmux send` / `botmux schedule` without a global npm install.
+ *  Core-only writes into a DEDICATED bin dir under its own state root (never the
+ *  shared `~/.botmux/bin`), so a same-HOME fleet's wrapper/PATH is not clobbered
+ *  with this canary/review dist and left unrestored on exit (codex P1). */
+function botmuxWrapperBinDir(): string {
+  if (process.env.BOTMUX_CORE_ONLY === '1') {
+    return join(config.session.dataDir, 'bin');
+  }
+  return join(homedir(), '.botmux', 'bin');
+}
+const BOTMUX_BIN_DIR = botmuxWrapperBinDir();
 
 function writePidFile(): void {
   const dir = config.session.dataDir;
@@ -2989,12 +2998,18 @@ function writePidFile(): void {
     mkdirSync(dir, { recursive: true });
   }
   atomicWriteFileSync(getPidFile(), String(process.pid));
-  // Write breadcrumb so CLI tools (botmux list/delete) can find the active data dir
-  const breadcrumb = join(homedir(), '.botmux', '.data-dir');
-  try {
-    mkdirSync(join(homedir(), '.botmux'), { recursive: true });
-    atomicWriteFileSync(breadcrumb, config.session.dataDir);
-  } catch { /* best effort */ }
+  // Write breadcrumb so CLI tools (botmux list/delete) can find the active data dir.
+  // SKIP in core-only (codex P1): the global `~/.botmux/.data-dir` is a shared-HOME
+  // signpost for bare-shell CLIs; a core-only service must not rewrite it to point
+  // a same-HOME host operator at the core-only store. Core-only's own workers get
+  // the data dir via the frozen SESSION_DATA_DIR env, not this breadcrumb.
+  if (process.env.BOTMUX_CORE_ONLY !== '1') {
+    const breadcrumb = join(homedir(), '.botmux', '.data-dir');
+    try {
+      mkdirSync(join(homedir(), '.botmux'), { recursive: true });
+      atomicWriteFileSync(breadcrumb, config.session.dataDir);
+    } catch { /* best effort */ }
+  }
 
   // Write a thin wrapper script so `botmux` is always in PATH for CLI sessions,
   // regardless of whether the package was installed globally.  The wrapper

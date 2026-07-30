@@ -541,4 +541,23 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     expect(block).toContain('startCliRuntimeUpdateMonitor(');
     expect(block).toContain('sendRestartReportIfPending(');
   });
+
+  it('P1(3rd round): core-only does NOT write shared-HOME .data-dir breadcrumb or ~/.botmux/bin wrapper', () => {
+    // writePidFile writes the global ~/.botmux/.data-dir signpost + ~/.botmux/bin
+    // wrapper. Both are shared-HOME: core-only must not rewrite them (would point a
+    // same-HOME host operator/fleet PATH at the core-only store/canary dist, unrestored
+    // on exit). breadcrumb skipped in core-only; wrapper goes to a dedicated bin dir.
+    const wp = region(daemonSource, 'function writePidFile(', 'logger.info(`PID file written');
+    expect(wp).toContain("if (process.env.BOTMUX_CORE_ONLY !== '1') {"); // breadcrumb gated
+    // The wrapper bin dir is core-only-aware (dedicated under the state root).
+    const binDirFn = region(daemonSource, 'function botmuxWrapperBinDir(', '\n}\n');
+    expect(binDirFn).toContain("if (process.env.BOTMUX_CORE_ONLY === '1')");
+    expect(binDirFn).toContain("join(config.session.dataDir, 'bin')");
+    // The worker PATH matches the same dedicated bin dir (else the wrapper is off PATH).
+    const workerPoolSrc = readFileSync(resolve('src/core/worker-pool.ts'), 'utf8');
+    expect(workerPoolSrc).toContain("process.env.BOTMUX_CORE_ONLY === '1'\n    ? join(config.session.dataDir, 'bin')");
+    // fs-policy grants the dedicated bin dir readOnly for the sandboxed no-transport turn.
+    const ipcOrPolicy = readFileSync(resolve('src/adapters/cli/fs-policy.ts'), 'utf8');
+    expect(ipcOrPolicy).toContain('`${ctx.sessionDataDir}/bin`');
+  });
 });
