@@ -658,3 +658,39 @@ describe('compiler parity with accessForPath', () => {
       .toBeGreaterThan(prof.indexOf('(allow file-read* (subpath "/srv/ref"))'));
   });
 });
+
+describe('no-Lark-transport credential profile (larkTransportEnabled=false)', () => {
+  // Worst case: workingDir defaults to $HOME, which would grant the whole home
+  // (bots.json + sibling BOT_HOMEs + lark-cli stores) readWrite. The mandatory
+  // no-transport denies must beat that broad grant.
+  const noTransport = (o: Partial<FsPolicyContext> = {}) => buildFsPolicy(ctx({
+    larkTransportEnabled: false,
+    workingDir: '/Users/u',                       // = homeDir (worst case)
+    authPaths: ['/Users/u/.lark_login'],          // an adapter Feishu-login surface
+    ...o,
+  }));
+
+  it('denies bots.json, lark-cli stores, and adapter authPaths even with workingDir=~', () => {
+    const p = noTransport();
+    expect(accessForPath(p.rules, '/Users/u/.botmux/bots.json').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.lark-cli-bots/cli_self/config').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/Library/Application Support/lark-cli/master.key.file').access).toBe('deny');
+    // adapter authPaths (Feishu login) are NOT granted for a no-transport turn.
+    expect(accessForPath(p.rules, '/Users/u/.lark_login').access).not.toBe('readWrite');
+  });
+
+  it('a NORMAL (transport-enabled) bot still gets its own lark-cli + authPaths', () => {
+    const p = buildFsPolicy(ctx({ larkTransportEnabled: true, authPaths: ['/Users/u/.lark_login'] }));
+    expect(accessForPath(p.rules, '/Users/u/.lark-cli-bots/cli_self/config').access).toBe('readWrite');
+    expect(accessForPath(p.rules, '/Users/u/.lark_login').access).toBe('readWrite');
+    // Linux keystore path: normal bot on darwin gets the master key carve-out.
+    expect(accessForPath(p.rules, '/Users/u/Library/Application Support/lark-cli/master.key.file').access).toBe('readOnly');
+  });
+
+  it('own BOT_HOME working dir stays writable under no-transport (deny is scoped to cred paths only)', () => {
+    const p = buildFsPolicy(ctx({ larkTransportEnabled: false, workingDir: '/Users/u/.botmux/bots/cli_self' }));
+    expect(accessForPath(p.rules, '/Users/u/.botmux/bots/cli_self/scratch.txt').access).toBe('readWrite');
+    // but bots.json (sibling secrets) still denied
+    expect(accessForPath(p.rules, '/Users/u/.botmux/bots.json').access).toBe('deny');
+  });
+});
