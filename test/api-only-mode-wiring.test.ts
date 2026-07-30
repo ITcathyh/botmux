@@ -157,6 +157,14 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     expect(clientSource).toContain('export { LarkTransportDisabledError }');
   });
 
+  it('downloadMessageResource gates BEFORE the app→user-token fallback', () => {
+    // getBotClient throws for apiOnly; without an early gate the app-token attempt
+    // is caught and silently falls back to a raw user-token fetch (codex round-5).
+    const clientSource = readFileSync(resolve('src/im/lark/client.ts'), 'utf8');
+    const block = region(clientSource, 'export async function downloadMessageResource(', 'Try App Token first');
+    expect(block).toContain("assertLarkTransport(larkAppId, 'downloadMessageResource')");
+  });
+
   it('worker-pool suppresses ALL aux UI for no-transport sessions at managedAuxUiSuppressed', () => {
     const block = region(workerPoolSource, 'const managedAuxUiSuppressed =', 'const managedFinalOutputSuppressed');
     expect(block).toContain('larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })');
@@ -187,15 +195,20 @@ describe('API-only bot mode — non-client direct-Feishu paths (source lock)', (
     expect(block).toContain('assertLarkTransport(larkAppId');
   });
 
-  it('worker screenshot upload is disabled for apiOnly (capability rides the init message)', () => {
+  it('worker screenshot upload is disabled for apiOnly AND virtual-session (capability rides init)', () => {
     // The worker uploads via its OWN client (utils/lark-upload), bypassing the
-    // daemon getBot gate, so apiOnly must ride the init message into the worker.
+    // daemon getBot gate, so the no-transport capability must ride the init
+    // message. Covers apiOnly bot AND a normal bot in an HTTP virtual session.
     const workerSource = readFileSync(resolve('src/worker.ts'), 'utf8');
-    expect(workerSource).toContain('apiOnlyForUpload = msg.apiOnly === true;');
+    expect(workerSource).toContain('apiOnlyForUpload = msg.apiOnly === true');
+    expect(workerSource).toContain("msg.chatId?.startsWith('http_async_')");
     expect(workerSource).toContain("if (apiOnlyForUpload)");
     // worker-pool forwards apiOnly on the init message (both fork sites).
     const wpSource = readFileSync(resolve('src/core/worker-pool.ts'), 'utf8');
     expect((wpSource.match(/apiOnly: botCfg\.apiOnly/g) ?? []).length).toBeGreaterThanOrEqual(2);
+    // And WITHHOLDS the real secret from a no-transport worker (removes the
+    // capability rather than trusting a flag the sandboxed agent could flip).
+    expect(wpSource).toContain("larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }) ? botCfg.larkAppSecret : ''");
   });
 });
 

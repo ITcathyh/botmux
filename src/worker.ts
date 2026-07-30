@@ -4445,7 +4445,7 @@ async function captureAndUpload(): Promise<void> {
   // stray scheduleOneShotAfterAction firing after user toggled back to hidden.
   if (displayMode !== 'screenshot') { logScreenshotSkip(`displayMode=${displayMode}`); return; }
   if (awaitingFirstPrompt)          { logScreenshotSkip('awaitingFirstPrompt'); return; }
-  if (apiOnlyForUpload)             { logScreenshotSkip('apiOnly bot — no Feishu transport'); return; }
+  if (apiOnlyForUpload)             { logScreenshotSkip('no Feishu transport (apiOnly bot or HTTP virtual session)'); return; }
   if (!larkAppIdForUpload || !larkAppSecretForUpload) { logScreenshotSkip('lark credentials missing'); return; }
 
   let png: Buffer;
@@ -10043,8 +10043,13 @@ process.on('message', async (raw: unknown) => {
       // Core-only (apiOnly) bots have no Feishu transport — the worker uploads
       // screenshots via its OWN client (utils/lark-upload), bypassing the daemon's
       // bot-level assertLarkTransport gate, so the capability must ride the init
-      // message into this process and hard-disable upload here.
-      apiOnlyForUpload = msg.apiOnly === true;
+      // message into this process and hard-disable upload here. Also disable for
+      // a NORMAL bot whose turn runs in an HTTP virtual session (chatId is
+      // http_async_*/http_wait_*): it has real creds so apiOnly is false, but the
+      // synthetic chat has no card to attach a screenshot to.
+      apiOnlyForUpload = msg.apiOnly === true
+        || msg.chatId?.startsWith('http_async_') === true
+        || msg.chatId?.startsWith('http_wait_') === true;
       // brand 决定截图上传打哪个域（feishu / larksuite）。缺省 feishu。
       larkBrandForUpload = msg.brand === 'lark' ? 'lark' : 'feishu';
       // Resolve render dimensions BEFORE startScreenUpdates() — the
