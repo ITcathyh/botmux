@@ -283,20 +283,19 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     expect(fedRoster).toContain('larkTransportEnabled: b.larkTransportEnabled,');
   });
 
-  it('no-transport session FORCES read isolation at EVERY worker-spawn entry', () => {
-    // The authoritative fail-closed boundary (pid-marker gate is only friendly
-    // early-reject): a no-transport worker gets read isolation so it cannot read
-    // full bots.json / sibling creds even by deleting the marker or bypassing CLI.
+  it('no-transport session FORCES read isolation on fresh/resume/restart; adopt is refused at restore', () => {
+    // fresh-spawn forkWorker (shared by fresh/resume/restart) forces read
+    // isolation for a no-transport session — the fail-closed credential boundary.
     const wp = readFileSync(resolve('src/core/worker-pool.ts'), 'utf8');
-    // BOTH fork entries (fresh-spawn forkWorker + forkAdoptWorker) gate it, so a
-    // second spawn path can't bypass the credential boundary.
-    const gatedReadIso = wp.match(
-      /readIsolation: botCfg\.readIsolation === true\s*\|\| !larkTransportEnabled\(\{ chatId: ds\.chatId, apiOnly: botCfg\.apiOnly \}\)/g,
-    ) ?? [];
-    expect(gatedReadIso.length, 'both fork sites gate readIsolation').toBeGreaterThanOrEqual(2);
-    // And no ungated `readIsolation: botCfg.readIsolation === true,` remains (the
-    // trailing comma form = the OLD un-gated assignment).
-    expect(wp).not.toContain('readIsolation: botCfg.readIsolation === true,');
+    expect(wp).toContain('readIsolation: botCfg.readIsolation === true\n      || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly })');
+    // Adopt does NOT gate via the init field (the observe branch returns before
+    // fs-policy is built — an init readIsolation would be a dead no-op). Instead
+    // adoptSandboxBlocked refuses a no-transport adopt at daemon restore and
+    // converts it to cold-start, covering "normal adopt session later flipped to
+    // apiOnly then restarted".
+    const gate = region(wp, 'export function adoptSandboxBlocked(', 'export function forkAdoptWorker(');
+    expect(gate).toContain('botCfg.apiOnly === true');
+    expect(gate).toContain("session.chatId.startsWith('http_async_') || session.chatId.startsWith('http_wait_')");
   });
 });
 
