@@ -780,12 +780,54 @@ describe('no-Lark-transport credential profile (larkTransportEnabled=false)', ()
     );
   });
 
-  it('a loaded bots-config INSIDE a frozen root needs no extra rule (parent mask covers it)', () => {
-    // Default layout: getLoadedConfigPath() = ~/.botmux/bots.json, already under
-    // the frozen default root — no throw, covered by the parent deny.
+  it('a loaded bots-config in a DENIED subtree of a frozen root builds (config + dir + sidecar all deny)', () => {
+    // Default layout: getLoadedConfigPath() = ~/.botmux/bots.json, denied wholesale
+    // by the authority-root deny (NOT re-opened by any carve-out) — no throw, and
+    // the post-merge self-check confirms config + dirname + sidecars are all deny.
     const p = noTransport({ loadedBotsConfigPath: '/Users/u/.botmux/bots.json' });
     expect(accessForPath(p.rules, '/Users/u/.botmux/bots.json').access).toBe('deny');
     expect(accessForPath(p.rules, '/Users/u/.botmux/bots.json.bak').access).toBe('deny');
+    // A config in a plain denied subdir (not a carve-out) also builds, dir denied.
+    const q = noTransport({ loadedBotsConfigPath: '/Users/u/.botmux/conf/bots.json' });
+    expect(accessForPath(q.rules, '/Users/u/.botmux/conf/bots.json').access).toBe('deny');
+    expect(accessForPath(q.rules, '/Users/u/.botmux/conf').access).toBe('deny');
+  });
+
+  it('a loaded bots-config that lands in a trusted CARVE-OUT FAILS CLOSED (inside-root is not sufficient)', () => {
+    // codex P1: white-in-black + deepest-prefix-wins means a deeper trusted
+    // carve-out (own BOT_HOME RW / bin RO / attachments RW / outbox / install-root)
+    // re-opens the config even though it's INSIDE a frozen authority root — which
+    // would re-expose every bot's secret + sidecars. The post-merge accessForPath
+    // self-check (config AND its dirname must be deny) catches every such case,
+    // including future carve-outs, without enumerating filenames.
+    const carve = (o: Partial<FsPolicyContext>) => noTransport({
+      botmuxInstallRoot: '/Users/u/.botmux/install',
+      outbox: '/Users/u/.botmux/data/sandboxes/s/outbox',
+      ...o,
+    });
+    for (const bad of [
+      '/Users/u/.botmux/bots/cli_self/bots.json',            // own BOT_HOME (readWrite)
+      '/Users/u/.botmux/bin/bots.json',                      // CLI bin (readOnly)
+      '/Users/u/.botmux/data/attachments/cli_self/bots.json',// own attachments (readWrite)
+      '/Users/u/.botmux/data/sandboxes/s/outbox/bots.json',  // relay outbox (readWrite)
+      '/Users/u/.botmux/install/bots.json',                  // install root (readOnly)
+    ]) {
+      expect(() => carve({ loadedBotsConfigPath: bad }), bad).toThrowError(FsPolicyConfigError);
+    }
+    // kind is machine-branchable
+    try {
+      carve({ loadedBotsConfigPath: '/Users/u/.botmux/bots/cli_self/bots.json' });
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(e).toBeInstanceOf(FsPolicyConfigError);
+      expect((e as FsPolicyConfigError).kind).toBe('bots-config-in-carveout');
+    }
+    // a transport-ENABLED bot with the same carve-out placement does NOT throw
+    // (the self-check is no-transport-only).
+    expect(() => buildFsPolicy(ctx({
+      larkTransportEnabled: true, botmuxInstallRoot: '/Users/u/.botmux/install',
+      loadedBotsConfigPath: '/Users/u/.botmux/bots/cli_self/bots.json',
+    }))).not.toThrow();
   });
 
   it('an EXTERNAL loaded bots-config (outside every authority root) FAILS CLOSED — never silent parent-dir mask', () => {

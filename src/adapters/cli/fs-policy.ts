@@ -112,10 +112,14 @@ export interface FsPolicyContext {
    *  chat). Generic read-isolation is NOT a credential boundary: it still grants
    *  the bot's own lark-cli identity readWrite AND, when workingDir defaults to
    *  `~`, re-opens $HOME (incl. bots.json + sibling BOT_HOMEs) readWrite. When
-   *  false, buildFsPolicy SUPPRESSES every Feishu-credential grant (adapter
-   *  authPaths, own lark-cli config dir, macOS lark-cli keystore carve-out) and
-   *  emits MANDATORY denies for the Feishu-cred paths so a wide workingDir grant
-   *  can't re-expose them (mandatory deny wins). Absent/true = normal behavior. */
+   *  false, buildFsPolicy freezes the botmux authority ROOTS (configured + default
+   *  `~/.botmux`, `~/.lark-cli(-bots)`, macOS lark-cli store) as WHOLE-DIR denies,
+   *  withholds this bot's own lark-cli identity / keystore carve-out, and
+   *  FAIL-CLOSES any caller allow path (workingDir / userPaths / readonlyRoots)
+   *  that would fall inside an authority root — dropped BEFORE merge so a deeper
+   *  grant can't re-open the deny (deepest-prefix-wins). The model CLI's own
+   *  authPaths (`~/.codex` etc.) are NOT Feishu creds and stay granted readWrite.
+   *  Absent/true = normal behavior. */
   larkTransportEnabled?: boolean;
   /** No-transport ONLY: the SECOND botmux authority root to freeze, when the
    *  daemon runs with a custom SESSION_DATA_DIR so `configuredBotmuxHome`
@@ -390,7 +394,7 @@ function linuxBaseline(h: string): FsRule[] {
  * fail-closed, never fail-open (codex P1). Carries `.kind` so callers/tests can
  * branch without string-matching the message. */
 export class FsPolicyConfigError extends Error {
-  readonly kind: 'external-bots-config' | 'working-dir-is-authority';
+  readonly kind: 'external-bots-config' | 'working-dir-is-authority' | 'bots-config-in-carveout';
   constructor(kind: FsPolicyConfigError['kind'], message: string) {
     super(message);
     this.name = 'FsPolicyConfigError';
@@ -410,8 +414,12 @@ export class FsPolicyConfigError extends Error {
  *    open (codex P1).
  *  - freezes the lark-cli identity/key stores: bare `~/.lark-cli` (repo marks it
  *    sensitive), `~/.lark-cli-bots`, macOS lark-cli store.
- *  - the loaded bots-config path: inside a frozen root → already covered (no extra
- *    root). OUTSIDE every root → THROW (fail-closed); never mask its parent dir.
+ *  - the loaded bots-config path: OUTSIDE every root → THROW here (fail-closed);
+ *    never mask its parent dir. Being INSIDE a root is necessary but NOT
+ *    sufficient — a deeper trusted carve-out (own BOT_HOME / bin / attachments /
+ *    outbox) can re-open it via deepest-prefix-wins, so buildFsPolicy ALSO runs a
+ *    post-merge `accessForPath` self-check that the config + its dirname resolve
+ *    to `deny`, else throws `bots-config-in-carveout` (codex P1).
  */
 export function computeNoTransportAuthorityRoots(input: {
   homeDir: string;
@@ -632,8 +640,41 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     // reaching sibling daemons, and the secret is the escalation vector.
   }
 
+  const rules = mergeFsRules(candidates);
+
+  // Post-merge self-check for the loaded bots-config (codex P1). Being inside a
+  // frozen authority root is necessary but NOT sufficient: this is a white-in-black
+  // policy where the DEEPEST rule wins, and the no-transport carve-outs re-open
+  // subtrees of the authority roots (own BOT_HOME readWrite, `bin` readOnly,
+  // `attachments`/outbox readWrite, session metadata, install-root). BOTS_CONFIG
+  // may be ANY file, so a config that happens to sit under one of those carve-outs
+  // — or a future one — would be readable again, re-exposing every bot's secret
+  // (and its .bak/.tmp sidecars). Assert the resolved policy actually DENIES both
+  // the config file AND its containing dir (covers sidecars created next to it);
+  // any readOnly/readWrite means a carve-out re-opened it → fail the layout closed.
+  // This auto-covers carve-outs added later without re-enumerating filenames.
+  if (!larkTransport && ctx.loadedBotsConfigPath) {
+    const cfg = normalizeFsPath(ctx.loadedBotsConfigPath);
+    if (cfg) {
+      const dir = cfg.slice(0, cfg.lastIndexOf('/')) || '/';
+      for (const probe of [cfg, dir]) {
+        const eff = accessForPath(rules, probe).access;
+        if (eff !== 'deny') {
+          throw new FsPolicyConfigError(
+            'bots-config-in-carveout',
+            `no-transport session refuses bots-config at ${cfg}: it (or its directory ${dir}) `
+            + `resolves to '${eff}', not 'deny' — a trusted carve-out (own BOT_HOME / bin / `
+            + `attachments / outbox / install-root) re-opens it under deepest-prefix-wins, which `
+            + `would re-expose every bot's secret. Move the config out of the botmux data/BOT_HOME `
+            + `carve-out surface (a plain ~/.botmux/bots.json is denied wholesale).`,
+          );
+        }
+      }
+    }
+  }
+
   return {
-    rules: mergeFsRules(candidates),
+    rules,
     net: ctx.net !== false,
     writeRegexes: [...(ctx.writeRegexes ?? [])],
     denyRegexes: [...(ctx.mandatoryDenyRegexes ?? [])],
