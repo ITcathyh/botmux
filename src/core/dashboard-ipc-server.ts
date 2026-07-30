@@ -386,6 +386,29 @@ function routeHasPublicAccess(method: string, pathname: string): boolean {
   return method === 'GET' && (pathname === '/__health' || pathname === '/healthz');
 }
 
+/**
+ * Core-only ONLY: the exact riff-facing routes that bypass the trusted-host HMAC
+ * when the daemon runs headless in riff's sandbox. Everything else STILL requires
+ * the HMAC (codex P1: authRequired:false opened all 96 IPC routes — a co-resident
+ * model turn could read/perturb sessions, scheduler, mutations). This is a tight
+ * allowlist of drive-my-own-turn + poll-my-own-output surfaces:
+ *   POST /api/trigger                              (start a turn)
+ *   GET  /api/sessions/:id/trigger-result          (poll final)
+ *   GET  /api/sessions/:id/insight                 (poll conversation/progress)
+ * `/api/asks/answer` is deliberately EXCLUDED — it is askId-keyed with no
+ * session/turn binding, so exposing it would let any co-resident turn hijack
+ * another pending ask (codex). riff's async main-link needs no awaiting_input;
+ * a future clarify path must be a sessionId+interaction-bound endpoint.
+ */
+function routeIsCoreOnlyPublic(method: string, pathname: string): boolean {
+  if (method === 'POST' && pathname === '/api/trigger') return true;
+  if (method === 'GET') {
+    return /^\/api\/sessions\/[^/]+\/trigger-result$/.test(pathname)
+      || /^\/api\/sessions\/[^/]+\/insight$/.test(pathname);
+  }
+  return false;
+}
+
 function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean {
   // The receiver action endpoint performs its own rotating worker-capability
   // verification and then enters the durable action ledger. Keeping this one
@@ -447,10 +470,23 @@ function trustedHostAuthorized(
 ipcRoute('GET', '/__health', (_req, res) => {
   jsonRes(res, 200, { ok: true });
 });
+// Core-only readiness barrier (codex P1-3): the daemon binds its HTTP port BEFORE
+// restoreActiveSessions / v3 cold-attach / scheduler finish, so a launcher that
+// triggers the instant the port answers would race durable restore (transient
+// not_found / re-fire). /healthz returns 503 until the daemon marks itself ready
+// (setCoreOnlyReady, called AFTER restore in daemon.ts). Non-core-only daemons
+// never set this gate, so /healthz stays an unconditional 200 there.
+let coreOnlyReadinessGate = false; // true only in core-only, until ready
+let coreOnlyReady = false;
+export function armCoreOnlyReadinessGate(): void { coreOnlyReadinessGate = true; }
+export function setCoreOnlyReady(): void { coreOnlyReady = true; }
 // Public alias for core-only: riff's sandbox launcher polls GET /healthz to know
-// the service is up (friendlier name than the internal /__health). Same 200
-// {ok:true}; both are in the public-route allowlist so no auth is needed.
+// the service is FULLY up (bound AND restore-complete). 200 {ok:true} once ready;
+// 503 {ok:false,status:'starting'} while the readiness gate is armed but not ready.
 ipcRoute('GET', '/healthz', (_req, res) => {
+  if (coreOnlyReadinessGate && !coreOnlyReady) {
+    return jsonRes(res, 503, { ok: false, status: 'starting' });
+  }
   jsonRes(res, 200, { ok: true });
 });
 
@@ -3632,13 +3668,18 @@ export function startIpcServer(opts: {
    * port — riff's task-runner is told a fixed port and must not have the service
    * silently drift to another one. */
   maxProbe?: number;
+  /** Core-only: additionally treat the tight riff-facing route allowlist
+   * (routeIsCoreOnlyPublic) as public (no HMAC). Every OTHER route still requires
+   * the trusted-host HMAC — this does NOT disable auth wholesale (codex P1). */
+  coreOnlyPublicRoutes?: boolean;
 }): Promise<IpcServerHandle> {
   let boundPort = opts.port;
   const server: Server = createServer(async (req, res) => {
     try {
       const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
       const method = req.method ?? 'GET';
-      const publicRoute = routeHasPublicAccess(method, url.pathname);
+      const publicRoute = routeHasPublicAccess(method, url.pathname)
+        || (opts.coreOnlyPublicRoutes === true && routeIsCoreOnlyPublic(method, url.pathname));
       const capabilityRoute = routeHasNarrowUntrustedAuth(method, url.pathname);
       if (opts.authRequired && !publicRoute) {
         const secret = ipcAuthSecret();

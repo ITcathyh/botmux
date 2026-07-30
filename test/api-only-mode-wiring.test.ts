@@ -426,3 +426,65 @@ describe('API-only bot mode — no-transport fs-policy authority provenance (wor
     expect(workerPoolSource).toContain("import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath }");
   });
 });
+
+describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
+  const daemonSource = readFileSync(resolve('src/daemon.ts'), 'utf8');
+  const ipcSource = readFileSync(resolve('src/core/dashboard-ipc-server.ts'), 'utf8');
+  const registrySource = readFileSync(resolve('src/bot-registry.ts'), 'utf8');
+  const entrySource = readFileSync(resolve('src/index-core-only.ts'), 'utf8');
+
+  it('P1-1: keeps HMAC on (authRequired:true) and only ALLOWLISTS the tight riff routes', () => {
+    // The bug: authRequired:false opened all 96 IPC routes. The fix keeps auth on
+    // and adds a narrow core-only public allowlist — NOT a wholesale auth-off.
+    const block = region(daemonSource, 'const coreOnly = process.env.BOTMUX_CORE_ONLY', 'desc.ipcPort = ipcHandle.port;');
+    expect(block).toContain('authRequired: true,');
+    expect(block).toContain('coreOnlyPublicRoutes: coreOnly,');
+    expect(block).not.toContain('authRequired: coreOnly');   // old auth-off gone
+    expect(block).not.toContain('BOTMUX_API_REQUIRE_AUTH');  // old opt-back-in gone
+    // The allowlist is exactly trigger + trigger-result + insight (NOT /answer,
+    // which is askId-keyed with no session binding — codex).
+    const allow = region(ipcSource, 'function routeIsCoreOnlyPublic(', '\n}\n');
+    expect(allow).toContain("pathname === '/api/trigger'");
+    expect(allow).toContain('trigger-result$');
+    expect(allow).toContain('insight$');
+    expect(allow).not.toContain('answer');
+    // And the gate consults it only under the core-only flag.
+    expect(ipcSource).toContain('opts.coreOnlyPublicRoutes === true && routeIsCoreOnlyPublic(method, url.pathname)');
+  });
+
+  it('P1-2: core-only skips fleet sandbox migration + synthesis ignores ambient BOTS_CONFIG', () => {
+    // Migration reads/backs-up/rewrites the on-disk fleet bots.json — must not run
+    // for a headless core-only service.
+    expect(daemonSource).toContain("if (process.env.BOTMUX_CORE_ONLY !== '1') {\n    await migrateSandboxConfigAtStartup();");
+    // Synthesis is authoritative: no early-return on BOTS_CONFIG (the old
+    // `if (process.env.BOTS_CONFIG) return null;` deference is gone).
+    const synth = region(registrySource, 'function maybeSynthesizeCoreOnlyConfig(', 'return configs;');
+    expect(synth).toContain("if (process.env.BOTMUX_CORE_ONLY !== '1') return null;");
+    expect(synth).not.toContain('if (process.env.BOTS_CONFIG) return null;');
+  });
+
+  it('P1-3: readiness barrier — /healthz 503 until restore done, ready line AFTER restore', () => {
+    // The gate: healthz returns 503 while armed-but-not-ready.
+    const health = region(ipcSource, "ipcRoute('GET', '/healthz'", '\n});');
+    expect(health).toContain('coreOnlyReadinessGate && !coreOnlyReady');
+    expect(health).toContain('503');
+    // Gate armed right after bind; released + ready line only after restore, at the
+    // very end of startDaemon (after 'Daemon is running').
+    const armAt = daemonSource.indexOf('armCoreOnlyReadinessGate()');
+    const restoreAt = daemonSource.indexOf('await restoreActiveSessions(activeSessions)');
+    const readyAt = daemonSource.indexOf('setCoreOnlyReady()');
+    const readyLineAt = daemonSource.indexOf('[core-only] listening on 127.0.0.1:');
+    expect(armAt).toBeGreaterThan(0);
+    expect(restoreAt).toBeGreaterThan(armAt);          // arm before restore
+    expect(readyAt).toBeGreaterThan(restoreAt);        // release AFTER restore
+    expect(readyLineAt).toBeGreaterThan(readyAt);      // ready line after release
+  });
+
+  it('P1-4: core-only forces terminal proxy + worker HTTP to loopback', () => {
+    expect(daemonSource).toContain("const terminalProxyHost = coreOnly ? '127.0.0.1' : config.web.host;");
+    expect(daemonSource).toContain('host: terminalProxyHost,');
+    // Entrypoint pins the worker HTTP host to loopback (unless explicitly overridden).
+    expect(entrySource).toContain("process.env.BOTMUX_WORKER_HTTP_HOST = '127.0.0.1';");
+  });
+});
+

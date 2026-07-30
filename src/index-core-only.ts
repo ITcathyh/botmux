@@ -33,8 +33,16 @@ scrubClaudeSessionMarkerEnv(process.env);
 
 // Mark this process core-only BEFORE any config/daemon module loads: bot-registry
 // synthesizes the apiOnly bot on this flag, and daemon.ts reads it for the
-// fixed-port / no-probe / no-auth IPC decisions.
+// fixed-port / no-probe / core-only-public-route / loopback IPC decisions.
 process.env.BOTMUX_CORE_ONLY = '1';
+// Confine the worker HTTP (xterm/web terminal) to loopback too (codex P1-4): the
+// daemon's terminal proxy is already forced to 127.0.0.1 for core-only, but the
+// per-worker web server reads BOTMUX_WORKER_HTTP_HOST (default 0.0.0.0) from the
+// env it inherits from this process. Pin it to loopback unless the operator has
+// explicitly set a worker-host knob (respect an intentional override).
+if (!process.env.BOTMUX_WORKER_HTTP_HOST && !process.env.BOTMUX_WORKER_HOST) {
+  process.env.BOTMUX_WORKER_HTTP_HOST = '127.0.0.1';
+}
 
 function fail(msg: string): never {
   console.error(`[core-only] ${msg}`);

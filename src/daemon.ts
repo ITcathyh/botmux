@@ -129,7 +129,7 @@ import {
   getDaemonBootId,
   type WorkerSessionReplyOptions,
 } from './core/worker-pool.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, armCoreOnlyReadinessGate, setCoreOnlyReady } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import {
   cancelSessionReadyAck,
@@ -17376,7 +17376,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // sandboxReadonlyPaths / readDenyExtraPaths → sandbox + sandboxPaths) BEFORE
   // loading, so the parsed configs below already carry the new model. Writes
   // new fields, keeps old ones (downgrade = zero-op), backs up once. Idempotent.
-  await migrateSandboxConfigAtStartup();
+  // SKIP in core-only (codex P1-2): this reads + backs-up + rewrites the on-disk
+  // fleet bots.json. A headless core-only service must never touch an ambient
+  // host fleet config — its identity is a synthesized in-memory apiOnly bot.
+  if (process.env.BOTMUX_CORE_ONLY !== '1') {
+    await migrateSandboxConfigAtStartup();
+  }
 
   // Load the assigned bot (one daemon per bot)
   let botConfigs = loadBotConfigs();
@@ -17747,17 +17752,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     join(homedir(), '.botmux', '.dashboard-secret'),
   );
   const coreOnly = process.env.BOTMUX_CORE_ONLY === '1';
-  // Core-only default: no trusted-host HMAC. It's a single-tenant, loopback-only
-  // service in riff's sandbox — there are NO sibling daemons/bots to protect (the
-  // `.dashboard-secret` boundary exists for multi-bot co-location, absent here),
-  // and the in-sandbox task-runner IS the trusted driver dialing plain 127.0.0.1.
-  // The blast radius of the co-resident CLI reaching the port is one tenant's own
-  // turns (no cross-bot reach). Opt back in with BOTMUX_API_REQUIRE_AUTH=1.
-  const coreOnlyAuth = coreOnly && process.env.BOTMUX_API_REQUIRE_AUTH === '1';
+  // Core-only keeps the trusted-host HMAC ON (codex P1: authRequired:false opened
+  // ALL 96 IPC routes — a co-resident model turn could read/perturb sessions,
+  // scheduler, mutations). Instead we allowlist ONLY the tight riff-facing routes
+  // (routeIsCoreOnlyPublic: /api/trigger + /api/sessions/:id/{trigger-result,insight}
+  // + the always-public /healthz) as no-HMAC; every other route still requires it.
   const ipcHandle = await startIpcServer({
     port: ipcPort,
     host: '127.0.0.1',
-    authRequired: coreOnly ? coreOnlyAuth : true,
+    authRequired: true,
+    coreOnlyPublicRoutes: coreOnly,
     // Fleet: probe upward so a port race can't crash boot. Core-only: BIND-OR-FAIL
     // on the exact BOTMUX_API_PORT — riff was handed that port and the service must
     // never silently drift to another (client would dial a dead port).
@@ -17770,23 +17774,26 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   desc.ipcPort = ipcHandle.port;
   process.env.BOTMUX_DAEMON_IPC_PORT = String(ipcHandle.port);
   logger.info(`[dashboard-ipc] listening on 127.0.0.1:${ipcHandle.port} (bot ${idx})`);
-  if (coreOnly) {
-    // Machine-parseable ready line for riff's sandbox launcher: spawn → await this
-    // line (or poll GET /healthz) → point the task-runner client at the port.
-    // Exact text is a locked contract (regex ^\[core-only\] listening on ).
-    // eslint-disable-next-line no-console
-    console.log(`[core-only] listening on 127.0.0.1:${ipcHandle.port} (bot ${cfg.larkAppId}, cli ${cfg.cliId})`);
-  }
+  // NOTE: the core-only ready line + /healthz→200 flip are emitted LATER, AFTER
+  // restoreActiveSessions completes (see setCoreOnlyReady below) — a readiness
+  // barrier so riff never triggers into a racing durable restore (codex P1-3).
+  if (coreOnly) armCoreOnlyReadinessGate(); // /healthz → 503 until restore done
 
   // Single reverse-proxy port that fronts every session's web terminal under
   // /s/{sessionId}, so dev-machine users forward one port (proxyBasePort+idx)
   // instead of one per topic. Bound on the public host so `ssh -L` can reach it.
   const proxyPort = config.web.proxyBasePort + idx;
+  // Core-only (codex P1-4): the web terminal proxy + worker web ports default to
+  // config.web.host (0.0.0.0). In riff's sandbox the whole surface must stay
+  // loopback — an in-sandbox headless service has no reason to expose terminals
+  // on all interfaces. Force 127.0.0.1 so nothing but the local task-runner can
+  // reach it (the IPC server is already 127.0.0.1-bound above).
+  const terminalProxyHost = coreOnly ? '127.0.0.1' : config.web.host;
   let terminalProxy: TerminalProxyHandle | null = null;
   try {
     terminalProxy = await startTerminalProxy({
       port: proxyPort,
-      host: config.web.host,
+      host: terminalProxyHost,
       resolvePort: (sessionId) => {
         for (const ds of activeSessions.values()) {
           if (ds.session.sessionId === sessionId && ds.workerPort) return ds.workerPort;
@@ -17806,7 +17813,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // falls back to the worker's own port so links stay reachable if the port
     // was taken (e.g. EADDRINUSE).
     setTerminalProxyPort(terminalProxy.port);
-    logger.info(`[terminal-proxy] listening on ${config.web.host}:${terminalProxy.port} (bot ${idx}) — session terminals at /s/{sessionId}`);
+    logger.info(`[terminal-proxy] listening on ${terminalProxyHost}:${terminalProxy.port} (bot ${idx}) — session terminals at /s/{sessionId}`);
   } catch (err) {
     logger.error(`[terminal-proxy] failed to bind port ${proxyPort} — falling back to direct worker ports for terminal links: ${(err as Error).message}`);
   }
@@ -18460,4 +18467,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   });
 
   logger.info('Daemon is running. Press Ctrl+C to stop.');
+  if (coreOnly) {
+    // Readiness barrier release (codex P1-3): restoreActiveSessions + v3 attach +
+    // scheduler + signal handlers are all wired now, so the HTTP surface is safe
+    // to drive. Flip /healthz → 200 THEN print the machine-parseable ready line.
+    // riff's launcher waits for either signal before pointing its client here, so
+    // a trigger can't race a durable restore (transient not_found / re-fire).
+    // Exact ready-line text is a locked contract (regex ^\[core-only\] listening on ).
+    setCoreOnlyReady();
+    // eslint-disable-next-line no-console
+    console.log(`[core-only] listening on 127.0.0.1:${ipcHandle.port} (bot ${cfg.larkAppId}, cli ${cfg.cliId})`);
+  }
 }

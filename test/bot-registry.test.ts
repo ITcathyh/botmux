@@ -855,15 +855,21 @@ describe('loadBotConfigs — core-only synthesis (BOTMUX_CORE_ONLY=1)', () => {
     expect(cfgs[0].larkAppSecret).toBe(''); // the REAL_SECRET is never read
   });
 
-  it('defers to an EXPLICIT BOTS_CONFIG override (deliberate operator file)', () => {
+  it('IGNORES an ambient BOTS_CONFIG too (codex P1-2: authoritative, no file override in core-only)', () => {
+    // A leaked/inherited BOTS_CONFIG must NOT boot a file-defined (possibly real
+    // Feishu) bot in core-only — identity is exactly the env-synthesized apiOnly one.
     fsMock.existsSync.mockReturnValue(true);
     fsMock.readFileSync.mockReturnValue(JSON.stringify([
-      { larkAppId: 'local_fromfile', apiOnly: true, cliId: 'codex-app' },
+      { larkAppId: 'cli_real_via_bots_config', larkAppSecret: 'SECRET', cliId: 'claude-code' },
     ]));
     process.env.BOTMUX_CORE_ONLY = '1';
-    process.env.BOTS_CONFIG = '/tmp/explicit-core.json';
+    process.env.BOTS_CONFIG = '/tmp/leaked-bots.json';
+    process.env.BOTMUX_API_ONLY_BOT = 'local_riff';
     const cfgs = mod.loadBotConfigs();
-    expect(cfgs[0].larkAppId).toBe('local_fromfile'); // from the explicit file
+    expect(cfgs).toHaveLength(1);
+    expect(cfgs[0].larkAppId).toBe('local_riff'); // synthetic, NOT the BOTS_CONFIG bot
+    expect(cfgs[0].apiOnly).toBe(true);
+    expect(cfgs[0].larkAppSecret).toBe('');
   });
 
   it('defaults the synthetic id to local_riff and cli to codex-app', () => {

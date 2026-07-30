@@ -1750,14 +1750,15 @@ export function loadBotConfigs(): BotConfig[] {
  * Core-only headless config: when BOTMUX_CORE_ONLY=1, synthesize ONE apiOnly bot
  * from env so the daemon boots with zero Feishu credentials and no on-disk config.
  *
- * Core-only is AUTHORITATIVE about identity: it ignores any ambient
- * ~/.botmux/bots.json entirely. Otherwise a core-only service started on a host
- * that happens to have a real fleet config would silently boot a REAL,
- * transport-enabled Feishu bot (WSClient, real credentials) instead of the
- * headless apiOnly one — the exact opposite of "no Feishu". The only way to feed
- * a real config file in this mode is an EXPLICIT BOTS_CONFIG env (a deliberate
- * operator override, still parsed + validated normally). Returns null when not in
- * core-only mode, or when BOTS_CONFIG is explicitly set (defer to that file).
+ * Core-only is AUTHORITATIVE about identity and IGNORES all ambient config inputs
+ * — both ~/.botmux/bots.json AND the BOTS_CONFIG env (codex P1-2). Otherwise a
+ * core-only service started on a host that happens to have a real fleet config —
+ * or with an inherited/leaked BOTS_CONFIG — would silently boot a REAL,
+ * transport-enabled Feishu bot (WSClient, real credentials, `--bot` ignored)
+ * instead of the headless apiOnly one, the exact opposite of "no Feishu". There
+ * is deliberately NO file-based override in this mode: the identity is exactly the
+ * one synthesized here (frozen: apiOnly, `local_<slug>`, no secret). Returns null
+ * only when not in core-only mode.
  *
  * The synthesized `loadedConfigPath` is pinned to the DEFAULT ~/.botmux/bots.json
  * path (even though the file is absent/ignored) so the no-transport fs-policy sees
@@ -1766,8 +1767,6 @@ export function loadBotConfigs(): BotConfig[] {
  */
 function maybeSynthesizeCoreOnlyConfig(): BotConfig[] | null {
   if (process.env.BOTMUX_CORE_ONLY !== '1') return null;
-  // Explicit BOTS_CONFIG is a deliberate override — respect the file path.
-  if (process.env.BOTS_CONFIG) return null;
 
   const larkAppId = process.env.BOTMUX_API_ONLY_BOT || 'local_riff';
   if (!/^local_[A-Za-z0-9._-]+$/.test(larkAppId)) {
