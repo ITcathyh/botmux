@@ -5642,6 +5642,9 @@ async function cmdHistory(rest: string[]): Promise<void> {
   const scopeArg = argValue(rest, '--scope') ?? 'session';
   const sessionIdArg = argValue(rest, '--session-id');
   const { sid, larkAppId: appId, session: s } = await resolveSessionAppId(sessionIdArg);
+  // Target-aware gate: a --session-id pointing at a virtual/apiOnly session must
+  // be refused even from a normal turn (env gate above can't see the argument).
+  assertSessionTransportOrExit({ chatId: s.chatId, larkAppId: appId }, 'history');
 
   const validScopes = new Set(['session', 'thread', 'chat', 'ambient']);
   if (!validScopes.has(scopeArg)) {
@@ -5790,7 +5793,9 @@ async function cmdQuoted(rest: string[]): Promise<void> {
   // bots.json — same as cmdHistory / cmdSend. Missing this was why a sandboxed
   // isolated bot's `botmux quoted` failed "Bot not registered".
   await registerSelfFromCredFile();
-  const { larkAppId: appId } = await resolveSessionAppId(sessionIdArg);
+  const { larkAppId: appId, session: quotedSession } = await resolveSessionAppId(sessionIdArg);
+  // Target-aware gate (see cmdHistory).
+  assertSessionTransportOrExit({ chatId: quotedSession.chatId, larkAppId: appId }, 'quoted');
 
   const { getMessageDetail } = await import('./im/lark/client.js');
   const { expandMergeForward } = await import('./im/lark/merge-forward.js');
@@ -6119,6 +6124,23 @@ function assertTurnTransportOrExit(op: string): void {
     `botmux ${op} is unavailable: ${why}.\n` +
     `Feishu read/write is not possible here — the turn communicates only over the HTTP\n` +
     `control API (input via trigger, output via trigger-result). Produce your normal answer.`,
+  );
+  process.exit(2);
+}
+
+/** Target-aware variant: gate on the RESOLVED session (its chatId + owning bot's
+ *  apiOnly), not just the calling process env. The env gate can't see a
+ *  `--session-id <other>` argument that targets a different (virtual) session, so
+ *  commands that accept --session-id must call this AFTER resolving the target to
+ *  close the cross-session bypass. Read-only + total (never throws besides exit). */
+function assertSessionTransportOrExit(session: { chatId?: string; larkAppId?: string }, op: string): void {
+  const chatId = session.chatId ?? '';
+  const virtual = chatId.startsWith('http_async_') || chatId.startsWith('http_wait_');
+  const apiOnly = !!session.larkAppId && currentBotIsApiOnly(session.larkAppId);
+  if (!virtual && !apiOnly) return;
+  console.error(
+    `botmux ${op} is unavailable for the target session: ${virtual ? 'it is an HTTP control-API session (no Feishu chat)' : 'its bot is core-only (apiOnly)'}.\n` +
+    `Feishu read/write is not possible for that session.`,
   );
   process.exit(2);
 }
@@ -8909,6 +8931,8 @@ async function cmdBots(sub: string, rest: string[]): Promise<void> {
   // 与 history/quoted 同一前奏：本地会话解析 + riff sandbox env 合成会话兜底
   //（远端沙箱无 sessions.json/bots.json 时 `botmux bots list` 照常可用）。
   const { sid, larkAppId: resolvedAppId, session: s } = await resolveSessionAppId(sessionIdArg);
+  // Target-aware gate (see cmdHistory).
+  assertSessionTransportOrExit({ chatId: s.chatId, larkAppId: resolvedAppId }, 'bots list');
 
   const appId = resolvedAppId;
   const dataDir = resolveDataDir();

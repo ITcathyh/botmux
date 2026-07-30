@@ -141,7 +141,7 @@ import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import { ChatRenameCooldown, ChatRenameSerialQueue, normalizeLarkChatName } from './chat-rename.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
-import { sessionAnchorId, type DaemonSession } from './types.js';
+import { sessionAnchorId, larkTransportEnabled, type DaemonSession } from './types.js';
 import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
 import { readSkillRegistry } from '../services/skill-registry-store.js';
 import {
@@ -576,6 +576,10 @@ ipcRoute('POST', '/api/sessions/:sessionId/close', async (req, res, params) => {
  *  Best-effort and fire-and-forget; never blocks the HTTP response. */
 function postRestartNotice(ds: DaemonSession, fresh: boolean): void {
   if (!ds.larkAppId) return;
+  // No-transport session (apiOnly bot or HTTP virtual chat) has no Feishu chat
+  // to post a restart notice into — skip (the raw sendMessage/replyMessage below
+  // bypass sessionReply's gate). Best-effort path; a silent skip is correct.
+  if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return;
   const loc = localeForBot(ds.larkAppId);
   const cliName = getCliDisplayName(ds.session.cliId ?? 'claude-code');
   const text = fresh
@@ -1089,6 +1093,12 @@ ipcRoute('GET', '/api/sessions/:sessionId/history', async (req, res, params) => 
   if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
   const appId = session.larkAppId || cachedLarkAppId;
   if (!appId) return jsonRes(res, 422, { ok: false, error: 'no_lark_app' });
+  // No-transport session (apiOnly bot or HTTP virtual chat) has no Feishu chat
+  // history — listChatMessages/listThreadMessages would dial Feishu with a
+  // synthetic chatId. Return empty history instead of making the network call.
+  if (!larkTransportEnabled({ chatId: session.chatId, apiOnly: getBot(appId).config.apiOnly })) {
+    return jsonRes(res, 200, { ok: true, messages: [], hint: 'no_feishu_transport' });
+  }
   const url = new URL(req.url ?? '/', 'http://localhost');
   const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') ?? '80', 10) || 80, 1), 200);
   try {

@@ -1980,12 +1980,20 @@ async function createTeamGroup(args: { name: string; larkAppIds: string[]; userO
   // Only auto-invite the web user when their paired bot is the creator (open_id
   // is scoped to that app); otherwise create the group but don't forward a
   // wrong-scope open_id — UI will flag autoInviteUnavailable.
+  // A group creator must be able to call the Feishu chat.create API. A core-only
+  // (apiOnly) bot cannot (getBotClient throws), so it is neither creator-eligible
+  // nor a valid member here — exclude it from both the online check and the pick.
+  const canCreateFeishuGroup = (id: string): boolean => {
+    if (!registry.getByAppId(id)) return false;
+    try { return loadBotConfigs().find(b => b.larkAppId === id)?.apiOnly !== true; }
+    catch { return true; }
+  };
   const plan = planGroupCreator(
     selectedIds,
     args.preferredCreator,
-    (id) => !!registry.getByAppId(id),
+    canCreateFeishuGroup,
     (ids) => {
-      const p = pickCreatorForGroup(ids, (id) => {
+      const p = pickCreatorForGroup(ids.filter(canCreateFeishuGroup), (id) => {
         const d = registry.getByAppId(id);
         return d ? { larkAppId: d.larkAppId, resolvedAllowedUsers: d.resolvedAllowedUsers ?? [] } : undefined;
       });

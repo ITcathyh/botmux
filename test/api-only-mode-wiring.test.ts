@@ -186,6 +186,29 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     for (const op of ['send', 'history', 'quoted', 'dispatch', 'bots list']) {
       expect(cliSource, op).toContain(`assertTurnTransportOrExit('${op}')`);
     }
+    // Target-aware gate: --session-id-accepting reads also gate on the RESOLVED
+    // session (closes the cross-session bypass — env gate can't see the arg).
+    for (const op of ['history', 'quoted', 'bots list']) {
+      expect(cliSource, `session-aware ${op}`).toContain(`assertSessionTransportOrExit(`);
+    }
+    const sessGate = region(cliSource, 'function assertSessionTransportOrExit(', 'process.exit(2);\n}');
+    expect(sessGate).toContain("chatId.startsWith('http_async_') || chatId.startsWith('http_wait_')");
+    expect(sessGate).toContain('currentBotIsApiOnly(session.larkAppId)');
+  });
+
+  it('daemon dashboard IPC session-history + restart-notice gate no-transport sessions', () => {
+    const ipcSource = readFileSync(resolve('src/core/dashboard-ipc-server.ts'), 'utf8');
+    const hist = region(ipcSource, "ipcRoute('GET', '/api/sessions/:sessionId/history'", 'listChatMessages(appId');
+    expect(hist).toContain('larkTransportEnabled({ chatId: session.chatId, apiOnly: getBot(appId).config.apiOnly })');
+    const notice = region(ipcSource, 'function postRestartNotice(', 'localeForBot(ds.larkAppId)');
+    expect(notice).toContain('larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })');
+  });
+
+  it('createTeamGroup excludes apiOnly bots from creator eligibility', () => {
+    const dashSource = readFileSync(resolve('src/dashboard.ts'), 'utf8');
+    const block = region(dashSource, 'const canCreateFeishuGroup =', 'if (!plan.creatorLarkAppId)');
+    expect(block).toContain('.apiOnly !== true');
+    expect(block).toContain('ids.filter(canCreateFeishuGroup)');
   });
 });
 
