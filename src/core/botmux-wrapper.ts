@@ -33,16 +33,6 @@ export function resolveBotmuxWrapperBinDir(env: NodeJS.ProcessEnv = process.env)
   return join(env.HOME ?? env.USERPROFILE ?? homedir(), '.botmux', 'bin');
 }
 
-/** POSIX shell snippet that EXPORTS `PATH` with the wrapper bin dir prepended,
- *  resolving the dir at pane-script runtime the same way resolveBotmuxWrapperBinDir
- *  does: core-only ([ "$BOTMUX_CORE_ONLY" = 1 ] && SESSION_DATA_DIR set) →
- *  "$SESSION_DATA_DIR/bin", else "$HOME/.botmux/bin". The pane inherits the
- *  daemon's BOTMUX_CORE_ONLY / SESSION_DATA_DIR, so it matches the JS resolver.
- *  Baked into tmux pane scripts in place of a hardcoded `$HOME/.botmux/bin`. */
-export function botmuxWrapperPathExportSh(): string {
-  return 'export PATH="$(if [ "$BOTMUX_CORE_ONLY" = 1 ] && [ -n "$SESSION_DATA_DIR" ]; then printf %s "$SESSION_DATA_DIR/bin"; else printf %s "$HOME/.botmux/bin"; fi):$PATH"';
-}
-
 /**
  * Prepend the wrapper bin dir to a PATH string using the platform-correct
  * separator (':' on POSIX, ';' on Windows). Hardcoding ':' silently breaks the

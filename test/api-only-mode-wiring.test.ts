@@ -563,7 +563,6 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     const wrapperSrc = readFileSync(resolve('src/core/botmux-wrapper.ts'), 'utf8');
     expect(wrapperSrc).toContain('export function resolveBotmuxWrapperBinDir(');
     expect(wrapperSrc).toContain("env.BOTMUX_CORE_ONLY === '1' && env.SESSION_DATA_DIR");
-    expect(wrapperSrc).toContain('export function botmuxWrapperPathExportSh(');
     // worker.ts: all 4 PATH prepends go through the resolver; NO hardcoded bin join.
     const workerSrc = readFileSync(resolve('src/worker.ts'), 'utf8');
     const prependCount = (workerSrc.match(/prependBotmuxBin\(resolveBotmuxWrapperBinDir\(process\.env\)/g) || []).length;
@@ -573,10 +572,24 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     const wpSrc = readFileSync(resolve('src/core/worker-pool.ts'), 'utf8');
     expect(wpSrc).toContain('const botmuxBinDir = resolveBotmuxWrapperBinDir(process.env);');
     expect(wpSrc).not.toContain("join(homedir(), '.botmux', 'bin')");
-    // tmux backend: both pane-script PATH exports use the runtime resolver snippet,
-    // NOT a hardcoded $HOME/.botmux/bin.
+    // tmux backend: pane scripts bake a HOST-RESOLVED bin dir literal (codex P1:
+    // the pane can't resolve at runtime — BOTMUX_CORE_ONLY/SESSION_DATA_DIR are
+    // scrubbed before the script runs). shellWrapperScript(binDir) takes it as an
+    // arg; call sites resolve via resolveBotmuxWrapperBinDir(opts.env). NO hardcoded
+    // $HOME/.botmux/bin and NO runtime-env shell resolution.
     const tmuxSrc = readFileSync(resolve('src/adapters/backend/tmux-backend.ts'), 'utf8');
-    expect(tmuxSrc).toContain('botmuxWrapperPathExportSh()');
+    expect(tmuxSrc).toContain('export function shellWrapperScript(binDir: string)');
+    expect(tmuxSrc).toContain('resolveBotmuxWrapperBinDir(opts.env ?? process.env)');
     expect(tmuxSrc).not.toContain('export PATH="$HOME/.botmux/bin:$PATH"');
+    expect(tmuxSrc).not.toContain('botmuxWrapperPathExportSh'); // footgun removed
+    // The other two persistent backends resolve host-side too (not the old const).
+    for (const f of ['src/adapters/backend/tmux-pipe-backend.ts', 'src/adapters/backend/zellij-backend.ts']) {
+      const src = readFileSync(resolve(f), 'utf8');
+      expect(src, f).toContain('shellWrapperScript(resolveBotmuxWrapperBinDir(opts.env ?? process.env))');
+      // No longer IMPORTS or CALLS the old const (a lingering mention in a prose
+      // comment is fine — assert the import + call-site are gone, not the word).
+      expect(src, f).not.toMatch(/import \{[^}]*\bSHELL_WRAPPER_SCRIPT\b/);
+      expect(src, f).not.toMatch(/'-c', SHELL_WRAPPER_SCRIPT\b/);
+    }
   });
 });
