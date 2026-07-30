@@ -463,28 +463,52 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     expect(synth).not.toContain('if (process.env.BOTS_CONFIG) return null;');
   });
 
-  it('P1-3: readiness barrier — /healthz 503 until restore done, ready line AFTER restore', () => {
-    // The gate: healthz returns 503 while armed-but-not-ready.
+  it('P1-3: readiness barrier — gate armed BEFORE bind; control routes + /healthz 503 until ready', () => {
+    // /healthz reports 503 while armed-but-not-ready (via coreOnlyNotReady()).
     const health = region(ipcSource, "ipcRoute('GET', '/healthz'", '\n});');
-    expect(health).toContain('coreOnlyReadinessGate && !coreOnlyReady');
+    expect(health).toContain('coreOnlyNotReady()');
     expect(health).toContain('503');
-    // Gate armed right after bind; released + ready line only after restore, at the
-    // very end of startDaemon (after 'Daemon is running').
+    // The server-level gate ALSO 503s the public control routes when not ready —
+    // so a trigger during 'starting' can't slip past by skipping the healthz probe.
+    expect(ipcSource).toContain('if (coreOnlyPublic && coreOnlyNotReady())');
+    // Ordering: arm BEFORE the bind (no bound-but-unarmed window), release only
+    // after restore, ready line last.
     const armAt = daemonSource.indexOf('armCoreOnlyReadinessGate()');
+    const bindAt = daemonSource.indexOf('const ipcHandle = await startIpcServer(');
     const restoreAt = daemonSource.indexOf('await restoreActiveSessions(activeSessions)');
     const readyAt = daemonSource.indexOf('setCoreOnlyReady()');
     const readyLineAt = daemonSource.indexOf('[core-only] listening on 127.0.0.1:');
     expect(armAt).toBeGreaterThan(0);
-    expect(restoreAt).toBeGreaterThan(armAt);          // arm before restore
+    expect(bindAt).toBeGreaterThan(armAt);             // arm BEFORE bind (P1)
+    expect(restoreAt).toBeGreaterThan(bindAt);
     expect(readyAt).toBeGreaterThan(restoreAt);        // release AFTER restore
     expect(readyLineAt).toBeGreaterThan(readyAt);      // ready line after release
   });
 
-  it('P1-4: core-only forces terminal proxy + worker HTTP to loopback', () => {
+  it('P1-4: core-only forces terminal proxy + worker HTTP to loopback (unconditional)', () => {
     expect(daemonSource).toContain("const terminalProxyHost = coreOnly ? '127.0.0.1' : config.web.host;");
     expect(daemonSource).toContain('host: terminalProxyHost,');
-    // Entrypoint pins the worker HTTP host to loopback (unless explicitly overridden).
+    // Entrypoint pins the worker HTTP host to loopback UNCONDITIONALLY (a stray
+    // parent/dotenv 0.0.0.0 must not survive) and drops the legacy alias.
     expect(entrySource).toContain("process.env.BOTMUX_WORKER_HTTP_HOST = '127.0.0.1';");
+    expect(entrySource).toContain('delete process.env.BOTMUX_WORKER_HOST;');
+    // NOT gated on "only when unset" anymore.
+    expect(entrySource).not.toContain('if (!process.env.BOTMUX_WORKER_HTTP_HOST');
+  });
+
+  it('P1-2: entrypoint strips BOTS_CONFIG so no worker fork inherits it', () => {
+    // The parser ignores BOTS_CONFIG for identity, but the raw env is inherited by
+    // forked workers — an agent could cat $BOTS_CONFIG. Delete it after dotenv,
+    // before startDaemon (so workerForkEnv(process.env) sees it gone).
+    expect(entrySource).toContain('delete process.env.BOTS_CONFIG;');
+    const delAt = entrySource.indexOf('delete process.env.BOTS_CONFIG;');
+    const startAt = entrySource.indexOf('await startDaemon()');
+    expect(delAt).toBeGreaterThan(0);
+    expect(startAt).toBeGreaterThan(delAt); // stripped BEFORE the daemon (and any fork)
+    // cmdServe (the CLI spawn path) also scrubs it from the child env.
+    const cliSource = readFileSync(resolve('src/cli.ts'), 'utf8');
+    const serve = region(cliSource, 'async function cmdServe(', 'child.on(');
+    expect(serve).toContain('delete e.BOTS_CONFIG;');
+    expect(serve).toContain("BOTMUX_WORKER_HTTP_HOST: '127.0.0.1',");
   });
 });
-

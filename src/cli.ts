@@ -431,14 +431,25 @@ async function cmdServe(args: string[]): Promise<void> {
   const coreScript = join(PKG_ROOT, 'dist', 'index-core-only.js');
   const child = spawn(process.execPath, [coreScript], {
     stdio: 'inherit',
-    env: {
-      ...process.env,
-      BOTMUX_CORE_ONLY: '1',
-      BOTMUX_API_PORT: port,
-      ...(bot ? { BOTMUX_API_ONLY_BOT: bot } : {}),
-      ...(cli ? { BOTMUX_CORE_CLI: cli } : {}),
-      ...(workingDir ? { BOTMUX_CORE_WORKING_DIR: workingDir } : {}),
-    },
+    env: (() => {
+      const e: NodeJS.ProcessEnv = {
+        ...process.env,
+        BOTMUX_CORE_ONLY: '1',
+        BOTMUX_API_PORT: port,
+        // Freeze worker HTTP to loopback here too (defense-in-depth with the
+        // entrypoint) so a stray parent/dotenv 0.0.0.0 never reaches the child.
+        BOTMUX_WORKER_HTTP_HOST: '127.0.0.1',
+        ...(bot ? { BOTMUX_API_ONLY_BOT: bot } : {}),
+        ...(cli ? { BOTMUX_CORE_CLI: cli } : {}),
+        ...(workingDir ? { BOTMUX_CORE_WORKING_DIR: workingDir } : {}),
+      };
+      // Never hand an ambient BOTS_CONFIG / legacy worker-host alias to the
+      // core-only child — the entrypoint strips these too, but keep the spawn
+      // env clean from the start (codex P1: agent could read $BOTS_CONFIG).
+      delete e.BOTS_CONFIG;
+      delete e.BOTMUX_WORKER_HOST;
+      return e;
+    })(),
   });
   // Foreground lifetime tracks the child: forward termination signals and exit
   // with the child's code so a launcher/supervisor sees an honest status.

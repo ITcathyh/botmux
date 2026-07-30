@@ -480,11 +480,18 @@ let coreOnlyReadinessGate = false; // true only in core-only, until ready
 let coreOnlyReady = false;
 export function armCoreOnlyReadinessGate(): void { coreOnlyReadinessGate = true; }
 export function setCoreOnlyReady(): void { coreOnlyReady = true; }
+/** @internal test-only: reset the core-only readiness gate between cases. */
+export function __testOnly_resetCoreOnlyReadiness(): void { coreOnlyReadinessGate = false; coreOnlyReady = false; }
+/** True when the readiness gate is armed (core-only) but restore hasn't finished.
+ *  The server-level gate returns 503 for the public control routes in this state,
+ *  and /healthz reports 'starting' — a barrier so riff can't trigger into a racing
+ *  durable restore even if it skips the healthz probe (codex P1). */
+function coreOnlyNotReady(): boolean { return coreOnlyReadinessGate && !coreOnlyReady; }
 // Public alias for core-only: riff's sandbox launcher polls GET /healthz to know
 // the service is FULLY up (bound AND restore-complete). 200 {ok:true} once ready;
 // 503 {ok:false,status:'starting'} while the readiness gate is armed but not ready.
 ipcRoute('GET', '/healthz', (_req, res) => {
-  if (coreOnlyReadinessGate && !coreOnlyReady) {
+  if (coreOnlyNotReady()) {
     return jsonRes(res, 503, { ok: false, status: 'starting' });
   }
   jsonRes(res, 200, { ok: true });
@@ -3678,8 +3685,16 @@ export function startIpcServer(opts: {
     try {
       const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
       const method = req.method ?? 'GET';
-      const publicRoute = routeHasPublicAccess(method, url.pathname)
-        || (opts.coreOnlyPublicRoutes === true && routeIsCoreOnlyPublic(method, url.pathname));
+      const coreOnlyPublic = opts.coreOnlyPublicRoutes === true && routeIsCoreOnlyPublic(method, url.pathname);
+      const publicRoute = routeHasPublicAccess(method, url.pathname) || coreOnlyPublic;
+      // Readiness barrier (codex P1): the core-only public control routes
+      // (trigger / trigger-result / insight) must NOT enter their handlers until
+      // restore completes — a trigger during 'starting' races durable restore.
+      // Gate them at the server level so it doesn't depend on the caller probing
+      // /healthz first. /healthz itself reports 503 via its own handler.
+      if (coreOnlyPublic && coreOnlyNotReady()) {
+        return jsonRes(res, 503, { ok: false, status: 'starting', error: 'core-only service is still restoring; retry after /healthz returns 200' });
+      }
       const capabilityRoute = routeHasNarrowUntrustedAuth(method, url.pathname);
       if (opts.authRequired && !publicRoute) {
         const secret = ipcAuthSecret();

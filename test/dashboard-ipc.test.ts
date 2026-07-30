@@ -4,7 +4,7 @@ import { createHmac, randomBytes } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setExactChatGrantHandler, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
+import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setExactChatGrantHandler, armCoreOnlyReadinessGate, setCoreOnlyReady, __testOnly_resetCoreOnlyReadiness, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { cliAuthBind, signCliAuth } from '../src/dashboard/auth.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import * as groupsStore from '../src/services/groups-store.js';
@@ -2546,5 +2546,63 @@ describe('role profile IPC routes', () => {
       config.session.dataDir = prevConfigDataDir;
       rmSync(dataDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('core-only public routes + readiness barrier (behavioral)', () => {
+  afterEach(async () => {
+    __testOnly_resetCoreOnlyReadiness();
+    if (handle) { await handle.close(); handle = null; }
+  });
+
+  it('allowlists ONLY trigger/trigger-result/insight (no HMAC), everything else still 401', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    setLarkAppId('local_smoke');
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true, coreOnlyPublicRoutes: true });
+    setCoreOnlyReady(); // past the readiness barrier for this case
+    const base = `http://127.0.0.1:${handle.port}`;
+    // Allowlisted (no auth header) → must NOT be 401 (reaches handler: 400 bad-shape / 200 / 404).
+    const trig = await fetch(`${base}/api/trigger`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    expect(trig.status).not.toBe(401);
+    const tr = await fetch(`${base}/api/sessions/nope/trigger-result`);
+    expect(tr.status).not.toBe(401);
+    const ins = await fetch(`${base}/api/sessions/nope/insight?detail=conversation`);
+    expect(ins.status).not.toBe(401);
+    // NOT allowlisted (no auth header) → 401.
+    expect((await fetch(`${base}/api/sessions`)).status).toBe(401);
+    expect((await fetch(`${base}/api/asks/pending`)).status).toBe(401);
+    // /api/asks/answer is deliberately excluded from the allowlist → 401.
+    expect((await fetch(`${base}/api/asks/answer`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"askId":"x","selections":[]}' })).status).toBe(401);
+  });
+
+  it('readiness barrier: control routes AND /healthz return 503 until ready, without a healthz pre-check', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    setLarkAppId('local_smoke');
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true, coreOnlyPublicRoutes: true });
+    armCoreOnlyReadinessGate(); // armed, NOT ready
+    const base = `http://127.0.0.1:${handle.port}`;
+    // Directly hit a control route WITHOUT probing /healthz first — must be 503.
+    const early = await fetch(`${base}/api/trigger`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    expect(early.status).toBe(503);
+    expect((await early.json()).status).toBe('starting');
+    // /healthz also reports starting.
+    const h = await fetch(`${base}/healthz`);
+    expect(h.status).toBe(503);
+    expect((await h.json()).status).toBe('starting');
+    // After release: healthz 200 and the control route reaches its handler (not 503).
+    setCoreOnlyReady();
+    expect((await fetch(`${base}/healthz`)).status).toBe(200);
+    const afterReady = await fetch(`${base}/api/trigger`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    expect(afterReady.status).not.toBe(503);
+  });
+
+  it('does NOT gate a normal (non-core-only) server: /healthz is unconditional 200', async () => {
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' }); // no coreOnlyPublicRoutes
+    // Even if some other test armed the gate, a server without coreOnlyPublicRoutes
+    // never 503s its control routes (they require HMAC anyway); /healthz stays 200
+    // because the gate is only consulted for the core-only public surface.
+    const res = await fetch(`http://127.0.0.1:${handle.port}/healthz`);
+    expect(res.status).toBe(200);
+    expect((await res.json()).ok).toBe(true);
   });
 });

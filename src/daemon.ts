@@ -17757,6 +17757,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // scheduler, mutations). Instead we allowlist ONLY the tight riff-facing routes
   // (routeIsCoreOnlyPublic: /api/trigger + /api/sessions/:id/{trigger-result,insight}
   // + the always-public /healthz) as no-HMAC; every other route still requires it.
+  // Arm the readiness gate BEFORE the bind (codex P1): between listen() and a
+  // later arm there'd be a window where the port answers unarmed and a trigger
+  // could slip past the 503 barrier. Armed-first means the very first accepted
+  // connection already sees the not-ready gate.
+  if (coreOnly) armCoreOnlyReadinessGate();
   const ipcHandle = await startIpcServer({
     port: ipcPort,
     host: '127.0.0.1',
@@ -17774,10 +17779,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   desc.ipcPort = ipcHandle.port;
   process.env.BOTMUX_DAEMON_IPC_PORT = String(ipcHandle.port);
   logger.info(`[dashboard-ipc] listening on 127.0.0.1:${ipcHandle.port} (bot ${idx})`);
-  // NOTE: the core-only ready line + /healthz→200 flip are emitted LATER, AFTER
-  // restoreActiveSessions completes (see setCoreOnlyReady below) — a readiness
-  // barrier so riff never triggers into a racing durable restore (codex P1-3).
-  if (coreOnly) armCoreOnlyReadinessGate(); // /healthz → 503 until restore done
+  // NOTE: the core-only ready line + readiness release (setCoreOnlyReady) are
+  // emitted LATER, AFTER restoreActiveSessions completes — until then BOTH
+  // /healthz AND the public control routes (trigger/result/insight) return 503,
+  // so riff never triggers into a racing durable restore (codex P1).
 
   // Single reverse-proxy port that fronts every session's web terminal under
   // /s/{sessionId}, so dev-machine users forward one port (proxyBasePort+idx)

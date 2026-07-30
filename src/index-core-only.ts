@@ -3,9 +3,10 @@
 // serves the HTTP control API on 127.0.0.1:<BOTMUX_API_PORT> with NO Feishu
 // credentials, NO bots.json, and NO pm2/dashboard sibling. Designed for riff's
 // sandbox: the in-sandbox task-runner spawns this, waits for the ready line (or
-// GET /healthz), then drives codex via POST /api/trigger + poll
-// /api/sessions/:id/trigger-result | /insight — identical to the daemon IPC
-// contract, minus the trusted-host HMAC (single-tenant loopback; see daemon.ts).
+// GET /healthz → 200), then drives codex via POST /api/trigger + poll
+// /api/sessions/:id/trigger-result | /insight. Same daemon IPC contract; the
+// trusted-host HMAC stays ON, with ONLY those riff-facing routes (+ /healthz)
+// allowlisted as no-HMAC — every other IPC route still requires it (see daemon.ts).
 //
 // vs `botmux start` (the fleet path): that spawns pm2 + dashboard + a daemon per
 // bot and BLOCKS on a missing larkAppSecret. Core-only skips all of it — one
@@ -35,14 +36,21 @@ scrubClaudeSessionMarkerEnv(process.env);
 // synthesizes the apiOnly bot on this flag, and daemon.ts reads it for the
 // fixed-port / no-probe / core-only-public-route / loopback IPC decisions.
 process.env.BOTMUX_CORE_ONLY = '1';
-// Confine the worker HTTP (xterm/web terminal) to loopback too (codex P1-4): the
+// Strip BOTS_CONFIG entirely (codex P1): the config PARSER already ignores it for
+// identity, but the raw env is inherited by every forked worker — an agent could
+// `cat $BOTS_CONFIG` to read a real fleet.json (sibling secrets) if it points
+// inside the working dir. Delete it here, AFTER dotenv, so neither the daemon nor
+// any worker fork ever sees it. Its sole legitimate consumer (loadBotConfigs) is
+// deliberately bypassed by the synthetic apiOnly config in core-only.
+delete process.env.BOTS_CONFIG;
+// Confine the worker HTTP (xterm/web terminal) to loopback (codex P1-4/P1-3): the
 // daemon's terminal proxy is already forced to 127.0.0.1 for core-only, but the
 // per-worker web server reads BOTMUX_WORKER_HTTP_HOST (default 0.0.0.0) from the
-// env it inherits from this process. Pin it to loopback unless the operator has
-// explicitly set a worker-host knob (respect an intentional override).
-if (!process.env.BOTMUX_WORKER_HTTP_HOST && !process.env.BOTMUX_WORKER_HOST) {
-  process.env.BOTMUX_WORKER_HTTP_HOST = '127.0.0.1';
-}
+// env it inherits. Freeze it to loopback UNCONDITIONALLY — a parent/dotenv value
+// of 0.0.0.0 must NOT survive and re-expose the worker on all interfaces. (A
+// future intentional exposure would be a separate explicit danger switch.)
+process.env.BOTMUX_WORKER_HTTP_HOST = '127.0.0.1';
+delete process.env.BOTMUX_WORKER_HOST; // legacy alias — must not shadow the freeze
 
 function fail(msg: string): never {
   console.error(`[core-only] ${msg}`);
