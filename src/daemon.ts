@@ -17584,6 +17584,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
   };
   setDisplayNameRefresher(refreshBotNameState);
+  // apiOnly (core-only) bots have no Feishu app to rename / re-avatar. These
+  // handlers drive the open-platform console (browser web-session, NOT
+  // getBotClient — so the bot-level gate can't catch them); skip registering
+  // them entirely so the dashboard profile actions are inert for a core-only bot.
+  if (!cfg.apiOnly) {
   // 机器人真·改名（dashboard 档案头 ✎）：开放平台自动化改飞书应用名并发布新版本
   // （群内显示名跟随已发布版本，见 services/open-platform-rename.ts）。成功后同步
   // 内存 botName / bots-info 名册 / descriptor，并清掉冗余的 displayName 别名——
@@ -17621,6 +17626,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     try { writeBotInfoFile(config.session.dataDir); } catch { /* best effort */ }
     return r;
   });
+  } // end !cfg.apiOnly (open-platform rename/avatar handlers)
   // One cap implementation shared by event-driven checks (process start / idle
   // edge) and the 60s safety-net timer below. Each daemon owns exactly one
   // bot's activeSessions map, so the configured limit is per bot.

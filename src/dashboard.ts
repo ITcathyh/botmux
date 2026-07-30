@@ -573,7 +573,11 @@ interface ResolvedDashboardSettings {
 function vcMeetingListenerBotOptions(): ResolvedDashboardSettings['vcMeetingAgent']['listenerBotOptions'] {
   try {
     const onlineByAppId = new Map(registry.list().map(bot => [bot.larkAppId, bot] as const));
-    return loadBotConfigs().map(bot => ({
+    // Exclude core-only (apiOnly) bots: a VC listener attends real Feishu
+    // meetings and needs open-platform scopes + a live Lark connection, which a
+    // no-Feishu bot categorically cannot have. Offering it would let setup
+    // raw-fetch token/application APIs with its synthetic/empty credentials.
+    return loadBotConfigs().filter(bot => bot.apiOnly !== true).map(bot => ({
       larkAppId: bot.larkAppId,
       botName: bot.displayName ?? onlineByAppId.get(bot.larkAppId)?.botName ?? bot.name ?? null,
       cliId: onlineByAppId.get(bot.larkAppId)?.cliId ?? bot.cliId,
@@ -712,7 +716,14 @@ async function reloadVcMeetingBotConfigOnDaemons(appIds: string[]): Promise<void
  * Used after automateOpenPlatformSetup to verify that VC meeting scopes were
  * actually applied (not just "requested").
  */
-async function fetchGrantedScopesForBot(bot: { larkAppId: string; larkAppSecret: string; brand?: string }): Promise<{ ok: true; granted: Set<string> } | { ok: false; error: string }> {
+async function fetchGrantedScopesForBot(bot: { larkAppId: string; larkAppSecret: string; brand?: string; apiOnly?: boolean }): Promise<{ ok: true; granted: Set<string> } | { ok: false; error: string }> {
+  // Core-only (apiOnly) bots have no real Feishu credentials — refuse the raw
+  // token/application fetch outright rather than dialing the open platform with
+  // a synthetic/empty secret. (Belt-and-suspenders: apiOnly is already excluded
+  // from listener options, but a pre-existing VC config could still reach here.)
+  if (bot.apiOnly === true) {
+    return { ok: false, error: 'api_only_bot_has_no_feishu_credentials' };
+  }
   const brand = bot.brand === 'lark' ? 'lark' : 'feishu';
   const openApi = larkHosts(brand).openApi;
   const ac = new AbortController();

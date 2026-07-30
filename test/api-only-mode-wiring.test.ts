@@ -226,4 +226,52 @@ describe('API-only bot mode — apiOnly survives config reconstruction (source l
     // when apiOnly — an apiOnly bot legitimately has none).
     expect(cliSource).toContain('cred.apiOnly === true');
   });
+
+  it('withholds LARK_APP_SECRET from the worker CLI env for no-transport sessions', () => {
+    // SEPARATE leak from the init-message field: forkWorker + forkAdoptWorker
+    // inject LARK_APP_SECRET into the spawned CLI env directly from botCfg.
+    const wpSource = readFileSync(resolve('src/core/worker-pool.ts'), 'utf8');
+    const envInjections = wpSource.match(
+      /LARK_APP_SECRET: larkTransportEnabled\(\{ chatId: ds\.chatId, apiOnly: botCfg\.apiOnly \}\) \? botCfg\.larkAppSecret : ''/g,
+    ) ?? [];
+    expect(envInjections.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('skips open-platform rename/avatar handler registration for apiOnly bots', () => {
+    // These drive the console via a browser web-session (NOT getBotClient), so
+    // the bot-level gate can't catch them — skip registration entirely.
+    const daemonSrc = readFileSync(resolve('src/daemon.ts'), 'utf8');
+    const block = region(daemonSrc, 'setDisplayNameRefresher(refreshBotNameState);', 'One cap implementation shared');
+    expect(block).toContain('if (!cfg.apiOnly) {');
+    expect(block.indexOf('if (!cfg.apiOnly) {')).toBeLessThan(block.indexOf('setBotRenamer('));
+    expect(block.indexOf('if (!cfg.apiOnly) {')).toBeLessThan(block.indexOf('setBotAvatarChanger('));
+  });
+});
+
+describe('API-only bot mode — riff env re-freeze + VC listener exclusion (source lock)', () => {
+  it('re-freezes no-transport keys AFTER the riff env merge (backendConfig.env cannot override)', () => {
+    const workerSource = readFileSync(resolve('src/worker.ts'), 'utf8');
+    const block = region(workerSource, 'const mergedEnv: Record<string, string> = {', 'riffBackendConfig = Object.assign(');
+    // The merge puts backendConfig.env LAST; the re-freeze must run after it.
+    expect(block).toContain('delete mergedEnv.BOTMUX_LARK_APP_SECRET;');
+    expect(block).toContain("mergedEnv.BOTMUX_API_ONLY = '1';");
+    expect(block).toContain('mergedEnv.BOTMUX_CHAT_ID = cfg.chatId;');
+    expect(block.indexOf('...cfg.backendConfig.env')).toBeLessThan(block.indexOf('delete mergedEnv.BOTMUX_LARK_APP_SECRET;'));
+  });
+
+  it('excludes apiOnly bots from VC listener options and fail-closes scope fetch', () => {
+    const dashSource = readFileSync(resolve('src/dashboard.ts'), 'utf8');
+    const optsBlock = region(dashSource, 'function vcMeetingListenerBotOptions(', '.map(bot => ({');
+    expect(optsBlock).toContain('bot.apiOnly !== true');
+    const fetchBlock = region(dashSource, 'async function fetchGrantedScopesForBot(', 'const brand =');
+    expect(fetchBlock).toContain('bot.apiOnly === true');
+    expect(fetchBlock).toContain('api_only_bot_has_no_feishu_credentials');
+  });
+
+  it('skips open-platform rename/avatar handler registration for apiOnly (fails closed to local rename)', () => {
+    // Daemon owns the config: with the handler unregistered, the IPC route
+    // returns renamer_not_wired (local displayName only, no console/Feishu call).
+    const daemonSrc = readFileSync(resolve('src/daemon.ts'), 'utf8');
+    expect(daemonSrc).toContain('} // end !cfg.apiOnly (open-platform rename/avatar handlers)');
+  });
 });
