@@ -171,12 +171,21 @@ function botConfigOrder(): string[] {
 /** This deployment's bots, in the shape the hub federates (bots.json order).
  *  Prefer the live daemon registry (authoritative) over bots-info.json. */
 function localBots(dataDir: string, live?: LiveBot[]): FederatedBot[] {
+  // apiOnly (core-only) bots have no Feishu transport → federate that capability
+  // so a hub/remote deployment won't try to invite them as group members. Read
+  // from local config (the source of truth); missing → treated as normal (true)
+  // by consumers for backward compatibility.
+  let apiOnlyIds = new Set<string>();
+  try {
+    apiOnlyIds = new Set(loadBotConfigs().filter(b => b.apiOnly === true).map(b => b.larkAppId));
+  } catch { /* no config access → leave all as transport-enabled */ }
   return buildTeamRoster(dataDir, undefined, undefined, live).bots.map(b => ({
     larkAppId: b.larkAppId,
     botName: b.name,
     cliId: b.cliId,
     capability: b.capability,
     hasTeamRole: b.hasTeamRole,
+    larkTransportEnabled: !apiOnlyIds.has(b.larkAppId),
     // owner (union_id+name) federated so the hub can pull owners into 拉群
     ownerUnionId: b.owner?.unionId,
     ownerName: b.owner?.name,

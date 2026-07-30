@@ -48,6 +48,7 @@ import {
 } from './dashboard/public-redact.js';
 import { handleWebhookRoute } from './dashboard/webhook-routes.js';
 import { handleFederationApi } from './dashboard/federation-api.js';
+import { buildFederatedRoster } from './services/federation-roster.js';
 import { handleFederationSpokeApi, syncAllMemberships, autoBindOwnerIfUnambiguous, type TeamSessionRowLike } from './dashboard/federation-spoke-api.js';
 import type { TeamGroupCreateResult, TeamGroupOwnerTransferResult } from './dashboard/federated-group-core.js';
 import { BotOnboardingManager } from './dashboard/bot-onboarding.js';
@@ -1981,17 +1982,26 @@ async function createTeamGroup(args: { name: string; larkAppIds: string[]; userO
   // is scoped to that app); otherwise create the group but don't forward a
   // wrong-scope open_id — UI will flag autoInviteUnavailable.
   // Two DISTINCT predicates — conflating them regressed federation:
-  //  • isApiOnlyBot: config-only. apiOnly bots have no Feishu identity, so they
-  //    can be neither creator nor member. Does NOT require local-registry
-  //    presence, so a federation REMOTE normal bot is correctly kept.
-  //  • canBeCreator: creator must be a locally-online daemon AND not apiOnly
-  //    (getBotClient throws for apiOnly). Remote bots can be members but not the
-  //    local creator.
-  const isApiOnlyBot = (id: string): boolean => {
+  //  • isNoTransportBot: a bot with no Feishu transport (core-only apiOnly).
+  //    Checked from LOCAL config AND, for a remote federated bot, from the
+  //    aggregated roster's `larkTransportEnabled === false` (propagated
+  //    spoke→sync→store→roster). undefined/absent (legacy spoke) → normal.
+  //    Does NOT require local-registry presence, so a remote normal bot stays.
+  //  • canBeCreator: creator must be a locally-online daemon AND have transport
+  //    (getBotClient throws for apiOnly). Remote bots can be members, not creator.
+  let noTransportRosterIds = new Set<string>();
+  try {
+    noTransportRosterIds = new Set(
+      buildFederatedRoster(config.session.dataDir, undefined, undefined, undefined, liveBots())
+        .bots.filter(b => b.larkTransportEnabled === false).map(b => b.larkAppId),
+    );
+  } catch { /* roster unavailable → rely on local config only */ }
+  const isNoTransportBot = (id: string): boolean => {
+    if (noTransportRosterIds.has(id)) return true;
     try { return loadBotConfigs().find(b => b.larkAppId === id)?.apiOnly === true; }
     catch { return false; }
   };
-  const canBeCreator = (id: string): boolean => !!registry.getByAppId(id) && !isApiOnlyBot(id);
+  const canBeCreator = (id: string): boolean => !!registry.getByAppId(id) && !isNoTransportBot(id);
   const plan = planGroupCreator(
     selectedIds,
     args.preferredCreator,
@@ -2010,7 +2020,7 @@ async function createTeamGroup(args: { name: string; larkAppIds: string[]; userO
     // Exclude ONLY apiOnly bots from the member payload (they have no Feishu
     // identity to invite). Federation remote NORMAL bots stay — the fix for the
     // creator-predicate regression that also dropped them.
-    const memberIds = selectedIds.filter(id => !isApiOnlyBot(id));
+    const memberIds = selectedIds.filter(id => !isNoTransportBot(id));
     const upstream = await proxyToDaemon(plan.creatorLarkAppId, '/api/groups/create', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
