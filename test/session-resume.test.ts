@@ -52,6 +52,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   adoptSandboxBlocked: vi.fn((botCfg: any, session?: any) =>
     botCfg?.sandbox === true || botCfg?.readIsolation === true || session?.sandbox === true || process.env.BOTMUX_SANDBOX === '1'),
   killStalePids: vi.fn(),
+  sweepDeadPidMarkers: vi.fn(),
   getCurrentCliVersion: vi.fn(() => '1.0.0-test'),
   restoreUsageLimitRuntimeState: vi.fn(),
   // Faithful: mirror the real setActiveSessionSafe — if a DIFFERENT entry

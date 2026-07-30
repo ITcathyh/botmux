@@ -4939,6 +4939,60 @@ export function killStalePids(activeSessions_: Session[]): void {
   cleanupPersistentBackendSessions('herdr', activeSessions_);
 }
 
+/**
+ * Sweep dead CLI-pid marker files out of `.botmux-cli-pids/`. Each marker is
+ * named for the PID that wrote it; when that PID is gone the file is a landmine —
+ * the kernel eventually recycles the number onto an unrelated process, and a
+ * `botmux send` climbing its ancestry can then read a since-exited session's
+ * marker and route the message into the WRONG bot's session. (Fix A already
+ * rejects such a marker at read time by verifying procStart / the env session
+ * id; this GC removes the file so the collision can't even be attempted, and
+ * keeps the directory from growing without bound — graceful worker exit unlinks
+ * its own marker, but SIGKILL / crash / force-kill do not.)
+ *
+ * Cross-daemon safe: with many daemons sharing one data dir, a DEAD pid cannot
+ * belong to any live daemon's session, so unlinking its marker never races a
+ * peer. A live pid's marker is always left untouched. The tiny window where a
+ * PID is recycled between the liveness probe and unlink is benign — the new
+ * owner rewrites its marker on the next turn, and Fix A makes a briefly-missing
+ * marker fall back to the correct env id, never to a wrong session.
+ *
+ * `isPidAlive` is injectable so tests are deterministic regardless of what PIDs
+ * the host has actually allocated (picking a "surely-dead" literal is unsafe —
+ * it can be below pid_max and collide with a live process on a busy runner).
+ * Production uses `process.kill(pid, 0)`: a signal-0 probe that never kills.
+ * Conservative on every ambiguity — only a definitively-dead PID is swept.
+ */
+export function defaultPidLiveness(pid: number): boolean {
+  try {
+    process.kill(pid, 0); // signal 0 = liveness probe, never kills
+    return true;          // alive → owned by some (possibly peer) daemon
+  } catch (err: any) {
+    if (err?.code === 'ESRCH') return false; // no such process → dead
+    return true; // EPERM (alive, not ours) or unknown error → keep, never guess
+  }
+}
+
+export function sweepDeadPidMarkers(
+  dataDir: string = config.session.dataDir,
+  isPidAlive: (pid: number) => boolean = defaultPidLiveness,
+): number {
+  const markersDir = join(dataDir, '.botmux-cli-pids');
+  let entries: string[];
+  try { entries = readdirSync(markersDir); }
+  catch { return 0; } // dir absent (fresh install) → nothing to sweep
+  let removed = 0;
+  for (const name of entries) {
+    const pid = Number(name);
+    if (!Number.isInteger(pid) || pid <= 1) continue; // ignore non-pid files
+    if (isPidAlive(pid)) continue;                    // keep live (incl. peer daemons)
+    try { unlinkSync(join(markersDir, name)); removed++; }
+    catch { /* raced with another sweeper or the owner — fine */ }
+  }
+  if (removed > 0) logger.info(`Swept ${removed} dead CLI-pid marker(s) from ${markersDir}`);
+  return removed;
+}
+
 function cleanupPersistentBackendSessions(backendType: 'tmux' | 'herdr', activeSessions_: Session[]): void {
   const anyBackend = getAllBots().some(b => (b.config.backendType ?? config.daemon.backendType) === backendType)
     || config.daemon.backendType === backendType;

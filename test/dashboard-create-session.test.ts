@@ -51,6 +51,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   forkAdoptWorker: vi.fn(),
   adoptSandboxBlocked: vi.fn((botCfg, session) => botCfg?.sandbox === true || botCfg?.readIsolation === true || session?.sandbox === true || process.env.BOTMUX_SANDBOX === '1'),
   killStalePids: vi.fn(),
+  sweepDeadPidMarkers: vi.fn(),
   getCurrentCliVersion: vi.fn(() => 'test-cli-v1'),
   restoreUsageLimitRuntimeState: vi.fn(),
   setActiveSessionSafe: vi.fn(async (map: Map<string, any>, k: string, ds: any) => { map.set(k, ds); }),

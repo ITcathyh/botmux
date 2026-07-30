@@ -78,6 +78,7 @@ vi.mock('../src/services/whiteboard-store.js', () => ({
 vi.mock('../src/core/worker-pool.js', () => ({
   forkWorker: vi.fn(),
   killStalePids: vi.fn(),
+  sweepDeadPidMarkers: vi.fn(),
   getActiveSessionsRegistry: vi.fn(() => undefined),
   getCurrentCliVersion: vi.fn(() => '1.0.0'),
 }));
