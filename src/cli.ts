@@ -5628,6 +5628,8 @@ async function resolveSessionAppId(sessionIdArg: string | undefined): Promise<{ 
 }
 
 async function cmdHistory(rest: string[]): Promise<void> {
+  // No-transport turn has no Feishu chat history to read — central hard gate.
+  assertTurnTransportOrExit('history');
   // Read isolation: register this bot from its cred file so the Lark client is
   // available without reading the denied bots.json (same as cmdSend).
   await registerSelfFromCredFile();
@@ -5768,6 +5770,8 @@ async function cmdHistory(rest: string[]): Promise<void> {
 
 
 async function cmdQuoted(rest: string[]): Promise<void> {
+  // No-transport turn cannot fetch a quoted Feishu message — central hard gate.
+  assertTurnTransportOrExit('quoted');
   const sessionIdArg = argValue(rest, '--session-id');
   // Positional message_id is required. The id comes verbatim from the
   // `[用户引用了消息 用 botmux quoted om_xxx 查看]` prompt prefix the daemon
@@ -6084,6 +6088,41 @@ function currentBotIsApiOnly(larkAppId: string): boolean {
   }
 }
 
+/** Central CLI session-transport capability check. A turn has NO Feishu
+ *  transport when either the running bot is core-only (apiOnly) OR the turn runs
+ *  in an HTTP virtual session (BOTMUX_CHAT_ID starts with http_async_ or
+ *  http_wait_). This is the single source of truth every Feishu-touching CLI
+ *  command consults — send/dispatch (writes) AND history/quoted/bots (reads) —
+ *  so a normal bot in a virtual session can't reach Feishu by reloading
+ *  bots.json for a real client (the daemon side is already gated by
+ *  larkTransportEnabled; this closes the non-sandbox local-CLI path). Kept
+ *  read-only and total (never throws). */
+function currentTurnHasNoTransport(): boolean {
+  const chatId = process.env.BOTMUX_CHAT_ID ?? '';
+  if (chatId.startsWith('http_async_') || chatId.startsWith('http_wait_')) return true;
+  const appId = process.env.BOTMUX_LARK_APP_ID;
+  return !!appId && currentBotIsApiOnly(appId);
+}
+
+/** Refuse a Feishu-touching CLI command for a no-transport turn with a clear,
+ *  actionable message (not a deep client error), then exit. `op` names the
+ *  command for the message. Returns true if it refused+exited is imminent — but
+ *  it calls process.exit(2), so callers just `if (assertTurnTransportOrExit(...)) return;`
+ *  for type-flow clarity; execution never continues past the exit. */
+function assertTurnTransportOrExit(op: string): void {
+  if (!currentTurnHasNoTransport()) return;
+  const chatId = process.env.BOTMUX_CHAT_ID ?? '';
+  const why = chatId.startsWith('http_async_') || chatId.startsWith('http_wait_')
+    ? 'this turn runs in an HTTP control-API session (no Feishu chat)'
+    : 'this is a core-only (apiOnly) bot with no Feishu connection';
+  console.error(
+    `botmux ${op} is unavailable: ${why}.\n` +
+    `Feishu read/write is not possible here — the turn communicates only over the HTTP\n` +
+    `control API (input via trigger, output via trigger-result). Produce your normal answer.`,
+  );
+  process.exit(2);
+}
+
 /** Under read isolation the CLI is denied bots.json, so `loadBotConfigs()` reads
  *  nothing. The worker instead wrote THIS bot's own secret to a per-bot cred file
  *  (its own is readable; siblings' are denied). Register just this bot from that
@@ -6229,30 +6268,10 @@ async function cmdSend(rest: string[]): Promise<void> {
     );
     process.exit(2);
   }
-  // No-transport turn: `botmux send` is a hard no-op door, not a prompt
-  // suggestion. Two cases refuse early with a clear message (mirrors the
-  // workflow refusal above) instead of a deep LarkTransportDisabledError / a
-  // send to a synthetic chat id:
-  //   (a) core-only (apiOnly) bot — no Feishu chat at all;
-  //   (b) ANY bot whose current turn runs in an HTTP virtual session
-  //       (BOTMUX_CHAT_ID = http_async_* / http_wait_*) — a normal bot driven
-  //       over the control API has real creds so getBotClient won't throw, but
-  //       the synthetic chat id is not a real Feishu chat. This closes the
-  //       normal-bot-in-virtual-session leak the bot-level gate can't catch.
-  {
-    const selfAppId = process.env.BOTMUX_LARK_APP_ID;
-    const selfChatId = process.env.BOTMUX_CHAT_ID ?? '';
-    const isVirtualTurn = selfChatId.startsWith('http_async_') || selfChatId.startsWith('http_wait_');
-    if ((selfAppId && currentBotIsApiOnly(selfAppId)) || isVirtualTurn) {
-      console.error(
-        `botmux send is unavailable for this turn: it has no Feishu chat to post into ` +
-        `(${isVirtualTurn ? 'HTTP control-API session' : 'core-only bot'}).\n` +
-        `The turn's output is returned to the caller via trigger-result, not sent to Feishu.\n` +
-        `Just produce your normal final answer.`,
-      );
-      process.exit(2);
-    }
-  }
+  // No-transport turn (apiOnly bot OR HTTP virtual session): refuse via the
+  // central session-capability gate — same hard door every Feishu-touching CLI
+  // command consults.
+  assertTurnTransportOrExit('send');
   // Managed output attribution must come from the live process-tree marker,
   // whose turn/attempt is refreshed by the worker. BOTMUX_TURN_ID is a
   // spawn-time fallback and can be stale in a detached child after a later
@@ -7578,6 +7597,9 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   --session-id <id>     指定来源会话（默认自动推断）`);
     return;
   }
+  // dispatch opens a real Feishu topic + pulls bots into a chat (a write). A
+  // no-transport turn has no Feishu chat to dispatch into — central hard gate.
+  assertTurnTransportOrExit('dispatch');
 
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
   const sessionIdArg = argValue(rest, '--session-id');
@@ -8878,6 +8900,10 @@ async function cmdBots(sub: string, rest: string[]): Promise<void> {
     console.error('用法: botmux bots list [--session-id ID]');
     process.exit(1);
   }
+  // `bots list` reads the Feishu chat roster (listChatBotMembers). A no-transport
+  // turn has no chat roster — central hard gate (also stops the routing prompt
+  // from advertising a Feishu-dependent helper in this context).
+  assertTurnTransportOrExit('bots list');
 
   const sessionIdArg = argValue(rest, '--session-id');
   // 与 history/quoted 同一前奏：本地会话解析 + riff sandbox env 合成会话兜底

@@ -175,14 +175,17 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     expect(block).toContain('larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })');
   });
 
-  it('botmux send refuses early for apiOnly bot AND any HTTP virtual-session turn (CLI capability gate)', () => {
+  it('every Feishu-touching CLI command consults the central session-transport gate', () => {
     const cliSource = readFileSync(resolve('src/cli.ts'), 'utf8');
-    const block = region(cliSource, 'async function cmdSend(', 'Managed output attribution');
-    // apiOnly bot refusal.
-    expect(block).toContain('currentBotIsApiOnly(selfAppId)');
-    // Normal-bot-in-virtual-session refusal: BOTMUX_CHAT_ID = http_async_*/http_wait_*.
-    expect(block).toContain("selfChatId.startsWith('http_async_') || selfChatId.startsWith('http_wait_')");
-    expect(block).toContain('botmux send is unavailable for this turn');
+    // The central gate is defined once and keys on apiOnly bot OR virtual chatId.
+    const helper = region(cliSource, 'function currentTurnHasNoTransport(', 'function assertTurnTransportOrExit(');
+    expect(helper).toContain("chatId.startsWith('http_async_') || chatId.startsWith('http_wait_')");
+    expect(helper).toContain('currentBotIsApiOnly(appId)');
+    // Every Feishu-touching command calls it (writes: send/dispatch; reads:
+    // history/quoted/bots). A missing one is a leak.
+    for (const op of ['send', 'history', 'quoted', 'dispatch', 'bots list']) {
+      expect(cliSource, op).toContain(`assertTurnTransportOrExit('${op}')`);
+    }
   });
 });
 
