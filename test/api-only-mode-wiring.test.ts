@@ -139,9 +139,22 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     ]) {
       expect(clientSource, op).toContain(`assertLarkTransport(larkAppId, '${op}')`);
     }
-    // The gate helper throws the typed error for an apiOnly bot.
-    expect(clientSource).toContain('class LarkTransportDisabledError');
+    // assertLarkTransport (early, op-named) throws the typed error for apiOnly.
     expect(clientSource).toContain('if (apiOnly) throw new LarkTransportDisabledError');
+  });
+
+  it('getBotClient is the authoritative bot-level gate (reads AND writes)', () => {
+    // The true single chokepoint: EVERY Feishu call resolves its client here, so
+    // gating getBotClient covers client.ts primitives, doc-comment drive API,
+    // open-platform rename/avatar, identity cache — reads included (apiOnly =
+    // zero Feishu network, not merely "no writes").
+    const registrySource = readFileSync(resolve('src/bot-registry.ts'), 'utf8');
+    const block = region(registrySource, 'export function getBotClient(', 'return bot.client;');
+    expect(block).toContain('bot.config.apiOnly === true');
+    expect(block).toContain('throw new LarkTransportDisabledError(larkAppId');
+    // The error class is defined in bot-registry (no import cycle) and re-exported.
+    expect(registrySource).toContain('export class LarkTransportDisabledError');
+    expect(clientSource).toContain('export { LarkTransportDisabledError }');
   });
 
   it('worker-pool suppresses ALL aux UI for no-transport sessions at managedAuxUiSuppressed', () => {
@@ -159,5 +172,42 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     const block = region(cliSource, 'async function cmdSend(', 'Managed output attribution');
     expect(block).toContain('currentBotIsApiOnly(selfAppId)');
     expect(block).toContain('botmux send is unavailable for this core-only');
+  });
+});
+
+describe('API-only bot mode — non-client direct-Feishu paths (source lock)', () => {
+  it('doc-comment driveApiCall enforces the same bot-level gate', () => {
+    // doc-comment has its OWN drive API (subscribe/reply/comment/reaction) that
+    // bypasses im/lark/client.ts — it must call assertLarkTransport too.
+    const docSource = readFileSync(resolve('src/im/lark/doc-comment.ts'), 'utf8');
+    const block = region(docSource, 'async function driveApiCall(', 'const bot = getBot(larkAppId);');
+    expect(block).toContain('assertLarkTransport(larkAppId');
+  });
+
+  it('worker screenshot upload is disabled for apiOnly (capability rides the init message)', () => {
+    // The worker uploads via its OWN client (utils/lark-upload), bypassing the
+    // daemon getBot gate, so apiOnly must ride the init message into the worker.
+    const workerSource = readFileSync(resolve('src/worker.ts'), 'utf8');
+    expect(workerSource).toContain('apiOnlyForUpload = msg.apiOnly === true;');
+    expect(workerSource).toContain("if (apiOnlyForUpload)");
+    // worker-pool forwards apiOnly on the init message (both fork sites).
+    const wpSource = readFileSync(resolve('src/core/worker-pool.ts'), 'utf8');
+    expect((wpSource.match(/apiOnly: botCfg\.apiOnly/g) ?? []).length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+describe('API-only bot mode — apiOnly survives config reconstruction (source lock)', () => {
+  it('worker init message + cred file + riff synthetic config all carry apiOnly', () => {
+    const workerSource = readFileSync(resolve('src/worker.ts'), 'utf8');
+    const cliSource = readFileSync(resolve('src/cli.ts'), 'utf8');
+    // Worker forwards apiOnly into the sandbox env (riffModeSession reads it) and
+    // persists it in the send-cred file (registerSelfFromCredFile reads it).
+    expect(workerSource).toContain("sessionEnv.BOTMUX_API_ONLY = '1'");
+    expect(workerSource).toContain('apiOnly: cfg.apiOnly');
+    // riffModeSession synthetic BotConfig picks up the env flag.
+    expect(cliSource).toContain("apiOnly: process.env.BOTMUX_API_ONLY === '1'");
+    // registerSelfFromCredFile keeps apiOnly (and no longer bails on empty secret
+    // when apiOnly — an apiOnly bot legitimately has none).
+    expect(cliSource).toContain('cred.apiOnly === true');
   });
 });

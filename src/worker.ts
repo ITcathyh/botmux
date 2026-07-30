@@ -4389,6 +4389,7 @@ let lastShotHash = '';
 let larkAppIdForUpload = '';
 let larkAppSecretForUpload = '';
 let larkBrandForUpload: 'feishu' | 'lark' = 'feishu';
+let apiOnlyForUpload = false;
 
 function startScreenshotLoop(): void {
   stopScreenshotLoop();
@@ -4444,6 +4445,7 @@ async function captureAndUpload(): Promise<void> {
   // stray scheduleOneShotAfterAction firing after user toggled back to hidden.
   if (displayMode !== 'screenshot') { logScreenshotSkip(`displayMode=${displayMode}`); return; }
   if (awaitingFirstPrompt)          { logScreenshotSkip('awaitingFirstPrompt'); return; }
+  if (apiOnlyForUpload)             { logScreenshotSkip('apiOnly bot — no Feishu transport'); return; }
   if (!larkAppIdForUpload || !larkAppSecretForUpload) { logScreenshotSkip('lark credentials missing'); return; }
 
   let png: Buffer;
@@ -6661,6 +6663,11 @@ async function spawnCli(
       BOTMUX_CHAT_ID: cfg.chatId,
       BOTMUX_LARK_APP_ID: cfg.larkAppId,
     };
+    // Core-only capability must survive into the sandboxed CLI: riffModeSession
+    // rebuilds a synthetic BotConfig from env (no bots.json), and would otherwise
+    // drop apiOnly → getBotClient would not throw → `botmux send` could reach
+    // Feishu. Thread the flag so the reconstructed config keeps the boundary.
+    if (cfg.apiOnly) sessionEnv.BOTMUX_API_ONLY = '1';
     // Session scope for `botmux send` inside the sandbox. Thread sessions
     // anchor on a real om_ message (reply_in_thread); chat-scope sessions use
     // the chat id as anchor (sessionAnchorId), which is NOT a message id —
@@ -7194,7 +7201,7 @@ async function spawnCli(
       mkdirSync(dirname(credPath), { recursive: true });
       writeFileSync(
         credPath,
-        JSON.stringify({ larkAppId: cfg.larkAppId, larkAppSecret: cfg.larkAppSecret, brand: cfg.brand }),
+        JSON.stringify({ larkAppId: cfg.larkAppId, larkAppSecret: cfg.larkAppSecret, brand: cfg.brand, apiOnly: cfg.apiOnly }),
         { mode: 0o600 },
       );
     } catch (e) {
@@ -10033,6 +10040,11 @@ process.on('message', async (raw: unknown) => {
       // Capture credentials for direct image upload from worker
       larkAppIdForUpload = msg.larkAppId;
       larkAppSecretForUpload = msg.larkAppSecret;
+      // Core-only (apiOnly) bots have no Feishu transport — the worker uploads
+      // screenshots via its OWN client (utils/lark-upload), bypassing the daemon's
+      // bot-level assertLarkTransport gate, so the capability must ride the init
+      // message into this process and hard-disable upload here.
+      apiOnlyForUpload = msg.apiOnly === true;
       // brand 决定截图上传打哪个域（feishu / larksuite）。缺省 feishu。
       larkBrandForUpload = msg.brand === 'lark' ? 'lark' : 'feishu';
       // Resolve render dimensions BEFORE startScreenUpdates() — the

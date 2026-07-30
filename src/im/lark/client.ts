@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync, createWriteStream, mkdirSync, existsSync }
 import { dirname, extname, basename, join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { Client } from '@larksuiteoapi/node-sdk';
-import { getBotClient, getAllBots, getBot, formatLarkError } from '../../bot-registry.js';
+import { getBotClient, getAllBots, getBot, formatLarkError, LarkTransportDisabledError } from '../../bot-registry.js';
 import { loadBotConfigs } from '../../bot-registry.js';
 import { config } from '../../config.js';
 import { emitHookEvent } from '../../services/hook-runner.js';
@@ -151,31 +151,19 @@ export class MessageWithdrawnError extends Error {
 }
 
 /**
- * Thrown when an outbound Feishu call is attempted for a core-only (`apiOnly`)
- * bot. Such a bot has no Feishu connection (synthetic identity, possibly empty
- * secret), so ANY send/reply/update/reaction/DM would either auth-fail against
- * a bogus app or silently succeed against a real one the operator never meant
- * to speak as. This is the BOT-LEVEL transport boundary: gating at the shared
- * `getBotClient` base of every primitive means no caller — sessionReply, a
- * direct updateMessage, `botmux send` from the agent, v3 distillation, an
- * overload DM — can reach Feishu regardless of session context. A well-built
- * apiOnly flow never triggers this (session-level gates suppress aux UI and the
- * trigger route rejects real chats); reaching here is genuine misuse and must
- * surface loudly, NOT be faked into a synthetic "success" message id.
+ * Re-exported from bot-registry (defined there to avoid an import cycle with
+ * getBotClient). apiOnly bots throw this on any Feishu client request.
  */
-export class LarkTransportDisabledError extends Error {
-  constructor(larkAppId: string, op: string) {
-    super(`Feishu transport is disabled for core-only bot ${larkAppId} (attempted: ${op})`);
-    this.name = 'LarkTransportDisabledError';
-  }
-}
+export { LarkTransportDisabledError };
 
 /** Bot-level transport gate: an apiOnly bot must never make an outbound Feishu
  * call. Called at the top of every write primitive. `op` names the primitive
  * for diagnostics. Read-only lookups (message detail, chat members) intentionally
  * do NOT call this — they are inert reads used by discovery, already filtered
- * elsewhere; only side-effecting writes are hard-gated here. */
-function assertLarkTransport(larkAppId: string, op: string): void {
+ * elsewhere; only side-effecting writes are hard-gated here. Exported so other
+ * modules with their OWN direct-Feishu implementations (e.g. doc-comment's
+ * drive API) can enforce the same bot-level boundary from one definition. */
+export function assertLarkTransport(larkAppId: string, op: string): void {
   let apiOnly = false;
   try {
     apiOnly = getBot(larkAppId).config.apiOnly === true;
