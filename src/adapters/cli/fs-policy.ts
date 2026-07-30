@@ -112,6 +112,11 @@ export interface FsPolicyContext {
    *  emits MANDATORY denies for the Feishu-cred paths so a wide workingDir grant
    *  can't re-expose them (mandatory deny wins). Absent/true = normal behavior. */
   larkTransportEnabled?: boolean;
+  /** Extra Feishu-AUTHORITY roots to deny wholesale when larkTransportEnabled is
+   *  false — beyond the defaults (botmuxHome, ~/.lark-cli-bots, macOS lark-cli
+   *  store). The daemon freezes in the resolved custom BOTS_CONFIG directory here
+   *  when it lives outside botmuxHome, so a no-transport turn can't read it. */
+  larkAuthorityRoots?: readonly string[];
 }
 
 /** Normalize: require absolute, strip trailing slashes, reject `..` segments.
@@ -376,6 +381,28 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // beats any broad readWrite that would otherwise re-expose them.
   const larkTransport = ctx.larkTransportEnabled !== false;
 
+  // No-Lark-transport authority roots (whole dirs, not exact files). A grant that
+  // falls INSIDE one of these (workingDir=~, hostile user sandboxPaths, external
+  // readonlyRoots) must be FAIL-CLOSED — dropped before it enters the rule set —
+  // so a deeper allow can't re-open the authority deny (deepest-prefix wins).
+  // The bot's OWN BOT_HOME is the sole exception (re-allowed deeper, minus
+  // send-cred). Model-CLI authPaths live outside these roots and are unaffected.
+  const authorityRoots = larkTransport ? [] : [...new Set([
+    ctx.botmuxHome,
+    `${ctx.homeDir}/.lark-cli-bots`,
+    `${ctx.homeDir}/Library/Application Support/lark-cli`,
+    ...(ctx.larkAuthorityRoots ?? []),
+  ])];
+  // A path is authority-restricted when it's inside an authority root but NOT
+  // inside the bot's own BOT_HOME (which is legitimately re-allowed).
+  const insideAuthority = (p: string): boolean =>
+    authorityRoots.some(root => coversPath(root, p)) && !coversPath(ctx.botHome, p);
+  const dropAuthority = (paths: readonly string[] | undefined): string[] =>
+    (paths ?? []).filter(p => {
+      const n = normalizeFsPath(p);
+      return n !== null && !insideAuthority(n);
+    });
+
   candidates.push(...(ctx.platform === 'darwin' ? darwinBaseline(ctx.homeDir) : linuxBaseline(ctx.homeDir)));
 
   // Adapter-declared surfaces.
@@ -388,11 +415,13 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   push(ctx.authPaths, 'readWrite', 'adapter');
   if (!ctx.redirectedCliData) push(ctx.cliDataPaths, 'readWrite', 'adapter');
 
-  // botmux internals.
-  push([ctx.workingDir, ctx.botHome], 'readWrite', 'internal');
+  // botmux internals. workingDir/extraWrite/readonlyRoots are FAIL-CLOSED against
+  // the authority roots for a no-transport turn (dropAuthority is identity when
+  // larkTransport). botHome is always kept — it's the sanctioned carve-out.
+  push([...dropAuthority([ctx.workingDir]), ctx.botHome], 'readWrite', 'internal');
   push(ctx.outbox ? [ctx.outbox] : [], 'readWrite', 'internal');
-  push(ctx.extraWritePaths, 'readWrite', 'internal');
-  push(ctx.readonlyRoots, 'readOnly', 'internal');
+  push(dropAuthority(ctx.extraWritePaths), 'readWrite', 'internal');
+  push(dropAuthority(ctx.readonlyRoots), 'readOnly', 'internal');
   // Own routing metadata (`botmux send` reply routing) — read-only.
   push([`${ctx.sessionDataDir}/sessions-${ctx.currentAppId}.json`], 'readOnly', 'internal');
   // Own upload bucket — readWRITE: `botmux quoted` / downloadResources writes the
@@ -424,7 +453,11 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     `${bh}/bin`,                // the daemon-written `botmux` wrapper (head of PATH)
     `${bh}/claude-plugin`,      // skill/plugin dir (claude --plugin-dir); no secrets
     `${bh}/lark-scopes.json`,   // static scope catalog
-    `${sd}/dashboard-daemons`,  // per-bot {ipcPort, resolvedAllowedUsers} — hook IPC discovery (operational, not secret)
+    // dashboard-daemons (sibling IPC port table) is the discovery half of the
+    // trusted-host escalation — a no-transport turn must NOT get it (paired with
+    // .dashboard-secret it lets an agent reach sibling daemons). Granted only for
+    // transport-enabled bots; for no-transport it stays denied by the authority root.
+    ...(larkTransport ? [`${sd}/dashboard-daemons`] : []),
     `${sd}/bots-info.json`,     // bot display names / avatars for <available_bots> + recipient rendering
     `${sd}/bot-openids-${app}.json`,  // OWN routing cross-ref (sibling ones stay denied)
     // own sessions-<self>.json + attachments/<self> already pushed above (readOnly)
@@ -459,34 +492,42 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   }
 
   // User config — highest precedence.
-  push(ctx.userPaths?.readWrite, 'readWrite', 'user');
-  push(ctx.userPaths?.readOnly, 'readOnly', 'user');
+  // User config — highest precedence, but readWrite/readOnly grants are
+  // FAIL-CLOSED against the authority roots for a no-transport turn (a hostile
+  // `sandboxPaths.readWrite ~/.lark-cli-bots/<self>` must not re-open the deny).
+  // User DENY entries are always kept (they only tighten).
+  push(dropAuthority(ctx.userPaths?.readWrite), 'readWrite', 'user');
+  push(dropAuthority(ctx.userPaths?.readOnly), 'readOnly', 'user');
   push(ctx.userPaths?.deny, 'deny', 'user');
   push(ctx.mandatoryDenyPaths, 'deny', 'mandatory');
   push(ctx.mandatoryReadOnlyPaths, 'readOnly', 'mandatory');
 
-  // No-Lark-transport MANDATORY credential denies. Emitted LAST as 'mandatory'
-  // so they outrank any broad readWrite (notably workingDir=~ re-opening $HOME,
-  // which contains bots.json + every sibling BOT_HOME + the lark-cli stores).
-  // These are ONLY Feishu-AUTHORITY surfaces — the model CLI's own authPaths
-  // (~/.codex etc.) are deliberately NOT here (they stay granted above), so a
-  // core-only turn can still authenticate its CLI while never reaching a Feishu
-  // credential. deny-by-longest-prefix keeps deeper allow rules (the bot's own
-  // BOT_HOME working dir) intact while sealing only the credential paths.
+  // No-Lark-transport HOST-AUTHORITY denies + minimal carve-out (codex escalation
+  // fix). We DENY THE WHOLE authority ROOT(s) — not exact credential files, which
+  // miss .bak/.tmp sidecars, future files, and `.dashboard-secret` (the
+  // trusted-host HMAC that would let a no-transport agent sign sibling-daemon
+  // routes). Conflicting deeper grants were already dropped above (dropAuthority),
+  // so these denies aren't re-opened. The model CLI's own authPaths (~/.codex …)
+  // live OUTSIDE these roots and stay granted.
   if (!larkTransport) {
-    const denies = [
-      `${ctx.botmuxHome}/bots.json`,               // all bots' appId+secret
-      `${ctx.homeDir}/.lark-cli-bots`,             // Linux per-bot lark-cli identities (all)
-      `${ctx.homeDir}/Library/Application Support/lark-cli`, // macOS keystore (all bots' ciphertext + master key)
-      `${ctx.botmuxHome}/bots`,                    // sibling BOT_HOMEs (incl. send-cred.json). NOTE: own
-                                                   // BOT_HOME is re-allowed at a deeper path just below.
-    ];
-    push(denies, 'deny', 'mandatory');
-    // Re-allow THIS bot's own BOT_HOME (deeper prefix wins) so its working dir /
-    // scratch stays writable; only the send-cred file inside it is denied (it's
-    // the Feishu secret — empty for apiOnly, but denied for defense-in-depth).
+    push(authorityRoots, 'deny', 'mandatory');
+    // Minimal carve-out — re-allowed at a DEEPER prefix so it wins the
+    // deepest-prefix resolution, WITHOUT re-exposing any authority file:
+    //  • own BOT_HOME readWrite (working dir / scratch) — but its send-cred.json
+    //    (the Feishu secret) stays denied at a deeper path still.
     push([ctx.botHome], 'readWrite', 'internal');
     push([`${ctx.botHome}/send-cred.json`], 'deny', 'mandatory');
+    //  • own routing cross-ref + session file the CLI legitimately reads (read-only,
+    //    own-app-scoped — NOT the shared secret/port table).
+    push([
+      `${ctx.sessionDataDir}/bots-info.json`,               // display names for <available_bots> (public-ish)
+      `${ctx.sessionDataDir}/sessions-${ctx.currentAppId}.json`,
+      `${ctx.sessionDataDir}/bot-openids-${ctx.currentAppId}.json`,
+    ], 'readOnly', 'internal');
+    if (ctx.sessionId) push([`${ctx.sessionDataDir}/turn-sends/${ctx.sessionId}.jsonl`], 'readWrite', 'internal');
+    // NOTE: dashboard-daemons (sibling IPC port table) and .dashboard-secret/-token
+    // are deliberately NOT re-allowed — a no-transport turn has no business
+    // reaching sibling daemons, and the secret is the escalation vector.
   }
 
   return {

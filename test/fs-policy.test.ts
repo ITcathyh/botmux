@@ -704,4 +704,44 @@ describe('no-Lark-transport credential profile (larkTransportEnabled=false)', ()
     expect(accessForPath(p.rules, '/Users/u/Library/Application Support/lark-cli/master.key.file').access).toBe('readOnly');
     // bots.json (sibling secrets) is baseline-denied for normal bots too.
   });
+
+  it('denies the trusted-host HMAC + port table (escalation vector) even with workingDir=~', () => {
+    // .dashboard-secret is the trusted-host HMAC — reading it would let a
+    // no-transport agent sign sibling-daemon routes. dashboard-daemons is the
+    // port-table discovery half. Both must be denied; .bak/.tmp sidecars too.
+    const p = noTransport();
+    expect(accessForPath(p.rules, '/Users/u/.botmux/.dashboard-secret').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/.dashboard-token').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/feishu-session.json').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/dashboard-daemons').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/bots.json.bak').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/bots.json.tmp').access).toBe('deny');
+  });
+
+  it('a HOSTILE deeper user sandboxPaths.readWrite cannot re-open an authority path', () => {
+    // The deepest-prefix-wins semantics codex flagged: a nested user grant used
+    // to beat the shallower authority deny. dropAuthority now strips it pre-merge.
+    const p = noTransport({ userPaths: { readWrite: [
+      '/Users/u/.lark-cli-bots/cli_self',        // deeper than the authority root
+      '/Users/u/.botmux/.dashboard-secret',      // directly targets the HMAC
+      '/Users/u/.botmux/bots.json',
+    ] } });
+    expect(accessForPath(p.rules, '/Users/u/.lark-cli-bots/cli_self/x').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/.dashboard-secret').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/bots.json').access).toBe('deny');
+  });
+
+  it('a custom BOTS_CONFIG root outside ~/.botmux is denied when frozen in', () => {
+    const p = noTransport({ larkAuthorityRoots: ['/etc/botmux-conf', '/etc/botmux-conf/bots.json'] });
+    expect(accessForPath(p.rules, '/etc/botmux-conf/bots.json').access).toBe('deny');
+    expect(accessForPath(p.rules, '/etc/botmux-conf/bots.json.bak').access).toBe('deny');
+  });
+
+  it('CLI runtime still works under no-transport (.data-dir / bin / bots-info / own session)', () => {
+    const p = noTransport({ botmuxInstallRoot: '/opt/botmux' });
+    expect(accessForPath(p.rules, '/Users/u/.botmux/.data-dir').access).toBe('readOnly');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/bin/botmux').access).toBe('readOnly');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/bots-info.json').access).toBe('readOnly');
+    expect(accessForPath(p.rules, '/opt/botmux/dist/cli.js').access).toBe('readOnly');
+  });
 });

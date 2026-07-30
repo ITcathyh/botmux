@@ -7658,6 +7658,13 @@ async function spawnCli(
       larkTransportEnabled: !(cfg.apiOnly === true
         || cfg.chatId?.startsWith('http_async_') === true
         || cfg.chatId?.startsWith('http_wait_') === true),
+      // Freeze the resolved custom BOTS_CONFIG path (daemon env, agent can't
+      // forge it) as an extra authority root so a no-transport turn can't read a
+      // bots.json living OUTSIDE ~/.botmux. Deny the whole containing dir (covers
+      // its .bak/.tmp sidecars too) rather than enumerate filenames.
+      larkAuthorityRoots: process.env.BOTS_CONFIG
+        ? [canonical(dirname(process.env.BOTS_CONFIG)), canonical(process.env.BOTS_CONFIG)]
+        : undefined,
       redirectedCliData: willRedirectCliData,
       cliDataPaths: willRedirectCliData ? undefined : keepExisting([
         cliAdapter.claudeDataDir,
