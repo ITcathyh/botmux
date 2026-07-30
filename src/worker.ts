@@ -9369,13 +9369,23 @@ if(hasToken && !/[?&]imefix=0\\b/.test(location.search)){(function(){
         try{term.input('\\x7f',true)}catch(_e){}
         return;
       }
-      // insertText / insertReplacementText etc. carrying the final char(s).
-      // Only forward composed input (what IMEs emit — every real Doubao/WeChat
-      // insert is composed=true). A composed=false insertText is one xterm's own
-      // _inputEvent WILL emit (its guard passes when !composed), so forwarding it
-      // here too — should _claim ever be stuck open — would double-emit. Gating on
-      // composed makes the two paths mutually exclusive and closes that window.
-      if(e.data&&e.composed){try{term.input(e.data,true)}catch(_e){}}
+      // Forward ONLY inputType==='insertText' — the exact dead path the target
+      // Doubao/WeChat traces take (keydown 229 → insertText, composed=true, no
+      // composition events). This is a strict WHITELIST, not a composed filter:
+      //   • e.composed is a shadow-DOM-crossing flag, NOT an "is-IME" marker —
+      //     EVERY trusted InputEvent (paste, replacement, drop…) is composed=true.
+      //     So gating on composed alone still swallows non-insertText paths.
+      //   • insertFromPaste: xterm's own paste handler already sent the text
+      //     (stopPropagation but NOT preventDefault), then the default paste
+      //     inserts into the textarea and fires insertFromPaste — forwarding it
+      //     here too would DOUBLE the paste.
+      //   • insertReplacementText: WebKit correction runs ㅎ→하→한 as a REPLACE
+      //     stream; appending each token yields "ㅎ하한" instead of "한".
+      // insertText remains gated on composed too: a composed=false insertText is
+      // one xterm's _inputEvent WILL emit itself (its guard passes when
+      // !composed), so — should _claim ever be stuck open — forwarding it here
+      // would double-emit. Whitelist + composed = mutually exclusive with xterm.
+      if(e.data&&e.composed&&it==='insertText'){try{term.input(e.data,true)}catch(_e){}}
     },{capture:true,passive:true});
     // Close the cycle on keyup (the claimed keydown's matching keyup).
     _ta.addEventListener('keyup',function(){_claim=false;},{capture:true,passive:true});
