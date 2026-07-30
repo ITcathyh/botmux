@@ -6,15 +6,23 @@
  */
 import { getOwnerOpenId, getBotOpenId, getBot } from '../../bot-registry.js';
 import { isBotMentioned, extractMessageTextForRouting } from './event-dispatcher.js';
-import { stripLeadingMentions, mentionOpenId } from './message-parser.js';
+import { stripLeadingMentions } from './message-parser.js';
 import { buildGrantCard } from './card-builder.js';
 import { openPendingMulti } from './grant-pending.js';
 import { revokeGrant, addAllowedChatGroup, removeAllowedChatGroup } from '../../services/grant-store.js';
 import { replyMessage } from './client.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import { logger } from '../../utils/logger.js';
+import {
+  parseTargetsAfterCommand, isCommandTargetOnly, stripAllMentions,
+} from './mention-targets.js';
 
-/** 从 mention 列表取所有非本 bot 的【授权目标】（可以是真人，也可以是另一个 bot——
+export { stripAllMentions };
+
+/** /grant|/revoke 的命令词匹配（带 \b 边界）。共享解析器见 mention-targets.ts。 */
+const GRANT_CMD_PATTERN = /\/(?:grant|revoke)\b/i;
+
+/** 取所有非本 bot 的【授权目标】（可以是真人，也可以是另一个 bot——
  *  授权 bot 走同一条路，命中后写本群 chatGrants，放行其在本群拉起 chat-scope 会话）。
  *  按 open_id 去重、保持 @ 顺序，支持一次 /grant @a @b、/revoke @a @b 批量处置。
  *
@@ -22,99 +30,15 @@ import { logger } from '../../utils/logger.js';
  *  （`@OperatorBot /grant @Grantee`），不是 grantee。否则 owner 一条 `@Claude @Codex /grant`
  *  把两个操作 bot 都前导 @ 了，每个 daemon 会把「另一个 bot」当成目标 → 两 bot 互相授权
  *  （实测 bug）。位置过滤仅在能拿到位置信息（text 形态的 key / post 的节点序）时生效；
- *  纯 mentions 的合成消息（无 content.text）退回历史「全部非本 bot」行为。 */
+ *  纯 mentions 的合成消息（无 content.text）退回历史「全部非本 bot」行为。
+ *  实现在 mention-targets.ts（与 /invite 共享）。 */
 export function parseGrantTargets(message: any, botOpenId: string | undefined): Array<{ openId: string; name: string }> {
-  let content: any;
-  try { content = JSON.parse(message?.content ?? '{}'); } catch { content = undefined; }
-
-  // text 形态：@ 落在 content.text 里，每个 mention 带 key 占位符可定位其位置 → 按命令词位置过滤。
-  if (content && typeof content.text === 'string') {
-    return parseTextTargetsAfterCommand(content.text, message?.mentions ?? [], botOpenId);
-  }
-  // post（富文本）形态：@ 落在 inline `at` 节点（message.mentions 常为空、偶有填充，统一走节点序）→
-  // 按命令词节点位置过滤，不被「message.mentions 是否填充」左右。
-  const inner = content?.zh_cn ?? content?.en_us ?? content;
-  if (Array.isArray(inner?.content)) {
-    return parsePostAtMentions(message, botOpenId);
-  }
-
-  // 合成消息（仅 mentions、无 content 结构，多见于单测/旧调用）：无位置信息，退回全部非本 bot。
-  const seen = new Set<string>();
-  const out: Array<{ openId: string; name: string }> = [];
-  for (const x of (message?.mentions ?? [])) {
-    const oid = mentionOpenId(x);
-    if (!oid || oid === botOpenId || seen.has(oid)) continue;
-    seen.add(oid);
-    out.push({ openId: oid, name: x.name ?? oid });
-  }
-  return out;
-}
-
-/** text 形态：只取「命令词之后」的非本 bot mention。用 mention 的 key 占位符定位其在 text 里的
- *  位置；`key(?!\d)` 边界规避 @_user_1 / @_user_10 前缀歧义（与 isGrantTargetOnly 同款）。
- *  定位不到 key（异常形态）时保守退回「视为目标」，与历史行为一致，不漏真实 grantee。 */
-function parseTextTargetsAfterCommand(
-  text: string, mentions: any[], botOpenId: string | undefined,
-): Array<{ openId: string; name: string }> {
-  const cmdIdx = text.search(/\/(?:grant|revoke)\b/i);
-  const seen = new Set<string>();
-  const out: Array<{ openId: string; name: string }> = [];
-  for (const m of mentions) {
-    const oid = mentionOpenId(m);
-    if (!oid || oid === botOpenId || seen.has(oid)) continue;
-    const key = m?.key;
-    if (cmdIdx >= 0 && typeof key === 'string' && key.length > 0) {
-      const km = new RegExp(`${escapeRe(key)}(?!\\d)`).exec(text);
-      if (km && km.index <= cmdIdx) continue;   // 命令词之前 = 操作 bot 点名，剔除
-    }
-    seen.add(oid);
-    out.push({ openId: oid, name: m.name ?? oid });
-  }
-  return out;
-}
-
-/** 从 post inline `at` 节点取非本 bot 的目标（user_name 兜 name），按 user_id 去重、保持顺序。
- *  同 text 形态：只收「命令词文本节点之后」的 `at` 节点（前导 @ 是操作 bot 点名，剔除）。 */
-function parsePostAtMentions(message: any, botOpenId: string | undefined): Array<{ openId: string; name: string }> {
-  const seen = new Set<string>();
-  const out: Array<{ openId: string; name: string }> = [];
-  let content: any;
-  try { content = JSON.parse(message?.content ?? '{}'); } catch { return out; }
-  const inner = content?.zh_cn ?? content?.en_us ?? content;
-  if (!Array.isArray(inner?.content)) return out;
-  // 先定位命令词文本节点的序号，再只收其后的 at 节点。
-  let seq = 0, cmdSeq = -1;
-  const ats: Array<{ oid: string; name: string; seq: number }> = [];
-  for (const para of inner.content) {
-    if (!Array.isArray(para)) continue;
-    for (const node of para) {
-      if (cmdSeq < 0 && node?.tag === 'text' && /\/(?:grant|revoke)\b/i.test(node.text ?? '')) cmdSeq = seq;
-      if (node?.tag === 'at' && node.user_id) ats.push({ oid: node.user_id, name: node.user_name ?? node.user_id, seq });
-      seq++;
-    }
-  }
-  for (const a of ats) {
-    if (a.oid === botOpenId || seen.has(a.oid)) continue;
-    if (cmdSeq >= 0 && a.seq <= cmdSeq) continue;   // 命令词之前 = 操作 bot 点名，剔除
-    seen.add(a.oid);
-    out.push({ openId: a.oid, name: a.name });
-  }
-  return out;
+  return parseTargetsAfterCommand(message, botOpenId, GRANT_CMD_PATTERN);
 }
 
 /** 取第一个非本 bot 的目标（单目标场景的便捷封装）。 */
 export function parseGrantTarget(message: any, botOpenId: string | undefined): { openId: string; name: string } | undefined {
   return parseGrantTargets(message, botOpenId)[0];
-}
-
-/** 把文本里所有 `@<name>` mention token 去掉（split/join，防正则注入），归一空白后 trim。 */
-export function stripAllMentions(text: string, mentions: any[]): string {
-  let s = text;
-  for (const m of mentions ?? []) {
-    const name = m?.name;
-    if (typeof name === 'string' && name.length) s = s.split(`@${name}`).join(' ');
-  }
-  return s.replace(/\s+/g, ' ').trim();
 }
 
 /**
@@ -133,50 +57,14 @@ export function parseGrantQuota(text: string, mentions: any[]): { ok: true; quot
   return { ok: true, quota: n };
 }
 
-function escapeRe(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
 /**
  * 本 bot 是否「只是作为 /grant、/revoke 的目标」被 @（@ 出现在命令词之后），
  * 而不是被前导 @ 点名执行命令的操作 bot。命中（仅目标）返回 true，调用方应静默放手——
  * 否则异主目标 bot 会误回 owner_only、同主目标 bot 会把自己剔空后误开整群授权。
- *
- * text 与 post（富文本）两种消息形态都覆盖，二者入口都能命中 /grant（见 event-dispatcher
- * 的 extractMessageTextForRouting / isBotMentioned），所以 guard 必须同时兜住：
- *  - text：{"text":"@_user_1 /grant @_user_2"}，@ 是占位符 key；用「key 后不接数字」的
- *    边界锁定整 token，规避 @_user_1 / @_user_10 这类 key 前缀歧义。
- *  - post：@ 是独立的 `at` 节点（不在 text 里、mentions 可能为空），按文档节点顺序比较
- *    本 bot 的 `at` 节点与含命令词的 text 节点的先后。
+ * 实现细节（text/post 双形态、key 前缀歧义规避）见 mention-targets.ts。
  */
 export function isGrantTargetOnly(message: any, botOpenId: string | undefined): boolean {
-  if (!botOpenId) return false;
-  let content: any;
-  try { content = JSON.parse(message?.content ?? '{}'); } catch { return false; }
-
-  if (typeof content?.text === 'string') {
-    const key = (message?.mentions ?? []).find((m: any) => mentionOpenId(m) === botOpenId)?.key;
-    if (!key) return false;
-    const cmdIdx = content.text.search(/\/(?:grant|revoke)\b/i);
-    const keyMatch = new RegExp(`${escapeRe(key)}(?!\\d)`).exec(content.text);
-    const myIdx = keyMatch ? keyMatch.index : -1;
-    return cmdIdx >= 0 && myIdx > cmdIdx;
-  }
-
-  const inner = content?.zh_cn ?? content?.en_us ?? content;
-  if (Array.isArray(inner?.content)) {
-    let seq = 0, cmdSeq = -1, mySeq = -1;
-    for (const para of inner.content) {
-      if (!Array.isArray(para)) continue;
-      for (const node of para) {
-        if (cmdSeq < 0 && node?.tag === 'text' && /\/(?:grant|revoke)\b/i.test(node.text ?? '')) cmdSeq = seq;
-        if (mySeq < 0 && node?.tag === 'at' && node.user_id === botOpenId) mySeq = seq;
-        seq++;
-      }
-    }
-    return cmdSeq >= 0 && mySeq > cmdSeq;
-  }
-  return false;
+  return isCommandTargetOnly(message, botOpenId, GRANT_CMD_PATTERN);
 }
 
 /** 返回 true 表示已拦截（不再进入路由/spawn）。 */

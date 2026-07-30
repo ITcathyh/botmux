@@ -3400,6 +3400,7 @@ export async function handleCommand(
           t('help.grant', undefined, loc),
           t('help.revoke', undefined, loc),
           t('help.vc_auth', undefined, loc),
+          t('help.invite', undefined, loc),
           '',
           t('help.heading_config', undefined, loc),
           t('help.config_get', undefined, loc),

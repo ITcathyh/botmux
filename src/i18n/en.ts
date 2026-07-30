@@ -130,6 +130,17 @@ export const messages: Record<string, string> = {
   'cmd.revoke.multi_would_open': '⚠️ {name} — skipped: last global allowed user / owner, revoking would open the bot to everyone',
   'cmd.revoke.multi_failed': '⚠️ {name} — revoke failed: {reason}',
 
+  // /invite (pull an out-of-chat bot into this chat, owner only)
+  'cmd.invite.owner_only': '⚠️ Only the owner can use /invite.',
+  'cmd.invite.p2p': '⚠️ Bots cannot be added in a DM — use /invite inside a group chat.',
+  'cmd.invite.usage': 'Usage: @me /invite @bot-to-add (multiple allowed), or @me /invite --app cli_xxx',
+  'cmd.invite.header': '🤝 /invite results:',
+  'cmd.invite.ok': '✅ Added to the chat: {names}',
+  'cmd.invite.already': '⏭️ Already in the chat (skipped): {names}',
+  'cmd.invite.unresolved': '⚠️ Could not resolve (not in this deployment\'s roster — use --app cli_xxx): {names}',
+  'cmd.invite.ambiguous_item': '⚠️ The name "{name}" matches multiple bots ({apps}) — use --app to pick one.',
+  'cmd.invite.failed_item': '❌ Failed to add: {name} — {reason}',
+
   // ─── Adopt card ──────────────────────────────────────────────────────────
   'card.adopt.title': '📡 Choose a CLI session to adopt',
   'card.adopt.placeholder_select': 'Pick a CLI session',
@@ -540,6 +551,7 @@ export const messages: Record<string, string> = {
   'help.grant': '@bot /grant @someone   - Let them talk in this chat (you can @ several at once); /grant (no target) opens the whole chat to talk',
   'help.revoke': '@bot /revoke @someone  - Revoke their talk access (you can @ several at once); /revoke (no target) revokes the whole-chat grant',
   'help.vc_auth': '/vc-auth @someone     - Temporarily trust an in-meeting instruction source; /vc-auth revoke @someone revokes; /vc-auth list shows current grants',
+  'help.invite': '@bot /invite @bot   - Pull an out-of-chat bot into this chat (multiple allowed; --app cli_xxx adds by app id)',
   'help.heading_config': '⚙️ Edit config remotely (owner only; written + hot-applied, no restart):',
   'help.config_get': '/botconfig get  - Show this bot\'s current operational config',
   'help.config_set': '/botconfig set <field> <value>  - Change model/cli/lang/toggles; /botconfig help for all fields',

@@ -38,6 +38,7 @@ import {
 import { automateOpenPlatformSetup } from '../../setup/open-platform-automation.js';
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
 import { tryHandleGrantCommand } from './grant-command.js';
+import { tryHandleInviteCommand } from './invite-command.js';
 import { tryHandleReplyModeCommand } from './reply-mode-command.js';
 import { tryHandleSubstituteCommand } from './substitute-command.js';
 import { buildGrantCard } from './card-builder.js';
@@ -2439,6 +2440,12 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       // /grant、/revoke — 群内授权元命令。在路由/spawn 之前拦截（仅 owner，需明确 @ 本 bot），
       // 否则会被当成 prompt 喂给 CLI 会话。
       if (await tryHandleGrantCommand(larkAppId, message, senderOpenId)) {
+        return;
+      }
+
+      // /invite — 把群外 bot 拉进本群的元命令。与 /grant 同款拦截模型（仅 owner，
+      // 需明确 @ 本 bot），防止进路由/spawn，也防多 bot 重复执行拉人。
+      if (await tryHandleInviteCommand(larkAppId, message, senderOpenId)) {
         return;
       }
 

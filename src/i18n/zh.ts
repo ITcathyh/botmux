@@ -133,6 +133,17 @@ export const messages: Record<string, string> = {
   'cmd.revoke.multi_would_open': '⚠️ {name} —— 跳过：ta 是最后的全局授权用户 / owner，撤销会让机器人对所有人开放',
   'cmd.revoke.multi_failed': '⚠️ {name} —— 撤销失败：{reason}',
 
+  // /invite（把群外 bot 拉进本群，owner 专用）
+  'cmd.invite.owner_only': '⚠️ 仅 owner 可以使用 /invite。',
+  'cmd.invite.p2p': '⚠️ 私聊里不能拉机器人，请在群里使用 /invite。',
+  'cmd.invite.usage': '用法：@我 /invite @要拉进群的机器人（可多个），或 @我 /invite --app cli_xxx',
+  'cmd.invite.header': '🤝 /invite 结果：',
+  'cmd.invite.ok': '✅ 已拉进群：{names}',
+  'cmd.invite.already': '⏭️ 已在群内（跳过）：{names}',
+  'cmd.invite.unresolved': '⚠️ 无法解析（不在本部署花名册，可用 --app cli_xxx 直接指定）：{names}',
+  'cmd.invite.ambiguous_item': '⚠️ 名字「{name}」对应多个机器人（{apps}），请改用 --app 指定。',
+  'cmd.invite.failed_item': '❌ 拉入失败：{name} —— {reason}',
+
   // ─── Adopt card ──────────────────────────────────────────────────────────
   'card.adopt.title': '📡 选择要接入的 CLI 会话',
   'card.adopt.placeholder_select': '选择 CLI 会话',
@@ -543,6 +554,7 @@ export const messages: Record<string, string> = {
   'help.grant': '@机器人 /grant @某人   - 授权对方在本群对话（可一次 @ 多人/多 bot）；/grant（不带人）授权本群所有成员对话',
   'help.revoke': '@机器人 /revoke @某人  - 撤销对方本群对话权（可一次 @ 多人/多 bot）；/revoke（不带人）撤销整群授权',
   'help.vc_auth': '/vc-auth @成员     - 会议监听中临时授权本场指令源；/vc-auth revoke @成员 撤销；/vc-auth list 查看',
+  'help.invite': '@机器人 /invite @bot  - 把不在群里的 bot 拉进本群（可一次多个；--app cli_xxx 可直接指定 app）',
   'help.heading_config': '⚙️ 远程改配置（owner 专用，写盘即热更新、无需重启）：',
   'help.config_get': '/botconfig get  - 查看本机器人当前运营配置',
   'help.config_set': '/botconfig set <字段> <值>  - 改 model/cli/lang/开关等；/botconfig help 看全部字段',

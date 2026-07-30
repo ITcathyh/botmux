@@ -1,0 +1,302 @@
+/**
+ * invite-command：`@bot /invite @目标bot` / `--app cli_xxx` 拉群外 bot 进本群。
+ * 覆盖：参数解析纯函数、花名册读取、target-only 守卫、owner 闸门、名字→appId
+ * 解析（唯一/未解析/歧义）、已在群内幂等、批量失败逐个回退。
+ * Run: pnpm vitest run test/invite-command.test.ts
+ */
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+vi.mock('@larksuiteoapi/node-sdk', () => {
+  class FakeClient { constructor(public opts: Record<string, unknown>) {} }
+  return { Client: FakeClient };
+});
+
+// 拦截回执与拉人 API，避免真实 Lark 调用。
+const replyMock = vi.fn(async () => 'om_reply');
+const rosterMock = vi.fn(async (_app: string, _chat: string) => [] as any[]);
+const addBotMock = vi.fn(async (_app: string, _chat: string, ids: string[]) =>
+  ids.map(id => ({ id, ok: true })) as { id: string; ok: boolean; error?: string }[]);
+vi.mock('../src/im/lark/client.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/im/lark/client.js')>();
+  return {
+    ...actual,
+    replyMessage: (...a: any[]) => replyMock(...a),
+    listChatBotMembers: (...a: any[]) => rosterMock(...a),
+  };
+});
+vi.mock('../src/services/groups-store.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/services/groups-store.js')>();
+  return { ...actual, addBotToChat: (...a: any[]) => addBotMock(...a) };
+});
+
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { tryHandleInviteCommand, parseInviteArgs, readBotsInfoEntries } from '../src/im/lark/invite-command.js';
+import { registerBot } from '../src/bot-registry.js';
+import { config } from '../src/config.js';
+
+const OWNER = 'ou_owner';
+const ME = 'ou_bot';
+
+/** text 形态：`@_user_1`（=本 bot，前导操作方点名）+ `/invite` + 尾部目标。 */
+function inviteMessage(overrides: {
+  text?: string; mentions?: any[]; chatType?: string; chatId?: string;
+} = {}) {
+  return {
+    message_id: 'om_inv', chat_id: overrides.chatId ?? 'oc_1',
+    ...(overrides.chatType ? { chat_type: overrides.chatType } : {}),
+    content: JSON.stringify({ text: overrides.text ?? '@_user_1 /invite @_user_2' }),
+    mentions: overrides.mentions ?? [
+      { key: '@_user_1', id: { open_id: ME }, name: 'Claude' },
+      { key: '@_user_2', id: { open_id: 'ou_codex' }, name: 'Codex' },
+    ],
+  };
+}
+
+let tmpDir: string;
+function writeBotsInfo(entries: Array<{ larkAppId: string; botName: string | null }>) {
+  writeFileSync(join(tmpDir, 'bots-info.json'), JSON.stringify(entries));
+}
+
+beforeEach(() => {
+  replyMock.mockClear();
+  rosterMock.mockClear();
+  addBotMock.mockClear();
+  rosterMock.mockImplementation(async () => []);
+  addBotMock.mockImplementation(async (_a, _c, ids: string[]) => ids.map(id => ({ id, ok: true })));
+  const bot = registerBot({ larkAppId: 'b1', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: [OWNER] });
+  bot.botOpenId = ME;
+  bot.resolvedAllowedUsers = [OWNER];
+  tmpDir = mkdtempSync(join(tmpdir(), 'invite-cmd-'));
+  config.session.dataDir = tmpDir;
+});
+afterEach(() => {
+  vi.restoreAllMocks();
+  rmSync(tmpDir, { recursive: true, force: true });
+  delete process.env.SESSION_DATA_DIR;
+});
+
+describe('parseInviteArgs', () => {
+  it('parses --app with space and = forms, deduped', () => {
+    expect(parseInviteArgs('/invite --app cli_a --app=cli_b --app cli_a', [])).toEqual({
+      appIds: ['cli_a', 'cli_b'], badAppTokens: [], leftover: '',
+    });
+  });
+  it('flags non-cli_ tokens after --app', () => {
+    const r = parseInviteArgs('/invite --app not_an_app', []);
+    expect(r.appIds).toEqual([]);
+    expect(r.badAppTokens).toEqual(['not_an_app']);
+  });
+  it('flags dangling --app', () => {
+    expect(parseInviteArgs('/invite --app', []).badAppTokens.length).toBe(1);
+  });
+  it('captures leftover garbage tokens', () => {
+    expect(parseInviteArgs('/invite 乱七八糟', []).leftover).toBe('乱七八糟');
+  });
+  it('strips mention display names before tokenizing', () => {
+    const r = parseInviteArgs('/invite @张 三 --app cli_a', [{ name: '张 三' }]);
+    expect(r.appIds).toEqual(['cli_a']);
+    expect(r.leftover).toBe('');
+  });
+});
+
+describe('readBotsInfoEntries', () => {
+  it('returns [] when file missing', () => {
+    expect(readBotsInfoEntries()).toEqual([]);
+  });
+  it('parses entries with larkAppId', () => {
+    writeBotsInfo([{ larkAppId: 'cli_codex', botName: 'Codex' }]);
+    expect(readBotsInfoEntries()).toEqual([{ larkAppId: 'cli_codex', botName: 'Codex' }]);
+  });
+});
+
+describe('tryHandleInviteCommand — 拦截与闸门', () => {
+  it('unrelated message is not intercepted', async () => {
+    const msg = inviteMessage({ text: '@_user_1 帮我看下代码' });
+    expect(await tryHandleInviteCommand('b1', msg, OWNER)).toBe(false);
+  });
+
+  it('non-owner: replies owner_only, never calls addBotToChat', async () => {
+    writeBotsInfo([{ larkAppId: 'cli_codex', botName: 'Codex' }]);
+    expect(await tryHandleInviteCommand('b1', inviteMessage(), 'ou_intruder')).toBe(true);
+    expect(addBotMock).not.toHaveBeenCalled();
+    expect(replyMock).toHaveBeenCalled();
+    expect(String(replyMock.mock.calls.at(-1)![2])).toContain('owner');
+  });
+
+  it('another bot addressed (I am not mentioned): intercepted but fully silent', async () => {
+    const msg = inviteMessage({ mentions: [
+      { key: '@_user_1', id: { open_id: 'ou_otherbot' }, name: 'CoCo' },
+      { key: '@_user_2', id: { open_id: 'ou_codex' }, name: 'Codex' },
+    ] });
+    expect(await tryHandleInviteCommand('b1', msg, OWNER)).toBe(true);
+    expect(replyMock).not.toHaveBeenCalled();
+    expect(addBotMock).not.toHaveBeenCalled();
+  });
+
+  it('target-only guard: I am @ed AFTER /invite → silent (I am the invitee, not the operator)', async () => {
+    const msg = inviteMessage({
+      text: '@_user_1 /invite @_user_2',
+      mentions: [
+        { key: '@_user_1', id: { open_id: 'ou_opbot' }, name: 'OpBot' },
+        { key: '@_user_2', id: { open_id: ME }, name: 'Claude' },
+      ],
+    });
+    expect(await tryHandleInviteCommand('b1', msg, OWNER)).toBe(true);
+    expect(replyMock).not.toHaveBeenCalled();
+    expect(addBotMock).not.toHaveBeenCalled();
+  });
+
+  it('p2p chat: refuses with p2p reply', async () => {
+    expect(await tryHandleInviteCommand('b1', inviteMessage({ chatType: 'p2p' }), OWNER)).toBe(true);
+    expect(addBotMock).not.toHaveBeenCalled();
+    expect(String(replyMock.mock.calls.at(-1)![2])).toContain('私聊');
+  });
+
+  it('p2p without any @ (real DM form): still gets the p2p reply, not silence', async () => {
+    const msg = { message_id: 'om_dm', chat_id: 'oc_dm', chat_type: 'p2p', content: JSON.stringify({ text: '/invite @Codex' }), mentions: [] };
+    expect(await tryHandleInviteCommand('b1', msg, OWNER)).toBe(true);
+    expect(addBotMock).not.toHaveBeenCalled();
+    expect(String(replyMock.mock.calls.at(-1)![2])).toContain('私聊');
+  });
+
+  it('no targets at all → usage reply, no API call', async () => {
+    const msg = inviteMessage({ text: '@_user_1 /invite', mentions: [
+      { key: '@_user_1', id: { open_id: ME }, name: 'Claude' },
+    ] });
+    expect(await tryHandleInviteCommand('b1', msg, OWNER)).toBe(true);
+    expect(addBotMock).not.toHaveBeenCalled();
+    expect(String(replyMock.mock.calls.at(-1)![2])).toContain('用法');
+  });
+
+  it('bad --app token → usage reply', async () => {
+    const msg = inviteMessage({ text: '@_user_1 /invite --app oops', mentions: [
+      { key: '@_user_1', id: { open_id: ME }, name: 'Claude' },
+    ] });
+    expect(await tryHandleInviteCommand('b1', msg, OWNER)).toBe(true);
+    expect(addBotMock).not.toHaveBeenCalled();
+    expect(String(replyMock.mock.calls.at(-1)![2])).toContain('用法');
+  });
+});
+
+describe('tryHandleInviteCommand — 解析与拉人', () => {
+  it('happy path: unique roster name resolves and is added', async () => {
+    writeBotsInfo([{ larkAppId: 'cli_codex', botName: 'Codex' }]);
+    expect(await tryHandleInviteCommand('b1', inviteMessage(), OWNER)).toBe(true);
+    expect(addBotMock).toHaveBeenCalledWith('b1', 'oc_1', ['cli_codex']);
+    const out = String(replyMock.mock.calls.at(-1)![2]);
+    expect(out).toContain('已拉进群');
+    expect(out).toContain('Codex');
+  });
+
+  it('already-in-chat target (live roster openId match) is skipped', async () => {
+    writeBotsInfo([{ larkAppId: 'cli_codex', botName: 'Codex' }]);
+    rosterMock.mockImplementation(async () => [
+      { larkAppId: 'cli_codex', openId: 'ou_codex', name: 'Codex', displayName: 'Codex' },
+    ]);
+    expect(await tryHandleInviteCommand('b1', inviteMessage(), OWNER)).toBe(true);
+    expect(addBotMock).not.toHaveBeenCalled();
+    expect(String(replyMock.mock.calls.at(-1)![2])).toContain('已在群内');
+  });
+
+  it('name not in bots-info → unresolved with --app hint, no add', async () => {
+    writeBotsInfo([{ larkAppId: 'cli_gemini', botName: 'Gemini' }]);
+    expect(await tryHandleInviteCommand('b1', inviteMessage(), OWNER)).toBe(true);
+    expect(addBotMock).not.toHaveBeenCalled();
+    const out = String(replyMock.mock.calls.at(-1)![2]);
+    expect(out).toContain('无法解析');
+    expect(out).toContain('Codex');
+    expect(out).toContain('--app');
+  });
+
+  it('duplicate display name → ambiguous with candidate app ids, no add', async () => {
+    writeBotsInfo([
+      { larkAppId: 'cli_dup1', botName: 'Codex' },
+      { larkAppId: 'cli_dup2', botName: 'Codex' },
+    ]);
+    expect(await tryHandleInviteCommand('b1', inviteMessage(), OWNER)).toBe(true);
+    expect(addBotMock).not.toHaveBeenCalled();
+    const out = String(replyMock.mock.calls.at(-1)![2]);
+    expect(out).toContain('多个机器人');
+    expect(out).toContain('cli_dup1');
+    expect(out).toContain('cli_dup2');
+  });
+
+  it('--app bypasses name resolution (also works for bots outside the roster)', async () => {
+    writeBotsInfo([]);
+    const msg = inviteMessage({ text: '@_user_1 /invite --app cli_ext', mentions: [
+      { key: '@_user_1', id: { open_id: ME }, name: 'Claude' },
+    ] });
+    expect(await tryHandleInviteCommand('b1', msg, OWNER)).toBe(true);
+    expect(addBotMock).toHaveBeenCalledWith('b1', 'oc_1', ['cli_ext']);
+    expect(String(replyMock.mock.calls.at(-1)![2])).toContain('已拉进群');
+  });
+
+  it('mixed batch: resolvable added, already-in-chat skipped, unresolved reported — only resolvable hits the API', async () => {
+    writeBotsInfo([{ larkAppId: 'cli_codex', botName: 'Codex' }]);
+    rosterMock.mockImplementation(async () => [
+      { larkAppId: 'b1', openId: ME, name: 'Claude', displayName: 'Claude' },
+      { larkAppId: 'cli_gemini', openId: 'ou_gemini', name: 'Gemini', displayName: 'Gemini' },
+    ]);
+    const msg = inviteMessage({
+      text: '@_user_1 /invite @_user_2 @_user_3 @_user_4',
+      mentions: [
+        { key: '@_user_1', id: { open_id: ME }, name: 'Claude' },
+        { key: '@_user_2', id: { open_id: 'ou_codex' }, name: 'Codex' },
+        { key: '@_user_3', id: { open_id: 'ou_gemini' }, name: 'Gemini' },
+        { key: '@_user_4', id: { open_id: 'ou_ghost' }, name: 'Ghost' },
+      ],
+    });
+    expect(await tryHandleInviteCommand('b1', msg, OWNER)).toBe(true);
+    expect(addBotMock).toHaveBeenCalledWith('b1', 'oc_1', ['cli_codex']);
+    const out = String(replyMock.mock.calls.at(-1)![2]);
+    expect(out).toContain('Codex');
+    expect(out).toContain('已在群内');
+    expect(out).toContain('Gemini');
+    expect(out).toContain('无法解析');
+    expect(out).toContain('Ghost');
+  });
+
+  it('whole-batch failure falls back to per-id invites and reports individual results', async () => {
+    writeBotsInfo([
+      { larkAppId: 'cli_codex', botName: 'Codex' },
+      { larkAppId: 'cli_gemini', botName: 'Gemini' },
+    ]);
+    addBotMock
+      .mockImplementationOnce(async (_a, _c, ids: string[]) => ids.map(id => ({ id, ok: false, error: 'batch boom' })))
+      .mockImplementation(async (_a, _c, ids: string[]) =>
+        ids.map(id => ({ id, ok: id !== 'cli_gemini', ...(id === 'cli_gemini' ? { error: 'invalid_id' } : {}) })));
+    const msg = inviteMessage({
+      text: '@_user_1 /invite @_user_2 @_user_3',
+      mentions: [
+        { key: '@_user_1', id: { open_id: ME }, name: 'Claude' },
+        { key: '@_user_2', id: { open_id: 'ou_codex' }, name: 'Codex' },
+        { key: '@_user_3', id: { open_id: 'ou_gemini' }, name: 'Gemini' },
+      ],
+    });
+    expect(await tryHandleInviteCommand('b1', msg, OWNER)).toBe(true);
+    // 1 次批量（全失败）+ 2 次逐个 = 3 次调用
+    expect(addBotMock).toHaveBeenCalledTimes(3);
+    const out = String(replyMock.mock.calls.at(-1)![2]);
+    expect(out).toContain('已拉进群');
+    expect(out).toContain('Codex');
+    expect(out).toContain('拉入失败');
+    expect(out).toContain('Gemini');
+  });
+
+  it('post (rich-text) form: operator at-node + invite text node + target at-node', async () => {
+    writeBotsInfo([{ larkAppId: 'cli_codex', botName: 'Codex' }]);
+    const postMsg = {
+      message_id: 'om_post', chat_id: 'oc_1',
+      content: JSON.stringify({ zh_cn: { content: [[
+        { tag: 'at', user_id: ME, user_name: 'Claude' },
+        { tag: 'text', text: ' /invite ' },
+        { tag: 'at', user_id: 'ou_codex', user_name: 'Codex' },
+      ]] } }),
+      mentions: [],
+    };
+    expect(await tryHandleInviteCommand('b1', postMsg, OWNER)).toBe(true);
+    expect(addBotMock).toHaveBeenCalledWith('b1', 'oc_1', ['cli_codex']);
+  });
+});
