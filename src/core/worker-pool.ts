@@ -4564,11 +4564,19 @@ function reserveWorkerGeneration(ds: DaemonSession): number {
  * a fresh CLI, which the sandbox wraps normally.
  */
 export function adoptSandboxBlocked(
-  botCfg: { sandbox?: boolean; readIsolation?: boolean },
-  session?: { sandbox?: boolean },
+  botCfg: { sandbox?: boolean; readIsolation?: boolean; apiOnly?: boolean },
+  session?: { sandbox?: boolean; chatId?: string },
 ): boolean {
   return botCfg.sandbox === true
     || botCfg.readIsolation === true
+    // A core-only (apiOnly) bot — or a session on a synthetic HTTP virtual chat —
+    // must NOT adopt-observe a pre-existing external CLI: that CLI runs fully
+    // unisolated (the adopt observe branch returns before any fs-policy build),
+    // so it could read this host's bots.json / sibling creds on behalf of a
+    // no-transport turn. Convert to cold-start instead (same as sandbox adopt).
+    || botCfg.apiOnly === true
+    || (typeof session?.chatId === 'string'
+        && (session.chatId.startsWith('http_async_') || session.chatId.startsWith('http_wait_')))
     || session?.sandbox === true
     || sandboxEnabled();
 }
@@ -4779,13 +4787,6 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     botName: bot.botName,
     botOpenId: bot.botOpenId,
     locale: botLocale(botCfg),
-    // Same HARD credential boundary as the fresh-spawn fork: a no-transport
-    // session forces read isolation so the adopted CLI can't read full bots.json
-    // / sibling creds. Adopt is structurally a human-pane attach (never apiOnly/
-    // virtual today), but gating here too makes the capability provably frozen
-    // across EVERY worker-spawn entry, not just the main fork.
-    readIsolation: botCfg.readIsolation === true
-      || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }),
     // Zellij adopt targets carry zellijSession+zellijPaneId (observe via
     // dump-screen / drive via action); tmux carries tmuxTarget (pipe-pane).
     // The worker's adopt branch picks the backend from whichever is present.
