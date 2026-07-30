@@ -6095,7 +6095,7 @@ async function registerSelfFromCredFile(): Promise<void> {
   const sd = process.env.SESSION_DATA_DIR;
   if (!appId || !sd) return;
   const { sendCredFilePath } = await import('./adapters/cli/read-isolation.js');
-  let cred: { larkAppSecret?: string; brand?: string };
+  let cred: { larkAppSecret?: string; brand?: string; apiOnly?: boolean };
   try {
     // send-cred lives in the bot's BOT_HOME (<BOTMUX_HOME>/bots/<appId>/send-cred.json);
     // sendCredFilePath takes SESSION_DATA_DIR and derives BOTMUX_HOME (its parent).
@@ -6103,11 +6103,16 @@ async function registerSelfFromCredFile(): Promise<void> {
   } catch {
     return; // no cred file → not isolated (or first layer supplies creds elsewhere)
   }
-  if (!cred.larkAppSecret) return;
+  // apiOnly bots legitimately have an empty secret — don't bail on that, but DO
+  // carry the apiOnly flag through so the reconstructed config keeps the
+  // transport boundary (getBotClient throws for apiOnly). A non-apiOnly bot with
+  // no secret is still a no-op (nothing to register).
+  if (!cred.larkAppSecret && cred.apiOnly !== true) return;
   const { registerBot } = await import('./bot-registry.js');
   registerBot({
     larkAppId: appId,
-    larkAppSecret: cred.larkAppSecret,
+    larkAppSecret: cred.larkAppSecret ?? '',
+    apiOnly: cred.apiOnly === true || undefined,
     cliId: 'claude-code',
     brand: cred.brand as 'feishu' | 'lark' | undefined,
   } as import('./bot-registry.js').BotConfig);
@@ -6171,6 +6176,7 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
   const botConfig = {
     larkAppId: appId,
     larkAppSecret: appSecret,
+    apiOnly: process.env.BOTMUX_API_ONLY === '1' || undefined,
     brand,
     cliId: 'riff',
     allowedUsers: [],

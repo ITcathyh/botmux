@@ -22,12 +22,23 @@ const fakeClient = {
     },
   },
 };
-vi.mock('../src/bot-registry.js', () => ({
-  getBot: (...a: any[]) => getBotMock(...a),
-  getBotClient: () => fakeClient,
-  getAllBots: vi.fn(() => []),
-  formatLarkError: (e: any) => String(e),
-}));
+vi.mock('../src/bot-registry.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/bot-registry.js')>();
+  return {
+    ...actual,
+    getBot: (...a: any[]) => getBotMock(...a),
+    getAllBots: vi.fn(() => []),
+    formatLarkError: (e: any) => String(e),
+    // Mirror the real getBotClient gate against the mocked getBot: apiOnly →
+    // throw the (real) LarkTransportDisabledError; otherwise hand back the fake.
+    getBotClient: (larkAppId: string) => {
+      if (getBotMock(larkAppId)?.config?.apiOnly === true) {
+        throw new actual.LarkTransportDisabledError(larkAppId, 'getBotClient');
+      }
+      return fakeClient;
+    },
+  };
+});
 
 import {
   sendMessage, replyMessage, updateMessage, deleteMessage,

@@ -24,6 +24,20 @@ import type {
 } from './types.js';
 import type { VcMeetingActivityType } from './vc-agent/types.js';
 
+/**
+ * Thrown when any Feishu client is requested for a core-only (`apiOnly`) bot.
+ * Defined here (the lowest-level module that owns bot config + client) so both
+ * `getBotClient` and higher layers (im/lark/client.ts primitives, doc-comment)
+ * throw the SAME typed error without an import cycle. apiOnly = zero Feishu
+ * network (reads AND writes); reaching a client request is genuine misuse.
+ */
+export class LarkTransportDisabledError extends Error {
+  constructor(larkAppId: string, op: string) {
+    super(`Feishu transport is disabled for core-only bot ${larkAppId} (attempted: ${op})`);
+    this.name = 'LarkTransportDisabledError';
+  }
+}
+
 export type {
   VcMeetingConsumerAgentConfig,
   VcMeetingConsumerConfig,
@@ -1493,7 +1507,18 @@ export function getBot(larkAppId: string): BotState {
 }
 
 export function getBotClient(larkAppId: string): Lark.Client {
-  return getBot(larkAppId).client;
+  const bot = getBot(larkAppId);
+  // Bot-level transport boundary at the TRUE shared base. `apiOnly` (core-only)
+  // means zero Feishu network — reads AND writes — not merely "no sends". Every
+  // Feishu call in the codebase resolves its client here (client.ts primitives,
+  // doc-comment drive API, open-platform rename/avatar, identity cache…), so
+  // throwing here is the single authoritative gate no caller can bypass. A
+  // correctly-built apiOnly flow never reaches this (session/CLI gates fire
+  // first); reaching it is genuine misuse and must fail loud, not silently.
+  if (bot.config.apiOnly === true) {
+    throw new LarkTransportDisabledError(larkAppId, 'getBotClient');
+  }
+  return bot.client;
 }
 
 /** Owner = bot 首个已授权 open_id，与「缺权限警告私信对象」同口径（见 admin 解析）。 */
