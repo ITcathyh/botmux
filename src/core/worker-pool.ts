@@ -2437,7 +2437,12 @@ export function forkWorker(
     ownerOpenId: ds.ownerOpenId,
     webPort: ds.session.webPort,
     larkAppId: botCfg.larkAppId,
-    larkAppSecret: botCfg.larkAppSecret,
+    // Freeze on the session transport capability: a no-transport session
+    // (apiOnly bot OR HTTP virtual chat) must not even RECEIVE the real secret —
+    // withholding it removes the capability rather than gating a tamperable flag
+    // the sandboxed agent could flip. The worker then physically cannot dial
+    // Feishu (uploader/cred-write are also skipped downstream on the same test).
+    larkAppSecret: larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }) ? botCfg.larkAppSecret : '',
     apiOnly: botCfg.apiOnly,
     brand: normalizeBrand(botCfg.brand),
     botName: bot.botName,
@@ -4748,7 +4753,12 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     ownerOpenId: ds.ownerOpenId,
     webPort: ds.session.webPort,
     larkAppId: botCfg.larkAppId,
-    larkAppSecret: botCfg.larkAppSecret,
+    // Freeze on the session transport capability: a no-transport session
+    // (apiOnly bot OR HTTP virtual chat) must not even RECEIVE the real secret —
+    // withholding it removes the capability rather than gating a tamperable flag
+    // the sandboxed agent could flip. The worker then physically cannot dial
+    // Feishu (uploader/cred-write are also skipped downstream on the same test).
+    larkAppSecret: larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }) ? botCfg.larkAppSecret : '',
     apiOnly: botCfg.apiOnly,
     brand: normalizeBrand(botCfg.brand),
     botName: bot.botName,

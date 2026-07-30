@@ -937,6 +937,12 @@ export async function getMessageChatId(
 }
 
 export async function downloadMessageResource(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string): Promise<void> {
+  // apiOnly hard-gate BEFORE the app→user token fallback. Without this, the
+  // App Token attempt (getBotClient) throws LarkTransportDisabledError, gets
+  // caught below as a "failed app download", and silently falls through to the
+  // raw user-token fetch — bypassing the boundary. A core-only bot has no
+  // Feishu resource to download; refuse up front.
+  assertLarkTransport(larkAppId, 'downloadMessageResource');
   const dir = dirname(savePath);
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
