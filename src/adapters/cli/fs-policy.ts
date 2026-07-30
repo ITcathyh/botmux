@@ -380,8 +380,12 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
 
   // Adapter-declared surfaces.
   push(ctx.execPaths, 'readOnly', 'adapter');
-  // authPaths carry Feishu/login credentials — withheld from a no-transport turn.
-  if (larkTransport) push(ctx.authPaths, 'readWrite', 'adapter');
+  // authPaths = the model CLI's OWN login/state surface (~/.codex, ~/.claude
+  // credentials, Seed/bytedcli SSO, Gemini OAuth, OpenCode DB, …) — NOT Feishu.
+  // These MUST stay granted even for a no-transport turn, else the CLI can't
+  // authenticate and the core functionality breaks. The no-Lark-transport gate
+  // only denies Feishu-authority paths (below), never the CLI's own auth.
+  push(ctx.authPaths, 'readWrite', 'adapter');
   if (!ctx.redirectedCliData) push(ctx.cliDataPaths, 'readWrite', 'adapter');
 
   // botmux internals.
@@ -464,21 +468,25 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // No-Lark-transport MANDATORY credential denies. Emitted LAST as 'mandatory'
   // so they outrank any broad readWrite (notably workingDir=~ re-opening $HOME,
   // which contains bots.json + every sibling BOT_HOME + the lark-cli stores).
-  // These are the exact Feishu-credential surfaces a core-only turn must never
-  // read; deny-by-longest-prefix keeps deeper allow rules (e.g. the bot's own
-  // BOT_HOME working dir) intact while sealing the credential paths.
+  // These are ONLY Feishu-AUTHORITY surfaces — the model CLI's own authPaths
+  // (~/.codex etc.) are deliberately NOT here (they stay granted above), so a
+  // core-only turn can still authenticate its CLI while never reaching a Feishu
+  // credential. deny-by-longest-prefix keeps deeper allow rules (the bot's own
+  // BOT_HOME working dir) intact while sealing only the credential paths.
   if (!larkTransport) {
     const denies = [
       `${ctx.botmuxHome}/bots.json`,               // all bots' appId+secret
       `${ctx.homeDir}/.lark-cli-bots`,             // Linux per-bot lark-cli identities (all)
       `${ctx.homeDir}/Library/Application Support/lark-cli`, // macOS keystore (all bots' ciphertext + master key)
-      // Adapter-declared Feishu/login surfaces (authPaths): suppressed from the
-      // adapter grant above, but a broad workingDir=~ grant would re-open them —
-      // so hard-deny them here too. (A CLI-login token that lives inside the CLI
-      // data root is out of scope; these are the Feishu-facing login sources.)
-      ...(ctx.authPaths ?? []),
+      `${ctx.botmuxHome}/bots`,                    // sibling BOT_HOMEs (incl. send-cred.json). NOTE: own
+                                                   // BOT_HOME is re-allowed at a deeper path just below.
     ];
     push(denies, 'deny', 'mandatory');
+    // Re-allow THIS bot's own BOT_HOME (deeper prefix wins) so its working dir /
+    // scratch stays writable; only the send-cred file inside it is denied (it's
+    // the Feishu secret — empty for apiOnly, but denied for defense-in-depth).
+    push([ctx.botHome], 'readWrite', 'internal');
+    push([`${ctx.botHome}/send-cred.json`], 'deny', 'mandatory');
   }
 
   return {

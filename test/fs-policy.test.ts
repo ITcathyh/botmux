@@ -662,35 +662,46 @@ describe('compiler parity with accessForPath', () => {
 describe('no-Lark-transport credential profile (larkTransportEnabled=false)', () => {
   // Worst case: workingDir defaults to $HOME, which would grant the whole home
   // (bots.json + sibling BOT_HOMEs + lark-cli stores) readWrite. The mandatory
-  // no-transport denies must beat that broad grant.
+  // no-transport denies must beat that broad grant — but ONLY for Feishu
+  // authority, never the model CLI's own auth. authPaths here uses the REAL
+  // codex-app adapter surface (~/.codex), not a fictional one.
   const noTransport = (o: Partial<FsPolicyContext> = {}) => buildFsPolicy(ctx({
     larkTransportEnabled: false,
     workingDir: '/Users/u',                       // = homeDir (worst case)
-    authPaths: ['/Users/u/.lark_login'],          // an adapter Feishu-login surface
+    redirectedCliData: false,
+    authPaths: ['/Users/u/.codex'],               // REAL codex-app CLI login/state surface
     ...o,
   }));
 
-  it('denies bots.json, lark-cli stores, and adapter authPaths even with workingDir=~', () => {
+  it('denies Feishu authority (bots.json / lark-cli stores / sibling BOT_HOME) even with workingDir=~', () => {
     const p = noTransport();
     expect(accessForPath(p.rules, '/Users/u/.botmux/bots.json').access).toBe('deny');
     expect(accessForPath(p.rules, '/Users/u/.lark-cli-bots/cli_self/config').access).toBe('deny');
     expect(accessForPath(p.rules, '/Users/u/Library/Application Support/lark-cli/master.key.file').access).toBe('deny');
-    // adapter authPaths (Feishu login) are NOT granted for a no-transport turn.
-    expect(accessForPath(p.rules, '/Users/u/.lark_login').access).not.toBe('readWrite');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/bots/sibling/send-cred.json').access).toBe('deny');
   });
 
-  it('a NORMAL (transport-enabled) bot still gets its own lark-cli + authPaths', () => {
-    const p = buildFsPolicy(ctx({ larkTransportEnabled: true, authPaths: ['/Users/u/.lark_login'] }));
-    expect(accessForPath(p.rules, '/Users/u/.lark-cli-bots/cli_self/config').access).toBe('readWrite');
-    expect(accessForPath(p.rules, '/Users/u/.lark_login').access).toBe('readWrite');
-    // Linux keystore path: normal bot on darwin gets the master key carve-out.
-    expect(accessForPath(p.rules, '/Users/u/Library/Application Support/lark-cli/master.key.file').access).toBe('readOnly');
+  it('KEEPS the model CLI own auth (~/.codex) readWrite under no-transport — core functionality intact', () => {
+    // The regression codex caught: authPaths are the CLI's OWN login (not Feishu),
+    // so a core-only turn must still authenticate its CLI. ~/.codex stays RW even
+    // though it lives under the workingDir=~ home.
+    const p = noTransport();
+    expect(accessForPath(p.rules, '/Users/u/.codex').access).toBe('readWrite');
+    expect(accessForPath(p.rules, '/Users/u/.codex/auth.json').access).toBe('readWrite');
   });
 
-  it('own BOT_HOME working dir stays writable under no-transport (deny is scoped to cred paths only)', () => {
+  it('own BOT_HOME stays writable but its send-cred.json is denied (Feishu secret)', () => {
     const p = buildFsPolicy(ctx({ larkTransportEnabled: false, workingDir: '/Users/u/.botmux/bots/cli_self' }));
     expect(accessForPath(p.rules, '/Users/u/.botmux/bots/cli_self/scratch.txt').access).toBe('readWrite');
-    // but bots.json (sibling secrets) still denied
+    expect(accessForPath(p.rules, '/Users/u/.botmux/bots/cli_self/send-cred.json').access).toBe('deny');
     expect(accessForPath(p.rules, '/Users/u/.botmux/bots.json').access).toBe('deny');
+  });
+
+  it('a NORMAL (transport-enabled) bot gets its own lark-cli, authPaths, and keystore', () => {
+    const p = buildFsPolicy(ctx({ larkTransportEnabled: true, redirectedCliData: false, authPaths: ['/Users/u/.codex'] }));
+    expect(accessForPath(p.rules, '/Users/u/.lark-cli-bots/cli_self/config').access).toBe('readWrite');
+    expect(accessForPath(p.rules, '/Users/u/.codex/auth.json').access).toBe('readWrite');
+    expect(accessForPath(p.rules, '/Users/u/Library/Application Support/lark-cli/master.key.file').access).toBe('readOnly');
+    // bots.json (sibling secrets) is baseline-denied for normal bots too.
   });
 });
