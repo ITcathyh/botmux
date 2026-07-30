@@ -1887,7 +1887,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     // mandatory (daemon identity + dashboard routing + cachedLarkAppId gate); use
     // a synthetic local id like `local_<slug>`. Normal Feishu bots keep the hard
     // requirement — a missing secret there is a misconfig, not a headless bot.
-    if (entry.apiOnly !== true && (!entry.larkAppSecret || typeof entry.larkAppSecret !== 'string')) {
+    // The rule for apiOnly is "may be omitted; if present it must still be a
+    // string" — a number/object/array/false must NOT slip into a string field.
+    if (entry.apiOnly === true) {
+      if (entry.larkAppSecret !== undefined && typeof entry.larkAppSecret !== 'string') {
+        throw new Error(`Bot config [${i}]: larkAppSecret must be a string when provided (apiOnly bots may omit it)`);
+      }
+    } else if (!entry.larkAppSecret || typeof entry.larkAppSecret !== 'string') {
       throw new Error(`Bot config [${i}]: larkAppSecret is required and must be a string`);
     }
     // MOSA-managed onboarding persists the exact App/secret/owner binding so

@@ -423,3 +423,28 @@ export function activeSessionKey(ds: DaemonSession): string {
 export function isDocNativeSession(ds: Pick<DaemonSession, 'scope' | 'chatId'>): boolean {
   return ds.scope === 'chat' && ds.chatId.startsWith('doc:');
 }
+
+/** A session created by the HTTP control API (`waitForFinalOutput` /
+ * `asyncReturnSessionId`) whose `chatId` is a synthetic `http_async_*` /
+ * `http_wait_*` address, NOT a real Lark chat. Any Feishu chat API call
+ * targeting it (sendMessage / card / reply / roster probe) would fail — these
+ * sessions are request/response only and must never touch Lark transport. */
+export function isHttpVirtualSession(chatId: string): boolean {
+  return chatId.startsWith('http_async_') || chatId.startsWith('http_wait_');
+}
+
+/** Central Lark-transport capability gate for a live session. Returns false —
+ * meaning "no Feishu side effects are permitted for this session" — when either
+ * the owning bot is core-only (`apiOnly`, never connected to Feishu) OR the
+ * session's surface is a synthetic HTTP virtual chat. Every auxiliary-UI /
+ * reply / card / roster seam should fail-closed on `!larkTransportEnabled(...)`
+ * instead of re-deriving the condition, so a new no-Feishu surface is covered
+ * everywhere by construction. `doc:` sessions keep their own dedicated routing
+ * (comment API), so they are intentionally NOT folded in here. */
+export function larkTransportEnabled(
+  ds: Pick<DaemonSession, 'chatId'> & { apiOnly?: boolean },
+): boolean {
+  if (ds.apiOnly === true) return false;
+  if (isHttpVirtualSession(ds.chatId)) return false;
+  return true;
+}

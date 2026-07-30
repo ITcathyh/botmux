@@ -57,8 +57,68 @@ describe('API-only bot mode — boot-time Feishu decoupling (source lock)', () =
       .toBeLessThan(block.indexOf('startLarkEventDispatcher('));
   });
 
-  it('exempts apiOnly bots from the larkAppSecret requirement (registry)', () => {
+  it('exempts apiOnly bots from the larkAppSecret requirement but still type-checks it (registry)', () => {
     const block = region(registrySource, 'larkAppId is required and must be a string', 'MOSA-managed onboarding');
-    expect(block).toContain("entry.apiOnly !== true && (!entry.larkAppSecret || typeof entry.larkAppSecret !== 'string')");
+    // apiOnly: secret may be omitted, but if present must still be a string.
+    expect(block).toContain("if (entry.apiOnly === true) {");
+    expect(block).toContain("entry.larkAppSecret !== undefined && typeof entry.larkAppSecret !== 'string'");
+    // Normal bots keep the hard requirement.
+    expect(block).toContain("} else if (!entry.larkAppSecret || typeof entry.larkAppSecret !== 'string') {");
   });
 });
+
+describe('API-only bot mode — runtime Feishu transport gates (source lock)', () => {
+  const clientSource = readFileSync(resolve('src/im/lark/client.ts'), 'utf8');
+  const triggerSource = readFileSync(resolve('src/core/trigger-session.ts'), 'utf8');
+
+  it('gates the central sessionReply transport seam on larkTransportEnabled', () => {
+    // Gating at sessionReply covers ALL auxiliary worker UI (ready/screen/tui/
+    // stuck/startup+exit) by construction — the codex P1-1 fix.
+    const block = region(daemonSource, 'async function sessionReply(', 'const hookContext = ds ?');
+    expect(block).toContain('larkTransportEnabled({');
+    expect(block).toContain('apiOnly: getBot(appId).config.apiOnly');
+    expect(block).toContain('return anchor;'); // benign no-op sentinel
+  });
+
+  it('skips the getAvailableBots roster probe for no-transport sessions', () => {
+    const block = region(triggerSource, 'Skip the Feishu roster probe', 'buildNewTopicCliInput(');
+    expect(block).toContain('larkTransportEnabled({ chatId, apiOnly: bot.config.apiOnly })');
+    expect(block).toContain('await getAvailableBots(larkAppId, chatId)');
+    expect(block).toContain(': [];'); // empty roster when transport disabled
+  });
+
+  it('fail-closes the apiOnly trigger request shape (no real chat/root, requires HTTP mode)', () => {
+    const block = region(triggerSource, "if (getBot(larkAppId).config.apiOnly === true) {", 'const dryRun =');
+    expect(block).toContain('waitForFinalOutput && !req.options?.asyncReturnSessionId');
+    expect(block).toContain('cannot target a Feishu rootMessageId');
+    expect(block).toContain('cannot target a real Feishu chatId');
+    expect(block).toContain('may only resume its own HTTP virtual session');
+  });
+
+  it('rejects botmux ask for no-transport sessions before the Lark dispatcher', () => {
+    const block = region(daemonSource, "meeting receiver asks are not an idempotent managed action", 'canTalkChecker');
+    expect(block).toContain('larkTransportEnabled({ chatId: askSession.chatId');
+    expect(block).toContain("error: 'unsupported'");
+  });
+
+  it('excludes apiOnly bots from getAllBotClients (no normal-bot roster regression)', () => {
+    const block = region(clientSource, 'function loadAllBotClientConfigs(', 'function getAllBotClients(');
+    expect(block).toContain('c.apiOnly !== true');
+    expect(block).toContain('.filter(notApiOnly)');
+  });
+
+  it('gates doc-subscription restore + comment poller behind !cfg.apiOnly', () => {
+    const block = region(daemonSource, '文档订阅恢复 + 评论轮询', 'Sweep orphan sandbox trees');
+    expect(block).toContain('if (!cfg.apiOnly) {');
+    expect(block).toContain('restoreDocSubscriptions(activeSessions)');
+    expect(block).toContain('pollWatchedDocComments(cfg.larkAppId)');
+    expect(block.indexOf('if (!cfg.apiOnly) {'))
+      .toBeLessThan(block.indexOf('restoreDocSubscriptions('));
+  });
+
+  it('gates allowedUsers contact resolution behind !cfg.apiOnly', () => {
+    const block = region(daemonSource, 'Resolve allowed users per bot', 'needsResolve');
+    expect(block).toContain('if (!cfg.apiOnly && ((bot.config.allowedUsers?.length');
+  });
+});
+

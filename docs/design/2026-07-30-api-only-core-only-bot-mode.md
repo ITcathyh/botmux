@@ -63,3 +63,28 @@ apiOnly bot 天然不订阅事件 → 这些入口永不触发，无需额外禁
 
 ## 部署
 rebase master → 开 PR（中文 + 影响面）→ 发 canary → 配一个 `apiOnly:true` + `cliId:codex-app` 的 bot（合成 larkAppId）→ 把 baseUrl + 合成 botId 进群、dashboard token 私密给 riff。
+
+---
+
+## 修订（codex 复审后）：从「boot 三点」升级为「中央 transport 能力边界」
+
+首版只 gate 了 boot 的 3 个飞书订阅/探测点，误判「运行时零飞书」。codex 复审指出：final_output 前仍有多条飞书链路未 gate，且 apiOnly 只是 boot hint。修订按中央能力边界收口：
+
+**核心不变量** `larkTransportEnabled(ds)`（core/types.ts）：apiOnly bot 或 HTTP virtual session（http_async_*/http_wait_*）→ 返回 false = 该会话禁止一切飞书副作用。所有 seam fail-closed 于此，新增无飞书 surface 自动被覆盖。
+
+**运行时 gate（新增）**：
+1. `sessionReply`（daemon.ts）中央投递入口 fail-closed → 覆盖所有 worker 辅助 UI（ready/screen/tui/stuck/startup+exit），不再往 http_async_* 发 sendMessage。
+2. `getAvailableBots` roster 探测：no-transport 会话跳过（trigger-session.ts）。
+3. `botmux ask`（/api/asks）：no-transport 会话返回 unsupported，不落 Lark dispatcher。
+4. `/api/trigger` apiOnly 请求形态 fail-closed：拒真实 chatId/rootMessageId、必须带 HTTP response mode、sessionId 只能绑本 bot 的 virtual session。
+
+**boot gate（新增）**：
+5. `restoreDocSubscriptions` + 5s `pollWatchedDocComments` 文档轮询 → apiOnly 跳过（否则非 pristine dataDir 会主动打飞书）。
+6. allowedUsers 联系人解析（email/union_id → 飞书 contact API）→ apiOnly 跳过。
+
+**跨 bot 回归修复**：
+7. `getAllBotClients`/strict resolver 过滤 apiOnly——否则普通飞书 bot 探 roster 会连带探 apiOnly 合成 appId/空 secret，给健康 bot 引入认证失败+延迟。
+
+**校验类型洞修复**：apiOnly secret 规则改为「可省略；若提供必须是 string」——42/{}/[]/false 不再穿进 string 字段。
+
+**测试**：新增 api-only-transport-boundary.test（行为：larkTransportEnabled 真值表 + apiOnly 请求形态 fail-closed）+ 扩展 api-only-mode-wiring.test（source-lock 锁 7 处 gate，负向验证删 gate 即红）。
