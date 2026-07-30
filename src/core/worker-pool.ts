@@ -4779,6 +4779,13 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     botName: bot.botName,
     botOpenId: bot.botOpenId,
     locale: botLocale(botCfg),
+    // Same HARD credential boundary as the fresh-spawn fork: a no-transport
+    // session forces read isolation so the adopted CLI can't read full bots.json
+    // / sibling creds. Adopt is structurally a human-pane attach (never apiOnly/
+    // virtual today), but gating here too makes the capability provably frozen
+    // across EVERY worker-spawn entry, not just the main fork.
+    readIsolation: botCfg.readIsolation === true
+      || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }),
     // Zellij adopt targets carry zellijSession+zellijPaneId (observe via
     // dump-screen / drive via action); tmux carries tmuxTarget (pipe-pane).
     // The worker's adopt branch picks the backend from whichever is present.
