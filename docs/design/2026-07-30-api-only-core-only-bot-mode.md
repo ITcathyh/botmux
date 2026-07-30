@@ -108,3 +108,28 @@ rebase master → 开 PR（中文 + 影响面）→ 发 canary → 配一个 `ap
 - CLI 级 `botmux send` 早拒（cli.ts `currentBotIsApiOnly`）——给 agent 清晰反馈，不落深层 stack
 
 **测试**：新增 bot-level transport 原语抛错测试 + apiOnly card-patch 零飞书调用回归（真 scheduleCardPatch + FakeLarkClient 记账，负向验证过）。
+
+---
+
+## 最终架构（canonical，codex 7 轮复审收敛）
+
+前面「初稿 / 修订 / 修订2」记录演进；**以本节为准**。核心契约：**apiOnly bot 或 HTTP virtual session（http_async_/http_wait_）= 零飞书网络（读+写）**。分层：
+
+**1. bot 级唯一门 `getBotClient()`（bot-registry）** — 所有飞书调用在此解析 client（client.ts 11 出站原语 + downloadMessageResource + doc-comment driveApiCall + identity-cache）→ apiOnly 抛 `LarkTransportDisabledError`，读写全拦。
+
+**2. 会话级 `larkTransportEnabled(ds)`（core/types）** — daemon 侧：sessionReply（返 '' 不返伪 id）、managedAuxUiSuppressed（所有 worker 辅助 UI）、scheduleCardPatch、trigger roster、/api/asks。覆盖「普通 bot 的 virtual session」（getBotClient 不抛的那格）。
+
+**3. secret 从源头冻结** — 三条 spawn 路径的 secret 都从单一 `cfg.larkAppSecret` 冻结：
+   - init IPC 字段（forkWorker/forkAdoptWorker）
+   - CLI 进程 env `LARK_APP_SECRET`（forkWorker/forkAdoptWorker，独立于 IPC）
+   - riff mergedEnv：合并后**再冻结**（backendConfig.env 合并在最后，防覆盖）
+   - send-cred 文件（写空 secret + apiOnly 身份）
+   no-transport session 的 secret 根本不进 worker/沙箱进程。
+
+**4. CLI 中央 session-capability 硬门 `assertTurnTransportOrExit`（cli.ts）** — 所有飞书 CLI 命令（写：send/dispatch；读：history/quoted/bots list）统一 consult，键于 apiOnly bot OR 虚拟 `BOTMUX_CHAT_ID`。关闭「非 sandbox 本地 CLI 重载 bots.json 拿真 client」路径（普通 bot virtual session 的唯一防线）。
+
+**5. boot / dashboard 解耦** — apiOnly 跳过：open_id 探测、scope 校验、WSClient 订阅、doc 订阅+轮询、allowedUsers 联系人解析、开放平台 rename/avatar handler 注册（fail-closed 到本地 rename）；VC listener 选项排除 apiOnly + validator/sync 入口早拒 + fetchGrantedScopesForBot 拒。
+
+**6. 跨 bot 零回归** — getAllBotClients 过滤 apiOnly，普通 bot 探 roster 不连带探合成 appId。
+
+**已证伪并纠正的初稿判断**：①「运行时零改动、只 gate boot 三点」❌——final 前有大量飞书链路。②「getBotClient 是唯一门就够」❌——doc-comment/开放平台/worker uploader/CLI reload 各有旁路。③「send 单点早拒 = 中央 capability」❌——history/quoted/bots/dispatch 各自可达飞书。④「rename/avatar 是 setup-only」❌——是 dashboard runtime 路由。⑤「apiOnly boot hint 足够」❌——secret 若下发到 worker/env/cred 可被恢复。

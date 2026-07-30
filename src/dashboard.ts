@@ -599,6 +599,11 @@ async function validateVcMeetingListenerBotAppId(appId: string): Promise<{ ok: t
   }
   const bot = bots.find(b => b.larkAppId === appId);
   if (!bot) return { ok: false, error: 'vcMeetingAgent_listenerBot_unknown' };
+  // Core-only (apiOnly) bots cannot attend Feishu meetings (no Feishu connection,
+  // no open-platform scopes). Reject at the settings WRITE boundary so a manual
+  // PUT can't select one and drive syncVcMeetingListenerBotConfig →
+  // automateOpenPlatformSetup against the open platform with synthetic creds.
+  if (bot.apiOnly === true) return { ok: false, error: 'vcMeetingAgent_listenerBot_api_only' };
   return { ok: true };
 }
 
@@ -810,6 +815,18 @@ async function syncVcMeetingListenerBotConfig(listenerBotAppId: string | null, p
   const nextAppId = listenerBotAppId?.trim() || null;
   const prevAppId = previousListenerBotAppId?.trim() || null;
   if (!nextAppId && !prevAppId) return { ok: true };
+
+  // Defense-in-depth: even though the settings validator rejects apiOnly, guard
+  // the sync entry too so no caller reaches automateOpenPlatformSetup / the
+  // open-platform raw fetches for a core-only bot.
+  if (nextAppId) {
+    try {
+      const bot = loadBotConfigs().find(b => b.larkAppId === nextAppId);
+      if (bot?.apiOnly === true) {
+        return { ok: false, error: 'vcMeetingAgent_listenerBot_api_only' };
+      }
+    } catch { /* fall through to normal errors below */ }
+  }
 
   // Require lark-cli >= MIN_LARK_CLI_VERSION_FOR_VC_BOT for VC bot meeting commands
   // (vc +meeting-join/events/message-send --as bot). Earlier versions silently reject
