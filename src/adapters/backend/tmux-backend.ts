@@ -8,6 +8,7 @@ import { BOTMUX_INJECTED_ENV_KEYS, PROXY_ENV_KEYS, REDACTED_CHILD_ENV_KEYS } fro
 import { sanitizePerBotEnv } from '../../core/per-bot-env.js';
 import { logger } from '../../utils/logger.js';
 import { isExecutable } from '../../utils/executable.js';
+import { botmuxWrapperPathExportSh } from '../../core/botmux-wrapper.js';
 
 /**
  * `unset KEY KEY ...` clause spliced into the shell wrapper before exec. The
@@ -701,7 +702,7 @@ export function buildBotmuxEnvAssignments(
  * POSIX-syntax (works in bash/zsh/sh); fish/csh/nu users get remapped to
  * bash/zsh/sh by resolveUserShell() so they hit the same SCRIPT path.
  */
-export const SHELL_WRAPPER_SCRIPT = `cd -- "$1" && shift && ${PANE_ENV_UNSET_CLAUSE} && ${NON_INTERACTIVE_SHELL_ENV_UNSET_CLAUSE} && export PATH="$HOME/.botmux/bin:$PATH" && exec /usr/bin/env "$@"`;
+export const SHELL_WRAPPER_SCRIPT = `cd -- "$1" && shift && ${PANE_ENV_UNSET_CLAUSE} && ${NON_INTERACTIVE_SHELL_ENV_UNSET_CLAUSE} && ${botmuxWrapperPathExportSh()} && exec /usr/bin/env "$@"`;
 
 export const DIAGNOSTIC_SHELL_SCRIPT = [
   'cd -- "$1" 2>/dev/null || cd "$HOME" 2>/dev/null || cd /',
@@ -736,7 +737,7 @@ export function buildDebugKeepShellScript(shellPath: string): string {
     // The pre-rcfile launch override must not reach the CLI or debug shell.
     NON_INTERACTIVE_SHELL_ENV_UNSET_CLAUSE,
     // Same PATH prepend as SHELL_WRAPPER_SCRIPT (wrapper build wins over stale npm-global).
-    'export PATH="$HOME/.botmux/bin:$PATH"',
+    botmuxWrapperPathExportSh(),
     '/usr/bin/env "$@"',
     `printf '\\n[botmux debug] CLI exited (status %d) — interactive shell active. Type exit to close the session.\\n' "$?" >&2`,
     `exec '${safeShell}' -i`,

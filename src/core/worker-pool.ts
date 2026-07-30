@@ -82,7 +82,7 @@ import type { CliTurnPayload, CodexAppTurnInput, DaemonToWorker, WorkerToDaemon,
 import { activeSessionKey, sessionKey, sessionAnchorId, isDocNativeSession, larkTransportEnabled, type DaemonSession } from './types.js';
 import { DONE_REACTION_EMOJI_TYPE } from './pending-response.js';
 import { buildTerminalUrl } from './terminal-url.js';
-import { prependBotmuxBin } from './botmux-wrapper.js';
+import { prependBotmuxBin, resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
 import { usageLimitStateKey, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
 import {
   evaluateVcMeetingManagedSend,
@@ -2288,13 +2288,11 @@ export function forkWorker(
   if (familyAdapter.claudeStateJsonPath) ensureClaudeFolderTrust(cwd, familyAdapter.claudeStateJsonPath);
 
   // Prepend the botmux wrapper bin dir to PATH so CLIs can call `botmux send` etc.
-  // The wrapper script there is written by the daemon at startup. Core-only writes
-  // its wrapper into a DEDICATED bin dir under its state root (not the shared
-  // ~/.botmux/bin), so match that here or the worker's PATH would miss it and a
-  // stale/fleet wrapper could shadow it (codex P1: shared-HOME wrapper contamination).
-  const botmuxBinDir = process.env.BOTMUX_CORE_ONLY === '1'
-    ? join(config.session.dataDir, 'bin')
-    : join(homedir(), '.botmux', 'bin');
+  // Single source of truth (resolveBotmuxWrapperBinDir): core-only → dedicated
+  // `<SESSION_DATA_DIR>/bin` (not the shared ~/.botmux/bin), matching where the
+  // daemon WROTE the wrapper — else the worker PATH would miss it or a same-HOME
+  // fleet wrapper would shadow it (codex P1).
+  const botmuxBinDir = resolveBotmuxWrapperBinDir(process.env);
   const pathWithBotmux = prependBotmuxBin(botmuxBinDir, process.env.PATH);
 
   const forkEnv = workerForkEnv(process.env);

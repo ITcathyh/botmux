@@ -1,5 +1,34 @@
 import { describe, expect, it } from 'vitest';
-import { prependBotmuxBin, botmuxWrapperFiles } from '../src/core/botmux-wrapper.js';
+import { execFileSync } from 'node:child_process';
+import { prependBotmuxBin, botmuxWrapperFiles, resolveBotmuxWrapperBinDir, botmuxWrapperPathExportSh } from '../src/core/botmux-wrapper.js';
+
+describe('resolveBotmuxWrapperBinDir — single source of truth (core-only isolation)', () => {
+  it('core-only → dedicated <SESSION_DATA_DIR>/bin (never shared ~/.botmux/bin)', () => {
+    expect(resolveBotmuxWrapperBinDir({ BOTMUX_CORE_ONLY: '1', SESSION_DATA_DIR: '/srv/co/data', HOME: '/home/u' }))
+      .toBe('/srv/co/data/bin');
+  });
+  it('normal fleet → shared ~/.botmux/bin', () => {
+    expect(resolveBotmuxWrapperBinDir({ HOME: '/home/u' })).toBe('/home/u/.botmux/bin');
+  });
+  it('core-only WITHOUT SESSION_DATA_DIR falls back to shared (defensive; entrypoint always sets it)', () => {
+    expect(resolveBotmuxWrapperBinDir({ BOTMUX_CORE_ONLY: '1', HOME: '/home/u' })).toBe('/home/u/.botmux/bin');
+  });
+
+  it('shell snippet resolves the SAME dir at pane-script runtime (real /bin/sh)', () => {
+    const snippet = botmuxWrapperPathExportSh();
+    const run = (env: Record<string, string>) =>
+      execFileSync('/bin/sh', ['-c', `${snippet}; printf %s "$PATH"`], { env, encoding: 'utf8' });
+    // core-only: dedicated dir wins the prepend
+    expect(run({ BOTMUX_CORE_ONLY: '1', SESSION_DATA_DIR: '/srv/co/data', HOME: '/home/u', PATH: '/usr/bin' }))
+      .toBe('/srv/co/data/bin:/usr/bin');
+    // normal: shared dir
+    expect(run({ HOME: '/home/u', PATH: '/usr/bin' })).toBe('/home/u/.botmux/bin:/usr/bin');
+    // a HOSTILE shared wrapper dir is NOT prepended in core-only (its PATH position
+    // is behind the dedicated dir → `command -v` would resolve dedicated first).
+    const coreOnlyPath = run({ BOTMUX_CORE_ONLY: '1', SESSION_DATA_DIR: '/srv/co/data', HOME: '/home/u', PATH: '/home/u/.botmux/bin:/usr/bin' });
+    expect(coreOnlyPath.startsWith('/srv/co/data/bin:')).toBe(true);
+  });
+});
 
 describe('prependBotmuxBin', () => {
   it('uses : on POSIX', () => {

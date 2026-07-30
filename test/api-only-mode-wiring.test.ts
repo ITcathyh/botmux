@@ -549,15 +549,34 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     // on exit). breadcrumb skipped in core-only; wrapper goes to a dedicated bin dir.
     const wp = region(daemonSource, 'function writePidFile(', 'logger.info(`PID file written');
     expect(wp).toContain("if (process.env.BOTMUX_CORE_ONLY !== '1') {"); // breadcrumb gated
-    // The wrapper bin dir is core-only-aware (dedicated under the state root).
-    const binDirFn = region(daemonSource, 'function botmuxWrapperBinDir(', '\n}\n');
-    expect(binDirFn).toContain("if (process.env.BOTMUX_CORE_ONLY === '1')");
-    expect(binDirFn).toContain("join(config.session.dataDir, 'bin')");
-    // The worker PATH matches the same dedicated bin dir (else the wrapper is off PATH).
-    const workerPoolSrc = readFileSync(resolve('src/core/worker-pool.ts'), 'utf8');
-    expect(workerPoolSrc).toContain("process.env.BOTMUX_CORE_ONLY === '1'\n    ? join(config.session.dataDir, 'bin')");
+    // The daemon resolves the wrapper bin dir via the single source of truth.
+    expect(daemonSource).toContain('const BOTMUX_BIN_DIR = resolveBotmuxWrapperBinDir(process.env);');
     // fs-policy grants the dedicated bin dir readOnly for the sandboxed no-transport turn.
-    const ipcOrPolicy = readFileSync(resolve('src/adapters/cli/fs-policy.ts'), 'utf8');
-    expect(ipcOrPolicy).toContain('`${ctx.sessionDataDir}/bin`');
+    const policySrc = readFileSync(resolve('src/adapters/cli/fs-policy.ts'), 'utf8');
+    expect(policySrc).toContain('`${ctx.sessionDataDir}/bin`');
+  });
+
+  it('P1(4th round): wrapper bin dir has ONE resolver; every PATH consumer routes through it (no hardcoded ~/.botmux/bin prepend)', () => {
+    // codex P1: the WRITE went to a dedicated dir but the CONSUMERS (worker.ts x4,
+    // tmux x2) still prepended the shared ~/.botmux/bin — so PATH became
+    // shared:dedicated:… and `command -v botmux` hit the shared/fleet wrapper.
+    const wrapperSrc = readFileSync(resolve('src/core/botmux-wrapper.ts'), 'utf8');
+    expect(wrapperSrc).toContain('export function resolveBotmuxWrapperBinDir(');
+    expect(wrapperSrc).toContain("env.BOTMUX_CORE_ONLY === '1' && env.SESSION_DATA_DIR");
+    expect(wrapperSrc).toContain('export function botmuxWrapperPathExportSh(');
+    // worker.ts: all 4 PATH prepends go through the resolver; NO hardcoded bin join.
+    const workerSrc = readFileSync(resolve('src/worker.ts'), 'utf8');
+    const prependCount = (workerSrc.match(/prependBotmuxBin\(resolveBotmuxWrapperBinDir\(process\.env\)/g) || []).length;
+    expect(prependCount).toBeGreaterThanOrEqual(4);
+    expect(workerSrc).not.toContain("join(homedir(), '.botmux', 'bin')");
+    // worker-pool: fork PATH via the resolver.
+    const wpSrc = readFileSync(resolve('src/core/worker-pool.ts'), 'utf8');
+    expect(wpSrc).toContain('const botmuxBinDir = resolveBotmuxWrapperBinDir(process.env);');
+    expect(wpSrc).not.toContain("join(homedir(), '.botmux', 'bin')");
+    // tmux backend: both pane-script PATH exports use the runtime resolver snippet,
+    // NOT a hardcoded $HOME/.botmux/bin.
+    const tmuxSrc = readFileSync(resolve('src/adapters/backend/tmux-backend.ts'), 'utf8');
+    expect(tmuxSrc).toContain('botmuxWrapperPathExportSh()');
+    expect(tmuxSrc).not.toContain('export PATH="$HOME/.botmux/bin:$PATH"');
   });
 });

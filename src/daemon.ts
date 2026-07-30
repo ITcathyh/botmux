@@ -21,7 +21,7 @@ import { buildDashboardUrls } from './core/dashboard-url.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { reloadExactDaemonBotConfig } from './core/daemon-config-fence.js';
 import { writeHeartbeat } from './core/daemon-heartbeat.js';
-import { botmuxWrapperFiles } from './core/botmux-wrapper.js';
+import { botmuxWrapperFiles, resolveBotmuxWrapperBinDir } from './core/botmux-wrapper.js';
 import {
   evaluateOverload,
   formatOverloadAlert,
@@ -2981,16 +2981,12 @@ function getPidFile(): string {
 
 /** Path to the wrapper bin directory — injected into worker PATH so CLIs
  *  can call `botmux send` / `botmux schedule` without a global npm install.
- *  Core-only writes into a DEDICATED bin dir under its own state root (never the
- *  shared `~/.botmux/bin`), so a same-HOME fleet's wrapper/PATH is not clobbered
- *  with this canary/review dist and left unrestored on exit (codex P1). */
-function botmuxWrapperBinDir(): string {
-  if (process.env.BOTMUX_CORE_ONLY === '1') {
-    return join(config.session.dataDir, 'bin');
-  }
-  return join(homedir(), '.botmux', 'bin');
-}
-const BOTMUX_BIN_DIR = botmuxWrapperBinDir();
+ *  Single source of truth: resolveBotmuxWrapperBinDir (core-only → dedicated
+ *  `<SESSION_DATA_DIR>/bin`, never the shared `~/.botmux/bin`, so a same-HOME
+ *  fleet's wrapper/PATH is not clobbered and left unrestored on exit — codex P1).
+ *  Every consumer (worker-pool fork PATH, worker.ts child-env, tmux pane scripts)
+ *  MUST resolve the SAME dir. */
+const BOTMUX_BIN_DIR = resolveBotmuxWrapperBinDir(process.env);
 
 function writePidFile(): void {
   const dir = config.session.dataDir;
