@@ -194,6 +194,13 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   buildRepoSelectCard: vi.fn(() => '{"card":"json"}'),
   buildAdoptSelectCard: vi.fn(() => '{"card":"adopt-select"}'),
   buildCodexAppThreadSelectCard: vi.fn(() => '{"card":"codex-app-thread-select"}'),
+  buildAdoptBlockedCard: vi.fn((rootId: string, sessionId: string, cliId?: string) => JSON.stringify({
+    header: { title: { content: '⚠️ adopt blocked' } },
+    elements: [
+      { tag: 'markdown', content: 'waiting for repository selection' },
+      { tag: 'action', actions: [{ tag: 'button', type: 'danger', value: { action: 'close', root_id: rootId, session_id: sessionId, cli_id: cliId ?? 'claude-code' } }] },
+    ],
+  })),
   buildSessionClosedCard: vi.fn(
     (sid: string) =>
       `{"header":{"title":{"content":"🛑 会话已关闭"}},"action":"resume","cmd":"botmux resume ${sid.substring(0, 12)}"}`,
@@ -461,7 +468,7 @@ vi.mock('../src/services/card-mode-store.js', () => ({
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from '../src/core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation, startAdoptSession } from '../src/core/command-handler.js';
 import { setCardMode } from '../src/services/card-mode-store.js';
 import { writeRoleFile, deleteRoleFile, writeTeamRoleFile, deleteTeamRoleFile, resolveRole, resolveRoleFile } from '../src/core/role-resolver.js';
 import { setBotCapability, clearBotCapability } from '../src/services/bot-profile-store.js';
@@ -475,7 +482,7 @@ import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
-import { killWorker, suspendWorker, forkWorker, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart } from '../src/core/worker-pool.js';
+import { killWorker, suspendWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart } from '../src/core/worker-pool.js';
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
@@ -3086,6 +3093,45 @@ describe('handleCommand', () => {
   // ─── /adopt ─────────────────────────────────────────────────────────────
 
   describe('/adopt', () => {
+    it('refuses adopt while the session is still on the pendingRepo gate and posts a close-session card', async () => {
+      const ds = makeDaemonSession({
+        pendingRepo: true,
+        pendingPrompt: 'buffered while picking repo',
+        pendingFollowUps: ['second buffered line'],
+        repoCardMessageId: 'om_repo_card',
+      });
+      const deps = makeDeps(ds);
+      const target = {
+        source: 'tmux' as const,
+        tmuxTarget: '0:1.0',
+        cliPid: 4242,
+        sessionId: 'host-cli',
+        cliId: 'claude-code' as const,
+        cwd: '/repo',
+        paneCols: 80,
+        paneRows: 24,
+      };
+
+      await startAdoptSession(target, ds, deps, LARK_APP_ID);
+
+      // Refused: no takeover, no state mutation — the pending gate is untouched
+      // so the session can still finish via /repo (or the card's close button).
+      expect(forkAdoptWorker).not.toHaveBeenCalled();
+      expect(ds.adoptedFrom).toBeUndefined();
+      expect(ds.pendingRepo).toBe(true);
+      expect(ds.pendingPrompt).toBe('buffered while picking repo');
+      expect(ds.pendingFollowUps).toEqual(['second buffered line']);
+
+      // Posted an interactive card carrying a close-session button bound to this session.
+      const replyArgs = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls.at(-1)!;
+      expect(replyArgs[2]).toBe('interactive');
+      const card = JSON.parse(replyArgs[1] as string);
+      const buttons = card.elements.flatMap((el: any) => el.actions ?? []);
+      const closeBtn = buttons.find((b: any) => b.value?.action === 'close');
+      expect(closeBtn).toBeDefined();
+      expect(closeBtn.value.session_id).toBe(ds.session.sessionId);
+    });
+
     it('should refuse re-adopt and prompt 断开 when ds.adoptedFrom is already set', async () => {
       const ds = makeDaemonSession({
         adoptedFrom: {

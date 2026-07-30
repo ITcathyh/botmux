@@ -1414,6 +1414,43 @@ export function buildQuotaExhaustedCard(targetOpenId: string, limit: number, loc
   return JSON.stringify(card);
 }
 
+/**
+ * Reject card for `/adopt` (and Codex App / resume import) attempted while the
+ * session is still on the first-spawn repo-select gate (`pendingRepo`). Adopt
+ * attaches to an already-running CLI, so it cannot double as a way to finish
+ * that gate: the two states are mutually exclusive by design. Rather than fold
+ * the buffered repo-card messages into the takeover (complex + leaks botmux
+ * envelopes into the external CLI), we refuse and offer a one-tap "close
+ * session" so the user can retire the pending session and re-issue `/adopt`
+ * cleanly. The close button reuses the shared `action: 'close'` handler; the
+ * resulting closed card honours privateCard on its own.
+ */
+export function buildAdoptBlockedCard(rootId: string, sessionId: string, cliId: CliId | undefined, locale?: Locale): string {
+  const actionBase = { root_id: rootId, session_id: sessionId, cli_id: cliId ?? 'claude-code' };
+  const card = {
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: t('card.adopt_blocked.title', undefined, locale) },
+      template: 'orange',
+    },
+    elements: [
+      { tag: 'markdown', content: t('card.adopt_blocked.body', undefined, locale) },
+      {
+        tag: 'action',
+        actions: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: t('card.btn.close_session', undefined, locale) },
+            type: 'danger',
+            value: { action: 'close', ...actionBase },
+          },
+        ],
+      },
+    ],
+  };
+  return JSON.stringify(card);
+}
+
 /** 授权处置后的终态卡（无按钮，防重复点击）。 */
 function formatGrantExpiry(expiresAt: number, locale?: Locale): string {
   return new Date(expiresAt).toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN', { hour12: false });

@@ -365,6 +365,8 @@ export const messages: Record<string, string> = {
   'cmd.adopt.pane_not_found': '未找到 tmux pane {pane}',
   'cmd.adopt.target_exited': '⚠️ 目标 CLI 会话已退出',
   'cmd.adopt.sandbox_blocked': '🛡️ 本机器人已开启文件沙盒，无法 /adopt 已在运行的 CLI（沙盒只能在启动时套用，无法事后包裹活进程）。直接发消息会以沙盒方式冷启动一个新 CLI 会话。',
+  'card.adopt_blocked.title': '⚠️ 无法接入：请先关闭当前会话',
+  'card.adopt_blocked.body': '本话题正在等待你选择仓库，无法直接 /adopt 接管已在运行的 CLI。\n\n请点下方「关闭会话」结束当前的选仓会话，然后重新 /adopt 接管你的 CLI（原 CLI 不受影响）。',
   'cmd.adopt.success': '📡 已接入 {cliName} · {project} ({pane})',
   'cmd.adopt.resume_success': '↩️ 已恢复 {cliName} 历史会话 · {project} —「{title}」',
   'cmd.adopt.resume_not_found': '⚠️ 该历史会话已不存在或已被占用（{id}）',

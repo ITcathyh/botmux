@@ -362,6 +362,8 @@ export const messages: Record<string, string> = {
   'cmd.adopt.pane_not_found': 'tmux pane not found: {pane}',
   'cmd.adopt.target_exited': '⚠️ Target CLI session has exited.',
   'cmd.adopt.sandbox_blocked': '🛡️ This bot has the file sandbox enabled and cannot /adopt an already-running CLI (a sandbox can only be applied at spawn time, never retro-fitted around a live process). Just send a message to cold-start a new, sandboxed CLI session instead.',
+  'card.adopt_blocked.title': '⚠️ Cannot adopt: close the current session first',
+  'card.adopt_blocked.body': 'This topic is still waiting for you to pick a repository, so it cannot /adopt an already-running CLI directly.\n\nTap "Close session" below to end the pending repo-select session, then run /adopt again to attach your CLI (your original CLI is left untouched).',
   'cmd.adopt.success': '📡 Adopted {cliName} · {project} ({pane})',
   'cmd.adopt.resume_success': '↩️ Resumed {cliName} session · {project} — “{title}”',
   'cmd.adopt.resume_not_found': '⚠️ That past session no longer exists or is already in use ({id})',
