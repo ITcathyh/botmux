@@ -77,7 +77,10 @@ describe('API-only bot mode — runtime Feishu transport gates (source lock)', (
     const block = region(daemonSource, 'async function sessionReply(', 'const hookContext = ds ?');
     expect(block).toContain('larkTransportEnabled({');
     expect(block).toContain('apiOnly: getBot(appId).config.apiOnly');
-    expect(block).toContain('return anchor;'); // benign no-op sentinel
+    // Returns '' (empty id), NOT the synthetic anchor — a fake id would be stored
+    // as streamCardId and a later PATCH would dial Feishu (the codex round-3 P1).
+    expect(block).toContain("return '';");
+    expect(block).not.toContain('return anchor;');
   });
 
   it('skips the getAvailableBots roster probe for no-transport sessions', () => {
@@ -122,3 +125,38 @@ describe('API-only bot mode — runtime Feishu transport gates (source lock)', (
   });
 });
 
+describe('API-only bot mode — bot-level primitive boundary (source lock)', () => {
+  const clientSource = readFileSync(resolve('src/im/lark/client.ts'), 'utf8');
+  const workerPoolSource = readFileSync(resolve('src/core/worker-pool.ts'), 'utf8');
+
+  it('every outbound Feishu primitive calls assertLarkTransport before getBotClient', () => {
+    // The authoritative bot-level gate: no caller can reach Feishu for an apiOnly
+    // bot, regardless of session context.
+    for (const op of [
+      'sendMessage', 'replyMessage', 'updateMessage', 'deleteMessage',
+      'addReaction', 'removeReaction', 'sendUserMessage', 'sendEphemeralCard',
+    ]) {
+      expect(clientSource, op).toContain(`assertLarkTransport(larkAppId, '${op}')`);
+    }
+    // The gate helper throws the typed error for an apiOnly bot.
+    expect(clientSource).toContain('class LarkTransportDisabledError');
+    expect(clientSource).toContain('if (apiOnly) throw new LarkTransportDisabledError');
+  });
+
+  it('worker-pool suppresses ALL aux UI for no-transport sessions at managedAuxUiSuppressed', () => {
+    const block = region(workerPoolSource, 'const managedAuxUiSuppressed =', 'const managedFinalOutputSuppressed');
+    expect(block).toContain('larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })');
+  });
+
+  it('scheduleCardPatch is a defense-in-depth no-op for no-transport sessions', () => {
+    const block = region(workerPoolSource, 'export function scheduleCardPatch(', 'if (streamingCardDisabled(ds, turnId)) return;');
+    expect(block).toContain('larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })');
+  });
+
+  it('botmux send refuses early for an apiOnly bot (CLI capability gate)', () => {
+    const cliSource = readFileSync(resolve('src/cli.ts'), 'utf8');
+    const block = region(cliSource, 'async function cmdSend(', 'Managed output attribution');
+    expect(block).toContain('currentBotIsApiOnly(selfAppId)');
+    expect(block).toContain('botmux send is unavailable for this core-only');
+  });
+});

@@ -2700,20 +2700,22 @@ async function sessionReply(
   const appId = larkAppId ?? ds?.larkAppId ?? getAllBots()[0]?.config.larkAppId;
   if (!appId) throw new Error('No bot configured');
   // Central Lark-transport gate (fail-closed): a core-only (apiOnly) bot or an
-  // HTTP virtual session (http_async_* / http_wait_*) has no real Feishu chat,
-  // so every auxiliary-UI / reply that funnels through sessionReply must be a
-  // no-op instead of dialing sendMessage on a synthetic id. Gating HERE covers
-  // ready/screen_update/tui_prompt/stuck_warning/startup+exit UI by construction
-  // — final_output for HTTP sessions is already intercepted upstream in
-  // deliverFinalOutput and never reaches here. Returns the anchor as a benign
-  // "delivered" sentinel so callers that store a message id keep working.
+  // HTTP virtual session (http_async_* / http_wait_*) has no real Feishu chat.
+  // Auxiliary worker UI is already suppressed at its source (worker-pool
+  // managedAuxUiSuppressed) and HTTP final_output is intercepted upstream in
+  // deliverFinalOutput, so this path is normally unreachable for such sessions;
+  // this is a defense-in-depth backstop. Return '' (NOT the synthetic anchor) —
+  // an empty message id reads as "nothing posted" to every caller that stores
+  // the result as a card id, so the falsy-guarded scheduleCardPatch/updateMessage
+  // never fire on a synthetic id. Returning `anchor` would be a latent bug: it
+  // would be stored as streamCardId and a later PATCH would dial Feishu.
   const transportAllowed = larkTransportEnabled({
     chatId: ds?.chatId ?? anchor,
     apiOnly: getBot(appId).config.apiOnly,
   });
   if (!transportAllowed) {
     logger.debug(`[lark-transport] suppressed reply for no-transport session (app=${appId} anchor=${anchor.substring(0, 16)})`);
-    return anchor;
+    return '';
   }
   const hookContext = ds ? {
     sessionId: ds.session.sessionId,

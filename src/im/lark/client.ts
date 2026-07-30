@@ -151,6 +151,43 @@ export class MessageWithdrawnError extends Error {
 }
 
 /**
+ * Thrown when an outbound Feishu call is attempted for a core-only (`apiOnly`)
+ * bot. Such a bot has no Feishu connection (synthetic identity, possibly empty
+ * secret), so ANY send/reply/update/reaction/DM would either auth-fail against
+ * a bogus app or silently succeed against a real one the operator never meant
+ * to speak as. This is the BOT-LEVEL transport boundary: gating at the shared
+ * `getBotClient` base of every primitive means no caller — sessionReply, a
+ * direct updateMessage, `botmux send` from the agent, v3 distillation, an
+ * overload DM — can reach Feishu regardless of session context. A well-built
+ * apiOnly flow never triggers this (session-level gates suppress aux UI and the
+ * trigger route rejects real chats); reaching here is genuine misuse and must
+ * surface loudly, NOT be faked into a synthetic "success" message id.
+ */
+export class LarkTransportDisabledError extends Error {
+  constructor(larkAppId: string, op: string) {
+    super(`Feishu transport is disabled for core-only bot ${larkAppId} (attempted: ${op})`);
+    this.name = 'LarkTransportDisabledError';
+  }
+}
+
+/** Bot-level transport gate: an apiOnly bot must never make an outbound Feishu
+ * call. Called at the top of every write primitive. `op` names the primitive
+ * for diagnostics. Read-only lookups (message detail, chat members) intentionally
+ * do NOT call this — they are inert reads used by discovery, already filtered
+ * elsewhere; only side-effecting writes are hard-gated here. */
+function assertLarkTransport(larkAppId: string, op: string): void {
+  let apiOnly = false;
+  try {
+    apiOnly = getBot(larkAppId).config.apiOnly === true;
+  } catch {
+    // Bot not registered (e.g. a synthetic id from a cross-daemon fallback):
+    // leave the existing getBotClient error path to handle it, don't mask it.
+    return;
+  }
+  if (apiOnly) throw new LarkTransportDisabledError(larkAppId, op);
+}
+
+/**
  * Thrown ONLY when a resource download genuinely needs (re-)authorization: no
  * usable User Token on disk, or the User Token was rejected as unauthorized
  * (HTTP 401). Callers gate the "/login" prompt on `instanceof` this — NOT on a
@@ -203,6 +240,7 @@ export async function sendMessage(
   hookContext?: Record<string, unknown>,
   options?: OutboundMessageOptions,
 ): Promise<string> {
+  assertLarkTransport(larkAppId, 'sendMessage');
   const c = getBotClient(larkAppId);
   const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
 
@@ -263,6 +301,7 @@ export async function replyMessage(
   hookContext?: Record<string, unknown>,
   options?: OutboundMessageOptions,
 ): Promise<string> {
+  assertLarkTransport(larkAppId, 'replyMessage');
   const c = getBotClient(larkAppId);
   const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
 
@@ -308,6 +347,7 @@ export async function replyMessage(
 }
 
 export async function addReaction(larkAppId: string, messageId: string, emojiType: string): Promise<string> {
+  assertLarkTransport(larkAppId, 'addReaction');
   const c = getBotClient(larkAppId);
   const res = await (c as any).im.v1.messageReaction.create({
     path: { message_id: messageId },
@@ -322,6 +362,7 @@ export async function addReaction(larkAppId: string, messageId: string, emojiTyp
 }
 
 export async function removeReaction(larkAppId: string, messageId: string, reactionId: string): Promise<void> {
+  assertLarkTransport(larkAppId, 'removeReaction');
   const c = getBotClient(larkAppId);
   const res = await (c as any).im.v1.messageReaction.delete({
     path: { message_id: messageId, reaction_id: reactionId },
@@ -491,6 +532,7 @@ export async function sendUserMessage(
   uuid?: string,
   requestOptions?: LarkRequestOptions,
 ): Promise<string> {
+  assertLarkTransport(larkAppId, 'sendUserMessage');
   const c = getBotClient(larkAppId);
   const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
   const data = {
@@ -750,6 +792,7 @@ export async function getChatMode(
  * fall back instead of assuming success. Fire-and-forget callers can ignore it.
  */
 export async function deleteMessage(larkAppId: string, messageId: string): Promise<boolean> {
+  assertLarkTransport(larkAppId, 'deleteMessage');
   const c = getBotClient(larkAppId);
   try {
     const res: any = await c.im.v1.message.delete({ path: { message_id: messageId } });
@@ -779,6 +822,7 @@ export const LARK_CODE_EPHEMERAL_NOT_GROUP = 18053;
 export async function sendEphemeralCard(
   larkAppId: string, chatId: string, openId: string, cardJson: string,
 ): Promise<string> {
+  assertLarkTransport(larkAppId, 'sendEphemeralCard');
   const c = getBotClient(larkAppId);
   let card: unknown;
   try {
@@ -828,6 +872,7 @@ export async function deleteEphemeralCard(larkAppId: string, messageId: string):
 }
 
 export async function updateMessage(larkAppId: string, messageId: string, cardJson: string): Promise<void> {
+  assertLarkTransport(larkAppId, 'updateMessage');
   const c = getBotClient(larkAppId);
   let res: any;
   try {

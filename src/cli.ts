@@ -6072,6 +6072,18 @@ async function relaySend(
   process.exit(1);
 }
 
+/** True if the running bot (by daemon-injected larkAppId) is core-only
+ *  (apiOnly). Read-only + never throws: used by `botmux send` to refuse early
+ *  with a clear message. Reads bots.json best-effort; an apiOnly bot runs
+ *  non-isolated (no Feishu secret to protect), so bots.json is readable here. */
+function currentBotIsApiOnly(larkAppId: string): boolean {
+  try {
+    return loadBotsJson().some((b: any) => b?.larkAppId === larkAppId && b?.apiOnly === true);
+  } catch {
+    return false;
+  }
+}
+
 /** Under read isolation the CLI is denied bots.json, so `loadBotConfigs()` reads
  *  nothing. The worker instead wrote THIS bot's own secret to a per-bot cred file
  *  (its own is readable; siblings' are denied). Register just this bot from that
@@ -6210,6 +6222,24 @@ async function cmdSend(rest: string[]): Promise<void> {
       `chat-facing side effects belong in a hostExecutor activity, not a subagent.`,
     );
     process.exit(2);
+  }
+  // Core-only (apiOnly) bots have no Feishu transport: `botmux send` is a hard
+  // no-op door, not a prompt suggestion. Refuse early with a clear message
+  // (mirrors the workflow refusal above) so the agent gets actionable feedback
+  // instead of a deep LarkTransportDisabledError stack from the send primitive.
+  // BOTMUX_LARK_APP_ID is the daemon-injected identity of the running bot; the
+  // bot-level primitive gate in im/lark/client.ts is the authoritative backstop
+  // for every other path (direct updateMessage, aux UI, distillation, DMs).
+  {
+    const selfAppId = process.env.BOTMUX_LARK_APP_ID;
+    if (selfAppId && currentBotIsApiOnly(selfAppId)) {
+      console.error(
+        `botmux send is unavailable for this core-only (apiOnly) bot: it has no Feishu chat to post into.\n` +
+        `Core-only bots are driven purely over the HTTP control API; their turn output is returned to the\n` +
+        `caller via trigger-result, not sent to Feishu. Just produce your normal final answer.`,
+      );
+      process.exit(2);
+    }
   }
   // Managed output attribution must come from the live process-tree marker,
   // whose turn/attempt is refreshed by the worker. BOTMUX_TURN_ID is a
