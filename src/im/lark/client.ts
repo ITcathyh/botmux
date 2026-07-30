@@ -853,6 +853,7 @@ export async function sendEphemeralCard(
  * replacement by the time cleanup runs.
  */
 export async function deleteEphemeralCard(larkAppId: string, messageId: string): Promise<boolean> {
+  assertLarkTransport(larkAppId, 'deleteEphemeralCard');
   const c = getBotClient(larkAppId);
   try {
     const res: any = await (c as any).request({
@@ -1039,6 +1040,7 @@ const EXT_TO_FILE_TYPE: Record<string, string> = {
 };
 
 export async function uploadImage(larkAppId: string, imagePath: string): Promise<string> {
+  assertLarkTransport(larkAppId, 'uploadImage');
   const c = getBotClient(larkAppId);
   const buf = readFileSync(imagePath);
   // SDK returns { image_key } directly (not wrapped in { code, data })
@@ -1052,6 +1054,7 @@ export async function uploadImage(larkAppId: string, imagePath: string): Promise
 }
 
 export async function uploadFile(larkAppId: string, filePath: string, opts?: { duration?: number }): Promise<string> {
+  assertLarkTransport(larkAppId, 'uploadFile');
   const c = getBotClient(larkAppId);
   const buf = readFileSync(filePath);
   const ext = extname(filePath).toLowerCase();
