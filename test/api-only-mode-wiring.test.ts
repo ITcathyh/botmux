@@ -274,7 +274,7 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     // Spoke packs it from local apiOnly config.
     const spoke = readFileSync(resolve('src/dashboard/federation-spoke-api.ts'), 'utf8');
     const localBots = region(spoke, 'function localBots(', '// owner (union_id+name) federated');
-    expect(localBots).toContain('larkTransportEnabled: !apiOnlyIds.has(b.larkAppId)');
+    expect(localBots).toContain('larkTransportEnabled: configReadable ? !apiOnlyIds.has(b.larkAppId) : false');
     // Receiver preserves it (explicit boolean only; absent→undefined→legacy normal).
     const api = readFileSync(resolve('src/dashboard/federation-api.ts'), 'utf8');
     expect(api).toContain("larkTransportEnabled: typeof r.larkTransportEnabled === 'boolean' ? r.larkTransportEnabled : undefined");

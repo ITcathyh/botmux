@@ -7605,6 +7605,12 @@ async function spawnCli(
       currentAppId: cfg.larkAppId,
       sessionId: cfg.sessionId,
       botHome: canonical(ownBotHome!),
+      // No-Lark-transport credential profile: apiOnly bot OR HTTP virtual chat.
+      // buildFsPolicy suppresses every Feishu-cred grant + hard-denies bots.json/
+      // lark-cli stores so a workingDir=~ grant can't re-expose them.
+      larkTransportEnabled: !(cfg.apiOnly === true
+        || cfg.chatId?.startsWith('http_async_') === true
+        || cfg.chatId?.startsWith('http_wait_') === true),
       redirectedCliData: willRedirectCliData,
       cliDataPaths: willRedirectCliData ? undefined : keepExisting([
         cliAdapter.claudeDataDir,

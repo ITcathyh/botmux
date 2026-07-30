@@ -103,6 +103,15 @@ export interface FsPolicyContext {
   net?: boolean;
   /** Seatbelt write-allow regex passthrough (see FsPolicy.writeRegexes). */
   writeRegexes?: readonly string[];
+  /** FALSE = a no-Lark-transport session (core-only apiOnly bot or HTTP virtual
+   *  chat). Generic read-isolation is NOT a credential boundary: it still grants
+   *  the bot's own lark-cli identity readWrite AND, when workingDir defaults to
+   *  `~`, re-opens $HOME (incl. bots.json + sibling BOT_HOMEs) readWrite. When
+   *  false, buildFsPolicy SUPPRESSES every Feishu-credential grant (adapter
+   *  authPaths, own lark-cli config dir, macOS lark-cli keystore carve-out) and
+   *  emits MANDATORY denies for the Feishu-cred paths so a wide workingDir grant
+   *  can't re-expose them (mandatory deny wins). Absent/true = normal behavior. */
+  larkTransportEnabled?: boolean;
 }
 
 /** Normalize: require absolute, strip trailing slashes, reject `..` segments.
@@ -360,11 +369,19 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     for (const p of paths ?? []) candidates.push({ path: p, access, source });
   };
 
+  // No-Lark-transport credential profile: a core-only (apiOnly) bot or HTTP
+  // virtual session must never be handed any Feishu credential, even under a
+  // wide workingDir=~ grant. When false we (a) suppress every Feishu-cred grant
+  // below and (b) append MANDATORY denies for those paths so longest-prefix deny
+  // beats any broad readWrite that would otherwise re-expose them.
+  const larkTransport = ctx.larkTransportEnabled !== false;
+
   candidates.push(...(ctx.platform === 'darwin' ? darwinBaseline(ctx.homeDir) : linuxBaseline(ctx.homeDir)));
 
   // Adapter-declared surfaces.
   push(ctx.execPaths, 'readOnly', 'adapter');
-  push(ctx.authPaths, 'readWrite', 'adapter');
+  // authPaths carry Feishu/login credentials — withheld from a no-transport turn.
+  if (larkTransport) push(ctx.authPaths, 'readWrite', 'adapter');
   if (!ctx.redirectedCliData) push(ctx.cliDataPaths, 'readWrite', 'adapter');
 
   // botmux internals.
@@ -379,8 +396,9 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // pre-uploaded files). The worker mkdirs it pre-spawn so it survives the
   // existence-filter and gets bound rw. Siblings' buckets stay uncovered.
   push([`${ctx.sessionDataDir}/attachments/${ctx.currentAppId}`], 'readWrite', 'internal');
-  // Own per-bot lark-cli config (agent-facing lark-cli identity).
-  push([`${ctx.homeDir}/.lark-cli-bots/${ctx.currentAppId}`], 'readWrite', 'internal');
+  // Own per-bot lark-cli config (agent-facing lark-cli identity). Withheld from
+  // a no-transport turn — it IS this bot's Feishu credential surface.
+  if (larkTransport) push([`${ctx.homeDir}/.lark-cli-bots/${ctx.currentAppId}`], 'readWrite', 'internal');
 
   // ── botmux CLI runtime surface (deny-by-default ALLOW-LIST) ──
   // The agent runs `botmux …` and claude fires SessionStart / AskUserQuestion
@@ -431,7 +449,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // read (verified: sibling ciphertext still DENIED). Linux keeps its keys in the
   // per-bot `.lark-cli-bots/<self>` dir (already readWrite above), so this is
   // darwin-only.
-  if (ctx.platform === 'darwin') {
+  if (ctx.platform === 'darwin' && larkTransport) {
     const larkStore = `${ctx.homeDir}/Library/Application Support/lark-cli`;
     push([`${larkStore}/master.key.file`, `${larkStore}/appsecret_${ctx.currentAppId}.enc`], 'readOnly', 'internal');
   }
@@ -442,6 +460,26 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   push(ctx.userPaths?.deny, 'deny', 'user');
   push(ctx.mandatoryDenyPaths, 'deny', 'mandatory');
   push(ctx.mandatoryReadOnlyPaths, 'readOnly', 'mandatory');
+
+  // No-Lark-transport MANDATORY credential denies. Emitted LAST as 'mandatory'
+  // so they outrank any broad readWrite (notably workingDir=~ re-opening $HOME,
+  // which contains bots.json + every sibling BOT_HOME + the lark-cli stores).
+  // These are the exact Feishu-credential surfaces a core-only turn must never
+  // read; deny-by-longest-prefix keeps deeper allow rules (e.g. the bot's own
+  // BOT_HOME working dir) intact while sealing the credential paths.
+  if (!larkTransport) {
+    const denies = [
+      `${ctx.botmuxHome}/bots.json`,               // all bots' appId+secret
+      `${ctx.homeDir}/.lark-cli-bots`,             // Linux per-bot lark-cli identities (all)
+      `${ctx.homeDir}/Library/Application Support/lark-cli`, // macOS keystore (all bots' ciphertext + master key)
+      // Adapter-declared Feishu/login surfaces (authPaths): suppressed from the
+      // adapter grant above, but a broad workingDir=~ grant would re-open them —
+      // so hard-deny them here too. (A CLI-login token that lives inside the CLI
+      // data root is out of scope; these are the Feishu-facing login sources.)
+      ...(ctx.authPaths ?? []),
+    ];
+    push(denies, 'deny', 'mandatory');
+  }
 
   return {
     rules: mergeFsRules(candidates),
