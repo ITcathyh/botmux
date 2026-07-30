@@ -181,17 +181,35 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     const helper = region(cliSource, 'function currentTurnHasNoTransport(', 'function assertTurnTransportOrExit(');
     expect(helper).toContain("chatId.startsWith('http_async_') || chatId.startsWith('http_wait_')");
     expect(helper).toContain('currentBotIsApiOnly(appId)');
-    // Every Feishu-touching command calls it (writes: send/dispatch; reads:
-    // history/quoted/bots). A missing one is a leak.
-    for (const op of ['send', 'history', 'quoted', 'dispatch', 'bots list']) {
-      expect(cliSource, op).toContain(`assertTurnTransportOrExit('${op}')`);
+    // Region-scoped per command (NOT file-wide contains): deleting the gate from
+    // any ONE command's body must fail this test. Map op → (fn start, fn end).
+    const envGated: Array<[string, string, string]> = [
+      ['history', 'async function cmdHistory(', 'async function cmdQuoted('],
+      ['quoted', 'async function cmdQuoted(', 'async function cmdSend('],
+      ['send', 'async function cmdSend(', 'async function cmdDispatch('],
+      ['dispatch', 'async function cmdDispatch(', 'async function cmdCreateGroup('],
+      ['create-group', 'async function cmdCreateGroup(', 'async function cmdBots('],
+    ];
+    for (const [op, start, end] of envGated) {
+      const body = region(cliSource, start, end);
+      expect(body, `${op} env gate`).toContain(`assertTurnTransportOrExit('${op}')`);
     }
-    // Target-aware gate: --session-id-accepting reads also gate on the RESOLVED
-    // session (closes the cross-session bypass — env gate can't see the arg).
-    // Reads AND writes that accept --session-id gate on the resolved target.
-    for (const op of ['history', 'quoted', 'bots list', 'send', 'dispatch']) {
-      expect(cliSource, `session-aware ${op}`).toContain(`assertSessionTransportOrExit({ chatId: `);
+    // Target-aware gate scoped per command: --session-id-accepting commands gate
+    // on the RESOLVED session (closes the cross-session bypass).
+    const targetGated: Array<[string, string, string]> = [
+      ['history', 'async function cmdHistory(', 'async function cmdQuoted('],
+      ['quoted', 'async function cmdQuoted(', 'async function cmdSend('],
+      ['send', 'async function cmdSend(', 'async function cmdDispatch('],
+      ['dispatch', 'async function cmdDispatch(', 'async function cmdCreateGroup('],
+    ];
+    for (const [op, start, end] of targetGated) {
+      const body = region(cliSource, start, end);
+      expect(body, `${op} target-aware`).toContain('assertSessionTransportOrExit({ chatId: ');
     }
+    // Root-dispatch gate: managed no-transport turn refused for ALL Lark-facing
+    // commands at the switch, keyed on the injected BOTMUX_SESSION_ID marker.
+    const rootGate = region(cliSource, 'const LARK_FACING_COMMANDS = new Set(', 'switch (command) {');
+    expect(rootGate).toContain('process.env.BOTMUX_SESSION_ID && currentTurnHasNoTransport()');
     const sessGate = region(cliSource, 'function assertSessionTransportOrExit(', 'process.exit(2);\n}');
     expect(sessGate).toContain("chatId.startsWith('http_async_') || chatId.startsWith('http_wait_')");
     expect(sessGate).toContain('currentBotIsApiOnly(session.larkAppId)');
@@ -203,10 +221,20 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     const helper = region(ipcSource, 'function sessionTransportDisabled(', '\n}\n');
     expect(helper).toContain('getBot(appId).config.apiOnly === true');
     expect(helper).toContain('larkTransportEnabled({');
-    // Each session-write route consults it (chat-rename / write-link-card /
-    // resume-notice / locate). Normal-bot-in-virtual-session has a real client so
-    // getBotClient won't throw — this is the only layer that catches it.
-    expect((ipcSource.match(/sessionTransportDisabled\(/g) ?? []).length).toBeGreaterThanOrEqual(5);
+    // Region-scoped per route (NOT file-wide count): each write route's body
+    // must call the gate, so deleting one seam fails.
+    const routes: Array<[string, string, string]> = [
+      ['chat-rename', "ipcRoute('POST', '/api/sessions/:sessionId/chat-rename'", 'groupsStore.renameChat('],
+      ['write-link-card', "ipcRoute('POST', '/api/sessions/:sessionId/write-link-card'", 'deliverWriteLinkCardToOwners(ds)'],
+      ['locate', "ipcRoute('POST', '/api/sessions/:sessionId/locate'", 'replyMessage('],
+    ];
+    for (const [name, start, end] of routes) {
+      const body = region(ipcSource, start, end);
+      expect(body, `${name} route`).toContain('sessionTransportDisabled(');
+    }
+    // resume-notice gates its notice block.
+    const resumeNotice = region(ipcSource, '会话已通过命令行恢复', 'getChatMode(ds.larkAppId');
+    expect(resumeNotice).toContain('!sessionTransportDisabled(ds)');
   });
 
   it('daemon dashboard IPC session-history + restart-notice gate no-transport sessions', () => {

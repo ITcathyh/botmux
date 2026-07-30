@@ -2003,12 +2003,16 @@ async function createTeamGroup(args: { name: string; larkAppIds: string[]; userO
   if (!plan.creatorLarkAppId) return { ok: false, error: 'no_online_daemon' };
   const userOpenIds = plan.inviteUser && args.userOpenId ? [args.userOpenId] : [];
   try {
+    // apiOnly bots can't be Feishu group MEMBERS either (no Feishu identity to
+    // invite) — exclude them from the member payload, not just from creator
+    // eligibility, so the creator doesn't try to invite a synthetic local_* id.
+    const memberIds = selectedIds.filter(canCreateFeishuGroup);
     const upstream = await proxyToDaemon(plan.creatorLarkAppId, '/api/groups/create', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(buildTeamGroupCreatePayload({
         name: args.name,
-        larkAppIds: selectedIds,
+        larkAppIds: memberIds,
         userOpenIds,
         ownerUnionIds: args.ownerUnionIds ?? [],
         transferOwnerUnionId: args.transferOwnerUnionId,
