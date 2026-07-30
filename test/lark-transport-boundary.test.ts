@@ -32,6 +32,7 @@ vi.mock('../src/bot-registry.js', () => ({
 import {
   sendMessage, replyMessage, updateMessage, deleteMessage,
   addReaction, removeReaction, sendUserMessage, sendEphemeralCard,
+  deleteEphemeralCard, uploadImage, uploadFile,
   LarkTransportDisabledError,
 } from '../src/im/lark/client.js';
 
@@ -55,6 +56,9 @@ describe('assertLarkTransport — bot-level outbound gate', () => {
     await expect(removeReaction(APIONLY, 'om', 'r')).rejects.toBeInstanceOf(LarkTransportDisabledError);
     await expect(sendUserMessage(APIONLY, 'ou', 'hi')).rejects.toBeInstanceOf(LarkTransportDisabledError);
     await expect(sendEphemeralCard(APIONLY, 'oc', 'ou', '{}')).rejects.toBeInstanceOf(LarkTransportDisabledError);
+    await expect(deleteEphemeralCard(APIONLY, 'om')).rejects.toBeInstanceOf(LarkTransportDisabledError);
+    await expect(uploadImage(APIONLY, '/tmp/none.png')).rejects.toBeInstanceOf(LarkTransportDisabledError);
+    await expect(uploadFile(APIONLY, '/tmp/none.bin')).rejects.toBeInstanceOf(LarkTransportDisabledError);
   });
 
   it('a normal bot is unaffected — sendMessage/updateMessage proceed to the client', async () => {

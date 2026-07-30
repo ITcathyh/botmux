@@ -135,6 +135,7 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     for (const op of [
       'sendMessage', 'replyMessage', 'updateMessage', 'deleteMessage',
       'addReaction', 'removeReaction', 'sendUserMessage', 'sendEphemeralCard',
+      'deleteEphemeralCard', 'uploadImage', 'uploadFile',
     ]) {
       expect(clientSource, op).toContain(`assertLarkTransport(larkAppId, '${op}')`);
     }
