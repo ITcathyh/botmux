@@ -9333,7 +9333,13 @@ if(hasToken && !/[?&]imefix=0\\b/.test(location.search)){(function(){
   var _ta=term.textarea;
   try{
     term.attachCustomKeyEventHandler(function(e){
-      if(e.type==='keydown'&&!_composing){
+      if(e.type==='keydown'){
+        // Reset at the start of every keydown: iOS IME synthetic keys often fire
+        // NO keyup, so _claim could otherwise stay stuck on from a prior cycle.
+        // Clearing here (before deciding to claim) guarantees a fresh state each
+        // physical key, closing the "stuck-open → double-emit" window.
+        _claim=false;
+        if(_composing) return true;
         if(e.keyCode===229){ _claim=true; return false; }
         // Backspace: claim ONLY when an IME edit is pending (textarea non-empty),
         // so one physical backspace's N delete events all reach the terminal.
@@ -9347,6 +9353,9 @@ if(hasToken && !/[?&]imefix=0\\b/.test(location.search)){(function(){
     // compositionstart/end bound the reliable path; never take over inside it.
     _ta.addEventListener('compositionstart',function(){_composing=true;_claim=false;},{capture:true,passive:true});
     _ta.addEventListener('compositionend',function(){_composing=false;_claim=false;},{capture:true,passive:true});
+    // Blur also closes the cycle — another guard against a stuck-open _claim when
+    // the matching keyup never arrives (the textarea can lose focus instead).
+    _ta.addEventListener('blur',function(){_claim=false;},{capture:true,passive:true});
     // A single claimed keydown can fire MULTIPLE input events, e.g. the
     // consecutive-space→。 conversion (delete THEN insertText) or a voice-input
     // correction (many deletes). So DON'T clear _claim per-input — forward every
@@ -9360,8 +9369,13 @@ if(hasToken && !/[?&]imefix=0\\b/.test(location.search)){(function(){
         try{term.input('\\x7f',true)}catch(_e){}
         return;
       }
-      // insertText / insertReplacementText etc. carrying the final char(s)
-      if(e.data){try{term.input(e.data,true)}catch(_e){}}
+      // insertText / insertReplacementText etc. carrying the final char(s).
+      // Only forward composed input (what IMEs emit — every real Doubao/WeChat
+      // insert is composed=true). A composed=false insertText is one xterm's own
+      // _inputEvent WILL emit (its guard passes when !composed), so forwarding it
+      // here too — should _claim ever be stuck open — would double-emit. Gating on
+      // composed makes the two paths mutually exclusive and closes that window.
+      if(e.data&&e.composed){try{term.input(e.data,true)}catch(_e){}}
     },{capture:true,passive:true});
     // Close the cycle on keyup (the claimed keydown's matching keyup).
     _ta.addEventListener('keyup',function(){_claim=false;},{capture:true,passive:true});
