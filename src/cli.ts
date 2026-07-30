@@ -6109,6 +6109,37 @@ function currentTurnHasNoTransport(): boolean {
   return !!appId && currentBotIsApiOnly(appId);
 }
 
+/** Tamper-resistant managed-origin transport check for the root-dispatch gate.
+ *  Resolves the origin session via the pid-marker ANCESTRY (process.ppid walk),
+ *  NOT the mutable BOTMUX_SESSION_ID env, then loads that session's record and
+ *  judges transport from its chatId + its bot's apiOnly config. So `env -u
+ *  BOTMUX_SESSION_ID -u BOTMUX_CHAT_ID -u BOTMUX_LARK_APP_ID` cannot shed the
+ *  managed no-transport identity. Returns false (not gated) when no managed
+ *  origin resolves — a bare host-operator shell keeps full access. Total; on any
+ *  resolution error falls back to the env-based check (never throws). */
+function managedOriginHasNoTransport(): boolean {
+  try {
+    const ctx = resolveSessionContext(resolveDataDir(), process.env.BOTMUX_SESSION_ID);
+    if (!ctx?.sessionId) {
+      // No managed origin at all (bare operator). Still honor an explicit env
+      // signal if present (daemon-spawned turn whose marker was pruned), but a
+      // truly bare shell has neither → not gated.
+      return !!process.env.BOTMUX_SESSION_ID && currentTurnHasNoTransport();
+    }
+    const s = loadSessions().get(ctx.sessionId);
+    if (!s) {
+      // Marker resolved a session id but no record on disk (riff sandbox etc.) —
+      // fall back to the env view for that same managed turn.
+      return currentTurnHasNoTransport();
+    }
+    const chatId = s.chatId ?? '';
+    if (chatId.startsWith('http_async_') || chatId.startsWith('http_wait_')) return true;
+    return !!s.larkAppId && currentBotIsApiOnly(s.larkAppId);
+  } catch {
+    return !!process.env.BOTMUX_SESSION_ID && currentTurnHasNoTransport();
+  }
+}
+
 /** Refuse a Feishu-touching CLI command for a no-transport turn with a clear,
  *  actionable message (not a deep client error), then exit. `op` names the
  *  command for the message. Returns true if it refused+exited is imminent — but
@@ -10031,24 +10062,24 @@ async function runPluginCommandByName(rawCommand: string, commandArgs: string[])
 
 // ─── Central root-dispatch transport gate ──────────────────────────────────
 // A MANAGED no-transport turn (a CLI turn the daemon spawned for an apiOnly bot
-// or an HTTP virtual session — identified by the injected BOTMUX_SESSION_ID
-// marker) must not run ANY Lark-facing command, regardless of which subcommand.
-// Gating here at the root — rather than per-command — covers every Feishu-facing
-// verb (send/dispatch/create-group/grant/history/quoted/bots/…) by construction,
-// so a new command can't silently reopen the hole. A BARE host-operator shell
-// (human running `botmux` directly, no managed-turn marker) is intentionally NOT
-// gated: the operator keeps full access. Per-command gates remain as
-// defense-in-depth + friendlier messages.
+// or an HTTP virtual session) must not run ANY Lark-facing command. The managed
+// origin is resolved via the pid-marker ANCESTRY (resolveSessionContext walks
+// process.ppid to a worker-written marker) — NOT the mutable BOTMUX_SESSION_ID
+// env — so `env -u BOTMUX_SESSION_ID … botmux create-group` cannot shed the
+// managed identity. We then load THAT session's record and gate on its chatId +
+// its bot's apiOnly (config, not env), so unsetting BOTMUX_CHAT_ID/LARK_APP_ID
+// also can't flip the verdict. Covers every Feishu-facing verb by construction.
+// A BARE host-operator shell (no ancestry marker, no env session) resolves no
+// managed origin → NOT gated: the operator keeps full access. per-command +
+// daemon-side getBotClient/larkTransportEnabled gates remain authoritative.
 const LARK_FACING_COMMANDS = new Set([
   'send', 'dispatch', 'create-group', 'history', 'quoted', 'bots', 'grant', 'react', 'thread',
+  'vc-agent', 'report',
 ]);
-if (LARK_FACING_COMMANDS.has(command) && process.env.BOTMUX_SESSION_ID && currentTurnHasNoTransport()) {
-  const chatId = process.env.BOTMUX_CHAT_ID ?? '';
-  const why = chatId.startsWith('http_async_') || chatId.startsWith('http_wait_')
-    ? 'this managed turn runs in an HTTP control-API session (no Feishu chat)'
-    : 'this is a core-only (apiOnly) bot with no Feishu connection';
+if (LARK_FACING_COMMANDS.has(command) && managedOriginHasNoTransport()) {
   console.error(
-    `botmux ${command} is unavailable: ${why}.\n` +
+    `botmux ${command} is unavailable: this managed turn has no Feishu transport ` +
+    `(core-only apiOnly bot or HTTP control-API session).\n` +
     `Feishu read/write is not possible for this turn — it communicates only over the HTTP\n` +
     `control API (input via trigger, output via trigger-result). Produce your normal answer.`,
   );
