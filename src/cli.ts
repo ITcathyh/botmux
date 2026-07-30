@@ -6572,6 +6572,11 @@ async function cmdSend(rest: string[]): Promise<void> {
 
   if (!s) { console.error(`未找到 session ${sid}`); process.exit(1); }
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
+  // Target-aware gate on the RESOLVED source session: `send --session-id <virtual>`
+  // (or an apiOnly bot's session) must be refused even if the ambient env looks
+  // transport-capable, and regardless of any `--chat-id` override — a no-transport
+  // turn may not originate ANY Feishu write. Closes the env-only gap for send.
+  assertSessionTransportOrExit({ chatId: s.chatId, larkAppId: s.larkAppId }, 'send');
   let deferredMaterializedByThisCommand = false;
   let deferredTopicRootMessageIdForOutput: string | undefined;
 
@@ -7683,6 +7688,11 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const s = sessions.get(sid);
   if (!s) { console.error(`未找到 session ${sid}`); process.exit(1); }
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
+  // Target-aware gate on the RESOLVED source session: dispatch from a virtual /
+  // apiOnly source turn is refused even with a real --chat-id override (a
+  // no-transport turn may not originate a Feishu topic/write). Closes the
+  // `dispatch --session-id <virtual> --chat-id oc_real` env-only gap.
+  assertSessionTransportOrExit({ chatId: s.chatId, larkAppId: s.larkAppId }, 'dispatch');
 
   const targetChatId = overrideChatId ?? s.chatId;
   if (!targetChatId) { console.error(`session ${sid} 缺少 chatId，且未提供 --chat-id`); process.exit(1); }

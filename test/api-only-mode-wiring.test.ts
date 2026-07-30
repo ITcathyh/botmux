@@ -188,12 +188,25 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     }
     // Target-aware gate: --session-id-accepting reads also gate on the RESOLVED
     // session (closes the cross-session bypass — env gate can't see the arg).
-    for (const op of ['history', 'quoted', 'bots list']) {
-      expect(cliSource, `session-aware ${op}`).toContain(`assertSessionTransportOrExit(`);
+    // Reads AND writes that accept --session-id gate on the resolved target.
+    for (const op of ['history', 'quoted', 'bots list', 'send', 'dispatch']) {
+      expect(cliSource, `session-aware ${op}`).toContain(`assertSessionTransportOrExit({ chatId: `);
     }
     const sessGate = region(cliSource, 'function assertSessionTransportOrExit(', 'process.exit(2);\n}');
     expect(sessGate).toContain("chatId.startsWith('http_async_') || chatId.startsWith('http_wait_')");
     expect(sessGate).toContain('currentBotIsApiOnly(session.larkAppId)');
+  });
+
+  it('daemon session-write IPC routes gate no-transport via sessionTransportDisabled', () => {
+    const ipcSource = readFileSync(resolve('src/core/dashboard-ipc-server.ts'), 'utf8');
+    // Central daemon helper keyed on apiOnly bot OR virtual chatId.
+    const helper = region(ipcSource, 'function sessionTransportDisabled(', '\n}\n');
+    expect(helper).toContain('getBot(appId).config.apiOnly === true');
+    expect(helper).toContain('larkTransportEnabled({');
+    // Each session-write route consults it (chat-rename / write-link-card /
+    // resume-notice / locate). Normal-bot-in-virtual-session has a real client so
+    // getBotClient won't throw — this is the only layer that catches it.
+    expect((ipcSource.match(/sessionTransportDisabled\(/g) ?? []).length).toBeGreaterThanOrEqual(5);
   });
 
   it('daemon dashboard IPC session-history + restart-notice gate no-transport sessions', () => {
