@@ -79,7 +79,7 @@ import { isStructuredBridgeAdoptCli } from '../services/structured-bridge-clis.j
 import { resolveEffectivePluginIds } from './plugins/effective.js';
 import { ensureGatewayEntry } from './plugins/mcp/gateway-installer.js';
 import type { CliTurnPayload, CodexAppTurnInput, DaemonToWorker, WorkerToDaemon, Session, DisplayMode } from '../types.js';
-import { activeSessionKey, sessionKey, sessionAnchorId, isDocNativeSession, type DaemonSession } from './types.js';
+import { activeSessionKey, sessionKey, sessionAnchorId, isDocNativeSession, larkTransportEnabled, type DaemonSession } from './types.js';
 import { DONE_REACTION_EMOJI_TYPE } from './pending-response.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { prependBotmuxBin } from './botmux-wrapper.js';
@@ -1111,6 +1111,11 @@ export async function deliverEphemeralOrReply(
  * any previously queued value — only the latest state matters).
  */
 export function scheduleCardPatch(ds: DaemonSession, cardJson: string, turnId?: string): void {
+  // Defense-in-depth transport gate: a no-transport session (apiOnly bot or HTTP
+  // virtual chat) has no real Feishu card to PATCH. Callers already suppress via
+  // managedAuxUiSuppressed, but guarding the flush entry too means a stray direct
+  // call can never dial updateMessage on a synthetic id.
+  if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return;
   // Bot opted out of the streaming card — never patch one into existence.
   // Turn-exact when the caller has turn context (screen updates): a substitute
   // turn arriving mid-PATCH must not suppress a normal turn's card (or vice
@@ -2610,6 +2615,14 @@ function setupWorkerHandlers(
   /** Auxiliary worker UI is never an authorized output channel for a dedicated
    * VC receiver. Dashboard/audit state is still updated before these guards. */
   const managedAuxUiSuppressed = (turnId?: string, dispatchAttempt?: number): boolean => {
+    // No-transport session (apiOnly bot or HTTP virtual chat): there is no real
+    // Feishu chat to render a card/reaction into. Suppress ALL auxiliary UI at
+    // the single source every aux-UI handler funnels through — this is the
+    // authoritative fix, NOT a fake "success" message id from sessionReply (a
+    // synthetic id would get stored as streamCardId and later scheduleCardPatch
+    // → updateMessage would still dial Feishu). Dashboard/web-terminal state is
+    // still updated before these guards, so the terminal view is unaffected.
+    if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return true;
     if (isSilentScheduledTurn(ds, turnId)) return true;
     if (ds.session.vcMeetingReceiver) return true;
     return ordinaryManagedSuppression(turnId, dispatchAttempt);

@@ -1,12 +1,14 @@
 # PR D · API-only (core-only / headless) bot mode — 设计方案
 
+> ⚠️ **阅读顺序**：下面「架构现状 / 需要 gate 的耦合点」是**首版初稿**，其中「核心控制回路已完全 Feishu-free、只需 gate boot 三点」的判断**经 codex 两轮复审已被推翻**。真正落地的设计以文末 **两个「修订」段** 为准（中央 `larkTransportEnabled` 会话边界 + bot 级 `assertLarkTransport` 原语边界）。初稿保留仅作演进记录。
+
 ## 目标
 让 botmux 作为 **core-only 控制 Server**：riff 在 Sandbox 里纯 HTTP API 驱动 botmux → botmux 直接控 CLI Agent，**全程无需真实飞书 Bot 凭证**。
 
 ## 架构现状（已核实）
 - **一个 daemon 进程 = 一个 bot**。pm2 ecosystem 有 botmux-0..3（`BOTMUX_BOT_INDEX` 经 `loadBotConfigAtIndex` 选 config）+ botmux-dashboard。
 - dashboard（:3000，内网 IP 可达）代理 `/api/trigger` + `/api/sessions/:id/trigger-result` 到 per-bot daemon（`registry.getByAppId(larkAppId)`）。riff 用 dashboard `activeToken` 鉴权。
-- **核心控制回路（trigger→spawn→CLI→trigger-result）走 `asyncReturnSessionId` 时已完全 Feishu-free**：虚拟 chatId `http_async_*`，`deliverFinalOutput` 命中 async 分支（worker-pool.ts:4149）后 `recordCompleted` 并 **early return，飞书投递代码全在其后不触达**。auto-worktree 的 notify 也 gated 在 `!isHttpVirtualSession`（trigger-session.ts:618）。
+- ~~**核心控制回路走 `asyncReturnSessionId` 时已完全 Feishu-free**，只需 gate boot 层~~ ← **首版误判，已被 codex 推翻**：final_output 之前还有 roster 探测、worker 辅助 UI、botmux ask、doc 轮询、allowedUsers 解析等多条飞书链路；且 apiOnly 只是 boot hint、trigger 仍可指向真实 chat。正确设计见文末修订段。
 
 ## 需要 gate 的耦合点（全部在 boot 层）
 | # | file:line | 作用 | 处理 |
@@ -88,3 +90,21 @@ rebase master → 开 PR（中文 + 影响面）→ 发 canary → 配一个 `ap
 **校验类型洞修复**：apiOnly secret 规则改为「可省略；若提供必须是 string」——42/{}/[]/false 不再穿进 string 字段。
 
 **测试**：新增 api-only-transport-boundary.test（行为：larkTransportEnabled 真值表 + apiOnly 请求形态 fail-closed）+ 扩展 api-only-mode-wiring.test（source-lock 锁 7 处 gate，负向验证删 gate 即红）。
+
+---
+
+## 修订 2（codex 第 3 轮复审后）：bot 级原语边界
+
+会话级 `larkTransportEnabled` 仍不够——它只覆盖「知道自己在哪个 session」的调用方。codex 指出还有 3 类旁路：
+1. **sessionReply 返回伪 messageId**：no-op 返回 `http_async_*` 被存进 streamCardId，下一条 screen_update 走 `updateMessage` 仍直调飞书 → 改为返回 `''`（空 id，falsy guard 天然跳过 patch）。
+2. **agent 直接 `botmux send`**：CLI 无 capability 门 → apiOnly 配了真 secret 会真发飞书。
+3. **非 session 全局路径**：v3 distillation / runtime-update / restart-report / overload DM 等直接 send/update，不经会话。
+
+**根治**：在 `im/lark/client.ts` 所有出站原语（sendMessage / replyMessage / updateMessage / deleteMessage / addReaction / removeReaction / sendUserMessage / sendEphemeralCard）的共同底座加 `assertLarkTransport(larkAppId, op)`——apiOnly bot 抛 `LarkTransportDisabledError`。这是**bot 级硬门**：无论调用方是谁（会话内/外、CLI/daemon），apiOnly bot 的任何飞书写操作都在原语处 fail-closed。
+
+**分层防御**：
+- bot 级原语 `assertLarkTransport`（client.ts）——authoritative，覆盖全部出站写
+- 会话级 `larkTransportEnabled`（worker-pool `managedAuxUiSuppressed` + `scheduleCardPatch` + trigger roster/ask）——在原语抛错前就静默 no-op，避免噪音日志 + 覆盖「普通 bot 的 virtual session」（此时 bot 非 apiOnly，原语不拦）
+- CLI 级 `botmux send` 早拒（cli.ts `currentBotIsApiOnly`）——给 agent 清晰反馈，不落深层 stack
+
+**测试**：新增 bot-level transport 原语抛错测试 + apiOnly card-patch 零飞书调用回归（真 scheduleCardPatch + FakeLarkClient 记账，负向验证过）。
