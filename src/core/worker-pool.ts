@@ -2305,7 +2305,11 @@ export function forkWorker(
       SESSION_DATA_DIR: config.session.dataDir,
       BOTMUX_SESSION_ID: ds.session.sessionId,
       LARK_APP_ID: botCfg.larkAppId,
-      LARK_APP_SECRET: botCfg.larkAppSecret,
+      // Withhold the real secret from the worker's own CLI env for a no-transport
+      // session (apiOnly bot or HTTP virtual chat). SEPARATE leak from the
+      // init-message larkAppSecret — the spawned CLI env carries it directly from
+      // botCfg. Empty it here too so no secret reaches the worker/sandbox.
+      LARK_APP_SECRET: larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }) ? botCfg.larkAppSecret : '',
     },
   } as WindowsForkOptions);
   const startupState: WorkerStartupState = {
@@ -4627,7 +4631,9 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
       CLAUDECODE: undefined,
       BOTMUX: '1',
       LARK_APP_ID: botCfg.larkAppId,
-      LARK_APP_SECRET: botCfg.larkAppSecret,
+      // Withhold the real secret from the adopt worker's CLI env for a
+      // no-transport session — same rationale as forkWorker above.
+      LARK_APP_SECRET: larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }) ? botCfg.larkAppSecret : '',
     },
   } as WindowsForkOptions);
   const startupState: WorkerStartupState = { ready: false, failureNotified: false };

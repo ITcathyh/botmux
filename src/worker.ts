@@ -6702,6 +6702,19 @@ async function spawnCli(
     // Per-bot env (bots.json `env`) takes precedence over session context;
     // explicit riff config.env takes precedence over both.
     const mergedEnv: Record<string, string> = { ...sessionEnv, ...sanitizePerBotEnv(cfg.env), ...cfg.backendConfig.env };
+    // Re-freeze the no-transport capability keys AFTER the merge: a stale or
+    // attacker-shaped backendConfig.env / per-bot env merges LAST and would
+    // otherwise override the frozen values, restoring send capability for a
+    // core-only bot or an HTTP virtual session. The host-owned session context
+    // is authoritative here — these keys cannot be overridden from config.
+    const noTransport = cfg.apiOnly === true
+      || cfg.chatId?.startsWith('http_async_') === true
+      || cfg.chatId?.startsWith('http_wait_') === true;
+    if (noTransport) {
+      delete mergedEnv.BOTMUX_LARK_APP_SECRET;
+      mergedEnv.BOTMUX_API_ONLY = '1';
+      mergedEnv.BOTMUX_CHAT_ID = cfg.chatId; // host-owned; never from config
+    }
     riffBackendConfig = Object.assign({}, cfg.backendConfig, { env: mergedEnv, resumeParentTaskId: cfg.riffParentTaskId });
     // 复用本地仓库+分支：多仓只认会话上的显式 stamp（仓库选择卡多选流按用户
     // 顺序写入 cfg.riffRepoDirs，首仓=primary）；否则仅对 workingDir 本身做单仓
