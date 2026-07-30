@@ -854,6 +854,17 @@ export interface BotConfig {
   larkAppId: string;
   larkAppSecret: string;
   /**
+   * Core-only / headless 模式：该 bot 纯 HTTP 控制 API 驱动（trigger →
+   * spawn → CLI → trigger-result），**不连接任何飞书**——boot 时跳过
+   * open_id 探测、required-scope 校验、WSClient 事件订阅，也不投递飞书消息
+   * （异步控制回路本就在 `deliverFinalOutput` 的 async 分支 early-return，
+   * 运行时不触达飞书）。`larkAppId` 仍必填但用合成本地身份（如
+   * `local_<slug>`，非 `cli_` 前缀）作为 daemon 标识 + dashboard 路由 key +
+   * `/api/trigger` 的 cachedLarkAppId gate；`larkAppSecret` 在此模式下可缺省。
+   * 缺省 / false 保持原有飞书 bot 行为字节不变。
+   */
+  apiOnly?: boolean;
+  /**
    * 租户品牌：`'feishu'`（中国版，open.feishu.cn）或 `'lark'`（国际版，
    * open.larksuite.com）。缺省 / 旧 bots.json 无此字段 → 视为 `'feishu'`
    * （见 {@link normalizeBrand}），向后兼容。决定 SDK Client / WSClient 的
@@ -1871,7 +1882,12 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     if (!entry.larkAppId || typeof entry.larkAppId !== 'string') {
       throw new Error(`Bot config [${i}]: larkAppId is required and must be a string`);
     }
-    if (!entry.larkAppSecret || typeof entry.larkAppSecret !== 'string') {
+    // apiOnly (core-only) bots drive purely over the HTTP control API and never
+    // connect to Feishu, so a real app secret is not required. larkAppId is still
+    // mandatory (daemon identity + dashboard routing + cachedLarkAppId gate); use
+    // a synthetic local id like `local_<slug>`. Normal Feishu bots keep the hard
+    // requirement — a missing secret there is a misconfig, not a headless bot.
+    if (entry.apiOnly !== true && (!entry.larkAppSecret || typeof entry.larkAppSecret !== 'string')) {
       throw new Error(`Bot config [${i}]: larkAppSecret is required and must be a string`);
     }
     // MOSA-managed onboarding persists the exact App/secret/owner binding so
@@ -2088,7 +2104,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
 
     configs.push({
       larkAppId: entry.larkAppId,
-      larkAppSecret: entry.larkAppSecret,
+      // apiOnly bots may omit the secret (never used — no Feishu connection);
+      // fall back to '' so downstream env plumbing stays a string. Feishu image
+      // upload etc. already degrade gracefully on an empty secret.
+      larkAppSecret: entry.larkAppSecret ?? '',
+      apiOnly: entry.apiOnly === true || undefined,
       // brand：只认精确的 'lark'，其余 → undefined（下游 normalizeBrand 当
       // feishu）。feishu 故意存成 undefined，保持旧 bots.json 干净、不写死字段。
       brand: entry.brand === 'lark' ? 'lark' : undefined,

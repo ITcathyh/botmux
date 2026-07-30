@@ -17871,6 +17871,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
     checkAllowedChatGroupsConfig(bot);
 
+    // apiOnly (core-only) bots never connect to Feishu: skip the open_id probe,
+    // the required-scope check, and the WSClient event subscription. They are
+    // driven purely over the HTTP control API (trigger → spawn → trigger-result),
+    // whose async path early-returns in deliverFinalOutput before any Feishu send.
+    // Seed a synthetic identity so downstream reads (worker botOpenId, dashboard
+    // roster) get a stable non-undefined value instead of the never-probed one.
+    if (cfg.apiOnly) {
+      bot.botOpenId ||= `bot_${cfg.larkAppId}`;
+      bot.botName ||= cfg.displayName ?? cfg.larkAppId;
+      logger.info(`[api-only] ${cfg.larkAppId} 以 core-only 模式启动：跳过飞书 open_id 探测 / scope 校验 / WSClient 订阅，仅 HTTP 控制 API 驱动`);
+    } else {
     // Probe bot open_id and persist to bots-info.json. When the friendly
     // botName comes back from /bot/v3/info, refresh the dashboard descriptor
     // so the registry shows "Claude" / "Codex" instead of the raw app id.
@@ -17900,13 +17911,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // a single failure here is not actionable. Surface as debug only.
       logger.debug(`[${cfg.larkAppId}] Bot open_id probe failed (will retry): ${err.message}`);
     });
+    } // end !cfg.apiOnly (open_id probe)
 
     // Required-scope check: 启动后 best-effort 校验
     // im:message.group_at_msg.include_bot:readonly。缺失会 logger.error +
     // 私信 allowedUsers[0]。校验异步，跑失败不影响 daemon。
-    checkRequiredScopes(cfg.larkAppId).catch(err => {
-      logger.debug(`[${cfg.larkAppId}] required-scope check failed: ${err?.message ?? err}`);
-    });
+    // apiOnly 无飞书连接 → 无 scope 概念，跳过。
+    if (!cfg.apiOnly) {
+      checkRequiredScopes(cfg.larkAppId).catch(err => {
+        logger.debug(`[${cfg.larkAppId}] required-scope check failed: ${err?.message ?? err}`);
+      });
+    }
 
     // 主动开工 — 场景①: the bot.added event can't be self-verified via API, and
     // if it isn't subscribed the handler simply never fires (no runtime signal).
@@ -17946,7 +17961,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     };
     // 存起来供授权成功后重放消息用（replayGrantedMessage → replayMessageEvent）。
     botHandlers.set(cfg.larkAppId, botEventHandlers);
-    startLarkEventDispatcher(cfg.larkAppId, cfg.larkAppSecret, botEventHandlers, normalizeBrand(cfg.brand));
+    // apiOnly bots never subscribe to Feishu events → no WSClient. This is the
+    // core decoupling: the daemon serves the HTTP control API only.
+    if (!cfg.apiOnly) {
+      startLarkEventDispatcher(cfg.larkAppId, cfg.larkAppSecret, botEventHandlers, normalizeBrand(cfg.brand));
+    }
 
     // A distillation command is durably prepared before its model run/card
     // delivery. Resume active prepared/proposed allocations after a daemon
