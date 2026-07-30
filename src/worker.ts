@@ -32,7 +32,7 @@ import {
   isolationPaneMarkerContent,
   type IsolationCapability,
 } from './adapters/cli/read-isolation.js';
-import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRedirectedAdapterAuthPaths } from './adapters/cli/fs-policy.js';
+import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRedirectedAdapterAuthPaths, FsPolicyConfigError } from './adapters/cli/fs-policy.js';
 import { killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, type PersistentBackendType } from './core/persistent-backend.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, type TranscriptEvent } from './services/claude-transcript.js';
@@ -7643,7 +7643,7 @@ async function spawnCli(
       }
     }
 
-    const policy = buildFsPolicy({
+    const fsPolicyCtx = {
       platform: process.platform as 'darwin' | 'linux',
       homeDir: sandboxHome,
       botmuxHome: canonical(dirname(dataDir)),
@@ -7658,13 +7658,20 @@ async function spawnCli(
       larkTransportEnabled: !(cfg.apiOnly === true
         || cfg.chatId?.startsWith('http_async_') === true
         || cfg.chatId?.startsWith('http_wait_') === true),
-      // Freeze the resolved custom BOTS_CONFIG path (daemon env, agent can't
-      // forge it) as an extra authority root so a no-transport turn can't read a
-      // bots.json living OUTSIDE ~/.botmux. Deny the whole containing dir (covers
-      // its .bak/.tmp sidecars too) rather than enumerate filenames.
-      larkAuthorityRoots: process.env.BOTS_CONFIG
-        ? [canonical(dirname(process.env.BOTS_CONFIG)), canonical(process.env.BOTS_CONFIG)]
-        : undefined,
+      // ALWAYS freeze BOTH botmux authority roots for a no-transport turn: the
+      // configured one (`botmuxHome` above = dirname(dataDir)) AND the canonical
+      // default `~/.botmux`. A custom SESSION_DATA_DIR moves the data dir, but the
+      // default root still holds the live `.dashboard-secret` HMAC + bots.json —
+      // denying only one leaves the sibling-daemon escalation open (codex P1).
+      // Deduped inside buildFsPolicy when the two are equal (default layout).
+      defaultBotmuxHome: canonical(defaultBotmuxHome),
+      // The ACTUAL loaded bots-config path, frozen by the daemon
+      // (getLoadedConfigPath), NOT guessed from BOTS_CONFIG env here. Inside a
+      // frozen root → the parent mask already covers it; OUTSIDE every root →
+      // buildFsPolicy THROWS (fail-closed) rather than silently masking an
+      // arbitrary parent dir (`/tmp`, `/etc`, a project root) and bricking the
+      // core CLI (codex P1). Canonicalized so it shares the roots' namespace.
+      loadedBotsConfigPath: cfg.loadedBotsConfigPath ? canonical(cfg.loadedBotsConfigPath) : undefined,
       redirectedCliData: willRedirectCliData,
       cliDataPaths: willRedirectCliData ? undefined : keepExisting([
         cliAdapter.claudeDataDir,
@@ -7722,7 +7729,29 @@ async function spawnCli(
       writeRegexes: process.platform === 'darwin' && !willRedirectCliData && claudeDataDir
         ? [`^${sandboxHome.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/\\.claude\\.json\\.tmp\\.[^/]+$`]
         : [],
-    });
+    };
+    const policy = (() => {
+      try {
+        return buildFsPolicy(fsPolicyCtx);
+      } catch (err) {
+        // A no-transport layout that cannot be safely confined (external
+        // bots-config, or workingDir that IS a Feishu-authority root) fails the
+        // spawn CLOSED with a diagnostic — never a silent parent-dir mask that
+        // would hide /tmp, /etc, or a project root and brick the core CLI (codex P1).
+        if (err instanceof FsPolicyConfigError) {
+          const msg = `[file-sandbox] refusing to start no-transport session ${cfg.sessionId}: ${err.message}`;
+          log(msg);
+          throw new Error(msg);
+        }
+        throw err;
+      }
+    })();
+    // A no-transport turn drops caller allow paths (extraWrite / readonlyRoots /
+    // user RW+RO) that fell inside a Feishu-authority root. Log the suppression so
+    // it's diagnosable rather than a silent hole (codex).
+    if (policy.suppressedAuthorityPaths?.length) {
+      log(`[file-sandbox] no-transport suppressed ${policy.suppressedAuthorityPaths.length} allow path(s) inside a Feishu-authority root: ${policy.suppressedAuthorityPaths.join(', ')}`);
+    }
     // Existence-filter only the ALLOW rules (baseline entries are candidates,
     // not guarantees): a non-existent allow path has nothing to expose, and
     // bwrap cannot bind a non-existent SOURCE. DENY rules are kept regardless —

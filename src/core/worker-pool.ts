@@ -38,7 +38,7 @@ import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
 import { isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, killPersistentBackendTarget, probePersistentBackendTarget, managedTargetsForCliChange, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
-import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel } from '../bot-registry.js';
+import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath } from '../bot-registry.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 
@@ -2457,6 +2457,13 @@ export function forkWorker(
     // Feishu (uploader/cred-write are also skipped downstream on the same test).
     larkAppSecret: larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }) ? botCfg.larkAppSecret : '',
     apiOnly: botCfg.apiOnly,
+    // Freeze the ACTUAL loaded bots-config path (getLoadedConfigPath) so a
+    // no-transport worker's fs-policy denies it from a HOST-owned fact, not a
+    // guess off BOTS_CONFIG env (which the agent could see/forge). When it lives
+    // outside every botmux authority root, buildFsPolicy fails the spawn closed
+    // rather than silently masking an arbitrary parent dir (codex P1). Omitted
+    // from forkAdoptWorker below — its observe branch returns before fs-policy.
+    loadedBotsConfigPath: getLoadedConfigPath(),
     brand: normalizeBrand(botCfg.brand),
     botName: bot.botName,
     botOpenId: bot.botOpenId,

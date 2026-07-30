@@ -49,6 +49,11 @@ export interface FsPolicy {
   denyRegexes?: string[];
   /** Narrow read-only exceptions emitted after denyRegexes (macOS gateway socket). */
   finalReadOnlyPaths?: string[];
+  /** No-transport turns: caller-supplied allow paths (extraWrite / readonlyRoots /
+   *  user RW+RO) that fell inside a Feishu-authority root and were dropped before
+   *  merge (fail-closed). Empty/absent otherwise. The worker LOGS these so a
+   *  silently-suppressed grant is diagnosable (codex: "至少要记录被抑制项"). */
+  suppressedAuthorityPaths?: string[];
 }
 
 export interface FsPolicyUserPaths {
@@ -112,11 +117,23 @@ export interface FsPolicyContext {
    *  emits MANDATORY denies for the Feishu-cred paths so a wide workingDir grant
    *  can't re-expose them (mandatory deny wins). Absent/true = normal behavior. */
   larkTransportEnabled?: boolean;
-  /** Extra Feishu-AUTHORITY roots to deny wholesale when larkTransportEnabled is
-   *  false — beyond the defaults (botmuxHome, ~/.lark-cli-bots, macOS lark-cli
-   *  store). The daemon freezes in the resolved custom BOTS_CONFIG directory here
-   *  when it lives outside botmuxHome, so a no-transport turn can't read it. */
-  larkAuthorityRoots?: readonly string[];
+  /** No-transport ONLY: the SECOND botmux authority root to freeze, when the
+   *  daemon runs with a custom SESSION_DATA_DIR so `configuredBotmuxHome`
+   *  (= dirname(dataDir), passed as `botmuxHome`) differs from the default
+   *  `~/.botmux`. BOTH must be denied wholesale — the default root still holds
+   *  the live `.dashboard-secret` HMAC + bots.json even when the data dir moved
+   *  (codex P1: custom SESSION_DATA_DIR leaked the default `~/.botmux`). Ignored
+   *  when equal to `botmuxHome`. MUST be canonical + host-frozen (never derived
+   *  from agent-controllable env). */
+  defaultBotmuxHome?: string;
+  /** No-transport ONLY: the ACTUAL loaded bots-config path, frozen by the daemon
+   *  (`getLoadedConfigPath()`), NOT guessed from BOTS_CONFIG env by the worker.
+   *  When it lives INSIDE a frozen authority root the parent mask already covers
+   *  it (no extra rule needed). When it lives OUTSIDE every authority root,
+   *  buildFsPolicy THROWS {@link FsPolicyConfigError} — a no-transport turn must
+   *  not silently mask an arbitrary parent dir (`/tmp`, `/etc`, a project root),
+   *  which would break the core CLI (codex P1). Absent = default `~/.botmux/bots.json`. */
+  loadedBotsConfigPath?: string;
 }
 
 /** Normalize: require absolute, strip trailing slashes, reject `..` segments.
@@ -364,6 +381,65 @@ function linuxBaseline(h: string): FsRule[] {
 // ───────────────────────────── policy assembly ───────────────────────────────
 
 /**
+ * A no-transport (apiOnly / HTTP-virtual) session whose layout cannot be safely
+ * confined — e.g. an external `BOTS_CONFIG` sitting outside every botmux
+ * authority root, or a `workingDir` that IS a Feishu-authority root. buildFsPolicy
+ * throws this instead of silently masking an arbitrary parent dir (which would
+ * hide `/tmp`/`/etc`/a project root and brick the core CLI) or silently dropping
+ * the working dir. The worker turns it into a hard spawn-abort with a diagnostic —
+ * fail-closed, never fail-open (codex P1). Carries `.kind` so callers/tests can
+ * branch without string-matching the message. */
+export class FsPolicyConfigError extends Error {
+  readonly kind: 'external-bots-config' | 'working-dir-is-authority';
+  constructor(kind: FsPolicyConfigError['kind'], message: string) {
+    super(message);
+    this.name = 'FsPolicyConfigError';
+    this.kind = kind;
+  }
+}
+
+/**
+ * Compute the frozen Feishu-authority roots for a no-transport turn. PURE +
+ * exported so the worker's real path assembly and the unit matrix lock the SAME
+ * provenance logic (codex P2: prior tests hand-fed roots and never touched this).
+ *
+ *  - ALWAYS freezes BOTH the configured botmux root (`botmuxHome` = dirname of the
+ *    data dir) AND the canonical default `~/.botmux` — a custom SESSION_DATA_DIR
+ *    moves the data dir but the default root still holds the live `.dashboard-secret`
+ *    HMAC + bots.json, so denying only one leaves the sibling-daemon escalation
+ *    open (codex P1).
+ *  - freezes the lark-cli identity/key stores: bare `~/.lark-cli` (repo marks it
+ *    sensitive), `~/.lark-cli-bots`, macOS lark-cli store.
+ *  - the loaded bots-config path: inside a frozen root → already covered (no extra
+ *    root). OUTSIDE every root → THROW (fail-closed); never mask its parent dir.
+ */
+export function computeNoTransportAuthorityRoots(input: {
+  homeDir: string;
+  botmuxHome: string;
+  defaultBotmuxHome?: string;
+  loadedBotsConfigPath?: string;
+}): string[] {
+  const roots = [...new Set([
+    input.botmuxHome,
+    ...(input.defaultBotmuxHome ? [input.defaultBotmuxHome] : []),
+    `${input.homeDir}/.lark-cli`,
+    `${input.homeDir}/.lark-cli-bots`,
+    `${input.homeDir}/Library/Application Support/lark-cli`,
+  ])].map(normalizeFsPath).filter((r): r is string => !!r);
+  const cfg = input.loadedBotsConfigPath ? normalizeFsPath(input.loadedBotsConfigPath) : null;
+  if (cfg && !roots.some(root => coversPath(root, cfg))) {
+    throw new FsPolicyConfigError(
+      'external-bots-config',
+      `no-transport session refuses an external bots-config at ${cfg}: it lives outside every `
+      + `botmux authority root (${roots.join(', ')}). A no-transport turn cannot safely mask its `
+      + `parent directory (would hide arbitrary host paths like /tmp or /etc); move the config `
+      + `under ~/.botmux or a dedicated data-dir root.`,
+    );
+  }
+  return roots;
+}
+
+/**
  * Build the unified FsPolicy: baseline preset (platform) + adapter-declared
  * paths + botmux-internal injections + user sandboxPaths (highest precedence).
  * Pure — the worker canonicalizes and existence-filters all ctx paths first.
@@ -387,21 +463,47 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // so a deeper allow can't re-open the authority deny (deepest-prefix wins).
   // The bot's OWN BOT_HOME is the sole exception (re-allowed deeper, minus
   // send-cred). Model-CLI authPaths live outside these roots and are unaffected.
-  const authorityRoots = larkTransport ? [] : [...new Set([
-    ctx.botmuxHome,
-    `${ctx.homeDir}/.lark-cli-bots`,
-    `${ctx.homeDir}/Library/Application Support/lark-cli`,
-    ...(ctx.larkAuthorityRoots ?? []),
-  ])];
+  // computeNoTransportAuthorityRoots freezes BOTH the configured + default botmux
+  // roots and THROWS on an external bots-config (fail-closed, never silent-mask).
+  const authorityRoots = larkTransport ? [] : computeNoTransportAuthorityRoots({
+    homeDir: ctx.homeDir,
+    botmuxHome: ctx.botmuxHome,
+    defaultBotmuxHome: ctx.defaultBotmuxHome,
+    loadedBotsConfigPath: ctx.loadedBotsConfigPath,
+  });
   // A path is authority-restricted when it's inside an authority root but NOT
   // inside the bot's own BOT_HOME (which is legitimately re-allowed).
   const insideAuthority = (p: string): boolean =>
     authorityRoots.some(root => coversPath(root, p)) && !coversPath(ctx.botHome, p);
+  // Dropped caller allow paths are RECORDED so the worker can log the suppression
+  // (codex: a silently-dropped grant is a diagnosability hole).
+  const suppressedAuthorityPaths: string[] = [];
   const dropAuthority = (paths: readonly string[] | undefined): string[] =>
     (paths ?? []).filter(p => {
       const n = normalizeFsPath(p);
-      return n !== null && !insideAuthority(n);
+      if (n === null) return false;
+      if (insideAuthority(n)) { suppressedAuthorityPaths.push(n); return false; }
+      return true;
     });
+
+  // workingDir is the CLI's cwd — it MUST be granted, so we cannot silently drop
+  // it. A workingDir that IS (or is inside) a Feishu-authority root — own BOT_HOME
+  // excepted — is an unresolvable no-transport layout: fail-closed with a clear
+  // config error rather than dropAuthority-then-spawn into an ungranted cwd
+  // (codex P1). A workingDir that is merely an ANCESTOR of an authority root
+  // (the common `workingDir=~` HTTP-trigger default) is fine — the deeper parent
+  // deny masks the nested authority, so it stays granted below.
+  if (!larkTransport) {
+    const wd = normalizeFsPath(ctx.workingDir);
+    if (wd !== null && insideAuthority(wd)) {
+      throw new FsPolicyConfigError(
+        'working-dir-is-authority',
+        `no-transport session refuses workingDir ${wd}: it lives inside a Feishu-authority root `
+        + `(${authorityRoots.join(', ')}) that a core-only turn must deny; choose a workingDir `
+        + `outside these roots (or the bot's own BOT_HOME).`,
+      );
+    }
+  }
 
   candidates.push(...(ctx.platform === 'darwin' ? darwinBaseline(ctx.homeDir) : linuxBaseline(ctx.homeDir)));
 
@@ -536,6 +638,9 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     writeRegexes: [...(ctx.writeRegexes ?? [])],
     denyRegexes: [...(ctx.mandatoryDenyRegexes ?? [])],
     finalReadOnlyPaths: [...(ctx.mandatoryReadOnlyPaths ?? [])],
+    suppressedAuthorityPaths: suppressedAuthorityPaths.length
+      ? [...new Set(suppressedAuthorityPaths)].sort()
+      : undefined,
   };
 }
 

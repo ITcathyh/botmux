@@ -388,3 +388,41 @@ describe('API-only bot mode — riff env re-freeze + VC listener exclusion (sour
     expect(daemonSrc).toContain('} // end !cfg.apiOnly (open-platform rename/avatar handlers)');
   });
 });
+
+describe('API-only bot mode — no-transport fs-policy authority provenance (worker wiring source lock)', () => {
+  // codex P2: prior fs-policy tests hand-fed authority roots and never touched
+  // worker.ts's REAL path assembly — deleting the freeze stayed green. These
+  // lock the actual worker→buildFsPolicy wiring so the freeze can't be removed
+  // silently. The behavioral half lives in fs-policy.test.ts (the pure helper).
+  const workerSource = readFileSync(resolve('src/worker.ts'), 'utf8');
+  const workerPoolSource = readFileSync(resolve('src/core/worker-pool.ts'), 'utf8');
+
+  it('worker passes BOTH the configured botmuxHome AND the frozen default ~/.botmux into buildFsPolicy', () => {
+    const block = region(workerSource, 'const fsPolicyCtx = {', 'redirectedCliData: willRedirectCliData,');
+    // configured root (= dirname(dataDir)) and the ALWAYS-frozen default root
+    expect(block).toContain('botmuxHome: canonical(dirname(dataDir)),');
+    expect(block).toContain('defaultBotmuxHome: canonical(defaultBotmuxHome),');
+    // and the daemon-frozen loaded config path (not a BOTS_CONFIG env guess)
+    expect(block).toContain('loadedBotsConfigPath: cfg.loadedBotsConfigPath ? canonical(cfg.loadedBotsConfigPath) : undefined,');
+    // the OLD guess-the-dir approach is gone (no larkAuthorityRoots off env)
+    expect(workerSource).not.toContain('larkAuthorityRoots');
+  });
+
+  it('worker turns an unconfined no-transport layout into a fail-closed spawn abort', () => {
+    // FsPolicyConfigError (external bots-config / workingDir-is-authority) must
+    // abort the spawn with a diagnostic, never fall through to an unconfined run.
+    expect(workerSource).toContain('import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRedirectedAdapterAuthPaths, FsPolicyConfigError }');
+    const block = region(workerSource, 'const policy = (() => {', 'suppressedAuthorityPaths?.length');
+    expect(block).toContain('if (err instanceof FsPolicyConfigError) {');
+    expect(block).toContain('refusing to start no-transport session');
+    // suppressed (dropped) authority allow paths are LOGGED, not silent
+    expect(workerSource).toContain('no-transport suppressed');
+  });
+
+  it('daemon freezes the actual loaded bots-config path into the worker init message', () => {
+    // getLoadedConfigPath() is host-frozen; the worker must not re-guess from env.
+    const block = region(workerPoolSource, 'apiOnly: botCfg.apiOnly,', 'brand: normalizeBrand(botCfg.brand),');
+    expect(block).toContain('loadedBotsConfigPath: getLoadedConfigPath(),');
+    expect(workerPoolSource).toContain("import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath }");
+  });
+});
