@@ -253,19 +253,44 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     expect(notice).toContain('larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })');
   });
 
-  it('createTeamGroup: apiOnly excluded from creator AND members, but federation remote normal bots kept', () => {
+  it('createTeamGroup: no-transport (local apiOnly + remote apiOnly) excluded from creator AND members; remote normal kept', () => {
     const dashSource = readFileSync(resolve('src/dashboard.ts'), 'utf8');
-    const block = region(dashSource, 'const isApiOnlyBot =', 'proxyToDaemon(plan.creatorLarkAppId');
-    // Two DISTINCT predicates (the fix for the federation regression):
-    //  - isApiOnlyBot: config-only, does NOT require local-registry presence, so
-    //    a federation remote normal bot survives member filtering.
-    //  - canBeCreator: local-online AND not apiOnly.
+    const block = region(dashSource, 'let noTransportRosterIds', 'proxyToDaemon(plan.creatorLarkAppId');
+    // Remote apiOnly detected via the federated roster's larkTransportEnabled===false
+    // (propagated spoke→sync→store→roster), NOT just local bots.json.
+    expect(block).toContain('buildFederatedRoster(');
+    expect(block).toContain('b.larkTransportEnabled === false');
+    // Local apiOnly still detected from config.
     expect(block).toContain("b.larkAppId === id)?.apiOnly === true");
-    expect(block).toContain('const canBeCreator = (id: string): boolean => !!registry.getByAppId(id) && !isApiOnlyBot(id);');
-    // Member payload excludes ONLY apiOnly (not the local-online creator predicate)
-    // — remote normal bots stay.
-    expect(block).toContain('selectedIds.filter(id => !isApiOnlyBot(id))');
+    // Creator = local-online AND transport; member excludes no-transport only.
+    expect(block).toContain('const canBeCreator = (id: string): boolean => !!registry.getByAppId(id) && !isNoTransportBot(id);');
+    expect(block).toContain('selectedIds.filter(id => !isNoTransportBot(id))');
     expect(block).not.toContain('selectedIds.filter(canBeCreator)');
+  });
+
+  it('federation propagates larkTransportEnabled (spoke pack → sanitizer → roster)', () => {
+    const store = readFileSync(resolve('src/services/federation-store.ts'), 'utf8');
+    expect(store).toContain('larkTransportEnabled?: boolean;');
+    // Spoke packs it from local apiOnly config.
+    const spoke = readFileSync(resolve('src/dashboard/federation-spoke-api.ts'), 'utf8');
+    const localBots = region(spoke, 'function localBots(', '// owner (union_id+name) federated');
+    expect(localBots).toContain('larkTransportEnabled: !apiOnlyIds.has(b.larkAppId)');
+    // Receiver preserves it (explicit boolean only; absent→undefined→legacy normal).
+    const api = readFileSync(resolve('src/dashboard/federation-api.ts'), 'utf8');
+    expect(api).toContain("larkTransportEnabled: typeof r.larkTransportEnabled === 'boolean' ? r.larkTransportEnabled : undefined");
+    // Aggregated roster carries it for remote bots.
+    const fedRoster = readFileSync(resolve('src/services/federation-roster.ts'), 'utf8');
+    expect(fedRoster).toContain('larkTransportEnabled: b.larkTransportEnabled,');
+  });
+
+  it('no-transport session FORCES read isolation (credential-supply hard boundary)', () => {
+    // The authoritative fail-closed boundary (pid-marker gate is only friendly
+    // early-reject): a no-transport worker gets read isolation so it cannot read
+    // full bots.json / sibling creds even by deleting the marker or bypassing CLI.
+    const wp = readFileSync(resolve('src/core/worker-pool.ts'), 'utf8');
+    const block = region(wp, 'HARD credential boundary', 'readDenyExtraPaths:');
+    expect(block).toContain('botCfg.readIsolation === true');
+    expect(block).toContain('!larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly })');
   });
 });
 

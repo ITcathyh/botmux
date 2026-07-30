@@ -2412,7 +2412,16 @@ export function forkWorker(
     // Per-bot local read isolation (enforced worker-side; the worker gates it).
     // Sibling data needs no app-id enumeration: per-bot dirs are denied wholesale
     // and per-bot session files by filename pattern (see buildV2DenyPaths).
-    readIsolation: botCfg.readIsolation === true,
+    // HARD credential boundary for a no-transport session (apiOnly bot OR HTTP
+    // virtual chat): force read isolation so the CLI physically cannot read the
+    // full bots.json / sibling BOT_HOME / send-cred / lark-cli store — a model
+    // that deletes/forges the ancestry marker or bypasses the CLI still cannot
+    // build ANY (sibling) Lark client. The pid-marker gate is only friendly
+    // early-reject; THIS is the fail-closed boundary. Reuses the existing unified
+    // fs-policy (mac+Linux fail-closed); a backend that can't isolate locally
+    // refuses to spawn rather than leak creds.
+    readIsolation: botCfg.readIsolation === true
+      || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }),
     readDenyExtraPaths: botCfg.readDenyExtraPaths ?? [],
     // Identifies THIS daemon lifetime. Stamped onto isolated panes so the worker
     // can tell a suspend→resume reattach (same boot id, still isolated) from a
