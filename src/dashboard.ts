@@ -1980,20 +1980,24 @@ async function createTeamGroup(args: { name: string; larkAppIds: string[]; userO
   // Only auto-invite the web user when their paired bot is the creator (open_id
   // is scoped to that app); otherwise create the group but don't forward a
   // wrong-scope open_id — UI will flag autoInviteUnavailable.
-  // A group creator must be able to call the Feishu chat.create API. A core-only
-  // (apiOnly) bot cannot (getBotClient throws), so it is neither creator-eligible
-  // nor a valid member here — exclude it from both the online check and the pick.
-  const canCreateFeishuGroup = (id: string): boolean => {
-    if (!registry.getByAppId(id)) return false;
-    try { return loadBotConfigs().find(b => b.larkAppId === id)?.apiOnly !== true; }
-    catch { return true; }
+  // Two DISTINCT predicates — conflating them regressed federation:
+  //  • isApiOnlyBot: config-only. apiOnly bots have no Feishu identity, so they
+  //    can be neither creator nor member. Does NOT require local-registry
+  //    presence, so a federation REMOTE normal bot is correctly kept.
+  //  • canBeCreator: creator must be a locally-online daemon AND not apiOnly
+  //    (getBotClient throws for apiOnly). Remote bots can be members but not the
+  //    local creator.
+  const isApiOnlyBot = (id: string): boolean => {
+    try { return loadBotConfigs().find(b => b.larkAppId === id)?.apiOnly === true; }
+    catch { return false; }
   };
+  const canBeCreator = (id: string): boolean => !!registry.getByAppId(id) && !isApiOnlyBot(id);
   const plan = planGroupCreator(
     selectedIds,
     args.preferredCreator,
-    canCreateFeishuGroup,
+    canBeCreator,
     (ids) => {
-      const p = pickCreatorForGroup(ids.filter(canCreateFeishuGroup), (id) => {
+      const p = pickCreatorForGroup(ids.filter(canBeCreator), (id) => {
         const d = registry.getByAppId(id);
         return d ? { larkAppId: d.larkAppId, resolvedAllowedUsers: d.resolvedAllowedUsers ?? [] } : undefined;
       });
@@ -2003,10 +2007,10 @@ async function createTeamGroup(args: { name: string; larkAppIds: string[]; userO
   if (!plan.creatorLarkAppId) return { ok: false, error: 'no_online_daemon' };
   const userOpenIds = plan.inviteUser && args.userOpenId ? [args.userOpenId] : [];
   try {
-    // apiOnly bots can't be Feishu group MEMBERS either (no Feishu identity to
-    // invite) — exclude them from the member payload, not just from creator
-    // eligibility, so the creator doesn't try to invite a synthetic local_* id.
-    const memberIds = selectedIds.filter(canCreateFeishuGroup);
+    // Exclude ONLY apiOnly bots from the member payload (they have no Feishu
+    // identity to invite). Federation remote NORMAL bots stay — the fix for the
+    // creator-predicate regression that also dropped them.
+    const memberIds = selectedIds.filter(id => !isApiOnlyBot(id));
     const upstream = await proxyToDaemon(plan.creatorLarkAppId, '/api/groups/create', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },

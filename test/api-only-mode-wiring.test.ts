@@ -207,9 +207,17 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
       expect(body, `${op} target-aware`).toContain('assertSessionTransportOrExit({ chatId: ');
     }
     // Root-dispatch gate: managed no-transport turn refused for ALL Lark-facing
-    // commands at the switch, keyed on the injected BOTMUX_SESSION_ID marker.
+    // commands, resolved via TAMPER-RESISTANT pid-marker ancestry (not raw env).
     const rootGate = region(cliSource, 'const LARK_FACING_COMMANDS = new Set(', 'switch (command) {');
-    expect(rootGate).toContain('process.env.BOTMUX_SESSION_ID && currentTurnHasNoTransport()');
+    expect(rootGate).toContain('managedOriginHasNoTransport()');
+    // The command set includes the verbs codex flagged (vc-agent, report).
+    for (const cmd of ['send', 'dispatch', 'create-group', 'grant', 'vc-agent', 'report']) {
+      expect(rootGate, `LARK_FACING has ${cmd}`).toContain(`'${cmd}'`);
+    }
+    // managedOriginHasNoTransport resolves via ancestry (env-independent).
+    const originGate = region(cliSource, 'function managedOriginHasNoTransport(', '\n}\n');
+    expect(originGate).toContain('resolveSessionContext(resolveDataDir(), process.env.BOTMUX_SESSION_ID)');
+    expect(originGate).toContain('loadSessions().get(ctx.sessionId)');
     const sessGate = region(cliSource, 'function assertSessionTransportOrExit(', 'process.exit(2);\n}');
     expect(sessGate).toContain("chatId.startsWith('http_async_') || chatId.startsWith('http_wait_')");
     expect(sessGate).toContain('currentBotIsApiOnly(session.larkAppId)');
@@ -245,11 +253,19 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     expect(notice).toContain('larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })');
   });
 
-  it('createTeamGroup excludes apiOnly bots from creator eligibility', () => {
+  it('createTeamGroup: apiOnly excluded from creator AND members, but federation remote normal bots kept', () => {
     const dashSource = readFileSync(resolve('src/dashboard.ts'), 'utf8');
-    const block = region(dashSource, 'const canCreateFeishuGroup =', 'if (!plan.creatorLarkAppId)');
-    expect(block).toContain('.apiOnly !== true');
-    expect(block).toContain('ids.filter(canCreateFeishuGroup)');
+    const block = region(dashSource, 'const isApiOnlyBot =', 'proxyToDaemon(plan.creatorLarkAppId');
+    // Two DISTINCT predicates (the fix for the federation regression):
+    //  - isApiOnlyBot: config-only, does NOT require local-registry presence, so
+    //    a federation remote normal bot survives member filtering.
+    //  - canBeCreator: local-online AND not apiOnly.
+    expect(block).toContain("b.larkAppId === id)?.apiOnly === true");
+    expect(block).toContain('const canBeCreator = (id: string): boolean => !!registry.getByAppId(id) && !isApiOnlyBot(id);');
+    // Member payload excludes ONLY apiOnly (not the local-online creator predicate)
+    // — remote normal bots stay.
+    expect(block).toContain('selectedIds.filter(id => !isApiOnlyBot(id))');
+    expect(block).not.toContain('selectedIds.filter(canBeCreator)');
   });
 });
 
