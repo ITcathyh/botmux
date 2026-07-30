@@ -167,11 +167,14 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     expect(block).toContain('larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })');
   });
 
-  it('botmux send refuses early for an apiOnly bot (CLI capability gate)', () => {
+  it('botmux send refuses early for apiOnly bot AND any HTTP virtual-session turn (CLI capability gate)', () => {
     const cliSource = readFileSync(resolve('src/cli.ts'), 'utf8');
     const block = region(cliSource, 'async function cmdSend(', 'Managed output attribution');
+    // apiOnly bot refusal.
     expect(block).toContain('currentBotIsApiOnly(selfAppId)');
-    expect(block).toContain('botmux send is unavailable for this core-only');
+    // Normal-bot-in-virtual-session refusal: BOTMUX_CHAT_ID = http_async_*/http_wait_*.
+    expect(block).toContain("selfChatId.startsWith('http_async_') || selfChatId.startsWith('http_wait_')");
+    expect(block).toContain('botmux send is unavailable for this turn');
   });
 });
 
