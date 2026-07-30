@@ -511,4 +511,34 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     expect(serve).toContain('delete e.BOTS_CONFIG;');
     expect(serve).toContain("BOTMUX_WORKER_HTTP_HOST: '127.0.0.1',");
   });
+
+  it('P1(2nd round): entrypoint FREEZES a dedicated state root, ignoring ambient SESSION_DATA_DIR', () => {
+    // A managed turn that spawns `serve --api-only` carries the host's
+    // SESSION_DATA_DIR; core-only must NOT read/mutate that fleet store. The
+    // entrypoint overwrites SESSION_DATA_DIR with a dedicated per-bot root before
+    // any config module reads it.
+    expect(entrySource).toContain('process.env.SESSION_DATA_DIR = frozenStateDir;');
+    expect(entrySource).toContain("join(homedir(), '.botmux', 'core-only', coreBotId, 'data')");
+    expect(entrySource).toContain('BOTMUX_CORE_STATE_DIR'); // explicit override knob
+    // Freeze happens before startDaemon (which reads config.session.dataDir).
+    const freezeAt = entrySource.indexOf('process.env.SESSION_DATA_DIR = frozenStateDir;');
+    const startAt = entrySource.indexOf('await startDaemon()');
+    expect(freezeAt).toBeGreaterThan(0);
+    expect(startAt).toBeGreaterThan(freezeAt);
+    // cmdServe also strips ambient SESSION_DATA_DIR from the spawn env.
+    const cliSource = readFileSync(resolve('src/cli.ts'), 'utf8');
+    const serve = region(cliSource, 'async function cmdServe(', 'child.on(');
+    expect(serve).toContain('delete e.SESSION_DATA_DIR;');
+  });
+
+  it('P1(2nd round): core-only skips host-wide maintenance / auto-restart / restart-report', () => {
+    // The synthetic bot is idx=0 but must NOT own fleet maintenance (global
+    // botmux update + detached `botmux restart`). Gate the whole block on !coreOnly.
+    expect(daemonSource).toContain('if (idx === 0 && !coreOnly) {');
+    // The maintenance starter is inside that gated block.
+    const block = region(daemonSource, 'if (idx === 0 && !coreOnly) {', 'Host-overload watcher');
+    expect(block).toContain('startMaintenance();');
+    expect(block).toContain('startCliRuntimeUpdateMonitor(');
+    expect(block).toContain('sendRestartReportIfPending(');
+  });
 });

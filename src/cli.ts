@@ -410,7 +410,7 @@ function ensureUniqueBotProcessNames(bots: any[]): void {
 async function cmdServe(args: string[]): Promise<void> {
   const apiOnly = args.includes('--api-only');
   if (!apiOnly) {
-    console.error('Usage: botmux serve --api-only [--port <PORT>] [--bot <local_slug>] [--cli <cliId>]');
+    console.error('Usage: botmux serve --api-only [--port <PORT>] [--bot <local_slug>] [--cli <cliId>] [--state-dir <DIR>]');
     console.error('  Only core-only (--api-only) serving is supported. It runs a headless HTTP');
     console.error('  control-API service with no Feishu credentials (for riff sandbox / embedding).');
     process.exit(2);
@@ -427,6 +427,7 @@ async function cmdServe(args: string[]): Promise<void> {
   const bot = getOpt('--bot') ?? process.env.BOTMUX_API_ONLY_BOT;
   const cli = getOpt('--cli') ?? process.env.BOTMUX_CORE_CLI;
   const workingDir = getOpt('--working-dir') ?? process.env.BOTMUX_CORE_WORKING_DIR;
+  const stateDir = getOpt('--state-dir') ?? process.env.BOTMUX_CORE_STATE_DIR;
 
   const coreScript = join(PKG_ROOT, 'dist', 'index-core-only.js');
   const child = spawn(process.execPath, [coreScript], {
@@ -442,12 +443,16 @@ async function cmdServe(args: string[]): Promise<void> {
         ...(bot ? { BOTMUX_API_ONLY_BOT: bot } : {}),
         ...(cli ? { BOTMUX_CORE_CLI: cli } : {}),
         ...(workingDir ? { BOTMUX_CORE_WORKING_DIR: workingDir } : {}),
+        ...(stateDir ? { BOTMUX_CORE_STATE_DIR: stateDir } : {}),
       };
-      // Never hand an ambient BOTS_CONFIG / legacy worker-host alias to the
-      // core-only child — the entrypoint strips these too, but keep the spawn
-      // env clean from the start (codex P1: agent could read $BOTS_CONFIG).
+      // Never hand an ambient BOTS_CONFIG / legacy worker-host alias / ambient
+      // SESSION_DATA_DIR to the core-only child — the entrypoint freezes/strips
+      // these too, but keep the spawn env clean from the start (codex P1: agent
+      // could read $BOTS_CONFIG; ambient SESSION_DATA_DIR would point at a host
+      // fleet's store). The entrypoint re-derives a dedicated core-only state root.
       delete e.BOTS_CONFIG;
       delete e.BOTMUX_WORKER_HOST;
+      delete e.SESSION_DATA_DIR;
       return e;
     })(),
   });

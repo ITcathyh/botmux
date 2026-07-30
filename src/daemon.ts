@@ -18245,8 +18245,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   maintenanceHeartbeat.unref?.();
 
   // Auto-update / auto-restart and the restart-report DM run only on the
-  // primary daemon (bot-0) — a restart is host-wide.
-  if (idx === 0) {
+  // primary daemon (bot-0) — a restart is host-wide. NEVER in core-only (codex
+  // P1): a headless in-sandbox service synthesizes its single bot at idx=0, but
+  // it must NOT own host-wide fleet maintenance — auto-update could rewrite the
+  // global botmux install and a detached `botmux restart` would tear down the
+  // real fleet. Core-only manages only its own single process.
+  if (idx === 0 && !coreOnly) {
     startMaintenance();
     startCliRuntimeUpdateMonitor({
       dataDir: config.session.dataDir,

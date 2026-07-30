@@ -14,7 +14,7 @@
 import { config as dotenvConfig } from 'dotenv';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { installStdioEpipeGuard } from './utils/stdio-epipe-guard.js';
 import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
 
@@ -51,6 +51,30 @@ delete process.env.BOTS_CONFIG;
 // future intentional exposure would be a separate explicit danger switch.)
 process.env.BOTMUX_WORKER_HTTP_HOST = '127.0.0.1';
 delete process.env.BOTMUX_WORKER_HOST; // legacy alias — must not shadow the freeze
+
+// Freeze a DEDICATED state root (codex P1): core-only must never inherit an
+// ambient SESSION_DATA_DIR — a managed turn that spawns `serve --api-only`
+// carries the host's SESSION_DATA_DIR, and the daemon would then read the real
+// fleet's sessions and point its pid/descriptor/schedule-watcher/recovery/
+// sandbox-sweep at that shared store. The SYNTHETIC identity was authoritative
+// (bot-registry) but STORAGE authority was still parent-controlled. Overwrite
+// SESSION_DATA_DIR authoritatively BEFORE any config module reads it:
+//   • explicit BOTMUX_CORE_STATE_DIR (a deliberate core-only knob) wins, else
+//   • a per-bot dedicated default ~/.botmux/core-only/<botId>/data — isolated
+//     from the fleet's ~/.botmux/data and from any sibling core-only bot.
+// The ambient SESSION_DATA_DIR value is discarded either way.
+{
+  const coreBotId = process.env.BOTMUX_API_ONLY_BOT || 'local_riff';
+  const explicitStateDir = process.env.BOTMUX_CORE_STATE_DIR?.trim();
+  const frozenStateDir = explicitStateDir
+    ? explicitStateDir
+    : join(homedir(), '.botmux', 'core-only', coreBotId, 'data');
+  process.env.SESSION_DATA_DIR = frozenStateDir;
+  // The fleet's ~/.botmux/data always pre-exists; a dedicated core-only root may
+  // not. Create it (recursive, idempotent) so the daemon can write pid/descriptor/
+  // sessions there from the first boot.
+  try { mkdirSync(frozenStateDir, { recursive: true }); } catch { /* daemon will surface a real failure */ }
+}
 
 function fail(msg: string): never {
   console.error(`[core-only] ${msg}`);
