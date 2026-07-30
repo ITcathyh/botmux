@@ -801,6 +801,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params
   const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
   if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  if (sessionTransportDisabled(ds)) return jsonRes(res, 200, { ok: false, error: 'no_feishu_transport' });
   if (ds.chatType !== 'group') return jsonRes(res, 400, { ok: false, error: 'not_group_chat' });
   const normalized = normalizeLarkChatName(body.name);
   if (!normalized.ok) return jsonRes(res, 400, normalized);
@@ -924,6 +925,20 @@ ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
  *  store 持有同一对象，改字段后 updateSession 即落盘。 */
 function findSessionRecord(sessionId: string): Session | undefined {
   return findActiveBySessionId(sessionId)?.session ?? sessionStore.getSession(sessionId);
+}
+
+/** True when a session-bound IPC route must NOT touch Feishu: the owning bot is
+ *  core-only (apiOnly) OR the session is an HTTP virtual chat. Central guard for
+ *  every session-write route (chat-rename / write-link-card / resume-notice /
+ *  locate / restart-notice …) — the daemon owns the authoritative bot config,
+ *  so gating here catches the normal-bot-in-virtual-session case that
+ *  getBotClient (which only throws for apiOnly) cannot. Accepts a live
+ *  DaemonSession or a stored Session record. Never throws. */
+function sessionTransportDisabled(s: { chatId?: string; larkAppId?: string }): boolean {
+  const appId = s.larkAppId;
+  let apiOnly = false;
+  if (appId) { try { apiOnly = getBot(appId).config.apiOnly === true; } catch { /* unknown bot → not apiOnly */ } }
+  return !larkTransportEnabled({ chatId: s.chatId ?? '', apiOnly });
 }
 
 /** Four-state async lookup with durable fallback (design A).
@@ -1394,6 +1409,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/write-link-card', async (req, res, pa
   if (!ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
   const ds = findActiveBySessionId(params.sessionId);
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  if (sessionTransportDisabled(ds)) return jsonRes(res, 200, { ok: false, error: 'no_feishu_transport' });
   const r = await deliverWriteLinkCardToOwners(ds);
   const status = r.ok ? 200
     : r.error === 'terminal_unavailable' ? 409
@@ -1451,7 +1467,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
   const cliId = ds.session.cliId;
   const cliName = getCliDisplayName(cliId ?? 'claude-code');
   const notice = JSON.stringify({ text: `🔄 会话已通过命令行恢复，发条消息继续与 ${cliName} 对话。` });
-  if (ds.larkAppId) {
+  if (ds.larkAppId && !sessionTransportDisabled(ds)) {
     if (ds.scope === 'chat' && ds.chatId) {
       getChatMode(ds.larkAppId, ds.chatId, { forceRefresh: true })
         .then((mode) => mode === 'topic' && ds.session.rootMessageId
@@ -1640,6 +1656,11 @@ ipcRoute('POST', '/api/sessions/:sessionId/locate', async (_req, res, params) =>
   }
   if (!ctx.ownerOpenId) {
     return jsonRes(res, 422, { ok: false, error: 'no_owner' });
+  }
+  // No-transport session (apiOnly bot or HTTP virtual chat) has no Feishu thread
+  // to @-locate the owner in — the replyMessage below would dial Feishu.
+  if (sessionTransportDisabled({ chatId: ds?.chatId ?? closed?.chatId, larkAppId: ctx.larkAppId })) {
+    return jsonRes(res, 200, { ok: false, error: 'no_feishu_transport' });
   }
   try {
     const messageId = await replyMessage(
