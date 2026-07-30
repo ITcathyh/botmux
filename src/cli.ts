@@ -6229,20 +6229,26 @@ async function cmdSend(rest: string[]): Promise<void> {
     );
     process.exit(2);
   }
-  // Core-only (apiOnly) bots have no Feishu transport: `botmux send` is a hard
-  // no-op door, not a prompt suggestion. Refuse early with a clear message
-  // (mirrors the workflow refusal above) so the agent gets actionable feedback
-  // instead of a deep LarkTransportDisabledError stack from the send primitive.
-  // BOTMUX_LARK_APP_ID is the daemon-injected identity of the running bot; the
-  // bot-level primitive gate in im/lark/client.ts is the authoritative backstop
-  // for every other path (direct updateMessage, aux UI, distillation, DMs).
+  // No-transport turn: `botmux send` is a hard no-op door, not a prompt
+  // suggestion. Two cases refuse early with a clear message (mirrors the
+  // workflow refusal above) instead of a deep LarkTransportDisabledError / a
+  // send to a synthetic chat id:
+  //   (a) core-only (apiOnly) bot — no Feishu chat at all;
+  //   (b) ANY bot whose current turn runs in an HTTP virtual session
+  //       (BOTMUX_CHAT_ID = http_async_* / http_wait_*) — a normal bot driven
+  //       over the control API has real creds so getBotClient won't throw, but
+  //       the synthetic chat id is not a real Feishu chat. This closes the
+  //       normal-bot-in-virtual-session leak the bot-level gate can't catch.
   {
     const selfAppId = process.env.BOTMUX_LARK_APP_ID;
-    if (selfAppId && currentBotIsApiOnly(selfAppId)) {
+    const selfChatId = process.env.BOTMUX_CHAT_ID ?? '';
+    const isVirtualTurn = selfChatId.startsWith('http_async_') || selfChatId.startsWith('http_wait_');
+    if ((selfAppId && currentBotIsApiOnly(selfAppId)) || isVirtualTurn) {
       console.error(
-        `botmux send is unavailable for this core-only (apiOnly) bot: it has no Feishu chat to post into.\n` +
-        `Core-only bots are driven purely over the HTTP control API; their turn output is returned to the\n` +
-        `caller via trigger-result, not sent to Feishu. Just produce your normal final answer.`,
+        `botmux send is unavailable for this turn: it has no Feishu chat to post into ` +
+        `(${isVirtualTurn ? 'HTTP control-API session' : 'core-only bot'}).\n` +
+        `The turn's output is returned to the caller via trigger-result, not sent to Feishu.\n` +
+        `Just produce your normal final answer.`,
       );
       process.exit(2);
     }
