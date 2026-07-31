@@ -565,6 +565,64 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(cardJson).not.toContain('<at id=ou_foreign_bot></at>');
   });
 
+  it('addresses the daemon fallback footer to the last conversant (a peer bot) — bot→bot collab', async () => {
+    // Regression guard for the multi-agent-collaboration fix: when a peer bot
+    // triggered this turn and the model forgot to `botmux send`, the safety-net
+    // card must @ that bot back (via quoteTargetSenderOpenId, preserved for bot
+    // senders) so it is re-triggered — not the session owner.
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeDs();
+    ds.session.ownerOpenId = 'ou_human_owner';
+    ds.ownerOpenId = 'ou_human_owner';
+    ds.session.quoteTargetSenderOpenId = 'ou_peer_bot';
+    ds.session.quoteTargetSenderIsBot = true;
+
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    const cardJson = sessionReply.mock.calls[0][1] as string;
+    // @ the last conversant bot, NOT the human owner.
+    expect(cardJson).toContain('<at id=ou_peer_bot></at>');
+    expect(cardJson).not.toContain('<at id=ou_human_owner></at>');
+  });
+
+  it('addresses the daemon fallback footer to the last conversant human over the owner (oncall)', async () => {
+    // Oncall group: the caller is often not the session owner. The fallback
+    // should @ whoever actually spoke last this turn.
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeDs();
+    ds.session.ownerOpenId = 'ou_owner';
+    ds.ownerOpenId = 'ou_owner';
+    ds.session.quoteTargetSenderOpenId = 'ou_oncall_caller';
+    ds.session.quoteTargetSenderIsBot = false;
+
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    const cardJson = sessionReply.mock.calls[0][1] as string;
+    expect(cardJson).toContain('<at id=ou_oncall_caller></at>');
+  });
+
   it('addresses Mira daemon fallback output back to the bot dispatcher', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({

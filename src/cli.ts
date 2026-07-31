@@ -5925,6 +5925,7 @@ import { config } from './config.js';
 import {
   resolveQuoteTarget,
   validateMentionDecision,
+  shouldBlockMentionBackByParticipants,
   parseAttentionFlag,
   attentionUsageError,
   managedVcQuoteError,
@@ -6813,6 +6814,34 @@ async function cmdSend(rest: string[]): Promise<void> {
     hasQuoteTargetSender: !!replyTargetSenderOpenId,
   });
   if (!mentionGate.ok) { console.error(mentionGate.error); process.exit(2); }
+
+  // Participant gate for --mention-back: in a true 1v1 the triggerer is the
+  // only counterpart so auto-@-ing them back is unambiguous, but once a third
+  // party joins (humans + bots > 2) "who triggered this turn" is no longer
+  // reliably "who should be addressed". Force an explicit --mention there.
+  // Symmetric with the inbound un-@ gate (event-dispatcher getGroupStats).
+  // Only fetch when mention-back is actually requested AND the chat isn't a p2p
+  // DM (inherently 1v1) — keeps the common send path free of an API round-trip.
+  if (mentionBack && s.chatType !== 'p2p' && s.larkAppId && s.chatId && !sendTopLevel) {
+    try {
+      const { getGroupStats } = await import('./im/lark/event-dispatcher.js');
+      const { userCount, botCount } = await getGroupStats(s.larkAppId, s.chatId);
+      if (shouldBlockMentionBackByParticipants({ chatType: s.chatType, userCount, botCount })) {
+        console.error(
+          `--mention-back 在多人会话（当前 ${userCount} 人 + ${botCount} bot）里不可用：`
+          + '"回复触发这轮的人/bot" 在多方场景可能 @ 错对象。请改用 --mention <ou:Name> 显式点名，'
+          + '或 --no-mention 不 @。',
+        );
+        process.exit(2);
+      }
+    } catch (err: any) {
+      // getGroupStats already soft-fails to {999,999} (→ block) internally, so
+      // reaching here means the dynamic import itself failed. Fail-closed to a
+      // clear error rather than silently letting a possibly-wrong @ through.
+      console.error(`无法确认会话人数以校验 --mention-back：${err?.message ?? err}。请改用 --mention <ou:Name> 或 --no-mention。`);
+      process.exit(2);
+    }
+  }
 
   // --mention-back: @ the sender of the message this turn is replying to
   // (open_id from the session — model needn't know it). Bare-name form so it
