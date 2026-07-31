@@ -1451,9 +1451,11 @@ export interface AskAnswerActorContext {
  * `botmux ask` 答复者是否可作答（= 该 chat 的 canTalk 门）——ask-broker 注入的
  * canTalkChecker 的**唯一生产实现**，daemon bootstrap 一行转调它。
  *
- * 抽成独立导出函数（而非把分派内联进 daemon setter 闭包）的意义：让「文字作答的三条
- * 真实分派」能被回归测试直接咬住。测试对本函数喂真实 team store 状态断言三组行为，
- * 一旦 daemon 侧改回旧 evaluateTalk / 少传 actor，这里的分派与测试都会立刻发散。
+ * 抽成独立导出函数（而非把分派内联进 daemon setter 闭包）的意义：让**分派谓词本身**
+ * 能被回归测试直接咬住——测试对本函数喂真实 team store 状态断言三组行为，改坏这里的
+ * 分派逻辑（如退回旧 evaluateTalk / 不认 actor.botSender）会立刻红。注意测试只覆盖到
+ * 本函数；daemon setter 的一行转调与 submitCustomReply 的 actor 构造仍靠人工核对
+ * （setter 只有一行，不经测试机械覆盖）。
  *
  *  - bot 发送方（actor.botSender）→ evaluateBotTalk（含团队拉群那条 chat 维度腿，
  *    覆盖 sender 事件没带 union_id 的场景），与 dispatcher 外层闸 / quota 复查同源。

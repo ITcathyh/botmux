@@ -1,15 +1,19 @@
 /**
- * evaluateAskAnswerTalk 的真实分派回归 —— `botmux ask` 文字作答鉴权的生产真源。
+ * evaluateAskAnswerTalk 的分派回归 —— `botmux ask` 文字作答鉴权的生产分派谓词。
  *
  * 这个文件专门补 PR #685 delta 复审的 P3：ask 的「三组对照」原本只测 broker API +
- * 自制 mock checker，改坏 daemon wiring（把 setter 换回旧 evaluateTalk / 少传 actor）
- * 也照样绿——只证明「broker 会透传 actor」，不证明「三条真实生产分派对」。
+ * 自制 mock checker，把 mock 换成任意实现都照样绿——只证明「broker 会透传 actor」，
+ * 不证明「分派谓词把三条腿分对」。
  *
  * 这里直接对生产函数 evaluateAskAnswerTalk 喂**真实 team store 状态**断言三组分派：
  *  - 拉群无 union 的 bot → evaluateBotTalk 的团队群腿
  *  - 跨部署 union team bot → bot-locked senderUnionId
  *  - 平台 teamMember 真人 → evaluateTalk 的 memberUnionId 腿
- * daemon bootstrap 的 setAskCanTalkChecker 一行转调本函数，故本文件即咬住真实分派。
+ * 改坏本函数的分派逻辑（退回旧 evaluateTalk / 不认 actor.botSender）会立刻红。
+ *
+ * 覆盖边界：本文件咬的是**分派谓词本身**。daemon bootstrap 的 setAskCanTalkChecker
+ * 只有一行转调本函数、submitCustomReply 的 actor 构造也未被这里机械覆盖——那两处靠
+ * 人工核对保证（转调是一行，actor 构造在 handleThreadReply 内、由更上层的 sender 判定驱动）。
  *
  * Run: pnpm vitest run test/ask-answer-talk-dispatch.test.ts
  */
