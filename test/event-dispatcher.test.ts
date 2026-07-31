@@ -134,7 +134,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 // ─── Imports (must be after mocks) ──────────────────────────────────────────
 
 import { __resetAnchorQueues } from '../src/utils/anchor-serializer.js';
-import { __resetEventClaimsForTest, __resetChatStatsForTest, canOperate, canTalk, decideRouting, ensureBotOpenId, isBotMentioned, mentionsAnotherMember, markForwardFollowupsSessionsReady, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
+import { __resetEventClaimsForTest, __resetChatStatsForTest, canOperate, canTalk, decideRouting, ensureBotOpenId, getGroupStats, isBotMentioned, mentionsAnotherMember, markForwardFollowupsSessionsReady, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
 import {
   VC_BOT_MEETING_ACTIVITY_EVENT,
   VC_BOT_MEETING_ENDED_EVENT,
@@ -6561,6 +6561,13 @@ describe('1v1 陈旧缓存守门 — 拉新 bot 后 @ 新 bot 时老 bot 不跟�
   // 旧 bot 误按 solo 放行 → 跟着回复。修复①(solo 判定加 mentionsAnotherMember
   // 守卫)+②(成员变更事件驱动 invalidateChatStats)共同把窗口压到事件投递秒级,
   // 且①只影响 never 之外的策略——never 语义由前序条款先行结算,必须原样保留。
+  //
+  // ②的投递边界（codex 复审证实,见 PR #691 review）:im.chat.member.bot.added/
+  // deleted_v1 只推给「进群/被移出的那个 bot 自己的 app」,存量 bot 无事件可收;
+  // 因此 bot 事件的处理按 fleet 扇出——单 daemon 进程级共享缓存,任一本地 bot
+  // 收到自己的事件就清同群所有本地 bot 的条目。user.added/deleted_v1 则广播给
+  // 群内所有已订阅 bot,各自清自己那条。非 fleet 三方 bot 进群无任何信号,
+  // 靠①守卫 + TTL 兜底。
   let handlers: ReturnType<typeof makeHandlers>;
 
   const CHAT = 'chat-stale-1v1';
@@ -6646,48 +6653,66 @@ describe('1v1 陈旧缓存守门 — 拉新 bot 后 @ 新 bot 时老 bot 不跟�
     expect(mockGetChatInfo).not.toHaveBeenCalled();
   });
 
-  it('② bot.added 事件让陈旧 {1,1} 立刻失效:下一条纯文本消息按新鲜人数判定', async () => {
-    startStaleOwnedGroup(); // 首次判定后缓存 {1,1}(模拟拉新 bot 前的热缓存)
+  it.each([
+    'im.chat.member.bot.added_v1',
+    'im.chat.member.bot.deleted_v1',
+  ] as const)('② %s 扇出失效:fleet 某 bot 收到自己的事件后,同群本地全 bot 条目一并失效', async (eventName) => {
+    // 真实投递语义:bot.added/deleted 只推给「进群/被移出的那个 bot 自己的 app」,
+    // 存量 bot 永远收不到。修复靠单 daemon 进程级共享缓存:任一本地 bot 收到自己
+    // 的事件,就按 getAllBots() 枚举把该群在所有本地 bot app 下的条目一起清掉。
+    // 单测里用已捕获 handler 触发,等效于 fleet 内任一 bot 的 dispatcher 收事件——
+    // 扇出路径不依赖 handler 闭包的 larkAppId,而是纯枚举,这就是被测对象。
+    mockGetAllBots.mockReturnValue([
+      { config: { larkAppId: MY_APP_ID } },
+      { config: { larkAppId: OTHER_BOT_APP_ID } },
+    ] as any);
+    startStaleOwnedGroup(); // 首次判定后缓存 MY_APP_ID 视角的 {1,1}
 
     await capturedHandlers['im.message.receive_v1'](makeUserMessageEvent({
       senderOpenId: USER_OPEN_ID,
-      content: JSON.stringify({ text: 'continue please' }),
-      messageId: 'msg-before-add',
+      content: JSON.stringify({ text: 'seed the cache' }),
+      messageId: `msg-seed-${eventName}`,
       chatId: CHAT,
       chatType: 'group',
     }));
     await flushEventWork();
-    expect(handlers.handleThreadReply).toHaveBeenCalledTimes(1); // 真·1v1 时代放行
+    expect(handlers.handleThreadReply).toHaveBeenCalledTimes(1);
     expect(mockGetChatInfo).toHaveBeenCalledTimes(1);
 
-    // 用户把第二个 bot 拉进群 —— 事件到达老 bot 的 dispatcher:
-    capturedHandlers['im.chat.member.bot.added_v1']({
-      chat_id: CHAT,
-      operator_id: { open_id: USER_OPEN_ID },
-    });
-    // 飞书侧真实人数变化:
+    // 也给同群另一个本地 bot app(OTHER_BOT_APP_ID)塞一条 {1,1} 陈旧条目——
+    // 这是「同群存量 bot」在缓存里的实际存在形式,扇出必须连它一起清掉。
+    await getGroupStats(OTHER_BOT_APP_ID, CHAT);
+    expect(mockGetChatInfo).toHaveBeenCalledTimes(2);
+
+    capturedHandlers[eventName]({ chat_id: CHAT, operator_id: { open_id: USER_OPEN_ID } });
+    // 飞书侧真实人数变化(新 bot 进群 / 某 bot 离开,现在同群另一 bot 视角):
     mockGetChatInfo.mockResolvedValue({ userCount: 1, botCount: 2 });
+
+    // 扇出牙齿①:另一 bot app 的条目也必须被清——若失效退化成只清自己的 key,
+    // 这次读取会命中 B 的陈旧缓存、不发查询(总次数停在 3 而非 4)。
+    await getGroupStats(OTHER_BOT_APP_ID, CHAT);
+    expect(mockGetChatInfo).toHaveBeenCalledTimes(3);
 
     await capturedHandlers['im.message.receive_v1'](makeUserMessageEvent({
       senderOpenId: USER_OPEN_ID,
-      content: JSON.stringify({ text: 'another plain message' }),
-      messageId: 'msg-after-add',
+      content: JSON.stringify({ text: 'post-change plain text' }),
+      messageId: `msg-post-${eventName}`,
       chatId: CHAT,
       chatType: 'group',
     }));
     await flushEventWork();
 
-    // 失效→重查→{1,2}→不再按 solo 放行;没有失效的话会命中陈旧 {1,1} 继续回复。
+    // 扇出牙齿②:本 bot 条目同样被清→重查→{1,2}→不再按 solo 放行;
+    // 失效退化成 no-op 时这里会命中陈旧 {1,1} 继续回复。
     expect(handlers.handleThreadReply).toHaveBeenCalledTimes(1);
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
-    expect(mockGetChatInfo).toHaveBeenCalledTimes(2);
+    expect(mockGetChatInfo).toHaveBeenCalledTimes(4);
   });
 
   it.each([
-    'im.chat.member.bot.deleted_v1',
     'im.chat.member.user.added_v1',
     'im.chat.member.user.deleted_v1',
-  ] as const)('② %s 事件同样失效 group-stats 缓存', async (eventName) => {
+  ] as const)('② %s(广播给群内所有已订阅 bot)失效自己那条缓存', async (eventName) => {
     // fresh 值只需满足「非 solo」来证明判定用了新数,不必模拟各事件的真实增减方向。
     const freshStats = { userCount: 2, botCount: 1 };
     startStaleOwnedGroup();
@@ -6720,6 +6745,10 @@ describe('1v1 陈旧缓存守门 — 拉新 bot 后 @ 新 bot 时老 bot 不跟�
   });
 
   it('② 发在别的群的成员事件不误伤本群缓存（按 larkAppId:chatId 精确失效）', async () => {
+    mockGetAllBots.mockReturnValue([
+      { config: { larkAppId: MY_APP_ID } },
+      { config: { larkAppId: OTHER_BOT_APP_ID } },
+    ] as any);
     startStaleOwnedGroup();
 
     await capturedHandlers['im.message.receive_v1'](makeUserMessageEvent({
