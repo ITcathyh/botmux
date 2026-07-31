@@ -1469,3 +1469,38 @@ describe('loadBotConfigs', () => {
     expect(c.defaultOncallAutoboundChats).toEqual(['oc_ok', 'oc_also']);
   });
 });
+
+// ─── vcMeetingAgentConfigActive — apiOnly VC fail-close (codex #668 round-2 B2) ───
+
+describe('vcMeetingAgentConfigActive — apiOnly bots never attend VC meetings', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+  beforeEach(async () => { mod = await freshImport(); });
+
+  const enabledVc = { enabled: true, listenerChatId: 'oc_listener' } as any;
+
+  it('returns the config for a NORMAL bot with enabled VC (unchanged behavior)', () => {
+    expect(mod.vcMeetingAgentConfigActive({ vcMeetingAgent: enabledVc }))
+      .toEqual(enabledVc);
+  });
+
+  it('returns undefined for an apiOnly bot EVEN WHEN vcMeetingAgent.enabled is true', () => {
+    // The core B2 invariant: a migrated bots.json (normal VC bot flipped to apiOnly,
+    // leaving enabled:true) must NOT yield an active VC config — otherwise the boot
+    // restore path would spawn `lark-cli vc +meeting-events --as bot`, breaking the
+    // zero-Feishu-network contract. apiOnly short-circuits BEFORE the enabled check.
+    expect(mod.vcMeetingAgentConfigActive({ apiOnly: true, vcMeetingAgent: enabledVc }))
+      .toBeUndefined();
+  });
+
+  it('returns undefined when VC is not enabled (normal bot)', () => {
+    expect(mod.vcMeetingAgentConfigActive({ vcMeetingAgent: { enabled: false } as any }))
+      .toBeUndefined();
+    expect(mod.vcMeetingAgentConfigActive({})).toBeUndefined();
+    expect(mod.vcMeetingAgentConfigActive(undefined)).toBeUndefined();
+  });
+
+  it('apiOnly wins over enabled regardless of field order / extra keys (fail-closed)', () => {
+    expect(mod.vcMeetingAgentConfigActive({ vcMeetingAgent: enabledVc, apiOnly: true }))
+      .toBeUndefined();
+  });
+});

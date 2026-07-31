@@ -59,6 +59,7 @@ import {
   resolveVcMeetingConsumerProfiles,
   setResolvedAllowedUsersRepublishHook,
   setAllowedUsersResolveRetryHook,
+  vcMeetingAgentConfigActive,
   type BotConfig,
   type BotState,
   type OncallChat,
@@ -5554,8 +5555,15 @@ ipcRoute('POST', '/api/vc-meetings/consumer-catch-up', async (req, res) => {
 });
 
 function effectiveVcMeetingAgentConfig(larkAppId: string): VcMeetingAgentConfig | undefined {
-  const cfg = getBot(larkAppId)?.config.vcMeetingAgent;
-  return cfg?.enabled === true ? cfg : undefined;
+  // Delegate to the pure predicate (bot-registry) so the apiOnly fail-close and the
+  // enabled check live in ONE tested place. apiOnly (core-only) bots have no Feishu
+  // connection — a VC listener drives `lark-cli vc +meeting-events --as bot`, which
+  // breaks the zero-Feishu-network contract. This accessor gates every VC entry
+  // (config read / event fetch / sync) INCLUDING the boot-time
+  // `restoreVcMeetingRuntimeSessionsForBot`, whose call site sits OUTSIDE the
+  // `!cfg.apiOnly` boot block — so a migrated bots.json (normal VC bot flipped to
+  // apiOnly, stale runtime record on disk) can no longer re-spawn lark-cli at boot.
+  return vcMeetingAgentConfigActive(getBot(larkAppId)?.config);
 }
 
 function configuredVcMeetingListenerChatId(cfg: VcMeetingAgentConfig): string | undefined {

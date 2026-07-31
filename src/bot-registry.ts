@@ -1480,6 +1480,29 @@ const larkLogger = {
   trace: (..._msg: any[]) => { /* SDK trace dropped entirely — uninteresting per-byte WS frames */ },
 };
 
+/**
+ * Pure predicate: is this bot's VC-meeting-agent config ACTIVE (should the daemon
+ * attend meetings / restore VC runtime sessions / poll `lark-cli vc` for it)?
+ *
+ * Returns the config only when it is `enabled` AND the bot is NOT apiOnly. An
+ * apiOnly (core-only) bot has no Feishu connection — attending a VC meeting drives
+ * `lark-cli vc +meeting-events --as bot`, which categorically violates the
+ * zero-Feishu-network contract. Gating here (rather than only at each call site)
+ * means the daemon's central `effectiveVcMeetingAgentConfig` accessor — and every
+ * one of its ~24 consumers, including the boot-time `restoreVcMeetingRuntimeSessions`
+ * path that runs OUTSIDE the `!cfg.apiOnly` boot block — fail-closes for apiOnly by
+ * construction. The dashboard already refuses to SET an apiOnly listener; this also
+ * covers a hand-edited / migrated bots.json (a normal VC bot flipped to apiOnly with
+ * `vcMeetingAgent.enabled:true` + a stale on-disk runtime record).
+ */
+export function vcMeetingAgentConfigActive(
+  cfg: Pick<BotConfig, 'apiOnly' | 'vcMeetingAgent'> | undefined,
+): VcMeetingAgentConfig | undefined {
+  if (!cfg) return undefined;
+  if (cfg.apiOnly === true) return undefined;
+  return cfg.vcMeetingAgent?.enabled === true ? cfg.vcMeetingAgent : undefined;
+}
+
 export function registerBot(cfg: BotConfig): BotState {
   // apiOnly (core-only) bots have NO Feishu credential (empty appSecret). The Lark
   // SDK Client ctor throws "appSecret or clientAssertionProvider is required" on an

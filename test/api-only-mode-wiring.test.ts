@@ -123,6 +123,25 @@ describe('API-only bot mode — runtime Feishu transport gates (source lock)', (
     const block = region(daemonSource, 'Resolve allowed users per bot', 'needsResolve');
     expect(block).toContain('if (!cfg.apiOnly && ((bot.config.allowedUsers?.length');
   });
+
+  it('fail-closes VC-meeting-agent config for apiOnly bots at the central accessor (blocks boot restore → lark-cli)', () => {
+    // codex round-2 B2: the dashboard refuses to SET an apiOnly VC listener, but a
+    // hand-edited / migrated bots.json (normal VC bot flipped to apiOnly, leaving
+    // vcMeetingAgent.enabled:true + a stale runtime record on disk) would still hit
+    // restoreVcMeetingRuntimeSessionsForBot at boot — whose call site is OUTSIDE the
+    // `!cfg.apiOnly` block — and spawn `lark-cli vc +meeting-events --as bot`,
+    // breaking zero-Feishu-network. The fix gates at the ONE central accessor every
+    // VC entry funnels through (24 call sites incl. the boot restore) by delegating
+    // to the pure `vcMeetingAgentConfigActive` predicate (behaviorally tested in
+    // bot-registry.test.ts), which returns undefined for apiOnly.
+    const block = region(daemonSource, 'function effectiveVcMeetingAgentConfig(', 'function configuredVcMeetingListenerChatId(');
+    expect(block).toContain('vcMeetingAgentConfigActive(getBot(larkAppId)?.config)');
+    // The predicate itself fail-closes apiOnly BEFORE the enabled check.
+    const pred = region(registrySource, 'export function vcMeetingAgentConfigActive(', 'export function registerBot(');
+    expect(pred).toContain('if (cfg.apiOnly === true) return undefined;');
+    expect(pred.indexOf('apiOnly === true) return undefined'))
+      .toBeLessThan(pred.indexOf('vcMeetingAgent?.enabled === true'));
+  });
 });
 
 describe('API-only bot mode — bot-level primitive boundary (source lock)', () => {
