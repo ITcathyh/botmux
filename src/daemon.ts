@@ -15288,7 +15288,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
       // which left a hole once per-chat grants flow through canTalk.
       // canRunDaemonCommand = canOperate ∪（cmd ∈ canTalkDaemonCommands && canTalk）：
       // bot 可通过名单把选定命令（如 /status）降到 canTalk；未配置时与 canOperate 全等。
-      if (!canRunDaemonCommand(larkAppId, chatId, senderOpenId, teamTrustUnionId, cmd, senderUnionId, chatType)) {
+      if (!canRunDaemonCommand(larkAppId, chatId, senderOpenId, teamTrustUnionId, cmd, senderUnionId, chatType, isBotSenderType)) {
         await sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
       }
@@ -16143,7 +16143,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       // (see spawn-path gate above). Denies chat-granted users management commands.
       // canRunDaemonCommand：canTalkDaemonCommands 名单内的命令降到 canTalk，
       // 与 new-topic 路径的统一闸同款（未配置时与 canOperate 全等）。
-      if (!canRunDaemonCommand(larkAppId, effectiveThreadChatId, threadSenderOpenId, threadTeamTrustUnionId, cmd, threadSenderUnionId, ctxChatType)) {
+      if (!canRunDaemonCommand(larkAppId, effectiveThreadChatId, threadSenderOpenId, threadTeamTrustUnionId, cmd, threadSenderUnionId, ctxChatType, isBotSenderType || isForeignBot)) {
         sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
       }
@@ -16229,6 +16229,16 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
           askId: pendingAsk.askId,
           by: threadSenderOpenId,
           text: askReplyText,
+          // Actor context so the broker's talk check uses the same predicate as
+          // the dispatcher gate / quota recheck: a bot text-reply → evaluateBotTalk
+          // (covers team-拉群 with no union_id), a platform teamMember human →
+          // evaluateTalk's teamMember union leg. Omitting it (card clicks) degrades
+          // to the plain evaluateTalk(openId, chatType).
+          actor: {
+            botSender: isBotSenderType || isForeignBot,
+            senderUnionId: threadTeamTrustUnionId,
+            memberUnionId: threadSenderUnionId,
+          },
         });
         if (outcome === 'accepted') {
           logger.info(`[${anchor.substring(0, 12)}] ask custom reply accepted from ${threadSenderOpenId.substring(0, 12)}`);
@@ -17541,7 +17551,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   setAskCardDispatcher(createLarkAskCardDispatcher());
   // Honour the bot's canTalk gate for `botmux ask` answers: a clicker who may
   // address the bot in this chat may answer an implicit-approver ask.
-  setAskCanTalkChecker((appId, chatId, openId, chatType) => evaluateTalk(appId, chatId, openId, undefined, undefined, chatType).allowed);
+  //
+  // actor 透传时（文字作答路径）用与 dispatcher 外层闸 / quota 复查同一个谓词：
+  // bot 发送方 → evaluateBotTalk（含团队拉群那条腿，覆盖没带 union_id 的场景）；
+  // 人 → evaluateTalk 的完整模型（teamMember 走 memberUnionId 腿）。不传 actor
+  // （卡片点击路径，飞书 card-action 回调无 sender union / bot 标记）→ 退化为纯
+  // evaluateTalk(openId, chatType)，语义与改动前一致。
+  setAskCanTalkChecker((appId, chatId, openId, chatType, actor) =>
+    actor?.botSender
+      ? evaluateBotTalk(appId, chatId, openId, actor.senderUnionId).allowed
+      : evaluateTalk(appId, chatId, openId, actor?.senderUnionId, actor?.memberUnionId, chatType).allowed,
+  );
 
   writePidFile();
   const memoryDiagnostics = startMemoryDiagnostics();

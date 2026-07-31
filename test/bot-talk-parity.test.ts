@@ -40,7 +40,7 @@ vi.mock('../src/config.js', async (importOriginal) => {
 });
 
 import { registerBot, getBot } from '../src/bot-registry.js';
-import { evaluateTalk, evaluateBotTalk, TALK_REASONS, type TalkReason, type ChatKind } from '../src/im/lark/event-dispatcher.js';
+import { evaluateTalk, evaluateBotTalk, canRunDaemonCommand, TALK_REASONS, type TalkReason, type ChatKind } from '../src/im/lark/event-dispatcher.js';
 import { recordTeamBot } from '../src/services/team-bots-store.js';
 import { recordTeamGroup } from '../src/services/team-groups-store.js';
 
@@ -210,5 +210,54 @@ describe('bot talk parity — bot 闸门与人侧 evaluateTalk 同源', () => {
   it('团队拉群之外，未知 bot 仍被拦下（交给 /grant 卡）', () => {
     restricted();
     expect(evaluateBotTalk(APP, CHAT, SENDER, SENDER_UNION)).toEqual({ allowed: false, reason: 'none' });
+  });
+});
+
+describe('canRunDaemonCommand — bot 发送方走 evaluateBotTalk（daemon 命令闸同源）', () => {
+  // 回归 PR #685 复审抓到的 P2：本 PR 把 dispatcher 外层闸 + quota 复查收敛到
+  // evaluateBotTalk，但 daemon 命令在 quota 复查**之前**先走 canRunDaemonCommand，
+  // 其降权到 canTalk 的那段若仍用人侧谓词，「团队拉群 + 外部 bot 无 union_id」就会
+  // 能 talk 却执行不了降权命令（/status）。canRunDaemonCommand 的 botSender 形参必须
+  // 让 bot 分支走 evaluateBotTalk，与外层同源。
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), 'botmux-crd-'));
+    const bot = registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: [] });
+    // 受限 bot（配了 allowlist）+ /status 降到 canTalk
+    bot.config.allowedUsers = ['ou_owner'];
+    bot.resolvedAllowedUsers = ['ou_owner'];
+    bot.config.canTalkDaemonCommands = ['/status'];
+    // 团队拉群（bot 免 /grant 的信任根）
+    recordTeamGroup(tempDir, 'team-1', CHAT);
+  });
+  afterEach(() => { rmSync(tempDir, { recursive: true, force: true }); });
+
+  it('团队拉群 + 外部 bot 无 union_id：botSender=true → /status 放行', () => {
+    // evaluateBotTalk 的团队拉群腿命中（不看 union）；canRunDaemonCommand 走它才对齐。
+    expect(evaluateBotTalk(APP, CHAT, SENDER, undefined).allowed).toBe(true);
+    expect(
+      canRunDaemonCommand(APP, CHAT, SENDER, undefined, '/status', undefined, 'group', true),
+    ).toBe(true);
+  });
+
+  it('反向锁：不传 botSender（人侧谓词）→ 同一条 /status 被拒（就是复审复现的分叉）', () => {
+    // 人侧 canTalk 无 union → teamBot 腿落空、团队拉群腿不属于人侧 → 拒。
+    // 证明放行确实来自 botSender 这条分派，而不是把闸整体放宽。
+    expect(
+      canRunDaemonCommand(APP, CHAT, SENDER, undefined, '/status', undefined, 'group'),
+    ).toBe(false);
+  });
+
+  it('bot 发送方但命令不在 canTalkDaemonCommands 名单 → 仍按 canOperate 拒', () => {
+    // botSender 只影响「降权到 canTalk」这一段；名单外命令仍要 canOperate。
+    expect(
+      canRunDaemonCommand(APP, CHAT, SENDER, undefined, '/restart', undefined, 'group', true),
+    ).toBe(false);
+  });
+
+  it('团队拉群之外的 bot + /status → 仍拒（botSender 不放宽授权本身）', () => {
+    const otherChat = 'oc_not_team';
+    expect(
+      canRunDaemonCommand(APP, otherChat, SENDER, undefined, '/status', undefined, 'group', true),
+    ).toBe(false);
   });
 });

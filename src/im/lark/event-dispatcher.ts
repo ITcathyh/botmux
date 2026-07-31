@@ -1476,6 +1476,12 @@ export function canOperate(
  *
  * chatType 省略时 p2pOpen 腿不生效（fail-closed），与 canTalk 语义一致——
  * 私聊路径的调用点必须把 chatType 传进来。
+ *
+ * botSender：降权到 talk 判定这一段，必须与 dispatcher 外层闸 / quota 复查用**同一个**
+ * 谓词。bot 发送方走 evaluateBotTalk（含团队拉群那条 chat 维度腿，覆盖 sender 事件没带
+ * union_id 的情况）；否则「团队拉群里外部 bot 能 talk 却执行不了降权到 canTalk 的命令
+ * （如 /status）」——单一 talk 谓词在这道 daemon 命令闸继续分叉。不传（人的路径）→
+ * 原样走 canTalk / evaluateTalk，语义不变。canOperate 那段人/bot 通用，不受影响。
  */
 export function canRunDaemonCommand(
   larkAppId: string,
@@ -1485,11 +1491,14 @@ export function canRunDaemonCommand(
   cmd: string,
   memberUnionId?: string | undefined,
   chatType?: 'p2p' | 'group',
+  botSender?: boolean,
 ): boolean {
   if (canOperate(larkAppId, chatId, senderOpenId, senderUnionId)) return true;
   const list = getBot(larkAppId).config.canTalkDaemonCommands;
   if (!list?.includes(cmd)) return false;
-  return canTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId, chatType);
+  return botSender
+    ? evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId).allowed
+    : canTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId, chatType);
 }
 
 /**
