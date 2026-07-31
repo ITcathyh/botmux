@@ -444,6 +444,28 @@ describe('tryHandleGrantCommand bot-as-target (@operator /grant @thisBot)', () =
     expect(replyMock).not.toHaveBeenCalled();
     expect(getBot('btb').config.allowedChatGroups ?? []).toEqual([]);   // 整群授权绝不被误开
   });
+
+  // OPERATOR 视角（codex delta-3）：本 bot 是**前导** operator（命令前），尾部目标是**别的**
+  // app_id-only bot。parseGrantTargets 的 .filter 会把 app_id-only 目标剔空 → targets 空 →
+  // 若据此走裸 /grant 整群授权 = 提权（owner 本意授权某 bot，误对全群开放 talk）。必须 fail
+  // closed：hasAnyTargetMention 识别「命令后有目标只是不可按 open_id 授权」→ 回 usage、不开整群。
+  it('owner sender, this bot is OPERATOR + tail target is another app_id-only bot → fail closed, whole-chat NOT opened', async () => {
+    const opWithAppIdTarget = {
+      message_id: 'om_opa', chat_id: 'oc_1',
+      content: JSON.stringify({ text: '@_user_1 /grant @_user_2' }),
+      mentions: [
+        { key: '@_user_1', id: { open_id: 'ou_bot' }, name: 'Codex' },          // 本 bot = 前导 operator
+        { key: '@_user_2', id: 'cli_other', id_type: 'app_id', name: 'Other' }, // 别的 bot，app_id-only，尾部目标
+      ],
+    };
+    const handled = await tryHandleGrantCommand('btb', opWithAppIdTarget, 'ou_owner');
+    expect(handled).toBe(true);
+    expect(getBot('btb').config.allowedChatGroups ?? []).toEqual([]);   // 绝不因目标被剔空而误开整群
+    // 且不是静默：应回 usage 明确「不按 app_id 授权」，不能与真正裸 /grant 等价。
+    const [, , content, msgType] = replyMock.mock.calls.at(-1) ?? [];
+    expect(msgType ?? 'text').not.toBe('interactive');   // 不是授权卡
+    expect(String(content ?? '')).not.toContain('已授权本群所有成员');   // 绝不是整群授权回执
+  });
 });
 
 describe('tryHandleGrantCommand two bots co-addressed (@Claude @Codex /grant)', () => {
