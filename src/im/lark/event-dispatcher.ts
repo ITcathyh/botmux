@@ -765,10 +765,12 @@ export async function getGroupStats(larkAppId: string, chatId: string): Promise<
 
 /**
  * Drop the cached group stats for one chat — called when a membership-change
- * event arrives, so the 1v1 relax gate sees fresh counts on the very next
- * message instead of coasting on stale numbers for up to CHAT_CACHE_TTL.
- * Without this, "拉了新 bot 进 1V1 群" 后最多 5 分钟内老 bot 仍把群当成 solo,
- * 对不 @ 自己的消息继续应答。TTL 继续保留,作为事件未订阅（老应用）时的兜底。
+ * event that is VISIBLE to this app arrives (user add/delete broadcast, or our
+ * own bot being added/removed), so the 1v1 relax gate sees fresh counts on the
+ * very next message instead of coasting on stale numbers for up to
+ * CHAT_CACHE_TTL. TTL 继续保留,作为事件未订阅（老应用）时的兜底。
+ * 注意跨进程边界:「别的 bot 进群/离群」事件只推给当事 bot 自己的 app,
+ * 一 bot 一 daemon 部署下此函数够不到兄弟进程的缓存(见 handler 处注释)。
  */
 export function invalidateChatStats(larkAppId: string, chatId: string): void {
   if (chatStatsCache.delete(`${larkAppId}:${chatId}`)) {

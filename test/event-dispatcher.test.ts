@@ -6559,8 +6559,10 @@ describe('1v1 陈旧缓存守门 — 拉新 bot 后 @ 新 bot 时老 bot 不跟�
   // 复现并钉住生产投诉:原 1人1bot 群被拉进第二个 bot 后,旧 bot 的
   // group-stats 缓存仍是 {1,1}（TTL 5min 内）。此刻用户 @ 新 bot,
   // 旧 bot 误按 solo 放行 → 跟着回复。修复①(solo 判定加 mentionsAnotherMember
-  // 守卫)+②(成员变更事件驱动 invalidateChatStats)共同把窗口压到事件投递秒级,
-  // 且①只影响 never 之外的策略——never 语义由前序条款先行结算,必须原样保留。
+  // 守卫)在消息到达当下立即拦死该投诉路径;②(成员变更事件驱动
+  // invalidateChatStats)只负责把「有人进/出群、本 bot 被移出又拉回」这些
+  // 事件可见方向的纯文本窗口也压到秒级——别的 bot 进群方向无事件(见下),
+  // 靠①+TTL。①只影响 never 之外的策略:never 语义由前序条款先行结算。
   //
   // ②的投递+部署边界（codex 两轮复审证实,见 PR #691 review）:
   // im.chat.member.bot.added/deleted_v1 只推给「进群/被移出的那个 bot 自己的
