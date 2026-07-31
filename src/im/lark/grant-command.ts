@@ -41,6 +41,17 @@ export function parseGrantTargets(message: any, botOpenId: string | undefined): 
     .map(t => ({ openId: t.openId, name: t.name }));
 }
 
+/**
+ * 命令词之后是否存在**任何**目标 mention（含 app_id-only 的群外/协作 bot）。
+ * parseGrantTargets 会把 app_id-only 目标 .filter 掉，于是 `@OperatorBot /grant
+ * @OtherBot(app_id-only)` 在 operator daemon 里 targets 会变空 → 若据此走裸 /grant
+ * 整群授权分支 = 提权（owner 本意是授权某个 bot，却误对全群开放 talk）。用未过滤的
+ * raw 解析识别「指了目标但都不可按 open_id 授权」，让 handler fail closed 回 usage。
+ */
+export function hasAnyTargetMention(message: any, botOpenId: string | undefined): boolean {
+  return parseTargetsAfterCommand(message, botOpenId, GRANT_CMD_PATTERN).length > 0;
+}
+
 /** 取第一个非本 bot 的目标（单目标场景的便捷封装）。 */
 export function parseGrantTarget(message: any, botOpenId: string | undefined): { openId: string; name: string } | undefined {
   return parseGrantTargets(message, botOpenId)[0];
@@ -118,6 +129,14 @@ export async function tryHandleGrantCommand(
     if (!chatId) {
       await replyMessage(larkAppId, messageId, t(isGrant ? 'cmd.grant.usage' : 'cmd.revoke.usage', undefined, loc))
         .catch(err => logger.debug(`grant usage reply failed: ${err}`));
+      return true;
+    }
+    // fail closed：命令后其实**有**目标 mention，只是都是 app_id-only（群外/协作 bot，
+    // 被 parseGrantTargets .filter 掉）→ owner 本意是授权某个 bot，绝不能退化成「对全群
+    // 开放 talk」的整群授权（operator daemon 视角的提权）。回 usage，明确不按 app_id 授权。
+    if (hasAnyTargetMention(message, getBotOpenId(larkAppId))) {
+      await replyMessage(larkAppId, messageId, t(isGrant ? 'cmd.grant.usage' : 'cmd.revoke.usage', undefined, loc))
+        .catch(err => logger.debug(`grant app-id-target guard reply failed: ${err}`));
       return true;
     }
     // 无 @目标时只接受"整群"意图：精确 `/grant`（空尾巴）或 `/grant all`。带其它 token
