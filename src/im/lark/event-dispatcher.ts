@@ -1438,6 +1438,42 @@ export function evaluateBotTalk(
     : ev;
 }
 
+/** ask 答复者身份上下文（文字作答路径带，卡片点击路径不带）。与 ask-broker 的
+ *  AskAnswerActor 同形；放这里是为了让「ask 答复的 talk 分派」有一个生产共用真源，
+ *  daemon wiring 与回归测试都调 {@link evaluateAskAnswerTalk}，不各自手抄分派。 */
+export interface AskAnswerActorContext {
+  botSender?: boolean;
+  senderUnionId?: string;
+  memberUnionId?: string;
+}
+
+/**
+ * `botmux ask` 答复者是否可作答（= 该 chat 的 canTalk 门）——ask-broker 注入的
+ * canTalkChecker 的**唯一生产实现**，daemon bootstrap 一行转调它。
+ *
+ * 抽成独立导出函数（而非把分派内联进 daemon setter 闭包）的意义：让「文字作答的三条
+ * 真实分派」能被回归测试直接咬住。测试对本函数喂真实 team store 状态断言三组行为，
+ * 一旦 daemon 侧改回旧 evaluateTalk / 少传 actor，这里的分派与测试都会立刻发散。
+ *
+ *  - bot 发送方（actor.botSender）→ evaluateBotTalk（含团队拉群那条 chat 维度腿，
+ *    覆盖 sender 事件没带 union_id 的场景），与 dispatcher 外层闸 / quota 复查同源。
+ *  - 人 / 无 actor（卡片点击路径）→ evaluateTalk 全模型：actor.senderUnionId 走
+ *    teamBot 腿（人路径恒 undefined）、actor.memberUnionId 走 teamMember 腿。
+ *    actor 省略时两者都是 undefined → 退化为纯 evaluateTalk(openId, chatType)，
+ *    与本次改动前的卡片点击语义完全一致。
+ */
+export function evaluateAskAnswerTalk(
+  larkAppId: string,
+  chatId: string | undefined,
+  senderOpenId: string | undefined,
+  chatType?: ChatKind,
+  actor?: AskAnswerActorContext,
+): boolean {
+  return actor?.botSender
+    ? evaluateBotTalk(larkAppId, chatId, senderOpenId, actor.senderUnionId).allowed
+    : evaluateTalk(larkAppId, chatId, senderOpenId, actor?.senderUnionId, actor?.memberUnionId, chatType).allowed;
+}
+
 export function canOperate(
   larkAppId: string,
   _chatId: string | undefined,

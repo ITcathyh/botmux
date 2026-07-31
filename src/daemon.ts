@@ -316,7 +316,7 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
   try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
-import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, grantCommandRestriction, isKnownPeerBot, checkRequiredScopes, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, grantCommandRestriction, isKnownPeerBot, checkRequiredScopes, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
 import { getDocSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, removeDocSubscription, setDocCommentPollCursor, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync } from './im/lark/identity-cache.js';
@@ -17552,15 +17552,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Honour the bot's canTalk gate for `botmux ask` answers: a clicker who may
   // address the bot in this chat may answer an implicit-approver ask.
   //
-  // actor 透传时（文字作答路径）用与 dispatcher 外层闸 / quota 复查同一个谓词：
-  // bot 发送方 → evaluateBotTalk（含团队拉群那条腿，覆盖没带 union_id 的场景）；
-  // 人 → evaluateTalk 的完整模型（teamMember 走 memberUnionId 腿）。不传 actor
-  // （卡片点击路径，飞书 card-action 回调无 sender union / bot 标记）→ 退化为纯
-  // evaluateTalk(openId, chatType)，语义与改动前一致。
+  // 分派逻辑在 evaluateAskAnswerTalk（生产共用真源）：actor 透传时（文字作答路径）
+  // bot → evaluateBotTalk、人 → evaluateTalk 的完整模型（teamMember 走 memberUnionId
+  // 腿）；不传 actor（卡片点击路径，飞书 card-action 回调无 sender union/bot 标记）→
+  // 退化为纯 evaluateTalk(openId, chatType)，与改动前语义一致。三条分派由
+  // test/ask-answer-talk-dispatch.test.ts 直接咬住。
   setAskCanTalkChecker((appId, chatId, openId, chatType, actor) =>
-    actor?.botSender
-      ? evaluateBotTalk(appId, chatId, openId, actor.senderUnionId).allowed
-      : evaluateTalk(appId, chatId, openId, actor?.senderUnionId, actor?.memberUnionId, chatType).allowed,
+    evaluateAskAnswerTalk(appId, chatId, openId, chatType, actor),
   );
 
   writePidFile();

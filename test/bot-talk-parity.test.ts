@@ -43,22 +43,30 @@ import { registerBot, getBot } from '../src/bot-registry.js';
 import { evaluateTalk, evaluateBotTalk, canRunDaemonCommand, TALK_REASONS, type TalkReason, type ChatKind } from '../src/im/lark/event-dispatcher.js';
 import { recordTeamBot } from '../src/services/team-bots-store.js';
 import { recordTeamGroup } from '../src/services/team-groups-store.js';
+import { applyPlatformTeamSync } from '../src/services/platform-team-store.js';
 
 const APP = 'parity_app';
 const CHAT = 'oc_parity';
 const SENDER = 'ou_sender';
 /** bot 发送方的租户稳定 union（飞书按 sender_type 盖章过，见 evaluateBotTalk 契约）。 */
 const SENDER_UNION = 'on_sender';
+/** 真人成员的 union（teamMember 腿走 memberUnionId，不锁 bot）。 */
+const MEMBER_UNION = 'on_member';
 
 interface ParityCase {
   /** 布置「让这条腿命中」的最小状态。 */
   arrange: () => void;
   /** 人侧调用要不要传 chatType（仅 p2pOpen 腿读它）。 */
   chatType?: ChatKind;
+  /** 人侧调用的 memberUnionId（teamMember 腿走它，真人 union；默认 undefined）。 */
+  humanMemberUnionId?: string;
   /** 人侧 evaluateTalk 是否放行。 */
   human: boolean;
   /** bot 侧 evaluateBotTalk 是否放行。 */
   bot: boolean;
+  /** 人/bot 都放行、但 bot 命中的是**另一条腿**时，bot 侧期望的 reason（如 teamMember
+   *  场景：人走 teamMember、bot 走团队拉群 teamBot）。省略 = 与人侧同一条腿。 */
+  botReason?: TalkReason;
   /** 人/bot 不一致时必须写明为什么——不允许「不小心」不一致。 */
   why?: string;
 }
@@ -103,11 +111,25 @@ const CASES: Record<Exclude<TalkReason, 'none'>, ParityCase> = {
       + '否则恶意成员把真人 union 报成 bot 就能继承 bot 信任。所以人侧不命中不是 parity 缺口，而是这条腿的定义。',
   },
   teamMember: {
-    // 平台团队成员（真人）腿走 memberUnionId，evaluateBotTalk 根本没有这个参数
-    // ——bot 信任只认 bot-locked union，绝不复用真人成员名单。这里两侧都不布置
-    // 平台团队状态，只锁「bot 侧不存在这条腿」这个事实。
-    arrange: () => { restricted(); },
-    human: false, bot: false,
+    // 平台团队成员（真人）腿走 memberUnionId：布置一个平台团队（CHAT 是其协作群、
+    // MEMBER_UNION 是其成员），人侧传 memberUnionId=MEMBER_UNION → 命中 reason:'teamMember'。
+    //
+    // bot 侧同样放行，但走的是**另一条腿**：平台协作群会被镜像成团队拉群
+    // （applyPlatformTeamSync → team-groups），故 evaluateBotTalk 经团队拉群腿命中
+    // reason:'teamBot'（不看 union、不看成员名单）。这正是「团队群里人/bot 各免 grant，
+    // 但各自命中自己那条腿」的真实语义——不是同一条腿的人/bot 对齐，故用 botReason 标注。
+    arrange: () => {
+      restricted();
+      applyPlatformTeamSync(tempDir, {
+        rev: 'rev-1',
+        teams: [{ teamId: 'team-1', teamName: 'Team One', groupChatIds: [CHAT], memberUnionIds: [MEMBER_UNION], bots: [] }],
+      });
+    },
+    humanMemberUnionId: MEMBER_UNION,
+    human: true, bot: true,
+    botReason: 'teamBot',
+    why: '人走 teamMember 腿（memberUnionId 在团队成员名单里）；bot 走团队拉群腿（协作群即团队拉群）。'
+      + '两条腿都是「团队群免 grant」，但 evaluateBotTalk 不接受 memberUnionId（bot 信任只认 bot-locked union / 团队群，绝不复用真人成员名单），故命中的 reason 不同。',
   },
   allowedChatGroup: {
     arrange: () => {
@@ -164,19 +186,28 @@ describe('bot talk parity — bot 闸门与人侧 evaluateTalk 同源', () => {
     it(`talk 源 "${reason}"：人=${c.human ? '放行' : '拦截'} / bot=${c.bot ? '放行' : '拦截'}`, () => {
       c.arrange();
       // 人侧：union 走 memberUnionId 腿（不进 bot-trust）。
-      const human = evaluateTalk(APP, CHAT, SENDER, undefined, undefined, c.chatType);
+      const human = evaluateTalk(APP, CHAT, SENDER, undefined, c.humanMemberUnionId, c.chatType);
       // bot 侧：union 是飞书盖章的 bot 发送方 union。
       const forBot = evaluateBotTalk(APP, CHAT, SENDER, SENDER_UNION);
 
       expect(human.allowed).toBe(c.human);
       expect(forBot.allowed).toBe(c.bot);
       if (c.human && c.bot) {
-        // 同源的硬证据：不只是都放行，连判定理由都必须是同一条腿。
-        expect(forBot.reason).toBe(human.reason);
-        expect(forBot.reason).toBe(reason);
+        if (c.botReason) {
+          // 人/bot 各命中自己那条腿（如 teamMember 场景）：分别锁各自的 reason。
+          expect(human.reason).toBe(reason);
+          expect(forBot.reason).toBe(c.botReason);
+        } else {
+          // 同源的硬证据：不只是都放行，连判定理由都必须是同一条腿。
+          expect(forBot.reason).toBe(human.reason);
+          expect(forBot.reason).toBe(reason);
+        }
+      } else if (c.human) {
+        // 人侧单独放行（bot 侧刻意不命中的腿）：仍锁住人侧命中的确实是这条腿本身。
+        expect(human.reason).toBe(reason);
       }
-      if (c.human !== c.bot) {
-        expect(c.why, `talk 源 "${reason}" 人/bot 判定不一致，必须在 CASES 里写明 why`).toBeTruthy();
+      if (c.human !== c.bot || c.botReason) {
+        expect(c.why, `talk 源 "${reason}" 人/bot 判定或命中腿不一致，必须在 CASES 里写明 why`).toBeTruthy();
       }
     });
   }
