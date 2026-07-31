@@ -33,6 +33,7 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { tryHandleInviteCommand, parseInviteArgs, readBotsInfoEntries } from '../src/im/lark/invite-command.js';
+import { isCommandTargetOnly } from '../src/im/lark/mention-targets.js';
 import { registerBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
 
@@ -364,9 +365,9 @@ describe('tryHandleInviteCommand — app_id 形态目标（群外 bot 主场景�
     expect(String(replyMock.mock.calls.at(-1)![2])).toContain('已在群内');
   });
 
-  it('target-only guard still fires when THIS bot is @ed as app_id after /invite', async () => {
-    // 本 bot 被以 app_id 形态 @ 在 /invite 之后 = 本 bot 是 invitee → 静默放手。
-    // b1 的 larkAppId 即 "b1"，用它当本 bot 的 app_id 形态 mention。
+  it('target-only guard fires when THIS bot is @ed as app_id after /invite (SAME owner) → fully silent', async () => {
+    // `@OpBot /invite @ThisBot`，本 bot 以 app_id 形态(larkAppId=b1)被 @ 在命令词之后
+    // = 本 bot 是 invitee，命令属于前导 @ 的 OpBot → 必须静默放手：既不拉人也不回复。
     const msg = inviteMessage({
       text: '@_user_1 /invite @_user_2',
       mentions: [
@@ -374,12 +375,72 @@ describe('tryHandleInviteCommand — app_id 形态目标（群外 bot 主场景�
         { key: '@_user_2', id: 'b1', id_type: 'app_id', name: 'Claude' },
       ],
     });
-    // isCommandTargetOnly 用 open_id 判据；app_id 形态的本 bot @ 不会命中 target-only，
-    // 但仍必须不把「自己」误当拉取目标 → toInvite 不含 b1（rosterAppIds/larkAppId 自排除）。
     expect(await tryHandleInviteCommand('b1', msg, OWNER)).toBe(true);
-    // 关键断言：绝不把本 bot 自己的 app_id 拉进群。
-    for (const call of addBotMock.mock.calls) {
-      expect(call[2]).not.toContain('b1');
-    }
+    // 行为断言（不是只看拉人 API）：target-only 必须两者都不调用，否则会多回一条「已在群内」。
+    expect(addBotMock).not.toHaveBeenCalled();
+    expect(replyMock).not.toHaveBeenCalled();
+  });
+
+  it('target-only guard fires when THIS bot is @ed as app_id after /invite (CROSS owner) → no owner_only leak', async () => {
+    // 命令属于别的 daemon 的 owner；本 bot 是 app_id 形态的 invitee。修复前 guard 漏判 →
+    // 走到 owner 闸门对陌生 sender 误回 owner_only（异主泄漏）。契约=静默放手。
+    const msg = inviteMessage({
+      text: '@_user_1 /invite @_user_2',
+      mentions: [
+        { key: '@_user_1', id: { open_id: 'ou_opbot' }, name: 'OpBot' },
+        { key: '@_user_2', id: 'b1', id_type: 'app_id', name: 'Claude' },
+      ],
+    });
+    expect(await tryHandleInviteCommand('b1', msg, 'ou_not_my_owner')).toBe(true);
+    expect(addBotMock).not.toHaveBeenCalled();
+    expect(replyMock).not.toHaveBeenCalled();   // 不泄漏 owner_only
+  });
+
+  it('target-only guard fires for post form when THIS bot at-node (cli_ app_id) is after /invite', async () => {
+    const postMsg = {
+      message_id: 'om_post3', chat_id: 'oc_1',
+      content: JSON.stringify({ zh_cn: { content: [[
+        { tag: 'at', user_id: 'ou_opbot', user_name: 'OpBot' },
+        { tag: 'text', text: ' /invite ' },
+        { tag: 'at', user_id: 'b1', user_name: 'Claude' },   // 本 bot 以 app_id 形态被 @ 在命令后
+      ]] } }),
+      mentions: [],
+    };
+    expect(await tryHandleInviteCommand('b1', postMsg, OWNER)).toBe(true);
+    expect(addBotMock).not.toHaveBeenCalled();
+    expect(replyMock).not.toHaveBeenCalled();
+  });
+});
+
+// isCommandTargetOnly 单元级：直接锁 guard 机制识别 app_id 形态本 bot（text + post）。
+// handler 级的 post 用例在修复前靠 isBotMentioned 选举门也会静默（同 end-behavior），
+// 无法单独证明 guard 有牙；这里直接断言 guard 返回值，修复前 post/text 两支都必挂。
+describe('isCommandTargetOnly — app_id 形态本 bot 识别', () => {
+  const INVITE = /\/invite\b/i;
+  const APPID = 'cli_me';
+
+  it('text: bot @ed as app_id AFTER cmd → true (needs botAppId arg)', () => {
+    const msg = { content: JSON.stringify({ text: '@_user_1 /invite @_user_2' }), mentions: [
+      { key: '@_user_1', id: { open_id: 'ou_op' }, name: 'Op' },
+      { key: '@_user_2', id: APPID, id_type: 'app_id', name: 'Me' },
+    ] };
+    expect(isCommandTargetOnly(msg, 'ou_me', INVITE, APPID)).toBe(true);
+  });
+
+  it('post: bot at-node app_id AFTER cmd → true (needs botAppId arg)', () => {
+    const msg = { content: JSON.stringify({ zh_cn: { content: [[
+      { tag: 'at', user_id: 'ou_op', user_name: 'Op' },
+      { tag: 'text', text: ' /invite ' },
+      { tag: 'at', user_id: APPID, user_name: 'Me' },
+    ]] } }), mentions: [] };
+    expect(isCommandTargetOnly(msg, 'ou_me', INVITE, APPID)).toBe(true);
+  });
+
+  it('text: bot @ed as app_id BEFORE cmd (operator role) → false (not target-only)', () => {
+    const msg = { content: JSON.stringify({ text: '@_user_1 /invite @_user_2' }), mentions: [
+      { key: '@_user_1', id: APPID, id_type: 'app_id', name: 'Me' },
+      { key: '@_user_2', id: { open_id: 'ou_target' }, name: 'T' },
+    ] };
+    expect(isCommandTargetOnly(msg, 'ou_me', INVITE, APPID)).toBe(false);
   });
 });
