@@ -426,6 +426,24 @@ describe('tryHandleGrantCommand bot-as-target (@operator /grant @thisBot)', () =
     const [, , , msgType] = replyMock.mock.calls.at(-1)!;
     expect(msgType).toBe('interactive');                         // card still pops for the operator
   });
+
+  // 本 bot 以 **app_id 形态**（larkAppId=btb）作为目标出现在命令词后。这是协作 bot 被 @
+  // 的常见形态。修复前 guard 只认 open_id → 漏判 → parseGrantTargets 的 .filter(openId)
+  // 把 app_id-only 自身剔空 → targets 空 → 误走整群授权分支（提权，codex 警告的失败模式）。
+  it('owner sender, this bot @ed as app_id after /grant → silent, whole-chat NOT opened', async () => {
+    const appIdTargetMsg = {
+      message_id: 'om_aid', chat_id: 'oc_1',
+      content: JSON.stringify({ text: '@_user_1 /grant @_user_2' }),
+      mentions: [
+        { key: '@_user_1', id: { open_id: 'ou_op' }, name: 'Claude' },      // 操作 bot（前导 @）
+        { key: '@_user_2', id: 'btb', id_type: 'app_id', name: 'Codex' },   // 本 bot，app_id 形态目标
+      ],
+    };
+    const handled = await tryHandleGrantCommand('btb', appIdTargetMsg, 'ou_owner');
+    expect(handled).toBe(true);
+    expect(replyMock).not.toHaveBeenCalled();
+    expect(getBot('btb').config.allowedChatGroups ?? []).toEqual([]);   // 整群授权绝不被误开
+  });
 });
 
 describe('tryHandleGrantCommand two bots co-addressed (@Claude @Codex /grant)', () => {
