@@ -15,6 +15,9 @@ import type { DaemonSession } from '../src/core/types.js';
 const store = new Map<string, Session>();
 let sessionSeq = 0;
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   createSession: vi.fn((chatId: string, rootMessageId: string, title: string, chatType?: 'group' | 'p2p'): Session => {
     const s: Session = {
       sessionId: `sess-${++sessionSeq}`,
@@ -51,6 +54,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   forkAdoptWorker: vi.fn(),
   adoptSandboxBlocked: vi.fn((botCfg, session) => botCfg?.sandbox === true || botCfg?.readIsolation === true || session?.sandbox === true || process.env.BOTMUX_SANDBOX === '1'),
   killStalePids: vi.fn(),
+  sweepDeadPidMarkers: vi.fn(),
   getCurrentCliVersion: vi.fn(() => 'test-cli-v1'),
   restoreUsageLimitRuntimeState: vi.fn(),
   setActiveSessionSafe: vi.fn(async (map: Map<string, any>, k: string, ds: any) => { map.set(k, ds); }),

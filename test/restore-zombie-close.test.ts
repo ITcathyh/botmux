@@ -75,6 +75,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   adoptSandboxBlocked: vi.fn((botCfg: any, session?: any) =>
     botCfg?.sandbox === true || botCfg?.readIsolation === true || session?.sandbox === true || process.env.BOTMUX_SANDBOX === '1'),
   killStalePids: vi.fn(),
+  sweepDeadPidMarkers: vi.fn(),
   getActiveSessionsRegistry: vi.fn(() => wp.registry ?? undefined),
   getCurrentCliVersion: vi.fn(() => '1.0.0-test'),
   restoreUsageLimitRuntimeState: vi.fn(),

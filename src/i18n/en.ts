@@ -87,9 +87,20 @@ export const messages: Record<string, string> = {
   'card.grant.btn_chat': 'Grant talk in this chat',
   'card.grant.btn_global': 'Grant talk globally',
   'card.grant.btn_deny': 'Deny',
-  'card.grant.note': 'Grants talk access only (this chat or global); /restart, /close, terminal write and other sensitive ops remain limited to allowedUsers (owner).',
+  'card.grant.duration_label': 'Expires after',
+  'card.grant.duration_3600000': '1 hour',
+  'card.grant.duration_28800000': '8 hours',
+  'card.grant.duration_86400000': '1 day',
+  'card.grant.duration_604800000': '7 days',
+  'card.grant.duration_permanent': 'Never',
+  'card.grant.quota_label': 'Message quota',
+  'card.grant.quota_placeholder': 'Blank means unlimited',
+  'card.grant.note': 'Access is revoked when either limit is reached. Grants talk access only (this chat or global); /restart, /close, terminal write and other sensitive ops remain limited to allowedUsers (owner).',
   'card.grant.toast_owner_only': 'Only the owner can do this',
   'card.grant.toast_expired': 'This request has expired',
+  'card.grant.toast_bad_limit': 'Invalid grant limit',
+  'card.grant.toast_bad_quota': 'Enter a whole-number message quota from 1 to 1000, or leave it blank for unlimited',
+  'card.grant.toast_limit_staged': 'Limit updated; it takes effect after you grant access',
   'card.grant.toast_no_repo_perm': 'No permission',
   'card.grant.toast_failed': 'Grant failed: {reason}',
   'card.grant.result_chat': '✅ Granted for this chat',
@@ -99,6 +110,9 @@ export const messages: Record<string, string> = {
   'card.grant.notify_chat': '✅ {at} can now use me in this chat — just @-mention me.',
   'card.grant.notify_global': '✅ {at} now has global access — @-mention me in any chat.',
   'card.grant.notify_quota_suffix': ' (message quota: {n}; access is revoked once used up)',
+  'card.grant.notify_expiry_suffix': ' (expires at {time})',
+  'card.grant.result_expiry': 'Expires at: {time}',
+  'card.grant.result_quota': 'Message quota: {n}',
 
   // Message quota exhausted
   'quota.exhausted_notify': '⚠️ {at} has used up their message quota ({limit}/{limit}); talk access has been revoked. Ask the owner to /grant again to continue.',
@@ -109,7 +123,7 @@ export const messages: Record<string, string> = {
   // /grant, /revoke command replies
   'cmd.grant.owner_only': 'Only the owner can use /grant.',
   'cmd.grant.usage': 'Usage: @bot /grant @someone [N] (let them talk to me in this chat — you can @ several people/bots at once; with a number, grants an N-message quota) | @bot /grant (let every member of this chat talk). Talk-only; sensitive ops stay governed by allowedUsers.',
-  'cmd.grant.bad_quota': '⚠️ Bad quota. Usage: @bot /grant @someone 5 (grant a 5-message quota; must be a positive integer). Omit the number to use the default quota / unlimited.',
+  'cmd.grant.bad_quota': '⚠️ Bad quota. Usage: @bot /grant @someone 5 (grant a 5-message quota; must be a positive integer). Omit the number to use the card default.',
   'cmd.grant.chat_done': '✅ Everyone in this chat can now talk to me (just @-mention me). Sensitive ops still limited to allowedUsers.',
   'cmd.grant.chat_already': 'ℹ️ This chat is already open to talk; nothing to do.',
   'cmd.grant.chat_failed': '⚠️ Grant failed: {reason}',
@@ -129,6 +143,17 @@ export const messages: Record<string, string> = {
   'cmd.revoke.multi_ok': '✅ {name} — revoked (scope: {scope})',
   'cmd.revoke.multi_would_open': '⚠️ {name} — skipped: last global allowed user / owner, revoking would open the bot to everyone',
   'cmd.revoke.multi_failed': '⚠️ {name} — revoke failed: {reason}',
+
+  // /invite (pull an out-of-chat bot into this chat, owner only)
+  'cmd.invite.owner_only': '⚠️ Only the owner can use /invite.',
+  'cmd.invite.p2p': '⚠️ Bots cannot be added in a DM — use /invite inside a group chat.',
+  'cmd.invite.usage': 'Usage: @me /invite @bot-to-add (multiple allowed), or @me /invite --app cli_xxx',
+  'cmd.invite.header': '🤝 /invite results:',
+  'cmd.invite.ok': '✅ Added to the chat: {names}',
+  'cmd.invite.already': '⏭️ Already in the chat (skipped): {names}',
+  'cmd.invite.unresolved': '⚠️ Could not resolve (not in this deployment\'s roster — use --app cli_xxx): {names}',
+  'cmd.invite.ambiguous_item': '⚠️ The name "{name}" matches multiple bots ({apps}) — use --app to pick one.',
+  'cmd.invite.failed_item': '❌ Failed to add: {name} — {reason}',
 
   // ─── Adopt card ──────────────────────────────────────────────────────────
   'card.adopt.title': '📡 Choose a CLI session to adopt',
@@ -337,6 +362,8 @@ export const messages: Record<string, string> = {
   'cmd.adopt.pane_not_found': 'tmux pane not found: {pane}',
   'cmd.adopt.target_exited': '⚠️ Target CLI session has exited.',
   'cmd.adopt.sandbox_blocked': '🛡️ This bot has the file sandbox enabled and cannot /adopt an already-running CLI (a sandbox can only be applied at spawn time, never retro-fitted around a live process). Just send a message to cold-start a new, sandboxed CLI session instead.',
+  'card.adopt_blocked.title': '⚠️ Cannot adopt: close the current session first',
+  'card.adopt_blocked.body': 'This topic is still waiting for you to pick a repository, so it cannot /adopt an already-running CLI directly.\n\nTap "Close session" below to end the pending repo-select session, then run /adopt again to attach your CLI (your original CLI is left untouched).',
   'cmd.adopt.success': '📡 Adopted {cliName} · {project} ({pane})',
   'cmd.adopt.resume_success': '↩️ Resumed {cliName} session · {project} — “{title}”',
   'cmd.adopt.resume_not_found': '⚠️ That past session no longer exists or is already in use ({id})',
@@ -498,7 +525,6 @@ export const messages: Record<string, string> = {
   'help.term': '/term       - Get the operable (write-enabled) terminal link for this session, delivered privately to the owner (visible-to-you in-chat, falling back to DM in topic/p2p — never exposed in the group)',
   'help.dashboard': '/dashboard [module] - Open Dashboard control cards in Feishu (sessions/schedules/groups/settings/help, etc.)',
   'help.insight': '/insight    - Show tool-call summary and risk suggestions for this session (operators only)',
-  'help.land': '/land       - Preview sandbox-session diffs and let the owner confirm applying them to disk',
   'help.subscribe_doc': '/subscribe-lark-doc <doc link|list|off> - Subscribe through the Feishu API (requires a doc-scoped User Token)',
   'help.watch_comment': '/watch-comment <doc link|list|off> - Watch doc comments and post AI replies back into their threads',
   'help.vc': '/vc prepare <meeting link or number> - Use the current regular group as a preparation chat and reuse the same Agent session during the meeting',
@@ -540,6 +566,7 @@ export const messages: Record<string, string> = {
   'help.grant': '@bot /grant @someone   - Let them talk in this chat (you can @ several at once); /grant (no target) opens the whole chat to talk',
   'help.revoke': '@bot /revoke @someone  - Revoke their talk access (you can @ several at once); /revoke (no target) revokes the whole-chat grant',
   'help.vc_auth': '/vc-auth @someone     - Temporarily trust an in-meeting instruction source; /vc-auth revoke @someone revokes; /vc-auth list shows current grants',
+  'help.invite': '@bot /invite @bot   - Pull an out-of-chat bot into this chat (multiple allowed; --app cli_xxx adds by app id)',
   'help.heading_config': '⚙️ Edit config remotely (owner only; written + hot-applied, no restart):',
   'help.config_get': '/botconfig get  - Show this bot\'s current operational config',
   'help.config_set': '/botconfig set <field> <value>  - Change model/cli/lang/toggles; /botconfig help for all fields',
@@ -1120,16 +1147,6 @@ export const messages: Record<string, string> = {
 
   // Auto-start (joined chat) member-read failure admin DM
   'daemon.auto_start_member_read_failed': '⚠️ botmux “auto-start when added to a new chat” is on, but reading the chat members failed, so it can’t tell whether any authorized user is present — auto-start was skipped.\n\nMost likely cause: missing permission to read chat members (im:chat / chat info), or the “bot added to chat” event `im.chat.member.bot.added_v1` isn’t subscribed.\n\nGo to the Lark Open Platform → your app → Permissions / Event subscriptions to add them, then `botmux restart`.\n\nDetails: {detail}',
-
-  // Sandbox landing (/land) errors
-  'sandbox.no_clone': 'This session has no sandbox change layer (sandbox off, or the layer was cleaned up).',
-  'sandbox.clone_not_git': 'The sandbox change layer is unavailable; landing isn’t supported.',
-  'sandbox.nothing_to_land': 'No changes to land.',
-  'sandbox.target_not_git': 'Landing target directory does not exist: {dir}',
-  'sandbox.apply_failed': 'Landing failed: {detail}',
-  'sandbox.diff_failed': 'Reading sandbox changes failed: {detail}',
-  'sandbox.workingdir_not_found': 'Session workingDir not found',
-  'sandbox.no_changes_left': 'The sandbox change layer has no changes left',
 
   // ─── Dashboard create session ──────────────────────────────────────────────
   'cmd.createSession.untitled': 'New session',

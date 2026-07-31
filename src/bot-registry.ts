@@ -1082,9 +1082,9 @@ export interface BotConfig {
    */
   p2pOpen?: boolean;
   /**
-   * 消息额度机制（默认关闭）。`defaultLimit` 的"是否配置"本身就是开关：
-   *   • 未配置（undefined）→ 关闭：无显式数字的 /grant 仍是"无限授权"（当前行为）。
-   *   • 配置正整数 D    → 开启默认额度：`/grant @x`（不带数字）套用 D 条额度。
+   * 消息额度覆盖配置：
+   *   • 未配置（undefined）→ 卡片使用产品默认 3 条；oncall 不自动计数。
+   *   • 配置正整数 D    → 卡片默认 D 条，同时作为 oncall 默认额度。
    * 显式 `/grant @x N` 的 N **恒生效**，与本字段是否配置无关（见 {@link quotaState}）。
    * 仅约束 chatGrants / globalGrants 这类 per-user talk 授权，绝不影响 canOperate。
    */
@@ -1096,6 +1096,11 @@ export interface BotConfig {
    * used 达到 limit 后自动收回**对应 scope** 的授权并删除本记录。纯 talk-only。
    */
   quotaState?: { [quotaKey: string]: { limit: number; used: number } };
+  /**
+   * scope-aware 授权绝对过期时间。缺少对应记录表示永久授权；旧配置因此保持兼容。
+   * key 与 quotaState 相同，便于授权、撤销和到期回收在同一 scope 上原子处理。
+   */
+  grantExpiryState?: { [grantKey: string]: { expiresAt: number } };
   /**
    * 开启后：仅靠 per-user 授权（chatGrants / globalGrants）放行的发送者，禁止使用**任何
    * 斜杠命令**——botmux 自身的 DAEMON 命令、透传（PASSTHROUGH）命令、全部 `/workflow`
@@ -1124,7 +1129,7 @@ export interface BotConfig {
    * canTalk（oncall 群成员 / allowedChatGroups / chatGrant / globalGrant / p2pOpen 私聊
    * 等对话放行腿）。与 passthrough 无关——命令仍由 daemon 自己处理，只是准入门槛不同。
    * 解析时归一化（转小写、自动补 `/`、去重），且**只接受 DAEMON_COMMANDS 内的命令**，
-   * 其余条目丢弃并 warn。带 handler 内部第二道 owner 闸的命令（/card /term /insight /land）
+   * 其余条目丢弃并 warn。带 handler 内部第二道 owner 闸的命令（/card /term /insight）
    * 即使列入也仍会被内部闸拒绝（fail-closed，不视为本字段的适用对象）。
    * ⚠️ 与 `restrictGrantCommands` 的组合：那个开关在路由里先于本名单生效——开着时
    * chatGrant/globalGrant 被授权人发任何 slash 命令都被更早的限制闸挡下，本名单
@@ -1970,7 +1975,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       if (ids.length > 0) globalGrants = ids;
     }
 
-    // messageQuota.defaultLimit：仅保留正整数；非法/缺省 → undefined（= 默认额度关闭）。
+    // messageQuota.defaultLimit：仅保留正整数；非法/缺省 → undefined（卡片用产品默认 3 条）。
     let messageQuota: { defaultLimit?: number } | undefined;
     const rawMq = entry.messageQuota;
     if (rawMq && typeof rawMq === 'object' && !Array.isArray(rawMq)) {
@@ -1992,6 +1997,19 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         out[k] = { limit, used };
       }
       if (Object.keys(out).length > 0) quotaState = out;
+    }
+
+    let grantExpiryState: { [k: string]: { expiresAt: number } } | undefined;
+    if (entry.grantExpiryState && typeof entry.grantExpiryState === 'object' && !Array.isArray(entry.grantExpiryState)) {
+      const out: { [k: string]: { expiresAt: number } } = {};
+      for (const [k, v] of Object.entries(entry.grantExpiryState)) {
+        if (!/^(chat:.+:.+|global:.+)$/.test(k)) continue;
+        if (!v || typeof v !== 'object') continue;
+        const expiresAt = (v as any).expiresAt;
+        if (typeof expiresAt !== 'number' || !Number.isFinite(expiresAt) || expiresAt <= 0) continue;
+        out[k] = { expiresAt };
+      }
+      if (Object.keys(out).length > 0) grantExpiryState = out;
     }
 
     // customPassthroughCommands：用户额外放行透传的 slash 命令。归一化：转小写、
@@ -2157,6 +2175,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       p2pOpen: entry.p2pOpen === true || undefined,
       messageQuota,
       quotaState,
+      grantExpiryState,
       restrictGrantCommands: entry.restrictGrantCommands === true || undefined,
       // Default is ON, so only explicit false is meaningful/persisted.
       autoGrantRequestCards: entry.autoGrantRequestCards === false ? false : undefined,

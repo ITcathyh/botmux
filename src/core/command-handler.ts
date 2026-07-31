@@ -15,7 +15,7 @@ import { scanProjects, scanMultipleProjects, describeProjectDir } from '../servi
 import { createRepoWorktree, pushWorktreeBranch } from '../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
 import { resolvePairedSpawnBackendType } from './persistent-backend.js';
-import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard } from '../im/lark/card-builder.js';
+import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildAdoptBlockedCard } from '../im/lark/card-builder.js';
 import { handleDashboardCommand } from './dashboard-command/index.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId, ResumableSession } from '../adapters/cli/types.js';
@@ -67,7 +67,7 @@ import {
 import { resolveCliId, findInvalidAllowedUserEntries } from '../setup/bot-config-editor.js';
 import { buildClosedSessionCard } from './closed-session-card.js';
 import { ttadkConfigModelChoices } from '../setup/cli-selection.js';
-import { publishAttentionPatch, announcePendingRepoSession } from './session-activity.js';
+import { publishAttentionPatch, publishClosedSessionPatch, announcePendingRepoSession } from './session-activity.js';
 import { setCardMode } from '../services/card-mode-store.js';
 import { canOperate } from '../im/lark/event-dispatcher.js';
 import { buildSafeInsightReport } from '../services/insight/report.js';
@@ -1279,6 +1279,10 @@ export async function handleCommand(
           const card = buildClosedSessionCard(ds, loc);
           killWorker(ds);
           sessionStore.closeSession(ds.session.sessionId);
+          publishClosedSessionPatch(
+            ds.session.sessionId,
+            ds.session.closedAt ? Date.parse(ds.session.closedAt) : undefined,
+          );
           activeSessions.delete(sessionKey(rootId, larkAppId!));
           // 「会话已关闭」卡片优先「仅自己可见」：普通群里走 ephemeral 只发给执行
           // /close 的本人；话题群不支持 ephemeral(18053) 时回退为正常的群内可见回复
@@ -1338,6 +1342,10 @@ export async function handleCommand(
         const closedSessionId = ds.session.sessionId;
         killWorker(ds);
         sessionStore.closeSession(closedSessionId);
+        publishClosedSessionPatch(
+          closedSessionId,
+          ds.session.closedAt ? Date.parse(ds.session.closedAt) : undefined,
+        );
         activeSessions.delete(sessionKey(rootId, larkAppId!));
         await sessionReply(rootId, t('cmd.detach.success', undefined, loc));
         logger.info(`[${logTag}] Detached (adopt) by ${cmd} command`);
@@ -1628,6 +1636,10 @@ export async function handleCommand(
             const closedCard = buildClosedSessionCard(ds!, loc);
             killWorker(ds!);
             sessionStore.closeSession(ds!.session.sessionId);
+            publishClosedSessionPatch(
+              ds!.session.sessionId,
+              ds!.session.closedAt ? Date.parse(ds!.session.closedAt) : undefined,
+            );
             await deliverEphemeralOrReply(
               ds!,
               message.senderId,
@@ -3346,7 +3358,6 @@ export async function handleCommand(
           t('help.term', undefined, loc),
           t('help.dashboard', undefined, loc),
           t('help.insight', undefined, loc),
-          t('help.land', undefined, loc),
           t('help.subscribe_doc', undefined, loc),
           t('help.watch_comment', undefined, loc),
           t('help.vc', undefined, loc),
@@ -3400,6 +3411,7 @@ export async function handleCommand(
           t('help.grant', undefined, loc),
           t('help.revoke', undefined, loc),
           t('help.vc_auth', undefined, loc),
+          t('help.invite', undefined, loc),
           '',
           t('help.heading_config', undefined, loc),
           t('help.config_get', undefined, loc),
@@ -3472,6 +3484,39 @@ function isZellijTarget(t: AdoptableSession | ZellijAdoptableSession): t is Zell
   return 'zellijPaneId' in t;
 }
 
+/**
+ * Refuse a takeover (`/adopt`, Codex App thread, disk resume import) while the
+ * session is still on the first-spawn repo-select gate (`pendingRepo`).
+ *
+ * Adopt/import attaches to an already-running CLI, so it cannot double as a way
+ * to finish that gate — the two states are mutually exclusive by design. Rather
+ * than migrate the pending placeholder in place (which used to leave a
+ * contradictory `adopt` + "待选仓库" session, and risked folding botmux
+ * envelopes into the external CLI), we post a card that explains the refusal
+ * and offers a one-tap "close session". After the user closes it, a fresh
+ * `/adopt` runs as a clean first message (which never enters pendingRepo).
+ *
+ * Returns true when the takeover was blocked (caller must return immediately).
+ * Note pendingRepo is in-memory only, so this can never wrongly fire on a
+ * daemon-restored session.
+ */
+async function blockTakeoverWhilePendingRepo(
+  ds: DaemonSession,
+  sessionReply: (rid: string, content: string, msgType?: string) => Promise<string>,
+): Promise<boolean> {
+  if (!ds.pendingRepo) return false;
+  const loc = localeForBot(ds.larkAppId);
+  const card = buildAdoptBlockedCard(
+    sessionAnchorId(ds),
+    ds.session.sessionId,
+    getBot(ds.larkAppId).config.cliId,
+    loc,
+  );
+  await sessionReply(sessionAnchorId(ds), card, 'interactive');
+  logger.info(`[${tag(ds)}] Takeover refused: session still on pendingRepo gate — posted close-session card`);
+  return true;
+}
+
 export async function startCodexAppThreadSession(
   thread: CodexAppThreadSummary,
   ds: DaemonSession,
@@ -3482,6 +3527,8 @@ export async function startCodexAppThreadSession(
     deps.sessionReply(rid, content, msgType, larkAppId);
   const loc: Locale = localeForBot(ds.larkAppId ?? larkAppId);
   const title = codexAppThreadTitle(thread);
+
+  if (await blockTakeoverWhilePendingRepo(ds, sessionReply)) return;
 
   ds.adoptedFrom = undefined;
   ds.workingDir = thread.cwd;
@@ -3538,6 +3585,10 @@ export async function startAdoptSession(
     await sessionReply(sessionAnchorId(ds), t('cmd.adopt.sandbox_blocked', undefined, loc));
     return;
   }
+
+  // A session still on the repo-select gate can't be adopted in place — refuse
+  // and offer a one-tap close so the user retires it and re-adopts cleanly.
+  if (await blockTakeoverWhilePendingRepo(ds, sessionReply)) return;
 
   const valid = zellij
     ? validateZellijAdoptTarget(target.zellijSession, target.zellijPaneId, target.cliPid, target.cliId)
@@ -3626,6 +3677,8 @@ export async function startResumeImportSession(
     deps.sessionReply(rid, content, msgType, larkAppId);
   const loc: Locale = localeForBot(ds.larkAppId ?? larkAppId);
   const project = target.cwd.split('/').pop() || target.cwd;
+
+  if (await blockTakeoverWhilePendingRepo(ds, sessionReply)) return;
 
   ds.workingDir = target.cwd;
   ds.session.workingDir = target.cwd;

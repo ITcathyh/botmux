@@ -90,9 +90,20 @@ export const messages: Record<string, string> = {
   'card.grant.btn_chat': '授权本群对话',
   'card.grant.btn_global': '全局授权对话',
   'card.grant.btn_deny': '拒绝',
-  'card.grant.note': '仅授予对话权（本群或全局）；/restart、/close、终端写入等敏感操作仍仅限 allowedUsers（owner）。',
+  'card.grant.duration_label': '有效期',
+  'card.grant.duration_3600000': '1 小时',
+  'card.grant.duration_28800000': '8 小时',
+  'card.grant.duration_86400000': '1 天',
+  'card.grant.duration_604800000': '7 天',
+  'card.grant.duration_permanent': '永久',
+  'card.grant.quota_label': '消息额度（条）',
+  'card.grant.quota_placeholder': '留空不限',
+  'card.grant.note': '有效期或消息额度任一先到即自动收回授权。仅授予对话权（本群或全局）；/restart、/close、终端写入等敏感操作仍仅限 allowedUsers（owner）。',
   'card.grant.toast_owner_only': '仅 owner 可操作',
   'card.grant.toast_expired': '该授权请求已失效',
+  'card.grant.toast_bad_limit': '授权限制参数无效',
+  'card.grant.toast_bad_quota': '消息额度请输入 1–1000 的整数，留空表示不限',
+  'card.grant.toast_limit_staged': '已更新限制，点击授权后生效',
   'card.grant.toast_no_repo_perm': '无操作权限',
   'card.grant.toast_failed': '授权失败：{reason}',
   'card.grant.result_chat': '✅ 已授权本群使用',
@@ -102,6 +113,9 @@ export const messages: Record<string, string> = {
   'card.grant.notify_chat': '✅ {at} 已获授权在本群使用我，发消息 @ 我即可。',
   'card.grant.notify_global': '✅ {at} 已获全局授权，在任意群发消息 @ 我即可。',
   'card.grant.notify_quota_suffix': '（消息额度 {n} 条，用尽后自动收回授权）',
+  'card.grant.notify_expiry_suffix': '（有效至 {time}）',
+  'card.grant.result_expiry': '有效至：{time}',
+  'card.grant.result_quota': '消息额度：{n} 条',
 
   // 消息额度用尽
   'quota.exhausted_notify': '⚠️ {at} 的消息额度已用尽（{limit}/{limit}），已收回与我的对话授权。如需继续，请联系 owner 重新 /grant。',
@@ -112,7 +126,7 @@ export const messages: Record<string, string> = {
   // /grant、/revoke 命令回执
   'cmd.grant.owner_only': '仅 owner 可使用 /grant。',
   'cmd.grant.usage': '用法：@机器人 /grant @某人 [条数]（授权 ta 在本群与我对话，可一次 @ 多人/多 bot；带数字则给 N 条消息额度）｜@机器人 /grant（授权本群所有成员对话）。仅授对话权，敏感操作仍由 allowedUsers 控制。',
-  'cmd.grant.bad_quota': '⚠️ 额度格式不对。用法：@机器人 /grant @某人 5（给 5 条消息额度，须为正整数）；不带数字则按默认额度 / 无限。',
+  'cmd.grant.bad_quota': '⚠️ 额度格式不对。用法：@机器人 /grant @某人 5（给 5 条消息额度，须为正整数）；不带数字则使用卡片默认额度。',
   'cmd.grant.chat_done': '✅ 已授权本群所有成员与我对话（@ 我即可）。敏感操作仍仅限 allowedUsers。',
   'cmd.grant.chat_already': 'ℹ️ 本群已是授权状态，无需重复授权。',
   'cmd.grant.chat_failed': '⚠️ 授权失败：{reason}',
@@ -132,6 +146,17 @@ export const messages: Record<string, string> = {
   'cmd.revoke.multi_ok': '✅ {name} —— 已撤销（范围：{scope}）',
   'cmd.revoke.multi_would_open': '⚠️ {name} —— 跳过：ta 是最后的全局授权用户 / owner，撤销会让机器人对所有人开放',
   'cmd.revoke.multi_failed': '⚠️ {name} —— 撤销失败：{reason}',
+
+  // /invite（把群外 bot 拉进本群，owner 专用）
+  'cmd.invite.owner_only': '⚠️ 仅 owner 可以使用 /invite。',
+  'cmd.invite.p2p': '⚠️ 私聊里不能拉机器人，请在群里使用 /invite。',
+  'cmd.invite.usage': '用法：@我 /invite @要拉进群的机器人（可多个），或 @我 /invite --app cli_xxx',
+  'cmd.invite.header': '🤝 /invite 结果：',
+  'cmd.invite.ok': '✅ 已拉进群：{names}',
+  'cmd.invite.already': '⏭️ 已在群内（跳过）：{names}',
+  'cmd.invite.unresolved': '⚠️ 无法解析（不在本部署花名册，可用 --app cli_xxx 直接指定）：{names}',
+  'cmd.invite.ambiguous_item': '⚠️ 名字「{name}」对应多个机器人（{apps}），请改用 --app 指定。',
+  'cmd.invite.failed_item': '❌ 拉入失败：{name} —— {reason}',
 
   // ─── Adopt card ──────────────────────────────────────────────────────────
   'card.adopt.title': '📡 选择要接入的 CLI 会话',
@@ -340,6 +365,8 @@ export const messages: Record<string, string> = {
   'cmd.adopt.pane_not_found': '未找到 tmux pane {pane}',
   'cmd.adopt.target_exited': '⚠️ 目标 CLI 会话已退出',
   'cmd.adopt.sandbox_blocked': '🛡️ 本机器人已开启文件沙盒，无法 /adopt 已在运行的 CLI（沙盒只能在启动时套用，无法事后包裹活进程）。直接发消息会以沙盒方式冷启动一个新 CLI 会话。',
+  'card.adopt_blocked.title': '⚠️ 无法接入：请先关闭当前会话',
+  'card.adopt_blocked.body': '本话题正在等待你选择仓库，无法直接 /adopt 接管已在运行的 CLI。\n\n请点下方「关闭会话」结束当前的选仓会话，然后重新 /adopt 接管你的 CLI（原 CLI 不受影响）。',
   'cmd.adopt.success': '📡 已接入 {cliName} · {project} ({pane})',
   'cmd.adopt.resume_success': '↩️ 已恢复 {cliName} 历史会话 · {project} —「{title}」',
   'cmd.adopt.resume_not_found': '⚠️ 该历史会话已不存在或已被占用（{id}）',
@@ -501,7 +528,6 @@ export const messages: Record<string, string> = {
   'help.term': '/term       - 获取当前会话的「可操作终端」（带写权限）链接，私密发给 owner（群内仅你可见，话题/单聊回退私信，不在群里暴露）',
   'help.dashboard': '/dashboard [模块] - 在飞书里打开 Dashboard 控制卡片（sessions/schedules/groups/settings/help 等）',
   'help.insight': '/insight    - 查看当前会话的工具调用摘要与风险建议（operator 专用）',
-  'help.land': '/land       - 查看沙盒会话改动 diff，并由 owner 在卡片上确认落盘',
   'help.subscribe_doc': '/subscribe-lark-doc <文档链接|list|off> - 通过飞书 API 订阅文档（需要文档 User Token）',
   'help.watch_comment': '/watch-comment <文档链接|list|off> - 监听文档评论并把 AI 回复发回评论串',
   'help.vc': '/vc prepare <会议链接或会议号> - 将当前普通群设为会议准备群，并在开会后复用同一 Agent 会话',
@@ -543,6 +569,7 @@ export const messages: Record<string, string> = {
   'help.grant': '@机器人 /grant @某人   - 授权对方在本群对话（可一次 @ 多人/多 bot）；/grant（不带人）授权本群所有成员对话',
   'help.revoke': '@机器人 /revoke @某人  - 撤销对方本群对话权（可一次 @ 多人/多 bot）；/revoke（不带人）撤销整群授权',
   'help.vc_auth': '/vc-auth @成员     - 会议监听中临时授权本场指令源；/vc-auth revoke @成员 撤销；/vc-auth list 查看',
+  'help.invite': '@机器人 /invite @bot  - 把不在群里的 bot 拉进本群（可一次多个；--app cli_xxx 可直接指定 app）',
   'help.heading_config': '⚙️ 远程改配置（owner 专用，写盘即热更新、无需重启）：',
   'help.config_get': '/botconfig get  - 查看本机器人当前运营配置',
   'help.config_set': '/botconfig set <字段> <值>  - 改 model/cli/lang/开关等；/botconfig help 看全部字段',
@@ -1123,16 +1150,6 @@ export const messages: Record<string, string> = {
 
   // Auto-start (joined chat) member-read failure admin DM
   'daemon.auto_start_member_read_failed': '⚠️ botmux「被拉进新群自动开工」已开启，但读取群成员失败，无法判断群里是否有授权用户，自动开工被跳过。\n\n最可能原因：缺少读取群成员的权限（im:chat / 群信息读取），或没有订阅「机器人进群」事件 `im.chat.member.bot.added_v1`。\n\n请到飞书开放平台 → 应用 → 权限管理 / 事件订阅 里补齐，然后 `botmux restart`。\n\n错误详情：{detail}',
-
-  // Sandbox landing (/land) errors
-  'sandbox.no_clone': '该会话没有沙盒改动层（未开沙盒，或改动层已清理）',
-  'sandbox.clone_not_git': '沙盒改动层不可用，暂不支持落盘',
-  'sandbox.nothing_to_land': '没有改动可落盘',
-  'sandbox.target_not_git': '落盘目标目录不存在：{dir}',
-  'sandbox.apply_failed': '落盘失败：{detail}',
-  'sandbox.diff_failed': '读取沙盒改动失败：{detail}',
-  'sandbox.workingdir_not_found': '找不到会话 workingDir',
-  'sandbox.no_changes_left': '沙盒改动层已无改动',
 
   // ─── Dashboard 创建会话（createSession）─────────────────────────────────────
   'cmd.createSession.untitled': '新会话',

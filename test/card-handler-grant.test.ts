@@ -87,11 +87,58 @@ describe('card-handler grant actions', () => {
     expect(registry.getBot('h1').config.chatGrants).toBeUndefined();
   });
 
+  it('persists duration and free-form quota submitted with the grant button', async () => {
+    const { registry, pending, handler } = await fresh();
+    const nonce = pending.openPending('h1', 'oc_1', 'ou_g');
+    const submitted: any = action('grant_chat', { nonce });
+    submitted.action.form_value = {
+      grant_duration: String(8 * 60 * 60 * 1000),
+      grant_quota: '17',
+    };
+    const before = Date.now();
+    await handler.handleCardAction(submitted, deps, 'h1');
+    const cfg = registry.getBot('h1').config;
+    expect(cfg.quotaState?.['chat:oc_1:ou_g']).toEqual({ limit: 17, used: 0 });
+    const expiresAt = cfg.grantExpiryState?.['chat:oc_1:ou_g']?.expiresAt;
+    expect(expiresAt).toBeGreaterThanOrEqual(before + 8 * 60 * 60 * 1000);
+    expect(expiresAt).toBeLessThanOrEqual(Date.now() + 8 * 60 * 60 * 1000);
+  });
+
+  it('rejects invalid free-form quota without granting access', async () => {
+    const { registry, pending, handler } = await fresh();
+    const nonce = pending.openPending('h1', 'oc_1', 'ou_g');
+    const submitted: any = action('grant_chat', { nonce });
+    submitted.action.form_value = {
+      grant_duration: String(60 * 60 * 1000),
+      grant_quota: 'abc',
+    };
+    const res = await handler.handleCardAction(submitted, deps, 'h1');
+    expect(res?.toast?.type).toBe('error');
+    expect(res?.toast?.content).toBe('消息额度请输入 1–1000 的整数，留空表示不限');
+    expect(registry.getBot('h1').config.chatGrants).toBeUndefined();
+  });
+
+  it('rejects a quota above 1000 with an actionable error', async () => {
+    const { registry, pending, handler } = await fresh();
+    const nonce = pending.openPending('h1', 'oc_1', 'ou_g');
+    const submitted: any = action('grant_chat', { nonce });
+    submitted.action.form_value = {
+      grant_duration: String(60 * 60 * 1000),
+      grant_quota: '10000',
+    };
+    const res = await handler.handleCardAction(submitted, deps, 'h1');
+    expect(res?.toast).toEqual({
+      type: 'error',
+      content: '消息额度请输入 1–1000 的整数，留空表示不限',
+    });
+    expect(registry.getBot('h1').config.chatGrants).toBeUndefined();
+  });
+
   it('owner grant_chat WITH card id → 同步返回终态卡 patch + 后台 @notify + withdraw + persists', async () => {
     const { registry, pending, handler } = await fresh();
     const nonce = pending.openPending('h1', 'oc_1', 'ou_g');
     const res = await handler.handleCardAction(action('grant_chat', { nonce }, 'om_card'), deps, 'h1');
-    expect(res?.elements).toBeTruthy();           // 同步先回「已授权」终态卡（避免 callback 超时/竞态 → 300000）
+    expect(res?.body?.elements).toBeTruthy();     // 同步先回「已授权」终态卡（避免 callback 超时/竞态 → 300000）
     await flushBackground();                       // 通知 + 撤卡走后台 fire-and-forget
     expect(replyMock).toHaveBeenCalledWith('h1', 'om_card', expect.stringContaining('ou_g'), 'interactive', true);
     expect(deleteMock).toHaveBeenCalledWith('h1', 'om_card');
@@ -136,7 +183,7 @@ describe('card-handler grant actions', () => {
     const { registry, pending, handler } = await fresh();
     const nonce = pending.openPending('h1', 'oc_1', 'ou_g');
     const res = await handler.handleCardAction(action('grant_chat', { nonce }), deps, 'h1');
-    expect(res?.elements).toBeTruthy();           // raw card body (dispatcher wraps as patch)
+    expect(res?.body?.elements).toBeTruthy();     // raw card body (dispatcher wraps as patch)
     expect(deleteMock).not.toHaveBeenCalled();
     expect(registry.getBot('h1').config.chatGrants).toEqual({ oc_1: ['ou_g'] });
   });
@@ -146,7 +193,7 @@ describe('card-handler grant actions', () => {
     deleteMock.mockResolvedValueOnce(false);   // production deleteMessage swallows errors → returns false
     const nonce = pending.openPending('h1', 'oc_1', 'ou_g');
     const res = await handler.handleCardAction(action('grant_chat', { nonce }, 'om_card'), deps, 'h1');
-    expect(res?.elements).toBeTruthy();           // fell through to in-place patch
+    expect(res?.body?.elements).toBeTruthy();     // fell through to in-place patch
     expect(registry.getBot('h1').config.chatGrants).toEqual({ oc_1: ['ou_g'] });
   });
 
@@ -154,7 +201,7 @@ describe('card-handler grant actions', () => {
     const { registry, pending, handler } = await fresh();
     const nonce = pending.openPending('h1', 'oc_1', 'ou_g');
     const res = await handler.handleCardAction(action('grant_deny', { nonce }, 'om_card'), deps, 'h1');
-    expect(res?.elements).toBeTruthy();
+    expect(res?.body?.elements).toBeTruthy();
     expect(deleteMock).not.toHaveBeenCalled();
     expect(pending.isThrottled('h1', 'oc_1', 'ou_g')).toBe(true);
     expect(registry.getBot('h1').config.chatGrants).toBeUndefined();
@@ -164,7 +211,7 @@ describe('card-handler grant actions', () => {
     const { registry, pending, handler } = await fresh();
     const nonce = pending.openPending('h1', 'oc_1', 'ou_g');
     const res = await handler.handleCardAction(action('grant_global', { nonce }, 'om_card'), deps, 'h1');
-    expect(res?.elements).toBeTruthy();
+    expect(res?.body?.elements).toBeTruthy();
     await flushBackground();
     expect(replyMock).toHaveBeenCalledWith('h1', 'om_card', expect.stringContaining('ou_g'), 'interactive', true);
     expect(deleteMock).toHaveBeenCalledWith('h1', 'om_card');
@@ -193,7 +240,7 @@ describe('card-handler grant actions', () => {
     const { registry, pending, handler } = await fresh();
     const nonce = pending.openPendingMulti('h1', 'oc_1', ['ou_a', 'ou_b', 'ou_c']);
     const res = await handler.handleCardAction(multiAction('grant_chat', ['ou_a', 'ou_b', 'ou_c'], nonce, 'om_card'), deps, 'h1');
-    expect(res?.elements).toBeTruthy();
+    expect(res?.body?.elements).toBeTruthy();
     await flushBackground();
     // 通知 @ 了全部三人
     const notify = replyMock.mock.calls.at(-1)![2] as string;
@@ -216,7 +263,7 @@ describe('card-handler grant actions', () => {
     const { registry, pending, handler } = await fresh();
     const nonce = pending.openPendingMulti('h1', 'oc_1', ['ou_a', 'ou_b']);
     const res = await handler.handleCardAction(multiAction('grant_deny', ['ou_a', 'ou_b'], nonce, 'om_card'), deps, 'h1');
-    expect(res?.elements).toBeTruthy();
+    expect(res?.body?.elements).toBeTruthy();
     expect(pending.isThrottled('h1', 'oc_1', 'ou_a')).toBe(true);
     expect(pending.isThrottled('h1', 'oc_1', 'ou_b')).toBe(true);
     expect(registry.getBot('h1').config.chatGrants).toBeUndefined();

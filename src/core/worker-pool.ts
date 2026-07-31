@@ -70,7 +70,7 @@ function daemonCardLocalHomeLinkMode(ds: DaemonSession): LocalHomeLinkMode {
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { composeRowFromActive, composeRowFromClosed } from './dashboard-rows.js';
-import { publishAttentionPatch } from './session-activity.js';
+import { publishAttentionPatch, publishClosedSessionPatch } from './session-activity.js';
 import { knownBotOpenIdsFromCrossRef, type BotMentionEntry } from '../utils/bot-routing.js';
 import { emitSessionLifecycleHook, emitSessionStateTransitionHook } from '../services/session-lifecycle-hooks.js';
 import { anchorUsageForDaemonSession, recordOwnershipForDaemonSession, recordUsageForDaemonSession, reconcileUsageForDaemonSession } from '../services/usage-ledger.js';
@@ -131,6 +131,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const WORKER_SIGTERM_BACKSTOP_MS = 2_000;
 const WORKER_SIGKILL_BACKSTOP_MS = 7_000;
+const CLOSE_FENCE_WARN_MS = 8_000;
 const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN'] as const;
 
 function workerForkEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -1357,6 +1358,7 @@ export function killWorker(ds: DaemonSession): void {
     ds.worker.send({ type: 'close' } as DaemonToWorker);
   } catch { /* IPC already closed */ }
   const w = ds.worker;
+  armCloseFence(ds, w);
   // riff：worker close 分支要有界 await 远端 task-cancel（destroySession 5s×2 重试，
   // 外层 race 8s）。默认 2s SIGTERM backstop 会在取消发出前掐死进程，已关闭话题
   // 的远端任务照跑——冻结为 riff 的会话放宽到 24s（层级：destroy 20s < worker 22s
@@ -1460,6 +1462,24 @@ function destroyLivePaneBeforeRestart(ds: DaemonSession): void {
   }
 }
 
+/**
+ * Live-worker /restart 携带的最新 per-bot env（bots.json `env`）。worker 收到
+ * restart 时在 respawn 前全量覆盖 lastInitConfig.env —— 否则 live-worker 重启
+ * 一直用 fork 时刻的旧快照，dashboard 改完 env（如切 provider 的
+ * ANTHROPIC_BASE_URL/TOKEN）后 /restart 并不会生效（只有 refork 路径生效）。
+ * 三分态返回：对象 = 最新 env；null = 明确清空（dashboard 已删）；
+ * undefined = 取不到（bot 已注销等异常），让 worker 保持快照不动（=旧行为）。
+ * 只热更 env 一个字段：sandbox/backendType 是刻意 freeze-once 的设计（见
+ * forkWorker init 注释），cliId 换 CLI 会踩 resume transcript 对齐，均不带。
+ */
+export function latestPerBotEnvForRestart(ds: DaemonSession): Record<string, string> | null | undefined {
+  try {
+    return getBot(ds.larkAppId).config.env ?? null;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Join or start one correlated physical restart for a session. */
 export function requestSessionRestart(
   ds: DaemonSession,
@@ -1467,7 +1487,7 @@ export function requestSessionRestart(
 ): { attemptId: string; joined: boolean } {
   return restartCoordinator.request(ds.session.sessionId, observer, attemptId => {
     if (ds.worker && !ds.worker.killed) {
-      ds.worker.send({ type: 'restart', attemptId } as DaemonToWorker);
+      ds.worker.send({ type: 'restart', attemptId, env: latestPerBotEnvForRestart(ds) } as DaemonToWorker);
       return;
     }
     // No live worker but the persistent pane may still be alive (e.g. after a
@@ -1623,6 +1643,70 @@ function armWorkerKillBackstop(w: ChildProcess, label: string, sigtermMs: number
   });
 }
 
+type CloseFence = {
+  sessionId: string;
+  workerGeneration: number;
+  promise: Promise<void>;
+  resolve: () => void;
+  worker: ChildProcess;
+};
+
+const closeFences = new Map<string, CloseFence>();
+
+function closeFenceGeneration(ds: DaemonSession): number {
+  return ds.workerGeneration ?? ds.session.workerGeneration ?? 0;
+}
+
+function closeFenceKey(sessionId: string, workerGeneration: number): string {
+  return `${sessionId}:${workerGeneration}`;
+}
+
+function closeFenceFor(sessionId: string, workerGeneration: number | undefined): Promise<void> | undefined {
+  if (workerGeneration === undefined) return undefined;
+  return closeFences.get(closeFenceKey(sessionId, workerGeneration))?.promise;
+}
+
+function armCloseFence(ds: DaemonSession, worker: ChildProcess): Promise<void> {
+  const sessionId = ds.session.sessionId;
+  const workerGeneration = closeFenceGeneration(ds);
+  const key = closeFenceKey(sessionId, workerGeneration);
+  const existing = closeFences.get(key);
+  if (existing) return existing.promise;
+
+  let resolveFence!: () => void;
+  const promise = new Promise<void>(resolve => { resolveFence = resolve; });
+  const fence: CloseFence = {
+    sessionId,
+    workerGeneration,
+    promise,
+    resolve: resolveFence,
+    worker,
+  };
+  closeFences.set(key, fence);
+  sessionStore.registerSessionBridgeSendMarkerCleanupFence(sessionId, promise);
+  const timer = setTimeout(() => {
+    logger.warn(
+      `[${sessionId.substring(0, 8)}] worker close fence still waiting; `
+      + `generation=${workerGeneration}; bridge markers remain until ACK or worker exit`,
+    );
+  }, CLOSE_FENCE_WARN_MS);
+  timer.unref?.();
+  worker.once('exit', resolveFence);
+  if (worker.exitCode != null || worker.signalCode != null) {
+    queueMicrotask(resolveFence);
+  }
+  void promise.finally(() => {
+    clearTimeout(timer);
+    worker.off('exit', resolveFence);
+    if (closeFences.get(key) === fence) closeFences.delete(key);
+  });
+  return promise;
+}
+
+function resolveCloseFence(sessionId: string, workerGeneration: number): void {
+  closeFences.get(closeFenceKey(sessionId, workerGeneration))?.resolve();
+}
+
 // ─── Idempotent session close (dashboard IPC) ───────────────────────────────
 
 /**
@@ -1641,6 +1725,8 @@ export async function closeSession(
   // 会话关闭即可回收其崩溃重启计数；否则每个曾崩溃过的 session 会在 daemon
   // 生命周期内永久占位（restartCounts 此前无任何 delete）。
   restartCounts.delete(sessionId);
+  const hadLiveWorker = !!ds?.worker && !ds.worker.killed;
+  const closeWorkerGeneration = ds ? closeFenceGeneration(ds) : undefined;
   if (ds) {
     // Usage ledger: flush the final delta before the worker goes away (a
     // crash/limited turn may never have reached an idle edge).
@@ -1659,7 +1745,11 @@ export async function closeSession(
   // restore a session that was already explicitly closed.
   const stored = sessionStore.getSession(sessionId);
   const wasOpen = !!stored && stored.status !== 'closed';
-  if (wasOpen) sessionStore.closeSession(sessionId);
+  if (wasOpen) {
+    sessionStore.closeSession(sessionId, {
+      cleanupBridgeMarkers: !hadLiveWorker,
+    });
+  }
 
   if (ds) {
     if (!ds.exitEventEmitted) {
@@ -1677,17 +1767,16 @@ export async function closeSession(
   // above as part of the close barrier.
   if (wasOpen) {
     const after = sessionStore.getSession(sessionId);
-    dashboardEventBus.publish({
-      type: 'session.update',
-      body: {
-        sessionId,
-        patch: {
-          status: 'closed',
-          closedAt: after?.closedAt ? Date.parse(after.closedAt) : Date.now(),
-          tokenUsage: after ? composeRowFromClosed(after).tokenUsage : null,
-        },
-      },
-    });
+    publishClosedSessionPatch(
+      sessionId,
+      after?.closedAt ? Date.parse(after.closedAt) : undefined,
+      { tokenUsage: after ? composeRowFromClosed(after).tokenUsage : null },
+    );
+  }
+
+  if (wasOpen && hadLiveWorker) {
+    await closeFenceFor(sessionId, closeWorkerGeneration);
+    sessionStore.cleanupSessionBridgeSendMarkersNow(sessionId);
   }
 
   if (ds) {
@@ -3112,6 +3201,7 @@ function setupWorkerHandlers(
         // upstream debouncer — by the time we get here, status flips are
         // already coarse-grained.
         if (prevStatus !== ds.lastScreenStatus) {
+          const dashboardRow = composeRowFromActive(ds);
           dashboardEventBus.publish({
             type: 'session.update',
             body: {
@@ -3119,7 +3209,14 @@ function setupWorkerHandlers(
               patch: {
                 status: ds.lastScreenStatus,
                 lastMessageAt: ds.lastMessageAt,
-                tokenUsage: composeRowFromActive(ds).tokenUsage,
+                tokenUsage: dashboardRow.tokenUsage,
+                previewUserText: dashboardRow.previewUserText,
+                previewBotText: dashboardRow.previewBotText,
+                previewUserFullText: dashboardRow.previewUserFullText,
+                previewBotFullText: dashboardRow.previewBotFullText,
+                previewUserAt: dashboardRow.previewUserAt,
+                previewBotAt: dashboardRow.previewBotAt,
+                previewBotState: dashboardRow.previewBotState,
               },
             },
           });
@@ -3634,10 +3731,12 @@ function setupWorkerHandlers(
           break;
         }
 
-        // Auto-restart CLI within the same worker
+        // Auto-restart CLI within the same worker. 捎带最新 per-bot env：崩溃
+        // 往往正是旧 env 配的错（如过期 token / 失效 proxy），用户改完 env 后
+        // 下一轮 auto-restart 直接用新值恢复，不必再手工 /close。
         if (ds.worker && !ds.worker.killed) {
           logger.info(`[${t}] Auto-restarting ${getCliDisplayName(effectiveCliId)}...`);
-          ds.worker.send({ type: 'restart' } as DaemonToWorker);
+          ds.worker.send({ type: 'restart', env: latestPerBotEnvForRestart(ds) } as DaemonToWorker);
         }
         break;
       }
@@ -3888,6 +3987,11 @@ function setupWorkerHandlers(
           break;
         }
         ds.managedTurnOrigin = undefined;
+        break;
+      }
+
+      case 'session_close_ready': {
+        resolveCloseFence(msg.sessionId, workerGeneration);
         break;
       }
 
@@ -4937,6 +5041,60 @@ export function killStalePids(activeSessions_: Session[]): void {
 
   cleanupPersistentBackendSessions('tmux', activeSessions_);
   cleanupPersistentBackendSessions('herdr', activeSessions_);
+}
+
+/**
+ * Sweep dead CLI-pid marker files out of `.botmux-cli-pids/`. Each marker is
+ * named for the PID that wrote it; when that PID is gone the file is a landmine —
+ * the kernel eventually recycles the number onto an unrelated process, and a
+ * `botmux send` climbing its ancestry can then read a since-exited session's
+ * marker and route the message into the WRONG bot's session. (Fix A already
+ * rejects such a marker at read time by verifying procStart / the env session
+ * id; this GC removes the file so the collision can't even be attempted, and
+ * keeps the directory from growing without bound — graceful worker exit unlinks
+ * its own marker, but SIGKILL / crash / force-kill do not.)
+ *
+ * Cross-daemon safe: with many daemons sharing one data dir, a DEAD pid cannot
+ * belong to any live daemon's session, so unlinking its marker never races a
+ * peer. A live pid's marker is always left untouched. The tiny window where a
+ * PID is recycled between the liveness probe and unlink is benign — the new
+ * owner rewrites its marker on the next turn, and Fix A makes a briefly-missing
+ * marker fall back to the correct env id, never to a wrong session.
+ *
+ * `isPidAlive` is injectable so tests are deterministic regardless of what PIDs
+ * the host has actually allocated (picking a "surely-dead" literal is unsafe —
+ * it can be below pid_max and collide with a live process on a busy runner).
+ * Production uses `process.kill(pid, 0)`: a signal-0 probe that never kills.
+ * Conservative on every ambiguity — only a definitively-dead PID is swept.
+ */
+export function defaultPidLiveness(pid: number): boolean {
+  try {
+    process.kill(pid, 0); // signal 0 = liveness probe, never kills
+    return true;          // alive → owned by some (possibly peer) daemon
+  } catch (err: any) {
+    if (err?.code === 'ESRCH') return false; // no such process → dead
+    return true; // EPERM (alive, not ours) or unknown error → keep, never guess
+  }
+}
+
+export function sweepDeadPidMarkers(
+  dataDir: string = config.session.dataDir,
+  isPidAlive: (pid: number) => boolean = defaultPidLiveness,
+): number {
+  const markersDir = join(dataDir, '.botmux-cli-pids');
+  let entries: string[];
+  try { entries = readdirSync(markersDir); }
+  catch { return 0; } // dir absent (fresh install) → nothing to sweep
+  let removed = 0;
+  for (const name of entries) {
+    const pid = Number(name);
+    if (!Number.isInteger(pid) || pid <= 1) continue; // ignore non-pid files
+    if (isPidAlive(pid)) continue;                    // keep live (incl. peer daemons)
+    try { unlinkSync(join(markersDir, name)); removed++; }
+    catch { /* raced with another sweeper or the owner — fine */ }
+  }
+  if (removed > 0) logger.info(`Swept ${removed} dead CLI-pid marker(s) from ${markersDir}`);
+  return removed;
 }
 
 function cleanupPersistentBackendSessions(backendType: 'tmux' | 'herdr', activeSessions_: Session[]): void {

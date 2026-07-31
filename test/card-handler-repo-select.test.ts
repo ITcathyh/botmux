@@ -55,6 +55,9 @@ vi.mock('../src/config.js', () => ({
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   closeSession: vi.fn(),
   updateSession: vi.fn(),
   createSession: vi.fn(),
@@ -93,6 +96,8 @@ vi.mock('../src/im/lark/event-dispatcher.js', () => ({
 
 vi.mock('../src/core/session-activity.js', () => ({
   publishAttentionPatch: vi.fn(),
+  publishClosedSessionPatch: vi.fn(),
+  announcePendingRepoSession: vi.fn(),
 }));
 
 vi.mock('../src/services/frozen-card-store.js', () => ({
@@ -132,6 +137,7 @@ import { createRepoWorktree, pushWorktreeBranch, removeRepoWorktree } from '../s
 import { applyConfigField } from '../src/services/bot-config-store.js';
 import { deleteMessage } from '../src/im/lark/client.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
+import { publishClosedSessionPatch } from '../src/core/session-activity.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { ProjectInfo } from '../src/services/project-scanner.js';
@@ -266,6 +272,17 @@ afterEach(async () => {
 // ─── Tests ────────────────────────────────────────────────────────────────
 
 describe('repo select card — plain switch', () => {
+  it('mid-session selection publishes the closed preview patch for the displaced session', async () => {
+    const ds = makeDs();
+    const oldSession = ds.session;
+    const { deps } = makeDeps(ds);
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
+
+    expect(closeSession).toHaveBeenCalledWith(oldSession.sessionId);
+    expect(publishClosedSessionPatch).toHaveBeenCalledWith(oldSession.sessionId, undefined);
+  });
+
   it('pendingRepo selection forks the CLI with the buffered prompt', async () => {
     const ds = makeDs({
       pendingRepo: true,

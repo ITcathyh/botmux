@@ -74,6 +74,8 @@ const mockGetMessageDetail = vi.fn(async () => ({ items: [] as any[] }));
 // 默认所有 open_id 都判为「非真人」（bot）→ 保持既有用例「全部登记」的预期；
 // 需要模拟真人的用例用 mockResolvedValueOnce(true)。
 const mockIsHumanOpenId = vi.fn(async () => false);
+// best-effort profile 查询（授权申请卡取申请人名字用）：默认查不到 → 卡片回落缩略身份。
+const mockGetUserProfile = vi.fn(async () => null as { name: string } | null);
 vi.mock('../src/im/lark/client.js', () => ({
   getChatInfo: (...args: any[]) => mockGetChatInfo(...args),
   getChatMode: (...args: any[]) => mockGetChatMode(...args),
@@ -87,6 +89,7 @@ vi.mock('../src/im/lark/client.js', () => ({
   listChatMessages: (...args: any[]) => mockListChatMessages(...args),
   listChatMessagesUntil: (...args: any[]) => mockListChatMessagesUntil(...args),
   listThreadMessages: (...args: any[]) => mockListThreadMessages(...args),
+  getUserProfile: (...args: any[]) => mockGetUserProfile(...args),
 }));
 
 vi.mock('../src/utils/logger.js', () => ({

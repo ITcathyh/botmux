@@ -66,7 +66,7 @@ import { readGlobalConfig } from '../global-config.js';
 import { normalizeChatReplyMode, setChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isSuspendableBackendType } from './persistent-backend.js';
@@ -605,8 +605,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', (_req, res, params) => {
   const cliId = ds.session.cliId ?? 'unknown';
   if (ds.worker && !ds.worker.killed) {
     // Live worker → in-place CLI restart (kills the CLI, respawns with --resume).
+    // 捎带最新 per-bot env：dashboard 改完 env 后重启才真正生效（与 /restart 同逻辑）。
     try {
-      ds.worker.send({ type: 'restart' } as DaemonToWorker);
+      ds.worker.send({ type: 'restart', env: latestPerBotEnvForRestart(ds) } as DaemonToWorker);
     } catch (err) {
       return jsonRes(res, 502, { ok: false, error: String(err) });
     }
@@ -894,7 +895,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
     // 与 worker 侧一致（下次 forkWorker 用它重建 init 消息）。
     if (ds.initConfig) ds.initConfig.workingDir = v.resolvedPath;
     try {
-      ds.worker.send({ type: 'restart', updateWorkingDir: v.resolvedPath } as DaemonToWorker);
+      ds.worker.send({ type: 'restart', updateWorkingDir: v.resolvedPath, env: latestPerBotEnvForRestart(ds) } as DaemonToWorker);
     } catch {
       // send() 抛异常：worker 进程实际上已经不可达（管道已断），但 above 的
       // repinSessionWorkingDir 已经把记录改成了新目录——绝不能留下「记录新、
@@ -2648,7 +2649,7 @@ ipcRoute('PUT', '/api/bot-summary-trigger', async (req, res) => {
 // Per-bot 授权偏好。Body 任意子集：
 //   • restrictGrantCommands: boolean       — 限制被授权人只能纯对话
 //   • autoGrantRequestCards: boolean       — 未授权 @ 被挡住时是否发 grant 申请卡
-//   • messageQuotaDefaultLimit: number|null — 默认消息额度（null = 关闭，正整数 = 启用）
+//   • messageQuotaDefaultLimit: number|null — 卡片默认额度覆盖（null = 产品默认 3 条）
 ipcRoute('PUT', '/api/bot-grant-prefs', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   let raw: unknown;

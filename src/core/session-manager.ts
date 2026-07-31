@@ -12,7 +12,7 @@ import * as sessionStore from '../services/session-store.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, forkAdoptWorker, adoptSandboxBlocked, killStalePids, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
 import {
@@ -1208,6 +1208,12 @@ export async function staggeredRecoveryFork(
 export async function restoreActiveSessions(activeSessions: Map<string, DaemonSession>): Promise<void> {
   const sessions = sessionStore.listSessions();
   const active = sessions.filter(s => s.status === 'active');
+
+  // Sweep dead CLI-pid markers regardless of whether we have sessions to restore:
+  // the landmine files (recycled-PID misroute source) accumulate across every
+  // daemon run, and a run with zero active sessions is still a fresh start that
+  // should clean up after prior crashes/SIGKILLs.
+  sweepDeadPidMarkers();
 
   if (active.length === 0) {
     logger.info('No active sessions to restore');

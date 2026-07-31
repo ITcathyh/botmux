@@ -624,8 +624,13 @@ export type DaemonToWorker =
   /** Kill the CLI and respawn it with --resume. `updateWorkingDir`（可选）
    *  用于角色切换的 cwd-move respawn：respawn 前把 worker 侧 lastInitConfig
    *  收敛到新目录，让 CLI 在新 cwd 冷启动（新 CLAUDE.md/记忆索引开场注入）
-   *  同时 --resume 续回对话上下文。`attemptId` 关联手工 restart 的完成回执。 */
-  | { type: 'restart'; attemptId?: string; updateWorkingDir?: string }
+   *  同时 --resume 续回对话上下文。`attemptId` 关联手工 restart 的完成回执。
+   *  `env`（可选）携 daemon 侧最新的 per-bot env（bots.json `env`）：worker
+   *  在 respawn 前全量覆盖 lastInitConfig.env，使 dashboard 改完 env 后
+   *  /restart 真正生效（否则 live-worker restart 一直用 fork 时刻的旧快照）。
+   *  三分态：undefined = 不携带（旧 daemon / 兜底，worker 保持快照不动）；
+   *  null = 明确清空（dashboard 清除了 env，worker 移除快照）。 */
+  | { type: 'restart'; attemptId?: string; updateWorkingDir?: string; env?: Record<string, string> | null }
   /** Lease watchdog fencing: only the exact still-running durable attempt may
    * tear down/restart the CLI. A late command after terminal/current-turn
    * advance is ignored worker-side. */
@@ -679,6 +684,9 @@ export type WorkerToDaemon =
   | { type: 'cli_session_id'; cliSessionId: string; turnId?: string; dispatchAttempt?: number }
   | { type: 'native_session_title_generated'; title: string }
   | { type: 'claude_exit'; code: number | null; signal: string | null; logTail?: string; canParkDiagnostic?: boolean; turnId?: string; dispatchAttempt?: number }
+  /** Worker-side close handler has crossed the point where it will no longer
+   * read bridge send markers or emit transcript fallback for this session. */
+  | { type: 'session_close_ready'; sessionId: string }
   | { type: 'prompt_ready' }
   | { type: 'runner_build_ready'; runnerBuildId: string }
   | {

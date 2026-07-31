@@ -10,7 +10,7 @@ import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { join } from 'node:path';
 import { getBot, getAllBots, findOncallChat, getOwnerOpenId, type BotState } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
-import { getChatInfo, getChatMode, getCachedChatMode, listChatBotMembers, resolveSiblingBotBySenderOpenId, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
+import { getChatInfo, getChatMode, getCachedChatMode, getUserProfile, listChatBotMembers, resolveSiblingBotBySenderOpenId, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
@@ -38,12 +38,18 @@ import {
 import { automateOpenPlatformSetup } from '../../setup/open-platform-automation.js';
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
 import { tryHandleGrantCommand } from './grant-command.js';
+import { tryHandleInviteCommand } from './invite-command.js';
 import { tryHandleReplyModeCommand } from './reply-mode-command.js';
 import { tryHandleSubstituteCommand } from './substitute-command.js';
 import { buildGrantCard } from './card-builder.js';
 import { openPending, isThrottled, clearPending } from './grant-pending.js';
 import { localeForBot, t } from '../../i18n/index.js';
-import { chatQuotaKey, globalQuotaKey } from '../../services/grant-store.js';
+import {
+  chatQuotaKey,
+  getGrantExpiresAt,
+  globalQuotaKey,
+  removeExpiredGrant,
+} from '../../services/grant-store.js';
 import { ForwardFollowupBuffer } from './forward-followup-buffer.js';
 import { listForwardFollowups, putForwardFollowup, removeForwardFollowup } from './forward-followup-store.js';
 import { claimMessageOnce, _resetCacheForTest as _resetSeenMessagesForTest } from '../../services/seen-message-store.js';
@@ -62,6 +68,7 @@ import {
 } from '../../vc-agent/push-source.js';
 import type { VcMeetingPushContext, VcMeetingPushEventKind } from '../../vc-agent/types.js';
 import type { VcMeetingImTurnOrigin } from '../../types.js';
+import { DEFAULT_GRANT_DURATION_MS, DEFAULT_GRANT_QUOTA } from '../../services/grant-policy.js';
 
 // 大厅回执互教的防环闸：每进程对同一打卡者只回一次（见 hall swallow 分支）。
 const hallEchoReplied = new Set<string>();
@@ -1207,6 +1214,23 @@ export interface TalkEvaluation {
   allowed: boolean;
   reason: TalkReason;
   quotaKey?: string;
+  /**
+   * 仅在 reason==='oncall' 且命中 quotaKey 时可能为 true：本 oncall 用户在**同群**还持有一条
+   * 「未过期的显式 chatGrant」。oncall 与 chatGrant 共用同一把 chat quotaKey，owner 给 oncall
+   * 用户 /grant「不限」时磁盘上无 quota 记录（= 显式不限），若额度层再按 messageQuota.defaultLimit
+   * 懒初始化就会把「显式不限」静默套回 default。带上这个标志让额度层对这种交集**不兜 default**。
+   * 显式 N 授权已有 quota 记录，consumeQuota 直接消费现有记录，与本标志无关。
+   */
+  explicitGrantOverride?: boolean;
+  /**
+   * 仅在 reason==='oncall' 且该用户同群持有一条**已过期** chatGrant 时给出：透传给
+   * consumeQuota，由它在**同一把额度锁内**以「当前 expiry」为权威判定——当前 expiry<=now 则原子清
+   *「成员+quota+expiry」并回落 oncall default；当前无 expiry/未来 expiry 则该 grant 仍 live（成员在→
+   * 不兜 default 按现有记录/不限消费；成员已被清→普通 oncall→回落 default）。收口进一把锁，杜绝跨
+   * await 用陈旧 ev 决策，也不会让过期成员关系残留成永久授权。（pure chatGrant/globalGrant 的过期走
+   * grantNotExpired 拒发。）
+   */
+  expiredGrantCleanup?: { scope: 'chat'; chatId: string; openId: string };
 }
 
 export type GrantCommandRestrictionReason = 'chatGrant' | 'globalGrant';
@@ -1227,12 +1251,42 @@ export function grantCommandRestriction(
 
 /** per-chat per-user 授权命中判断（仅用于 canTalk —— 不给管理命令权）。 */
 function hasChatGrant(larkAppId: string, chatId: string | undefined, openId: string | undefined): boolean {
-  return !!chatId && !!openId && !!getBot(larkAppId).config.chatGrants?.[chatId]?.includes(openId);
+  if (!chatId || !openId || !getBot(larkAppId).config.chatGrants?.[chatId]?.includes(openId)) return false;
+  return grantNotExpired(larkAppId, 'chat', chatId, openId, chatQuotaKey(chatId, openId));
 }
 
 /** 全局对话授权命中判断（人/bot 通用，仅用于 canTalk / bot 路由闸 —— 不给管理命令权）。 */
 function hasGlobalGrant(larkAppId: string, openId: string | undefined): boolean {
-  return !!openId && !!getBot(larkAppId).config.globalGrants?.includes(openId);
+  if (!openId || !getBot(larkAppId).config.globalGrants?.includes(openId)) return false;
+  return grantNotExpired(larkAppId, 'global', undefined, openId, globalQuotaKey(openId));
+}
+
+const expiryCleanupInFlight = new Set<string>();
+
+/**
+ * 到期判断是同步安全边界：过期后本条消息立即拒绝；持久化清理由带 observedExpiresAt
+ * 条件的原子 RMW 异步完成，避免误删刚续期的授权。
+ */
+function grantNotExpired(
+  larkAppId: string,
+  scope: 'chat' | 'global',
+  chatId: string | undefined,
+  openId: string,
+  grantKey: string,
+): boolean {
+  const expiresAt = getGrantExpiresAt(larkAppId, grantKey);
+  if (expiresAt === undefined || Date.now() < expiresAt) return true;
+  const cleanupKey = `${larkAppId}:${grantKey}:${expiresAt}`;
+  if (!expiryCleanupInFlight.has(cleanupKey)) {
+    expiryCleanupInFlight.add(cleanupKey);
+    void removeExpiredGrant(larkAppId, scope, chatId, openId, expiresAt)
+      .then(result => {
+        if (!result.ok) logger.warn(`[grant:${larkAppId}] expiry cleanup failed key=${grantKey} reason=${result.reason}`);
+      })
+      .catch(err => logger.warn(`[grant:${larkAppId}] expiry cleanup failed key=${grantKey}: ${err}`))
+      .finally(() => expiryCleanupInFlight.delete(cleanupKey));
+  }
+  return false;
 }
 
 /** 整群 talk 授权命中判断（裸 `/grant` 写入的 allowedChatGroups）。chat 维度、sender 无关，
@@ -1290,7 +1344,20 @@ export function evaluateTalk(
   if (chatId && findOncallChat(larkAppId, chatId)) {
     const def = bot.config.messageQuota?.defaultLimit;
     if (typeof def === 'number' && Number.isInteger(def) && def > 0 && senderOpenId) {
-      return { allowed: true, reason: 'oncall', quotaKey: chatQuotaKey(chatId, senderOpenId) };
+      // 交集处理：同群若还持有显式 chatGrant，额度由授权决定而非 oncall default。
+      // 三态：live 显式授权 → explicitGrantOverride（不兜 default）；已过期 → expiredGrantCleanup
+      //（透传给 consumeQuota，锁内以当前 expiry 为准原子清成员+quota+expiry 并回落 default）；
+      // 非成员 → 无覆盖，正常走 oncall default 懒初始化。
+      const gk = chatQuotaKey(chatId, senderOpenId);
+      const isMember = !!bot.config.chatGrants?.[chatId]?.includes(senderOpenId);
+      const exp = isMember ? getGrantExpiresAt(larkAppId, gk) : undefined;
+      if (isMember && exp !== undefined && Date.now() >= exp) {
+        return {
+          allowed: true, reason: 'oncall', quotaKey: gk,
+          expiredGrantCleanup: { scope: 'chat', chatId, openId: senderOpenId },
+        };
+      }
+      return { allowed: true, reason: 'oncall', quotaKey: gk, explicitGrantOverride: isMember };
     }
     return { allowed: true, reason: 'oncall' };
   }
@@ -1404,7 +1471,7 @@ export function canOperate(
  * 对话放行腿命中即可）。名单外或未配置 → 与 canOperate 完全等价（现状不变）。
  *
  * 只作用于 daemon.ts 两条路由的 DAEMON_COMMANDS 统一闸；在统一闸之前特判的命令
- * （/vc-auth /term）与 handler 内部自带 owner 闸的命令（/card /insight /land）
+ * （/vc-auth /term）与 handler 内部自带 owner 闸的命令（/card /insight）
  * 不受影响——内部闸仍是最终权威（fail-closed）。
  *
  * chatType 省略时 p2pOpen 腿不生效（fail-closed），与 canTalk 语义一致——
@@ -1443,11 +1510,31 @@ async function maybeSendGrantRequestCard(
   const observedName = mentionName
     ? undefined
     : listObservedBots(config.session.dataDir, larkAppId, chatId).find(b => b.openId === requesterOpenId)?.name;
-  const name = mentionName ?? observedName ?? requesterOpenId;
+  const profileName = mentionName || observedName
+    ? undefined
+    : (await getUserProfile(larkAppId, requesterOpenId).catch(() => null))?.name;
+  const shortRequester = `${requesterOpenId.slice(0, 10)}…${requesterOpenId.slice(-4)}`;
+  const name = mentionName ?? observedName ?? profileName ?? shortRequester;
   // 把原始消息事件挂在 pending 上：授权成功后可重放，用户无需再 @ 一遍。
-  const nonce = openPending(larkAppId, chatId, requesterOpenId, getBot(larkAppId).config.messageQuota?.defaultLimit, messageData);
+  const quota = getBot(larkAppId).config.messageQuota?.defaultLimit ?? DEFAULT_GRANT_QUOTA;
+  const nonce = openPending(
+    larkAppId,
+    chatId,
+    requesterOpenId,
+    quota,
+    messageData,
+    DEFAULT_GRANT_DURATION_MS,
+  );
   const card = buildGrantCard(
-    { ownerOpenId: owner, targets: [{ openId: requesterOpenId, name: String(name) }], chatId, nonce, mode: 'request' },
+    {
+      ownerOpenId: owner,
+      targets: [{ openId: requesterOpenId, name: String(name) }],
+      chatId,
+      nonce,
+      mode: 'request',
+      quota,
+      durationMs: DEFAULT_GRANT_DURATION_MS,
+    },
     localeForBot(larkAppId),
   );
   await replyMessage(larkAppId, message.message_id, card, 'interactive')
@@ -2475,6 +2562,12 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       // /grant、/revoke — 群内授权元命令。在路由/spawn 之前拦截（仅 owner，需明确 @ 本 bot），
       // 否则会被当成 prompt 喂给 CLI 会话。
       if (await tryHandleGrantCommand(larkAppId, message, senderOpenId)) {
+        return;
+      }
+
+      // /invite — 把群外 bot 拉进本群的元命令。与 /grant 同款拦截模型（仅 owner，
+      // 需明确 @ 本 bot），防止进路由/spawn，也防多 bot 重复执行拉人。
+      if (await tryHandleInviteCommand(larkAppId, message, senderOpenId)) {
         return;
       }
 

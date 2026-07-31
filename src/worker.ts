@@ -1207,6 +1207,7 @@ function ensureZellijAttachConfig(): string {
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
+let closeRequested = false;
 /** Dashboard「复现命令」：session 冷启时最终交给 backend.spawn 的真实调用
  *  （bin + argv + cwd + 关键 env）。原样保留，worker `ready` 时随消息上报给 daemon
  *  持久化。仅有写权限的 dashboard 视图可见。 */
@@ -2160,6 +2161,7 @@ function bridgeMarkerPath(): string | undefined {
 }
 
 function readSendMarkers(): BridgeSendMarker[] {
+  if (closeRequested) return [];
   const path = bridgeMarkerPath();
   if (!path || !existsSync(path)) return [];
   try {
@@ -10062,6 +10064,10 @@ function workerIpcPayload(msg: WorkerToDaemon): WorkerToDaemon {
 }
 
 function send(msg: WorkerToDaemon): void {
+  if (closeRequested && msg.type === 'final_output') {
+    log('Dropped final_output after close fence');
+    return;
+  }
   const payload = workerIpcPayload(msg);
   if (isWorkflowWorker() && payload.type === 'final_output') {
     workflowFinalOutputSent = true;
@@ -10552,6 +10558,16 @@ process.on('message', async (raw: unknown) => {
       if (msg.updateWorkingDir && lastInitConfig) {
         lastInitConfig.workingDir = msg.updateWorkingDir;
       }
+      // per-bot env 热更：daemon 发 restart 时捎带 bots.json `env` 的最新值
+      // （live-worker restart 不 refork，没有 init 重发这条通道），respawn 前
+      // 全量覆盖 lastInitConfig.env —— spawnCli 的 sanitizePerBotEnv(cfg.env)
+      // 每次 spawn 都重跑，覆盖即在重启出的 CLI 上生效。undefined=不携带（旧
+      // daemon / 兜底）保持快照；null=dashboard 已清空 → 移除快照。与上面的
+      // cwd merge 一样放在合并守卫之前：被合并的重复 restart 也应带走 env
+      // 更新，pending 的 respawn 展开 {...lastInitConfig} 时自然拿到新值。
+      if (msg.env !== undefined && lastInitConfig) {
+        lastInitConfig.env = msg.env === null ? undefined : msg.env;
+      }
       // restart 合并：已有一轮 restart 在飞（teardown 进行中，或 tmux jitter
       // 定时器未触发）时不叠加第二轮——叠加会 clearTimeout 吃掉首轮 teardown、
       // 把重启预算无故烧到 tier-2 强制 FRESH（丢上下文），非 tmux 路径还会
@@ -10831,7 +10847,11 @@ process.on('message', async (raw: unknown) => {
 
     case 'close': {
       log('Close requested');
+      closeRequested = true;
+      send({ type: 'session_close_ready', sessionId });
       stopScreenshotLoop();
+      stopBridgeWatcher();
+      stopCodexBridge();
       // destroySession kills tmux session permanently; kill() only detaches.
       // riff 的 destroySession 是异步远端取消——必须有界 await：紧跟着的
       // process.exit 会掐断未发出的 fetch，让已关闭话题的远端 agent 继续跑。

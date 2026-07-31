@@ -14,7 +14,15 @@ import { findConfigField, applyConfigField, coerceConfigValue, getConfigCardData
 import { updateBotGrantPrefs } from '../../services/grant-prefs-store.js';
 import { writeTeamRoleFile, deleteTeamRoleFile } from '../../core/role-resolver.js';
 import { addChatGrant, addGlobalGrant } from '../../services/grant-store.js';
-import { checkNonce, clearPending, markDenied, getPendingQuota, getPendingMessage } from './grant-pending.js';
+import {
+  checkNonce,
+  clearPending,
+  getPendingGrantLimits,
+  getPendingMessage,
+  markDenied,
+  updatePendingGrantLimits,
+} from './grant-pending.js';
+import { normalizeGrantDurationOption, normalizeGrantQuotaOption } from '../../services/grant-policy.js';
 import { claimOverloadNonce, releaseOverloadNonce } from './overload-nonce.js';
 import {
   buildOverloadAlertCard,
@@ -72,7 +80,7 @@ import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-sto
 import { forkWorker, sendWorkerInput, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
-import { publishAttentionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
+import { publishAttentionPatch, publishClosedSessionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
 import { fallbackTurnId } from '../../core/reply-target.js';
 import { validateWorkingDir } from '../../core/working-dir.js';
 import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js';
@@ -614,6 +622,10 @@ export async function commitRepoSelection(
     // stays in the thread instead of vanishing prematurely.
     parkStreamCard(ds);
     sessionStore.closeSession(ds.session.sessionId);
+    publishClosedSessionPatch(
+      ds.session.sessionId,
+      ds.session.closedAt ? Date.parse(ds.session.closedAt) : undefined,
+    );
 
     await deliverEphemeralOrReply(
       ds,
@@ -899,9 +911,15 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // Rebuild the SAME card: clicked button → ✓done+disabled, other → still live.
     return JSON.parse(buildOverloadAlertCard(st));
   }
-  // ─── 群内授权卡片动作（grant_chat / grant_global / grant_deny，talk-only）─────
+  // ─── 群内授权卡片动作（限制提交 + grant/revoke，talk-only）──────────────────
   // 不绑定 session，必须在 session 解析之前处理。owner 强闸门 + nonce 校验。
-  if (value?.action && (value.action === 'grant_chat' || value.action === 'grant_global' || value.action === 'grant_deny') && larkAppId) {
+  if (value?.action && (
+    value.action === 'grant_chat'
+    || value.action === 'grant_global'
+    || value.action === 'grant_deny'
+    || value.action === 'grant_set_duration'
+    || value.action === 'grant_set_quota'
+  ) && larkAppId) {
     const loc = localeForBot(larkAppId);
     const owner = getOwnerOpenId(larkAppId);
     // owner 强闸门：必须是当前 app 的 owner 本人（比 canOperate 更严）
@@ -920,11 +938,53 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     if (!targets.length || !grantChatId || !nonce || !targets.every(tt => checkNonce(larkAppId, grantChatId, tt, nonce))) {
       return { toast: { type: 'error', content: t('card.grant.toast_expired', undefined, loc) } };
     }
+    // 兼容已发出的旧卡：旧卡用下拉 callback 暂存限制，新卡在授权按钮的 form_submit
+    // 中一次提交有效期和额度。两条路径都必须走服务端校验，不能信任卡片输入。
+    if (value.action === 'grant_set_duration' || value.action === 'grant_set_quota') {
+      const selected = action?.option;
+      const parsed = value.action === 'grant_set_duration'
+        ? normalizeGrantDurationOption(selected)
+        : normalizeGrantQuotaOption(selected);
+      if (parsed === null) {
+        return { toast: { type: 'error', content: t('card.grant.toast_bad_limit', undefined, loc) } };
+      }
+      const updated = updatePendingGrantLimits(
+        larkAppId,
+        grantChatId,
+        targets,
+        nonce,
+        value.action === 'grant_set_duration'
+          ? { durationMs: parsed ?? null }
+          : { quota: parsed ?? null },
+      );
+      return updated
+        ? { toast: { type: 'success', content: t('card.grant.toast_limit_staged', undefined, loc) } }
+        : { toast: { type: 'error', content: t('card.grant.toast_expired', undefined, loc) } };
+    }
     // 拒绝：只把卡更新成「已拒绝」+ 全部目标进 deny 冷却，绝不触碰 grant-store。
     // 返回原始卡 body，由 dispatcher 包成 in-place patch（不再走 updateMessage 双写）。
     if (value.action === 'grant_deny') {
       for (const tt of targets) markDenied(larkAppId, grantChatId, tt);
       return JSON.parse(buildGrantResultCard('deny', loc));
+    }
+    const formValue = action?.form_value;
+    if (formValue) {
+      const duration = normalizeGrantDurationOption(formValue.grant_duration);
+      const quota = normalizeGrantQuotaOption(
+        typeof formValue.grant_quota === 'string' ? formValue.grant_quota.trim() : formValue.grant_quota,
+      );
+      if (quota === null) {
+        return { toast: { type: 'error', content: t('card.grant.toast_bad_quota', undefined, loc) } };
+      }
+      if (duration === null) {
+        return { toast: { type: 'error', content: t('card.grant.toast_bad_limit', undefined, loc) } };
+      }
+      if (!updatePendingGrantLimits(larkAppId, grantChatId, targets, nonce, {
+        durationMs: duration ?? null,
+        quota: quota ?? null,
+      })) {
+        return { toast: { type: 'error', content: t('card.grant.toast_expired', undefined, loc) } };
+      }
     }
     // 授权（talk-only）：grant_chat 写本群 chatGrants，grant_global 写全局 globalGrants，
     // 两者都绝不碰 allowedUsers（operate 只由 bots.json 配）。逐个落库，统计成功/失败。
@@ -932,8 +992,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const names: string[] = Array.isArray(value.target_names) ? value.target_names : [];
     const idToName = new Map<string, string>();
     targets.forEach((tt, i) => idToName.set(tt, names[i] ?? ''));
-    // 额度挂在 pending 上（/grant @x N 解析所得；多目标共用同一额度）；clearPending 前先读出来。
-    const quota = getPendingQuota(larkAppId, grantChatId, targets[0]);
+    // 限制挂在 pending 上；确认时生成绝对 expiresAt，多目标共享同一组限制。
+    const limits = getPendingGrantLimits(larkAppId, grantChatId, targets[0]);
+    if (!limits) {
+      return { toast: { type: 'error', content: t('card.grant.toast_expired', undefined, loc) } };
+    }
+    const quota = limits.quota;
+    const expiresAt = limits.durationMs === undefined ? undefined : Date.now() + limits.durationMs;
     // 触发本次授权申请的原始消息事件：授权成功后重放，用户无需再 @ 一遍。
     // 自助申请卡每次只对应一个 target，取第一个即可。
     const pendingMessage = getPendingMessage(larkAppId, grantChatId, targets[0]);
@@ -941,8 +1006,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const failed: Array<{ openId: string; reason: string }> = [];
     for (const tt of targets) {
       const res = kind === 'global'
-        ? await addGlobalGrant(larkAppId, tt, quota)
-        : await addChatGrant(larkAppId, grantChatId, tt, quota);
+        ? await addGlobalGrant(larkAppId, tt, quota, expiresAt)
+        : await addChatGrant(larkAppId, grantChatId, tt, quota, expiresAt);
       if (res.ok) { clearPending(larkAppId, grantChatId, tt); granted.push(tt); }
       else { failed.push({ openId: tt, reason: res.reason }); logger.warn(`Grant action "${value.action}" store failed for ${tt}: ${res.reason}`); }
     }
@@ -984,7 +1049,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     //   1. 先同步返回 callback 响应（in-place patch 成「已授权」终态卡），避免飞书等待
     //      太久或 deleteMessage 与 callback 响应竞态导致客户端 300000 报错；
     //   2. 通知卡 + 部分失败告知 + 撤回原卡 走后台 fire-and-forget（不阻塞 callback）。
-    const resultCardBody = JSON.parse(buildGrantResultCard(kind, loc));
+    const resultCardBody = JSON.parse(buildGrantResultCard(kind, loc, quota, expiresAt));
     if (cardMessageId) {
       let replyInThread = true;
       try {
@@ -999,7 +1064,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       Promise.resolve()
         .then(async () => {
           try {
-            await replyMessage(larkAppId, cardMessageId, buildGrantNotifyCard(kind, notifyTargets, loc, quota), 'interactive', replyInThread);
+            await replyMessage(
+              larkAppId,
+              cardMessageId,
+              buildGrantNotifyCard(kind, notifyTargets, loc, quota, expiresAt),
+              'interactive',
+              replyInThread,
+            );
           } catch (err) {
             logger.warn(`grant notify failed (grant still applied): ${err}`);
           }
@@ -1832,6 +1903,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const card = buildClosedSessionCard(ds, localeForBot(ds.larkAppId));
       killWorker(ds);
       sessionStore.closeSession(ds.session.sessionId);
+      publishClosedSessionPatch(
+        ds.session.sessionId,
+        ds.session.closedAt ? Date.parse(ds.session.closedAt) : undefined,
+      );
       activeSessions.delete(sKey);
       // The closed card carries session title / CLI name / workingDir / resume
       // command. In private-card mode those must not leak to the group — send the
@@ -1885,6 +1960,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     if (actionType === 'disconnect' && ds) {
       killWorker(ds);
       sessionStore.closeSession(ds.session.sessionId);
+      publishClosedSessionPatch(
+        ds.session.sessionId,
+        ds.session.closedAt ? Date.parse(ds.session.closedAt) : undefined,
+      );
       activeSessions.delete(sKey);
       await sessionReply(rootId, t('card.action.disconnected', undefined, localeForBot(ds.larkAppId)));
       logger.info(`[${tag(ds)}] Disconnected (adopt) via card button`);

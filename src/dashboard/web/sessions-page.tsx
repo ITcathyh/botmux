@@ -2,6 +2,7 @@ import {
   Fragment,
   useCallback,
   useEffect,
+  useId,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -23,6 +24,7 @@ import {
 } from '../session-cleanup.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useStoreSelector, useT } from './react-hooks.js';
+import { copyText } from './clipboard.js';
 import {
   KANBAN_TEAM_STORAGE_KEY,
   normalizeHiddenTableColumns,
@@ -63,6 +65,7 @@ import {
   restartConfirmMessage,
   sessionLocationText,
   sessionLocationTitle,
+  sessionExchangePreview,
   sessionRuntimeCounts,
   sessionSearchText,
   sessionTopicKey,
@@ -385,9 +388,11 @@ function CopyButton(props: { value: string }): JSX.Element {
       type="button"
       data-copy={props.value}
       onClick={() => {
-        void navigator.clipboard.writeText(props.value);
-        setCopied(true);
-        window.setTimeout(() => setCopied(false), 800);
+        void copyText(props.value, t('sessions.copy')).then(didCopy => {
+          if (!didCopy) return;
+          setCopied(true);
+          window.setTimeout(() => setCopied(false), 800);
+        });
       }}
     >
       {copied ? t('sessions.copied') : t('sessions.copy')}
@@ -995,6 +1000,192 @@ function SessionsTable(props: {
   );
 }
 
+type SessionExchangePreviewValue = ReturnType<typeof sessionExchangePreview>;
+
+function SessionExchangePreview(props: { exchange: SessionExchangePreviewValue }): JSX.Element | null {
+  const { exchange } = props;
+  const triggerRef = useRef<HTMLDivElement>(null);
+  const detailsRef = useRef<HTMLButtonElement>(null);
+  const tooltipRef = useRef<HTMLDivElement>(null);
+  const hideTimerRef = useRef<number | null>(null);
+  const [open, setOpen] = useState(false);
+  const [position, setPosition] = useState<{
+    left: number;
+    placement: 'top' | 'bottom';
+    top: number;
+  } | null>(null);
+  const tooltipId = `session-exchange-tooltip-${useId().replace(/[^a-zA-Z0-9_-]/g, '-')}`;
+
+  const clearHide = useCallback(() => {
+    if (hideTimerRef.current === null) return;
+    window.clearTimeout(hideTimerRef.current);
+    hideTimerRef.current = null;
+  }, []);
+  const show = useCallback(() => {
+    clearHide();
+    setOpen(true);
+  }, [clearHide]);
+  const hide = useCallback(() => {
+    clearHide();
+    setOpen(false);
+    setPosition(null);
+  }, [clearHide]);
+  const scheduleHide = useCallback(() => {
+    clearHide();
+    hideTimerRef.current = window.setTimeout(hide, 120);
+  }, [clearHide, hide]);
+  const updatePosition = useCallback(() => {
+    const trigger = triggerRef.current;
+    const tooltip = tooltipRef.current;
+    if (!trigger || !tooltip) return;
+    const triggerRect = trigger.getBoundingClientRect();
+    const tooltipRect = tooltip.getBoundingClientRect();
+    const margin = 12;
+    const gap = 9;
+    const roomAbove = triggerRect.top - margin - gap;
+    const roomBelow = window.innerHeight - triggerRect.bottom - margin - gap;
+    const placement = roomAbove >= tooltipRect.height || roomAbove > roomBelow ? 'top' : 'bottom';
+    const desiredLeft = triggerRect.left + triggerRect.width / 2 - tooltipRect.width / 2;
+    const left = Math.min(
+      Math.max(desiredLeft, margin),
+      Math.max(margin, window.innerWidth - tooltipRect.width - margin),
+    );
+    const desiredTop = placement === 'top'
+      ? triggerRect.top - tooltipRect.height - gap
+      : triggerRect.bottom + gap;
+    const top = Math.min(
+      Math.max(desiredTop, margin),
+      Math.max(margin, window.innerHeight - tooltipRect.height - margin),
+    );
+    setPosition({ left, placement, top });
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    updatePosition();
+    window.addEventListener('resize', updatePosition);
+    window.addEventListener('scroll', updatePosition, true);
+    return () => {
+      window.removeEventListener('resize', updatePosition);
+      window.removeEventListener('scroll', updatePosition, true);
+    };
+  }, [exchange.botFullText, exchange.userFullText, open, updatePosition]);
+  useEffect(() => () => clearHide(), [clearHide]);
+  useEffect(() => {
+    if (!open) return;
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (
+        triggerRef.current?.contains(target)
+        || detailsRef.current?.contains(target)
+        || tooltipRef.current?.contains(target)
+      ) return;
+      hide();
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') hide();
+    };
+    document.addEventListener('pointerdown', closeOnOutsidePointer);
+    document.addEventListener('keydown', closeOnEscape);
+    return () => {
+      document.removeEventListener('pointerdown', closeOnOutsidePointer);
+      document.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [hide, open]);
+
+  if (!exchange.userText && !exchange.botText) return null;
+  return (
+    <>
+      <div className="session-card-exchange-wrap">
+        <div
+          ref={triggerRef}
+          className="session-card-exchange"
+          aria-label={t('sessions.preview.latestExchange')}
+          onPointerEnter={event => {
+            if (event.pointerType !== 'touch') show();
+          }}
+          onPointerLeave={event => {
+            if (event.pointerType !== 'touch') scheduleHide();
+          }}
+        >
+          {exchange.userText ? (
+            <div className="session-card-exchange-line">
+              <span>{t('sessions.history.user')}</span>
+              <p>{exchange.userText}</p>
+            </div>
+          ) : null}
+          {exchange.botText ? (
+            <div className="session-card-exchange-line bot">
+              <span>{t('sessions.history.bot')}</span>
+              <p>{exchange.botText}</p>
+            </div>
+          ) : null}
+        </div>
+        <button
+          ref={detailsRef}
+          type="button"
+          className="session-card-exchange-details"
+          aria-label={t('sessions.preview.showFull')}
+          aria-describedby={open ? tooltipId : undefined}
+          aria-expanded={open}
+          onClick={event => {
+            event.stopPropagation();
+          show();
+          }}
+          onFocus={show}
+          onBlur={scheduleHide}
+          onPointerEnter={event => {
+            if (event.pointerType !== 'touch') show();
+          }}
+          onPointerLeave={event => {
+            if (event.pointerType !== 'touch') scheduleHide();
+          }}
+          onKeyDown={event => {
+            if (event.key === 'Escape') hide();
+          }}
+        >
+          <span aria-hidden="true">•••</span>
+        </button>
+      </div>
+      {open && typeof document !== 'undefined' ? createPortal(
+        <div
+          ref={tooltipRef}
+          id={tooltipId}
+          className="session-card-exchange-tooltip"
+          role="tooltip"
+          data-placement={position?.placement ?? 'top'}
+          style={{
+            left: position?.left ?? -10_000,
+            top: position?.top ?? -10_000,
+            visibility: position ? 'visible' : 'hidden',
+          }}
+          onPointerEnter={clearHide}
+          onPointerLeave={event => {
+            if (event.pointerType !== 'touch') scheduleHide();
+          }}
+        >
+          <div className="session-card-exchange-tooltip-scroll">
+            {exchange.userFullText ? (
+              <div className="session-card-exchange-tooltip-line">
+                <span>{t('sessions.history.user')}</span>
+                <p>{exchange.userFullText}</p>
+              </div>
+            ) : null}
+            {exchange.botFullText ? (
+              <div className="session-card-exchange-tooltip-line bot">
+                <span>{t('sessions.history.bot')}</span>
+                <p>{exchange.botFullText}</p>
+              </div>
+            ) : null}
+          </div>
+        </div>,
+        document.body,
+      ) : null}
+    </>
+  );
+}
+
 function BoardCard(props: {
   row: any;
   selected: boolean;
@@ -1013,6 +1204,7 @@ function BoardCard(props: {
   const term = terminalHref(row);
   const signal = boardSignalLabel(row);
   const repo = repoBasename(row.workingDir);
+  const exchange = sessionExchangePreview(row);
   const onCardClick = (event: MouseEvent<HTMLElement>) => {
     const target = event.target as HTMLElement;
     if (target.closest('a, button, input, label')) return;
@@ -1043,6 +1235,7 @@ function BoardCard(props: {
           {signal ? <span className="session-signal" title={signal}>{signal}</span> : null}
         </div>
       ) : null}
+      <SessionExchangePreview exchange={exchange} />
       <div className="session-card-time">
         <span>{row.agentAttention?.at
           ? `${t('sessions.board.waiting')} ${relTime(attentionWaitSince(row))}`

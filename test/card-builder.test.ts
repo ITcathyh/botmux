@@ -17,6 +17,7 @@ import {
   buildSessionClosedCard,
   buildRelayPickerCard,
   buildAdoptSelectCard,
+  buildAdoptBlockedCard,
   buildPrivateSnapshotCard,
   buildConfigCard,
   getCliDisplayName,
@@ -82,6 +83,26 @@ describe('buildAdoptSelectCard', () => {
     const option = card.elements[1].actions[0].options[0].text.content;
     expect(option).toContain('Pi · herdr · collie:w3:p1');
     expect(option).not.toContain('· botmux ·');
+  });
+});
+
+describe('buildAdoptBlockedCard', () => {
+  it('carries a close-session button bound to the session and a repo-select explanation', () => {
+    const card = parse(buildAdoptBlockedCard('om_root', 'sess-123', 'codex', 'en'));
+    const actions = allActions(card);
+    const closeBtn = actions.find((a: any) => a.value?.action === 'close');
+    expect(closeBtn).toBeDefined();
+    expect(closeBtn.type).toBe('danger');
+    expect(closeBtn.value).toMatchObject({ action: 'close', root_id: 'om_root', session_id: 'sess-123', cli_id: 'codex' });
+    // Body must explain the refusal (waiting on repo selection) so the tap is understood.
+    const body = card.elements.map((e: any) => e.content ?? '').join(' ');
+    expect(body.toLowerCase()).toContain('repository');
+  });
+
+  it('defaults cli_id to claude-code when unknown', () => {
+    const card = parse(buildAdoptBlockedCard('om_root', 'sess-9', undefined, 'en'));
+    const closeBtn = allActions(card).find((a: any) => a.value?.action === 'close');
+    expect(closeBtn.value.cli_id).toBe('claude-code');
   });
 });
 
