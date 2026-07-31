@@ -134,7 +134,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 // ─── Imports (must be after mocks) ──────────────────────────────────────────
 
 import { __resetAnchorQueues } from '../src/utils/anchor-serializer.js';
-import { __resetEventClaimsForTest, canOperate, canTalk, decideRouting, ensureBotOpenId, isBotMentioned, mentionsAnotherMember, markForwardFollowupsSessionsReady, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
+import { __resetEventClaimsForTest, __resetChatStatsForTest, canOperate, canTalk, decideRouting, ensureBotOpenId, isBotMentioned, mentionsAnotherMember, markForwardFollowupsSessionsReady, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
 import {
   VC_BOT_MEETING_ACTIVITY_EVENT,
   VC_BOT_MEETING_ENDED_EVENT,
@@ -6552,5 +6552,203 @@ describe('startLarkEventDispatcher — 长连接死后自愈 (reconnect-exhauste
     expect(ws.start).toHaveBeenCalledTimes(1);
 
     vi.useRealTimers();
+  });
+});
+
+describe('1v1 陈旧缓存守门 — 拉新 bot 后 @ 新 bot 时老 bot 不跟回', () => {
+  // 复现并钉住生产投诉:原 1人1bot 群被拉进第二个 bot 后,旧 bot 的
+  // group-stats 缓存仍是 {1,1}（TTL 5min 内）。此刻用户 @ 新 bot,
+  // 旧 bot 误按 solo 放行 → 跟着回复。修复①(solo 判定加 mentionsAnotherMember
+  // 守卫)+②(成员变更事件驱动 invalidateChatStats)共同把窗口压到事件投递秒级,
+  // 且①只影响 never 之外的策略——never 语义由前序条款先行结算,必须原样保留。
+  let handlers: ReturnType<typeof makeHandlers>;
+
+  const CHAT = 'chat-stale-1v1';
+
+  function startStaleOwnedGroup(mentionMode?: 'always' | 'topic' | 'never' | 'ambient') {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], ...(mentionMode ? { regularGroupMentionMode: mentionMode } : {}) });
+    mockGetChatMode.mockResolvedValue('group');
+    // 陈旧现场:真实群已是 1人2bot,但这些调用方拿到的还是 TTL 内的老值。
+    mockGetChatInfo.mockResolvedValue({ userCount: 1, botCount: 1 });
+    handlers.resolveReplyThreadAlias.mockReturnValue(null);
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === CHAT);
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  }
+
+  function atOtherBotEvent(messageId: string, senderOpenId = USER_OPEN_ID) {
+    return makeUserMessageEvent({
+      senderOpenId,
+      content: JSON.stringify({ text: '@BotB 帮我看一下这个问题' }),
+      mentions: [{ key: '@_bot_b', name: 'BotB', id: { open_id: OTHER_BOT_OPEN_ID } }],
+      messageId,
+      chatId: CHAT,
+      chatType: 'group',
+    });
+  }
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    __resetChatStatsForTest();
+    _resetGrantPending();
+    handlers = makeHandlers();
+    mockFindOncallChat.mockReturnValue(undefined);
+    // 本组用例必须亲自摆出陈旧 {1,1};beforeEach 全局默认 {3,1} 不能泄漏进来。
+    mockGetChatInfo.mockReset();
+  });
+
+  it('① 默认 always + 陈旧 {1,1}:@ 别的 bot 时老 bot 静默（ownsSession 也不会触发 solo 放行）', async () => {
+    startStaleOwnedGroup();
+    await capturedHandlers['im.message.receive_v1'](atOtherBotEvent('msg-at-newbot-1'));
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    // @ 了别人时 solo 不可能成立,连人数查询都该省掉(顺带避免顺手刷新陈旧缓存)。
+    expect(mockGetChatInfo).not.toHaveBeenCalled();
+  });
+
+  it('① 无会话路径（checkGroupMessageAccess）:@ 别的 bot 同样不被陈旧 {1,1} 误放行', async () => {
+    startStaleOwnedGroup();
+    handlers.isSessionOwner.mockReturnValue(false); // 老 bot 在此群还没有会话
+
+    // 第一条纯文本:真·1v1 时代的老 bot 会直接开工（此调用把 {1,1} 写入缓存）。
+    await capturedHandlers['im.message.receive_v1'](makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'hi bot' }),
+      messageId: 'msg-plain-opens-1',
+      chatId: CHAT,
+      chatType: 'group',
+    }));
+    await flushEventWork();
+    expect(handlers.handleNewTopic).toHaveBeenCalledTimes(1);
+
+    // 拉了新 bot 之后(CLI 侧这里仍是同一老缓存 key),用户 @ 新 bot:
+    await capturedHandlers['im.message.receive_v1'](atOtherBotEvent('msg-at-newbot-2'));
+    await flushEventWork();
+    expect(handlers.handleNewTopic).toHaveBeenCalledTimes(1); // 没有第二次放行
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    // @ 了别人时连人数查询都省掉——getChatInfo 全程只在第一条真·solo 消息时调过一次。
+    expect(mockGetChatInfo).toHaveBeenCalledTimes(1);
+  });
+
+  it('① 遵循 dashboard「群聊 @ 策略」:never 模式下 @ 别的 bot 依旧应答', async () => {
+    startStaleOwnedGroup('never');
+    await capturedHandlers['im.message.receive_v1'](atOtherBotEvent('msg-at-newbot-never'));
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      anchor: CHAT,
+      larkAppId: MY_APP_ID,
+    }));
+    // never 语义不依赖人数:根本不发起 stats 查询。
+    expect(mockGetChatInfo).not.toHaveBeenCalled();
+  });
+
+  it('② bot.added 事件让陈旧 {1,1} 立刻失效:下一条纯文本消息按新鲜人数判定', async () => {
+    startStaleOwnedGroup(); // 首次判定后缓存 {1,1}(模拟拉新 bot 前的热缓存)
+
+    await capturedHandlers['im.message.receive_v1'](makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'continue please' }),
+      messageId: 'msg-before-add',
+      chatId: CHAT,
+      chatType: 'group',
+    }));
+    await flushEventWork();
+    expect(handlers.handleThreadReply).toHaveBeenCalledTimes(1); // 真·1v1 时代放行
+    expect(mockGetChatInfo).toHaveBeenCalledTimes(1);
+
+    // 用户把第二个 bot 拉进群 —— 事件到达老 bot 的 dispatcher:
+    capturedHandlers['im.chat.member.bot.added_v1']({
+      chat_id: CHAT,
+      operator_id: { open_id: USER_OPEN_ID },
+    });
+    // 飞书侧真实人数变化:
+    mockGetChatInfo.mockResolvedValue({ userCount: 1, botCount: 2 });
+
+    await capturedHandlers['im.message.receive_v1'](makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'another plain message' }),
+      messageId: 'msg-after-add',
+      chatId: CHAT,
+      chatType: 'group',
+    }));
+    await flushEventWork();
+
+    // 失效→重查→{1,2}→不再按 solo 放行;没有失效的话会命中陈旧 {1,1} 继续回复。
+    expect(handlers.handleThreadReply).toHaveBeenCalledTimes(1);
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(mockGetChatInfo).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    'im.chat.member.bot.deleted_v1',
+    'im.chat.member.user.added_v1',
+    'im.chat.member.user.deleted_v1',
+  ] as const)('② %s 事件同样失效 group-stats 缓存', async (eventName) => {
+    // fresh 值只需满足「非 solo」来证明判定用了新数,不必模拟各事件的真实增减方向。
+    const freshStats = { userCount: 2, botCount: 1 };
+    startStaleOwnedGroup();
+
+    await capturedHandlers['im.message.receive_v1'](makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'seed the cache' }),
+      messageId: `msg-seed-${eventName}`,
+      chatId: CHAT,
+      chatType: 'group',
+    }));
+    await flushEventWork();
+    expect(handlers.handleThreadReply).toHaveBeenCalledTimes(1);
+
+    expect(capturedHandlers[eventName]).toBeTypeOf('function');
+    capturedHandlers[eventName]({ chat_id: CHAT, operator_id: { open_id: USER_OPEN_ID } });
+    mockGetChatInfo.mockResolvedValue(freshStats);
+
+    await capturedHandlers['im.message.receive_v1'](makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'post-change plain text' }),
+      messageId: `msg-post-${eventName}`,
+      chatId: CHAT,
+      chatType: 'group',
+    }));
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledTimes(1);
+    expect(mockGetChatInfo).toHaveBeenCalledTimes(2);
+  });
+
+  it('② 发在别的群的成员事件不误伤本群缓存（按 larkAppId:chatId 精确失效）', async () => {
+    startStaleOwnedGroup();
+
+    await capturedHandlers['im.message.receive_v1'](makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'seed' }),
+      messageId: 'msg-seed-otherchat',
+      chatId: CHAT,
+      chatType: 'group',
+    }));
+    await flushEventWork();
+    expect(handlers.handleThreadReply).toHaveBeenCalledTimes(1);
+
+    // 别的群加了 bot —— 只清那个群的缓存:
+    capturedHandlers['im.chat.member.bot.added_v1']({
+      chat_id: 'chat-unrelated',
+      operator_id: { open_id: USER_OPEN_ID },
+    });
+
+    await capturedHandlers['im.message.receive_v1'](makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'still 1v1 here' }),
+      messageId: 'msg-after-otherchat',
+      chatId: CHAT,
+      chatType: 'group',
+    }));
+    await flushEventWork();
+
+    // 本群缓存命中(没有多余重查),仍按 1v1 放行。
+    expect(handlers.handleThreadReply).toHaveBeenCalledTimes(2);
+    expect(mockGetChatInfo).toHaveBeenCalledTimes(1);
   });
 });

@@ -763,6 +763,24 @@ export async function getGroupStats(larkAppId: string, chatId: string): Promise<
   }
 }
 
+/**
+ * Drop the cached group stats for one chat — called when a membership-change
+ * event arrives, so the 1v1 relax gate sees fresh counts on the very next
+ * message instead of coasting on stale numbers for up to CHAT_CACHE_TTL.
+ * Without this, "拉了新 bot 进 1V1 群" 后最多 5 分钟内老 bot 仍把群当成 solo,
+ * 对不 @ 自己的消息继续应答。TTL 继续保留,作为事件未订阅（老应用）时的兜底。
+ */
+export function invalidateChatStats(larkAppId: string, chatId: string): void {
+  if (chatStatsCache.delete(`${larkAppId}:${chatId}`)) {
+    logger.debug(`[group-stats] invalidated cached stats for ${chatId} (${larkAppId}): membership changed`);
+  }
+}
+
+/** Test-only: clear the group-stats cache between cases. */
+export function __resetChatStatsForTest(): void {
+  chatStatsCache.clear();
+}
+
 // ─── Cross-bot open_id mapping ──────────────────────────────────────────
 //
 // Lark open_id is per-app scoped: Bot A sees a different open_id for Bot B
@@ -1419,7 +1437,13 @@ export async function checkGroupMessageAccess(
   // No @mention — only allow if sender is the sole human in the group
   // AND this is the only bot in the chat. With multiple bots, require @mention
   // to disambiguate.
-  if (isAllowed) {
+  //
+  // 若消息 @ 了别的具体成员（mentionsAnotherMember），群必然不是 1人1bot——
+  // 只有群成员能被 @，多出的那个 @ 本身就是人数变化的证据。上游可能还抱着
+  // 陈旧缓存 {1,1}（刚拉了新 bot 的 TTL 窗口），这会直接跳过人数查询落到
+  // 'ignore'，挡住「用户 @ 新 bot、老 bot 跟着回复」。群聊 @ 策略 never/ambient
+  // 在调用方（relax 条款）已先行结算，这里不受影响。
+  if (isAllowed && !mentionsAnotherMember(larkAppId, message)) {
     const { userCount, botCount } = await getGroupStats(larkAppId, chatId);
     logger.debug(`Group user count: ${userCount}, bot count: ${botCount}`);
     if (userCount <= 1 && botCount <= 1) {
@@ -2764,8 +2788,16 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       //   !ownsSession (group)    → require @mention + allowlist
       //   p2p                     → allowlist only
       if (chatType === 'group') {
+        const mentionMode = resolveGroupMentionMode(larkAppId);
+        // 消息里 @ 了别的具体成员,就已经证明群不是 1人1bot（只有群成员能被 @）——
+        // 此刻末条 solo 放行必然不成立,而 stats 只被末条消费,直接跳过这次（可能
+        // 昂贵的）人数查询。这在「刚拉了新 bot、用户 @ 新 bot」窗口里尤为重要：
+        // 拦截老 bot 的同时不再为它反复刷新陈旧缓存。
+        const mentionsOther = mentionsAnotherMember(larkAppId, message);
         let stats: { userCount: number; botCount: number } | null = null;
-        if (ownsSession && !replyRootId) stats = await getGroupStats(larkAppId, chatId);
+        if (ownsSession && !replyRootId && !mentionsOther && mentionMode !== 'never') {
+          stats = await getGroupStats(larkAppId, chatId);
+        }
         // replyRootId means this turn has already been explicitly addressed
         // to the bot by shared-topic logic (possibly from inside an existing
         // Lark thread). Do not re-run the generic group @ gate, which would
@@ -2790,8 +2822,8 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         //     treat it as a hand-off and stay quiet.
         // Both gated on isAllowed so restricted groups still only react to
         // permitted senders. (The shared fold-back's replyRootId is already
-        // handled by the first clause.)
-        const mentionMode = resolveGroupMentionMode(larkAppId);
+        // handled by the first clause. `mentionMode` 已在块首解析,用于 stats
+        // 惰性获取。)
         // 话题群 owned-topic 免@续话不再无条件放行（#336 引入的默认行为回归：
         // 多人群里旁人不 @ 也会触发 bot）。现在与普通群共用同一套「群聊 @ 策略」:
         // 默认 'always' 在多人群里必须 @，想要话题内免@续话就把 mentionMode 配成
@@ -2800,12 +2832,16 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // 注：pairedForwardSeed 仅在 never/ambient 模式下产生，且 ambient redirect
         // 已在配对前排除，故 isAllowed=true 时下方 never/ambient 条款必然放行；
         // 不在此单独加 clause，以免 isAllowed=false 时绕过权限检查。
+        // 末条 solo 放行另有 `!mentionsOther` 守卫：消息 @ 了别的具体成员时,
+        // 群必然不是 1人1bot（只有群成员能被 @），且是指给别人的——拦住「刚拉新 bot、
+        // 缓存仍是陈旧 {1,1} 时老 bot 跟着回复」的误放行。never 条款在前已短路,
+        // 故该守卫不影响「群聊 @ 策略」配置的 never 语义。
         const relax = (!!replyRootId && isAllowed)
           || (!!substituteTrigger && isAllowed)
           || (isAllowed && mentionMode === 'never')
-          || (isAllowed && mentionMode === 'ambient' && !mentionsAnotherMember(larkAppId, message))
-          || (isAllowed && mentionMode === 'topic' && ownsSession && !!message.thread_id && !mentionsAnotherMember(larkAppId, message))
-          || (ownsSession && isAllowed && !!stats && stats.userCount <= 1 && stats.botCount <= 1);
+          || (isAllowed && mentionMode === 'ambient' && !mentionsOther)
+          || (isAllowed && mentionMode === 'topic' && ownsSession && !!message.thread_id && !mentionsOther)
+          || (ownsSession && isAllowed && !!stats && !mentionsOther && stats.userCount <= 1 && stats.botCount <= 1);
         if (!relax) {
           const access = await checkGroupMessageAccess(larkAppId, message, chatId, senderOpenId, humanSenderUnionId);
           if (access === 'not_allowed') {
@@ -2957,6 +2993,9 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       const chatIdForKey: string | undefined = data?.chat_id;
       const operatorForKey: string | undefined = data?.operator_id?.open_id;
       const eventKey = `im.chat.member.bot.added_v1:${larkAppId}:${eventIdForKey(data) ?? `${chatIdForKey ?? 'unknown'}:${operatorForKey ?? 'unknown'}`}`;
+      // 无论是本 bot 还是别的 bot 被拉进群，bot_count 都变了——先同步失效
+      // group-stats 缓存,让 1v1 放行在下一条消息就用新鲜人数,不等 TTL。
+      if (chatIdForKey) invalidateChatStats(larkAppId, chatIdForKey);
       scheduleAckSafeEvent(eventKey, async () => {
       try {
         const chatId: string | undefined = data?.chat_id;
@@ -2968,6 +3007,23 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         logger.error(`Error handling bot-added event: ${err}`);
       }
       }, 'bot-added event');
+    },
+    // 成员数变化的其余事件同样只做一件事：失效 group-stats 缓存（见
+    // invalidateChatStats 注释）。纯本地 map 删除,同步处理、即时 ACK,
+    // 不进 scheduleAckSafeEvent 的 work 队列;去重也不必要——失效是幂等的,
+    // 重推只是多删一次不存在的 key。bot.deleted 早已在基线订阅列表里,
+    // user.added/deleted 属尽力而为的可选订阅（老应用可能没订阅,靠 TTL 兜底）。
+    'im.chat.member.bot.deleted_v1': (data: any) => {
+      const chatId: string | undefined = data?.chat_id;
+      if (chatId) invalidateChatStats(larkAppId, chatId);
+    },
+    'im.chat.member.user.added_v1': (data: any) => {
+      const chatId: string | undefined = data?.chat_id;
+      if (chatId) invalidateChatStats(larkAppId, chatId);
+    },
+    'im.chat.member.user.deleted_v1': (data: any) => {
+      const chatId: string | undefined = data?.chat_id;
+      if (chatId) invalidateChatStats(larkAppId, chatId);
     },
     // 文档评论入口（/watch-comment / /subscribe-lark-doc）。notice 事件主要覆盖 @Bot
     // 通知；普通评论由 daemon 应用身份轮询补齐，不依赖逐文件 subscribe API。
