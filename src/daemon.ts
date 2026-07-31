@@ -4365,6 +4365,42 @@ async function deliverCodexNotifierEvent(
   }
 }
 
+/**
+ * Fully retire an in-memory repo-select placeholder when the Codex-notifier
+ * 「继续处理」callback takes over the DM session. The legacy inline clear only
+ * reset six fields and left `repoCardMessageId`, `pendingFollowUps`,
+ * `pendingRepoCommitInFlight`, `worktreeCreating`, attachments, mentions, raw
+ * input, etc. behind — a stale repo-card click or a late auto-worktree
+ * completion could then act on the just-adopted session. Clear the whole
+ * pending-repo surface so no residue survives the takeover. Buffered user input
+ * is dropped here — the drop is terminal (never rolled back, since concurrent
+ * background tasks may already have observed pendingRepo=false); the caller
+ * tells the user their input was cancelled on both the success and failure card.
+ */
+function clearPendingRepoStateForNotifierAdopt(ds: DaemonSession): void {
+  ds.pendingRepo = false;
+  ds.pendingRepoCommitInFlight = false;
+  ds.worktreeCreating = false;
+  ds.repoCardMessageId = undefined;
+  ds.pendingPrompt = undefined;
+  ds.pendingTurnId = undefined;
+  ds.pendingRawInput = undefined;
+  ds.pendingRawTurnId = undefined;
+  ds.pendingFollowUpInput = undefined;
+  ds.pendingAttachments = undefined;
+  ds.pendingMentions = undefined;
+  ds.pendingSubstituteTrigger = undefined;
+  ds.pendingSubstituteControlCard = undefined;
+  ds.pendingSender = undefined;
+  ds.pendingFollowUps = undefined;
+  ds.pendingFollowUpTurnId = undefined;
+  ds.pendingCodexAppText = undefined;
+  ds.pendingCodexAppApplicationContext = undefined;
+  ds.pendingCodexAppMessageContext = undefined;
+  ds.pendingCodexAppFollowUps = undefined;
+  ds.pendingCodexAppFollowUpContexts = undefined;
+}
+
 async function adoptCodexNotifierEvent(
   larkAppId: string,
   event: CodexTaskCompletedEvent,
@@ -4426,7 +4462,15 @@ async function adoptCodexNotifierEvent(
     }
   }
 
+  let bufferedInputDropped = false;
   if (ds.session.cliSessionId !== event.threadId || !ds.worker || ds.worker.killed) {
+    // Do the two throwable, deadline-sensitive steps FIRST, before mutating any
+    // session/pending state: the dynamic import and the 2.2s AbortSignal check.
+    // If either fails here nothing has been touched, so no rollback is needed
+    // and the buffered repo-select input is left intact for a retry.
+    const { startCodexAppThreadSession } = await import('./core/command-handler.js');
+    signal.throwIfAborted();
+
     // 接管原生 Codex App 线程时固定为纯 codex-app 启动，不能继承通知 Bot 的
     // wrapper/model；这些配置针对普通 CLI，会错误包装 app-server runner。
     ds.session.cliId = 'codex-app';
@@ -4435,12 +4479,29 @@ async function adoptCodexNotifierEvent(
     delete ds.session.model;
     ds.session.agentFrozen = true;
     sessionStore.updateSession(ds.session);
-    ds.pendingRepo = false;
-    ds.pendingPrompt = undefined;
-    ds.pendingTurnId = undefined;
-    ds.pendingCodexAppText = undefined;
-    ds.pendingCodexAppApplicationContext = undefined;
-    ds.pendingCodexAppMessageContext = undefined;
+
+    // 默认 flat DM(p2pMode=chat)下这条按钮回调复用同一私聊的现有会话。若该会话
+    // 恰好停在「待选仓库」挂起态且已缓冲一条尚未提交的输入，接管会消费掉
+    // pendingRepo(#669 的守卫要求接管前 pendingRepo 必须为 false)。旧逻辑只清了
+    // 部分字段并静默丢弃缓冲输入。这里完整清空全部 pending 状态(否则残留的
+    // repoCardMessageId/pendingFollowUps/worktreeCreating 等会让旧选仓卡二次点击、
+    // 迟到 auto-worktree 完成误操作已接管会话——见 runAutoWorktreeCommit 的
+    // pendingRepo 护栏),并记录「缓冲输入已丢弃」以便如实告知用户。
+    //
+    // 不做 pending 快照回滚:clear 之后 startCodexAppThreadSession 的 async guard
+    // 会让出微任务,迟到 auto-worktree / 正在 prepare 的 commit 可能已观察到
+    // pendingRepo=false 而正常结束并在 finally 清掉 in-flight 标志;此时若把
+    // pendingRepo=true/worktreeCreating=true 快照复活,后台任务已不在,会话会永久
+    // 卡在「正在创建/提交」。因此丢弃一旦发布即为终态——用「取消并请重发」的显式
+    // 语义告知用户,而非假装能恢复。
+    bufferedInputDropped = ds.pendingRepo === true && (
+      (ds.pendingPrompt?.trim().length ?? 0) > 0
+      || (ds.pendingFollowUps?.length ?? 0) > 0
+      || (ds.pendingAttachments?.length ?? 0) > 0
+      || (ds.pendingRawInput?.trim().length ?? 0) > 0
+      || (ds.pendingCodexAppText?.trim().length ?? 0) > 0
+    );
+    clearPendingRepoStateForNotifierAdopt(ds);
 
     // 完成事件已经携带恢复所需的原生 threadId/cwd。按钮回调不再额外启动一次
     // app-server 做非必要的元数据刷新，避免子进程把飞书回调拖过截止时间。
@@ -4452,28 +4513,40 @@ async function adoptCodexNotifierEvent(
       status: event.status,
     };
 
-    const { startCodexAppThreadSession } = await import('./core/command-handler.js');
-    signal.throwIfAborted();
-    await startCodexNotifierAdoptionSession(
-      startCodexAppThreadSession,
-      target,
-      ds,
-      {
-        activeSessions,
-        sessionReply,
-        getActiveCount,
-        lastRepoScan,
-      },
-      larkAppId,
-      cardMessageId,
-    );
+    try {
+      await startCodexNotifierAdoptionSession(
+        startCodexAppThreadSession,
+        target,
+        ds,
+        {
+          activeSessions,
+          sessionReply,
+          getActiveCount,
+          lastRepoScan,
+        },
+        larkAppId,
+        cardMessageId,
+      );
+    } catch (err) {
+      // 接管失败/超时:pending 已清空且不回滚(见上)。若曾丢弃过缓冲输入,把「已取消、
+      // 请重发」前置到抛给外层的错误里——外层用它渲染失败卡,用户就不会以为原消息还
+      // 在队列里等着(否则失败卡只说"接管失败请重试",缓冲却已没了=静默丢失)。
+      if (bufferedInputDropped) {
+        const detail = err instanceof Error ? err.message : String(err);
+        throw new Error(`你在选择仓库前输入的消息已取消，请在接管成功后重新发送。（接管未完成：${detail}）`);
+      }
+      throw err;
+    }
   }
 
+  const baseAdoptNotice = scope === 'chat'
+    ? '现在可以直接在当前私聊继续发送指令；需要操作终端时，请点击会话卡内的「获取操作链接」。'
+    : '请在本卡片的话题中继续发送指令；需要操作终端时，请点击话题会话卡内的「获取操作链接」。';
   return buildCodexNotifierResultCard(
     '已接管 Codex App 任务',
-    scope === 'chat'
-      ? '现在可以直接在当前私聊继续发送指令；需要操作终端时，请点击会话卡内的「获取操作链接」。'
-      : '请在本卡片的话题中继续发送指令；需要操作终端时，请点击话题会话卡内的「获取操作链接」。',
+    bufferedInputDropped
+      ? `⚠️ 你在选择仓库前输入的消息未随本次接管发送，请重新发送一次。\n\n${baseAdoptNotice}`
+      : baseAdoptNotice,
     'green',
   );
 }

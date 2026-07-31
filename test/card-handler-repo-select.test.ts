@@ -120,6 +120,10 @@ vi.mock('../src/services/worktree-slug-ai.js', () => ({
   }),
 }));
 
+vi.mock('../src/services/default-worktree.js', () => ({
+  maybeCreateDefaultWorktree: vi.fn(async (_appId: string, baseDir: string) => ({ dir: `${baseDir}-wt` })),
+}));
+
 vi.mock('@larksuiteoapi/node-sdk', () => ({
   Client: class { constructor() {} },
   WSClient: class { start() {} },
@@ -129,12 +133,13 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 
 // ─── Imports ──────────────────────────────────────────────────────────────
 
-import { handleCardAction, type CardHandlerDeps } from '../src/im/lark/card-handler.js';
+import { handleCardAction, runAutoWorktreeCommit, type CardHandlerDeps } from '../src/im/lark/card-handler.js';
 import { forkWorker, killWorker, teardownAuthoritativePersistentBackingBeforeClose, deliverEphemeralOrReply, deliverWriteLinkCard } from '../src/core/worker-pool.js';
 import { buildNewTopicCliInput, getAvailableBots, getSessionWorkingDir } from '../src/core/session-manager.js';
 import { getBot } from '../src/bot-registry.js';
 import { createSession, closeSession, updateSession } from '../src/services/session-store.js';
 import { createRepoWorktree, pushWorktreeBranch, removeRepoWorktree } from '../src/services/git-worktree.js';
+import { maybeCreateDefaultWorktree } from '../src/services/default-worktree.js';
 import { applyConfigField } from '../src/services/bot-config-store.js';
 import { deleteMessage } from '../src/im/lark/client.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
@@ -927,6 +932,37 @@ describe('repo select card — plain switch', () => {
 });
 
 describe('repo select card — worktree open', () => {
+  it('runAutoWorktreeCommit bails when pendingRepo was consumed mid-build (e.g. notifier adopt)', async () => {
+    // A takeover (Codex-notifier「继续处理」, etc.) can consume pendingRepo while
+    // the up-to-30s worktree build runs. The late completion must NOT funnel into
+    // commitRepoSelection and kill+replace the just-adopted session.
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: { killed: false } as any });
+    const { deps } = makeDeps(ds);
+    const d = deferred<{ dir: string }>();
+    vi.mocked(maybeCreateDefaultWorktree).mockReturnValueOnce(d.promise as any);
+
+    const run = runAutoWorktreeCommit({
+      ds,
+      anchor: ROOT_ID,
+      larkAppId: APP_ID,
+      baseDir: '/repos/alpha',
+      activeSessions: deps.activeSessions,
+      notify: vi.fn(),
+    });
+    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(true));
+
+    // Simulate the takeover consuming pendingRepo while git runs.
+    ds.pendingRepo = false;
+    d.resolve({ dir: '/repos/alpha-wt' });
+    await run;
+
+    // Guard fired: no commit, no fork/kill, workingDir untouched.
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(killWorker).not.toHaveBeenCalled();
+    expect(ds.workingDir).toBeUndefined();
+    expect(ds.worktreeCreating).toBe(false);
+  });
+
   it('double click starts ONE background creation and commits once', async () => {
     const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
     const { deps, sessionReply } = makeDeps(ds);
