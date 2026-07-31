@@ -193,7 +193,16 @@ export async function tryHandleInviteCommand(
   const ambiguous: string[] = [];
 
   for (const tgt of mentionTargets) {
-    if (rosterOpenIds.has(tgt.openId)) { already.push(tgt.name); continue; }
+    // 已在群内：open_id 命中 live 成员表即跳过（app_id 形态目标无 open_id，靠下方 appId 分支的 rosterAppIds 判定）。
+    if (tgt.openId && rosterOpenIds.has(tgt.openId)) { already.push(tgt.name); continue; }
+    // 目标 mention 自带 app_id（飞书对「群外 bot」的 @ 形态）→ app_id 就是待拉 id，
+    // 直接用，跳过名字→花名册解析（更可靠，规避重名/查无）。
+    if (tgt.appId) {
+      if (tgt.appId === larkAppId || rosterAppIds.has(tgt.appId)) already.push(tgt.name);
+      else if (!toInvite.includes(tgt.appId)) toInvite.push(tgt.appId);
+      continue;
+    }
+    // 仅有 open_id（无 app_id）：按显示名查部署花名册解析出 app_id。
     const candidates = tgt.name ? (byLowerName.get(tgt.name.toLowerCase()) ?? []) : [];
     if (candidates.length === 1) {
       const appId = candidates[0].larkAppId;

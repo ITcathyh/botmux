@@ -13,12 +13,21 @@
  * 从 grant-command.ts 提炼泛化（2026-07 /invite 落地时）；grant 的对外导出
  * （parseGrantTargets / isGrantTargetOnly / stripAllMentions）保持原样委托到这里。
  */
-import { mentionOpenId } from './message-parser.js';
+import { mentionOpenId, mentionIdentity } from './message-parser.js';
 
 /** 命令正则必须带 `\b` 边界、不带 g 标志（exec/index 语义依赖）。 */
 export type CommandPattern = RegExp;
 
-export interface MentionTarget { openId: string; name: string }
+/**
+ * `openId`：mention 的 open_id（可能为空——飞书用 `{id_type:'app_id', id:'cli_xxx'}`
+ * 形态标识**群外 bot**，此时无 open_id，见 message-parser 的 mentionOpenId 注释）。
+ * `appId`：mention 的 app_id（仅 app_id 形态 mention 才有）。
+ * 二者至少有一个非空该 target 才被收录（/invite 拉群外 bot 主场景恰恰只有 appId）。
+ * /grant 只消费 openId（授权对象必须是 open_id 主体），app_id-only 目标由
+ * parseGrantTargets 过滤掉——grant 行为与历史 byte-parity（app_id 形态过去被
+ * mentionOpenId 直接 drop，本就不在 grant 目标里）。
+ */
+export interface MentionTarget { openId: string; name: string; appId?: string }
 
 /**
  * 从 mention 列表取「cmdPattern 匹配的命令词之后」出现的所有非本 bot @，按
@@ -45,10 +54,11 @@ export function parseTargetsAfterCommand(
   const seen = new Set<string>();
   const out: MentionTarget[] = [];
   for (const x of (message?.mentions ?? [])) {
-    const oid = mentionOpenId(x);
-    if (!oid || oid === botOpenId || seen.has(oid)) continue;
-    seen.add(oid);
-    out.push({ openId: oid, name: x.name ?? oid });
+    const { openId: oid, appId } = mentionIdentity(x);
+    const dedup = oid || appId;                 // app_id 形态无 open_id，用 appId 去重
+    if (!dedup || oid === botOpenId || appId === botOpenId || seen.has(dedup)) continue;
+    seen.add(dedup);
+    out.push({ openId: oid ?? '', name: x.name ?? oid ?? appId ?? '', appId });
   }
   return out;
 }
@@ -63,15 +73,16 @@ function parseTextTargetsAfterCommand(
   const seen = new Set<string>();
   const out: MentionTarget[] = [];
   for (const m of mentions) {
-    const oid = mentionOpenId(m);
-    if (!oid || oid === botOpenId || seen.has(oid)) continue;
+    const { openId: oid, appId } = mentionIdentity(m);
+    const dedup = oid || appId;                 // app_id 形态（群外 bot）无 open_id，用 appId 去重
+    if (!dedup || oid === botOpenId || appId === botOpenId || seen.has(dedup)) continue;
     const key = m?.key;
     if (cmdIdx >= 0 && typeof key === 'string' && key.length > 0) {
       const km = new RegExp(`${escapeRe(key)}(?!\\d)`).exec(text);
       if (km && km.index <= cmdIdx) continue;   // 命令词之前 = 操作 bot 点名，剔除
     }
-    seen.add(oid);
-    out.push({ openId: oid, name: m.name ?? oid });
+    seen.add(dedup);
+    out.push({ openId: oid ?? '', name: m.name ?? oid ?? appId ?? '', appId });
   }
   return out;
 }
@@ -87,20 +98,23 @@ function parsePostAtMentions(message: any, botOpenId: string | undefined, cmdPat
   if (!Array.isArray(inner?.content)) return out;
   // 先定位命令词文本节点的序号，再只收其后的 at 节点。
   let seq = 0, cmdSeq = -1;
-  const ats: Array<{ oid: string; name: string; seq: number }> = [];
+  const ats: Array<{ id: string; name: string; seq: number }> = [];
   for (const para of inner.content) {
     if (!Array.isArray(para)) continue;
     for (const node of para) {
       if (cmdSeq < 0 && node?.tag === 'text' && cmdPattern.test(node.text ?? '')) cmdSeq = seq;
-      if (node?.tag === 'at' && node.user_id) ats.push({ oid: node.user_id, name: node.user_name ?? node.user_id, seq });
+      if (node?.tag === 'at' && node.user_id) ats.push({ id: node.user_id, name: node.user_name ?? node.user_id, seq });
       seq++;
     }
   }
   for (const a of ats) {
-    if (a.oid === botOpenId || seen.has(a.oid)) continue;
+    if (a.id === botOpenId || seen.has(a.id)) continue;
     if (cmdSeq >= 0 && a.seq <= cmdSeq) continue;   // 命令词之前 = 操作 bot 点名，剔除
-    seen.add(a.oid);
-    out.push({ openId: a.oid, name: a.name });
+    seen.add(a.id);
+    // 群外 bot 的 at 节点 user_id 是 `cli_` 前缀 app_id（open_id 恒为 `ou_`，不冲突）→
+    // 归到 appId 让 /invite 直接拿去拉人；否则按 open_id（/grant、群内 bot）。
+    const isAppId = /^cli_/.test(a.id);
+    out.push(isAppId ? { openId: '', name: a.name, appId: a.id } : { openId: a.id, name: a.name });
   }
   return out;
 }

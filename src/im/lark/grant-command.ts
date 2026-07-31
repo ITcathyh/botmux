@@ -33,7 +33,12 @@ const GRANT_CMD_PATTERN = /\/(?:grant|revoke)\b/i;
  *  纯 mentions 的合成消息（无 content.text）退回历史「全部非本 bot」行为。
  *  实现在 mention-targets.ts（与 /invite 共享）。 */
 export function parseGrantTargets(message: any, botOpenId: string | undefined): Array<{ openId: string; name: string }> {
-  return parseTargetsAfterCommand(message, botOpenId, GRANT_CMD_PATTERN);
+  // /grant 只接受 open_id 主体（授权对象是人 / 群内 bot）。共享解析器现在也收
+  // app_id-only 的 mention（/invite 拉群外 bot 用），但那种目标对授权无意义且过去
+  // 就被 mentionOpenId 直接 drop——过滤掉 openId 为空的项，保持 grant 行为 byte-parity。
+  return parseTargetsAfterCommand(message, botOpenId, GRANT_CMD_PATTERN)
+    .filter(t => t.openId)
+    .map(t => ({ openId: t.openId, name: t.name }));
 }
 
 /** 取第一个非本 bot 的目标（单目标场景的便捷封装）。 */
