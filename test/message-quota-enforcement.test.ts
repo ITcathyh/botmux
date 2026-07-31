@@ -60,6 +60,12 @@ vi.mock('../src/im/lark/client.js', async () => {
   };
 });
 
+// 团队拉群（bot 免 /grant 的信任根）。只把 oc_team_group 标成拉群，其余不变。
+vi.mock('../src/services/team-groups-store.js', async () => {
+  const actual = await vi.importActual<any>('../src/services/team-groups-store.js');
+  return { ...actual, isTeamGroupChat: (_dataDir: string, chatId?: string) => chatId === 'oc_team_group' };
+});
+
 import { registerBot } from '../src/bot-registry.js';
 import { parseSlashCommandInvocation } from '../src/core/command-handler.js';
 import { enforceMessageQuotaForCliInput, grantRestrictedCommandText, grantRestrictedSlashCommandText } from '../src/daemon.js';
@@ -94,6 +100,29 @@ describe('message quota enforcement', () => {
       .resolves.toBe(true);
     expect(mocks.beginCharge).not.toHaveBeenCalled();
     expect(mocks.consumeQuota).not.toHaveBeenCalled();
+  });
+
+  it('bot 发送方走 evaluateBotTalk：团队拉群里没带 union_id 也不被这道复查丢掉', async () => {
+    // 端到端断点（#332 同款的最后一截）：dispatcher 外层用 evaluateBotTalk 放行了
+    // 「团队拉群 + sender 没带 union_id」的 bot，这里若仍用 evaluateTalk 就会静默丢弃
+    // ——比弹授权卡更糟，owner 以为放行了、消息凭空消失。两道闸必须同一个谓词。
+    await expect(
+      enforceMessageQuotaForCliInput(
+        'quota_app', 'oc_team_group', 'ou_foreign_bot', 'om_bot_no_union', 'om_anchor',
+        undefined, undefined, 'group', true,
+      ),
+    ).resolves.toBe(true);
+  });
+
+  it('同一条消息不标 bot（人的路径）仍按 evaluateTalk 拦下——团队拉群不放行真人', async () => {
+    // 反向锁：证明放行来自 botSender 这一腿，而不是把闸门整体放宽了。
+    // 团队拉群对真人不是 talk 来源（真人走 teamMember 腿，要 union 在团队成员名单里）。
+    await expect(
+      enforceMessageQuotaForCliInput(
+        'quota_app', 'oc_team_group', 'ou_human', 'om_human_no_union', 'om_anchor',
+        undefined, undefined, 'group',
+      ),
+    ).resolves.toBe(false);
   });
 
   it('renders grant restriction text only for restricted per-user grantees', () => {

@@ -316,7 +316,7 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
   try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
-import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, grantCommandRestriction, isKnownPeerBot, checkRequiredScopes, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, grantCommandRestriction, isKnownPeerBot, checkRequiredScopes, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
 import { getDocSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, removeDocSubscription, setDocCommentPollCursor, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync } from './im/lark/identity-cache.js';
@@ -2861,12 +2861,21 @@ export async function enforceMessageQuotaForCliInput(
   senderUnionId?: string,
   memberUnionId?: string,
   chatType?: 'group' | 'p2p',
+  botSender?: boolean,
 ): Promise<boolean> {
   // senderUnionId（bot-locked）让 evaluateTalk 认出跨部署团队 peer bot（teamBot 腿）；
   // memberUnionId（可为真人 union）走 teamMember 腿——否则外部闸门/群闸门放进来的
   // 团队 bot 或团队成员消息会在这里复查处被静默丢弃（#332 端到端断点，人腿同理）。
   // chatType 同理：不传的话，p2pOpen 放行的私聊消息会在这道复查里被丢掉（同一个断点）。
-  const ev = evaluateTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId, chatType);
+  //
+  // botSender：这条消息的发送方是飞书盖章的 bot（sender_type ∈ app|bot，或 cross-ref
+  // 认识的自家 peer）。命中时必须与 dispatcher 的外层闸用**同一个谓词** evaluateBotTalk，
+  // 否则「团队拉群 + sender 没带 union_id」这条路径会外层放行、这里静默丢弃——比弹卡
+  // 更糟：owner 以为授权生效了，消息凭空消失（#332 同款断点的最后一截）。
+  // 不传（人的路径）→ 原样走 evaluateTalk，语义不变。
+  const ev = botSender
+    ? evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId)
+    : evaluateTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId, chatType);
   if (!ev.allowed) {
     logger.debug(`[quota:${larkAppId}] dropping message ${messageId.substring(0, 12)} from non-allowed sender ${senderOpenId?.substring(0, 12) ?? '?'}`);
     return false;
@@ -3297,6 +3306,8 @@ interface V3SavedWorkflowImInvocation {
   teamTrustUnionId?: string;
   /** Raw sender union_id may independently grant the configured teamMember leg. */
   memberUnionId?: string;
+  /** 发起方是飞书盖章的 bot → talk 复查走 evaluateBotTalk（与 dispatcher 外层同源）。 */
+  botSender?: boolean;
 }
 
 const v3DistillationGenerationInFlight = new Map<string, Promise<void>>();
@@ -3522,6 +3533,7 @@ async function handleV3SavedWorkflowCommandIfAny(
     initiatorOpenId,
     teamTrustUnionId,
     memberUnionId,
+    botSender,
   } = invocation;
   const command = parseV3SavedWorkflowCommand(content);
   if (!command) return false;
@@ -3575,6 +3587,7 @@ async function handleV3SavedWorkflowCommandIfAny(
       teamTrustUnionId,
       memberUnionId,
       chatType,
+      botSender,
     ),
   });
   if (!policy.ok) {
@@ -14892,12 +14905,14 @@ async function startInitialPassthroughSession(args: {
   ownerOpenId: string | undefined;
   ownerUnionId: string | undefined;
   creatorOpenId: string | undefined;
+  /** 发起方是飞书盖章的 bot → talk 复查走 evaluateBotTalk（与 dispatcher 外层同源）。 */
+  botSender?: boolean;
 }): Promise<void> {
   const {
     larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId,
-    parsed, commandContent, senderOpenId, senderUnionId, memberUnionId, ownerOpenId, ownerUnionId, creatorOpenId,
+    parsed, commandContent, senderOpenId, senderUnionId, memberUnionId, ownerOpenId, ownerUnionId, creatorOpenId, botSender,
   } = args;
-  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId, memberUnionId, chatType)) {
+  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId, memberUnionId, chatType, botSender)) {
     return;
   }
 
@@ -15117,8 +15132,11 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // operate），破坏「人绝不继承 bot 信任」的边界。旧联邦 team-bots 表结构上只收
   // bot（学习入口限 bot sender），这里对齐同一不变量。senderUnionId 本身保持原义
   //（人类会话的 ownerUnionId 还靠它）。
-  const teamTrustUnionId: string | undefined =
-    (data.sender?.sender_type === 'app' || data.sender?.sender_type === 'bot') ? senderUnionId : undefined;
+  // 飞书盖章的 bot 发送方。既锁 union 信任腿（下面的 teamTrustUnionId），也决定
+  // talk 复查走哪个谓词（evaluateBotTalk vs evaluateTalk）——两者必须同源，见
+  // enforceMessageQuotaForCliInput 的 botSender 说明。
+  const isBotSenderType = data.sender?.sender_type === 'app' || data.sender?.sender_type === 'bot';
+  const teamTrustUnionId: string | undefined = isBotSenderType ? senderUnionId : undefined;
   const botCfg = getBot(larkAppId).config;
   logger.info(`New session: "${content.substring(0, 60)}" (scope=${scope}, anchor=${anchor.substring(0, 12)}, resources: ${resources.length}, active: ${getActiveCount()}, messageId: ${messageId}, chatId: ${chatId})`);
   emitHookEvent('topic.new', {
@@ -15147,6 +15165,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     initiatorOpenId: senderOpenId,
     teamTrustUnionId,
     memberUnionId: senderUnionId,
+    botSender: isBotSenderType,
   })) {
     return;
   }
@@ -15233,6 +15252,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
           senderOpenId,
           senderUnionId: teamTrustUnionId,
           memberUnionId: senderUnionId, // 原始 union（人腿），不锁 bot
+          botSender: isBotSenderType,
           // New-topic senders are humans here (mirrors the normal new-topic
           // spawn path, which assigns ownership unconditionally too).
           ownerOpenId: senderOpenId,
@@ -15337,7 +15357,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     }
   }
 
-  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, teamTrustUnionId, senderUnionId, chatType)) {
+  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, teamTrustUnionId, senderUnionId, chatType, isBotSenderType)) {
     return;
   }
 
@@ -15957,6 +15977,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     initiatorOpenId: threadSenderOpenId,
     teamTrustUnionId: threadTeamTrustUnionId,
     memberUnionId: threadSenderUnionId,
+    botSender: isBotSenderType || isForeignBot,
   })) {
     return;
   }
@@ -16031,6 +16052,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
           senderOpenId: threadSenderOpenId,
           senderUnionId: threadTeamTrustUnionId,
           memberUnionId: threadSenderUnionId, // 原始 union（人腿），不锁 bot
+          botSender: isBotSenderType || isForeignBot,
           // Bot-started cold starts get no human owner (mirrors the auto-create
           // path) — see the ownership note on startInitialPassthroughSession.
           ownerOpenId: isForeignBot ? undefined : threadSenderOpenId,
@@ -16223,7 +16245,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   }
 
   const quotaSenderOpenId = threadSenderOpenId;
-  if (!await enforceMessageQuotaForCliInput(larkAppId, ctxChatId ?? data?.message?.chat_id, quotaSenderOpenId, parsed.messageId, anchor, threadTeamTrustUnionId, threadSenderUnionId, ctxChatType)) {
+  if (!await enforceMessageQuotaForCliInput(larkAppId, ctxChatId ?? data?.message?.chat_id, quotaSenderOpenId, parsed.messageId, anchor, threadTeamTrustUnionId, threadSenderUnionId, ctxChatType, isBotSenderType || isForeignBot)) {
     return;
   }
 
