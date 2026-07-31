@@ -300,3 +300,86 @@ describe('tryHandleInviteCommand — 解析与拉人', () => {
     expect(addBotMock).toHaveBeenCalledWith('b1', 'oc_1', ['cli_codex']);
   });
 });
+
+// 回归锁（codex blocker）：飞书对「群外 bot」的 @ 是 app_id 形态
+// （{id_type:'app_id', id:'cli_xxx'} 或 object {app_id:'cli_xxx'}），
+// 过去 mentionOpenId 直接 drop → 目标空 → 误回 usage 不拉人。这些用例在修复前必挂。
+describe('tryHandleInviteCommand — app_id 形态目标（群外 bot 主场景）', () => {
+  it('text form, target mention as app_id OBJECT (WS shape, no open_id) → invited by app_id directly', async () => {
+    writeBotsInfo([]);   // 花名册为空也应能拉（app_id 自带，不依赖名字解析）
+    const msg = inviteMessage({
+      text: '@_user_1 /invite @_user_2',
+      mentions: [
+        { key: '@_user_1', id: { open_id: ME }, name: 'Claude' },
+        { key: '@_user_2', id: { app_id: 'cli_codex' }, name: 'Codex' },
+      ],
+    });
+    expect(await tryHandleInviteCommand('b1', msg, OWNER)).toBe(true);
+    expect(addBotMock).toHaveBeenCalledWith('b1', 'oc_1', ['cli_codex']);
+    expect(String(replyMock.mock.calls.at(-1)![2])).toContain('已拉进群');
+  });
+
+  it('text form, target mention as app_id STRING (REST shape) → invited by app_id directly', async () => {
+    writeBotsInfo([]);
+    const msg = inviteMessage({
+      text: '@_user_1 /invite @_user_2',
+      mentions: [
+        { key: '@_user_1', id: { open_id: ME }, name: 'Claude' },
+        { key: '@_user_2', id: 'cli_codex', id_type: 'app_id', name: 'Codex' },
+      ],
+    });
+    expect(await tryHandleInviteCommand('b1', msg, OWNER)).toBe(true);
+    expect(addBotMock).toHaveBeenCalledWith('b1', 'oc_1', ['cli_codex']);
+  });
+
+  it('post form, target at-node carries cli_ app_id in user_id → invited directly', async () => {
+    writeBotsInfo([]);
+    const postMsg = {
+      message_id: 'om_post2', chat_id: 'oc_1',
+      content: JSON.stringify({ zh_cn: { content: [[
+        { tag: 'at', user_id: ME, user_name: 'Claude' },
+        { tag: 'text', text: ' /invite ' },
+        { tag: 'at', user_id: 'cli_codex', user_name: 'Codex' },
+      ]] } }),
+      mentions: [],
+    };
+    expect(await tryHandleInviteCommand('b1', postMsg, OWNER)).toBe(true);
+    expect(addBotMock).toHaveBeenCalledWith('b1', 'oc_1', ['cli_codex']);
+  });
+
+  it('app_id target already in chat (roster app_id match) is skipped, not re-invited', async () => {
+    writeBotsInfo([]);
+    rosterMock.mockImplementation(async () => [
+      { larkAppId: 'cli_codex', openId: 'ou_codex_scoped', name: 'Codex', displayName: 'Codex' },
+    ]);
+    const msg = inviteMessage({
+      text: '@_user_1 /invite @_user_2',
+      mentions: [
+        { key: '@_user_1', id: { open_id: ME }, name: 'Claude' },
+        { key: '@_user_2', id: { app_id: 'cli_codex' }, name: 'Codex' },
+      ],
+    });
+    expect(await tryHandleInviteCommand('b1', msg, OWNER)).toBe(true);
+    expect(addBotMock).not.toHaveBeenCalled();
+    expect(String(replyMock.mock.calls.at(-1)![2])).toContain('已在群内');
+  });
+
+  it('target-only guard still fires when THIS bot is @ed as app_id after /invite', async () => {
+    // 本 bot 被以 app_id 形态 @ 在 /invite 之后 = 本 bot 是 invitee → 静默放手。
+    // b1 的 larkAppId 即 "b1"，用它当本 bot 的 app_id 形态 mention。
+    const msg = inviteMessage({
+      text: '@_user_1 /invite @_user_2',
+      mentions: [
+        { key: '@_user_1', id: { open_id: 'ou_opbot' }, name: 'OpBot' },
+        { key: '@_user_2', id: 'b1', id_type: 'app_id', name: 'Claude' },
+      ],
+    });
+    // isCommandTargetOnly 用 open_id 判据；app_id 形态的本 bot @ 不会命中 target-only，
+    // 但仍必须不把「自己」误当拉取目标 → toInvite 不含 b1（rosterAppIds/larkAppId 自排除）。
+    expect(await tryHandleInviteCommand('b1', msg, OWNER)).toBe(true);
+    // 关键断言：绝不把本 bot 自己的 app_id 拉进群。
+    for (const call of addBotMock.mock.calls) {
+      expect(call[2]).not.toContain('b1');
+    }
+  });
+});
