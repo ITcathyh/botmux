@@ -284,6 +284,7 @@ vi.mock('../src/utils/logger.js', () => ({
 
 vi.mock('../src/core/worker-pool.js', () => ({
   killWorker: vi.fn(),
+  teardownAuthoritativePersistentBackingBeforeClose: vi.fn(),
   suspendWorker: vi.fn(() => false),
   forkWorker: vi.fn(),
   forkAdoptWorker: vi.fn(),
@@ -293,6 +294,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
     void observer.notify('in_progress');
     return { attemptId: 'attempt-test', joined: false };
   }),
+  isSessionTransferring: vi.fn(() => false),
   // /close routes the「会话已关闭」card through this: ephemeral (visible-to-you)
   // when the chat supports it, else the visible reply fallback. The stub just
   // invokes the fallback so the existing card-shape assertions (on sessionReply)
@@ -482,8 +484,9 @@ import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
-import { killWorker, suspendWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart } from '../src/core/worker-pool.js';
+import { closeSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart } from '../src/core/worker-pool.js';
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
+import { publishClosedSessionPatch } from '../src/core/session-activity.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
 import { getSessionWorkingDir, buildNewTopicPrompt, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots } from '../src/core/session-manager.js';
@@ -1117,6 +1120,14 @@ describe('parseForceTopicInvocation', () => {
 describe('handleCommand', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(closeSession).mockImplementation(async (sessionId: string) => {
+      // Model the authoritative close lifecycle's dashboard contract. The
+      // command must delegate this side effect instead of publishing a second
+      // patch itself.
+      publishClosedSessionPatch(sessionId);
+      return { ok: true, alreadyClosed: false, known: true };
+    });
+    vi.mocked(teardownAuthoritativePersistentBackingBeforeClose).mockImplementation(() => undefined);
     vi.mocked(getBot).mockImplementation(defaultGetBot as any);
     vi.mocked(listCodexAppThreads).mockResolvedValue([]);
     vi.mocked(resolveUserToken).mockResolvedValue(null);
@@ -1432,7 +1443,7 @@ describe('handleCommand', () => {
   // ─── /close ─────────────────────────────────────────────────────────────
 
   describe('/close', () => {
-    it('should kill worker and remove session when session exists', async () => {
+    it('closes through the authoritative worker-pool lifecycle and removes the session', async () => {
       const ds = makeDaemonSession();
       const deps = makeDeps(ds);
       const events: DashboardEvent[] = [];
@@ -1444,8 +1455,11 @@ describe('handleCommand', () => {
         unsubscribe();
       }
 
-      expect(killWorker).toHaveBeenCalledWith(ds);
-      expect(sessionStore.closeSession).toHaveBeenCalledWith('sess-001');
+      expect(closeSession).toHaveBeenCalledWith('sess-001');
+      // The command must not bypass closeSession's verified ZMX teardown by
+      // mutating worker/store state directly.
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(sessionStore.closeSession).not.toHaveBeenCalled();
       expect(deps.activeSessions.has(sessionKey(ROOT_ID, LARK_APP_ID))).toBe(false);
       expect(events).toContainEqual({
         type: 'session.update',
@@ -1488,6 +1502,52 @@ describe('handleCommand', () => {
       const cardJson = replyArgs[1] as string;
       expect(cardJson).toContain('botmux resume');
       expect(cardJson).toContain('"action":"resume"');
+    });
+
+    it('keeps the active session and reports a visible failure when teardown is refused', async () => {
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+      vi.mocked(closeSession).mockRejectedValueOnce(new Error('ZMX ownership probe unavailable'));
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close'), deps, LARK_APP_ID);
+
+      expect(closeSession).toHaveBeenCalledWith('sess-001');
+      expect(deps.activeSessions.get(sessionKey(ROOT_ID, LARK_APP_ID))).toBe(ds);
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(sessionStore.closeSession).not.toHaveBeenCalled();
+      expect(deliverEphemeralOrReply).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('会话关闭失败'),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+      expect(vi.mocked(deps.sessionReply).mock.calls[0]?.[1]).toContain('ZMX ownership probe unavailable');
+    });
+
+    it('does not delete a replacement session that wins the anchor while close awaits cleanup', async () => {
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+      let releaseClose!: (value: { ok: true; alreadyClosed: boolean; known: boolean }) => void;
+      vi.mocked(closeSession).mockImplementationOnce(() => new Promise(resolve => {
+        releaseClose = resolve;
+      }));
+
+      const closing = handleCommand('/close', ROOT_ID, makeLarkMessage('/close'), deps, LARK_APP_ID);
+      await vi.waitFor(() => expect(closeSession).toHaveBeenCalledWith('sess-001'));
+
+      const replacement = makeDaemonSession();
+      replacement.session = {
+        ...replacement.session,
+        sessionId: 'sess-replacement',
+        title: 'replacement',
+      };
+      deps.activeSessions.set(sessionKey(ROOT_ID, LARK_APP_ID), replacement);
+      releaseClose({ ok: true, alreadyClosed: false, known: true });
+      await closing;
+
+      expect(deps.activeSessions.get(sessionKey(ROOT_ID, LARK_APP_ID))).toBe(replacement);
     });
 
     it('keeps ttadk non-interactive flags in the closed-card resume command', async () => {
@@ -1895,18 +1955,20 @@ describe('handleCommand', () => {
       expect(sessionStore.updateSession).not.toHaveBeenCalled();
     });
 
-    it('updates the session title without restarting the worker', async () => {
+    it('updates and flattens title metadata without restarting the worker', async () => {
       const ds = makeDaemonSession();
       const deps = makeDeps(ds);
 
-      await handleCommand('/rename', ROOT_ID, makeLarkMessage('/rename  ZMX 后端集成推进  '), deps, LARK_APP_ID);
+      await handleCommand('/rename', ROOT_ID, makeLarkMessage('/rename  ZMX 后端集成推进\n阶段二  '), deps, LARK_APP_ID);
 
-      expect(ds.session.title).toBe('ZMX 后端集成推进');
+      expect(ds.session.title).toBe('ZMX 后端集成推进 阶段二');
+      expect(ds.session.titleSource).toBe('user');
+      expect(ds.session.titleUpdatedAt).toEqual(expect.any(String));
       expect(killWorker).not.toHaveBeenCalled();
       expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(replyContent).toContain('会话标题已更新');
-      expect(replyContent).toContain('ZMX 后端集成推进');
+      expect(replyContent).toContain('ZMX 后端集成推进 阶段二');
       expect(replyContent).toContain('Agent 当前未运行');
     });
 
@@ -2011,6 +2073,31 @@ describe('handleCommand', () => {
       expect(ds.session.sessionId).toBe('new-session-123');
       expect(ds.hasHistory).toBe(false);
       expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+    });
+
+    it('keeps the old ZMX session active when repo-switch teardown is refused', async () => {
+      const oldSession = makeSession({ backendType: 'zmx', workingDir: '/home/testuser/project-a' });
+      const ds = makeDaemonSession({ pendingRepo: false, session: oldSession, repoCardMessageId: 'om_repo_card' });
+      const deps = makeDeps(ds);
+      deps.lastRepoScan.set(CHAT_ID, [
+        { name: 'project-b', path: '/home/testuser/project-b', branch: 'dev' },
+      ]);
+      vi.mocked(teardownAuthoritativePersistentBackingBeforeClose).mockImplementationOnce(() => {
+        throw new Error('zmx generation changed');
+      });
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo 1'), deps, LARK_APP_ID);
+
+      expect(teardownAuthoritativePersistentBackingBeforeClose).toHaveBeenCalledWith(ds);
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(sessionStore.closeSession).not.toHaveBeenCalled();
+      expect(sessionStore.createSession).not.toHaveBeenCalled();
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(ds.session).toBe(oldSession);
+      expect(ds.session.status).toBe('active');
+      expect(ds.session.workingDir).toBe('/home/testuser/project-a');
+      expect(ds.repoCardMessageId).toBe('om_repo_card');
+      expect(vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join()).toContain('zmx generation changed');
     });
 
     it('mid-session chat switch preserves scope and the original message root', async () => {
@@ -4948,6 +5035,14 @@ describe('/term — operable terminal slash command (operator / canOperate)', ()
     await handleCommand('/term', ROOT_ID, ownerMsg(), deps, LARK_APP_ID);
     const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
     expect(reply).toContain('终端还没就绪');
+  });
+
+  it('backend without Web Terminal → unsupported notice', async () => {
+    vi.mocked(deliverWritableTerminalCardTo).mockResolvedValue('unsupported');
+    const deps = makeDeps(makeDaemonSession({ backendType: 'zmx' }));
+    await handleCommand('/term', ROOT_ID, ownerMsg(), deps, LARK_APP_ID);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('不提供 Web 终端');
   });
 
   it('delivery failure → failure notice', async () => {

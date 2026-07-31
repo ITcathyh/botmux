@@ -1,6 +1,9 @@
 import type { LarkMessage, LarkMention } from '../../types.js';
 import { getMessageDetail } from './client.js';
 import { logger } from '../../utils/logger.js';
+import {
+  REPLY_CARD_FOOTER_ELEMENT_ID,
+} from './reply-card-footer-signature.js';
 
 // Event data structure from WSClient im.message.receive_v1
 // sender is at data top-level, NOT inside data.message
@@ -613,23 +616,107 @@ function extractTextContent(msgType: string, rawContent: string, mentions?: RawE
 }
 
 /**
- * botmux-generated card footer signature. Every card `botmux send` /
- * buildMarkdownCard emits ends with a small grey note linking back to the repo
- * (`[botmux](https://github.com/deepcoldy/botmux)`, optionally `· 发送给：@owner`).
- * That footer is human-facing chrome — when another bot receives the card it
- * must NOT leak into the receiving bot's prompt (it surfaces as a stray
- * `<font color='grey'>botmux</font>` block and duplicates mention info). Both
- * Lark render formats carry the canonical repo URL on that footer line (Format B
- * as the markdown link target, Format A as the `<a href>`), so the URL is a
- * reliable, format-agnostic marker. Anchored on the full repo URL so genuine
- * body text merely mentioning "botmux" survives. Known, accepted trade-off: a
- * card whose own body puts this exact repo URL on a line would lose that line
- * too — vanishingly rare versus the value of a simple format-agnostic anchor.
+ * botmux-generated reply-card footer signature. New cards carry both a visible
+ * versioned link marker and an exact element id. The canonical repository URL
+ * is NOT a signature: it is valid body content. For pre-signature cards we
+ * recognize only the exact old default-brand + recipient chrome shape; a
+ * default-brand-only old card is intentionally preserved because it is
+ * indistinguishable from an ordinary repository link.
  */
-const BOTMUX_FOOTER_MARKER = 'github.com/deepcoldy/botmux';
+const LEGACY_DEFAULT_FOOTER_URL = 'https://github.com/deepcoldy/botmux';
+const FOOTER_MARKER_HASHES = new Set(['#reply-card-footer', '#reply-card-footer-v1']);
 
-function isBotmuxFooterLine(line: string): boolean {
-  return line.includes(BOTMUX_FOOTER_MARKER);
+function isBotmuxFooterMarkerUrl(value: unknown): boolean {
+  if (typeof value !== 'string') return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:'
+      && url.hostname === 'github.com'
+      && url.port === ''
+      && url.username === ''
+      && url.password === ''
+      && url.search === ''
+      && decodeURIComponent(url.pathname) === '/deepcoldy/botmux'
+      && FOOTER_MARKER_HASHES.has(url.hash);
+  } catch {
+    return false;
+  }
+}
+
+function isBotmuxFooterMarkerText(value: unknown): boolean {
+  return value === '·' || value === '\u200B';
+}
+
+function isBotmuxFooterMarkerAnchor(href: unknown, text: unknown): boolean {
+  return isBotmuxFooterMarkerText(text) && isBotmuxFooterMarkerUrl(href);
+}
+
+function greyFontInner(line: string): string | null {
+  const font = /^\s*<font\b([^>]*)>([\s\S]*?)<\/font>\s*$/i.exec(line);
+  if (!font || !/\bcolor\s*=\s*(?:"grey"|'grey'|grey)(?:\s|$)/i.test(font[1])) return null;
+  return font[2];
+}
+
+function hasExactMarkerMarkdown(value: string): boolean {
+  // Match only the protocol's reserved anchor texts. A generic Markdown-link
+  // regex can start at an unmatched `[` inside a custom brand and swallow the
+  // later marker before it gets a chance to match.
+  for (const match of value.matchAll(/\[(·|\u200B)\]\(([^)\s]+)\)/gu)) {
+    if (isBotmuxFooterMarkerAnchor(match[2], match[1])) return true;
+  }
+  return false;
+}
+
+function isSignedFormatBFooterLine(line: string): boolean {
+  const inner = greyFontInner(line);
+  return inner !== null && hasExactMarkerMarkdown(inner);
+}
+
+/** Strict compatibility recognizer for Format A cards emitted before the
+ * versioned marker existed. Recipient chrome is required; without it, the old
+ * default-brand-only footer is indistinguishable from a real repository link. */
+function isMeaningfulFormatANode(node: unknown): boolean {
+  if (!node || typeof node !== 'object') return false;
+  const value = node as any;
+  if (value.tag === 'text') return typeof value.text === 'string' && value.text.trim().length > 0;
+  return true;
+}
+
+function isLegacyFormatAFooterParagraph(paragraph: unknown[]): boolean {
+  const nodes = paragraph.filter(isMeaningfulFormatANode) as any[];
+  const first = nodes[0];
+  if (
+    first?.tag !== 'a'
+    || first.href !== LEGACY_DEFAULT_FOOTER_URL
+    || typeof first.text !== 'string'
+    || first.text.trim().toLowerCase() !== 'botmux'
+  ) {
+    return false;
+  }
+
+  let label = '';
+  let sawAt = false;
+  for (const node of nodes.slice(1)) {
+    if (node.tag === 'at') {
+      sawAt = true;
+      continue;
+    }
+    if (node.tag !== 'text' || typeof node.text !== 'string') return false;
+    if (sawAt && node.text.trim() !== '') return false;
+    label += node.text;
+  }
+  return sawAt && /^\s*·\s*(?:发送给：|Sent to:)\s*$/i.test(label);
+}
+
+/** Strict compatibility recognizer for an old original-format footer line.
+ * Grey styling plus exact default brand, locale label, and one or more native
+ * mentions are all required; styling or the canonical URL alone proves
+ * nothing. */
+function isLegacyFormatBFooterLine(line: string): boolean {
+  const inner = greyFontInner(line);
+  if (inner === null) return false;
+  return /^\s*\[botmux\]\(https:\/\/github\.com\/deepcoldy\/botmux\)\s*·\s*(?:发送给：|Sent to:)\s*(?:<at\s+id=(?:"[^"]+"|'[^']+'|[^\s>]+)\s*><\/at>\s*)+$/i
+    .test(inner);
 }
 
 /**
@@ -677,13 +764,32 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer): 
 
       if (isApiFormat) {
         // Format A: [[{tag:"text",text:"..."}, {tag:"img",...}, {tag:"button",...}], ...]
-        for (const paragraph of rootElements) {
+        let lastMeaningfulParagraphIndex = -1;
+        for (let i = rootElements.length - 1; i >= 0; i--) {
+          const candidate = rootElements[i];
+          if (Array.isArray(candidate) && candidate.some(isMeaningfulFormatANode)) {
+            lastMeaningfulParagraphIndex = i;
+            break;
+          }
+        }
+        for (let paragraphIndex = 0; paragraphIndex < rootElements.length; paragraphIndex++) {
+          const paragraph = rootElements[paragraphIndex];
           if (!Array.isArray(paragraph)) continue;
+          if (
+            paragraphIndex === lastMeaningfulParagraphIndex
+            && isLegacyFormatAFooterParagraph(paragraph)
+          ) {
+            continue;
+          }
           const textNodes: string[] = [];
           const buttons: string[] = [];
+          let hasFooterProof = false;
           for (const node of paragraph) {
             if (node.tag === 'text') { if (node.text) textNodes.push(node.text); }
             else if (node.tag === 'a') {
+              if (isBotmuxFooterMarkerAnchor(node.href, node.text)) {
+                hasFooterProof = true;
+              }
               // Keep the href so links survive — Format A separates text/href,
               // and dropping href loses real content (规则配置/详情/Trace 链接).
               // Bare long URLs (e.g. Argos Kibana 处理建议) come back with
@@ -725,7 +831,7 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer): 
             }
           }
           const line = textNodes.join('').trim();
-          if (line) parts.push(line);
+          if (line && !hasFooterProof) parts.push(line);
           if (buttons.length) parts.push(buttons.join(' '));
         }
       } else {
@@ -738,11 +844,30 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer): 
     // Drop the botmux footer chrome so a receiving bot's prompt isn't polluted
     // by the grey `botmux` badge / `发送给：@owner` line. Line-level (not
     // part-level) so a footer never takes adjacent real content with it.
-    const cleaned = parts
-      .join('\n')
-      .split('\n')
-      .filter(line => !isBotmuxFooterLine(line))
-      .join('\n');
+    // Stable legacy markers may occur inside a multiline element, so remove
+    // only their exact line. Marker-less footer-shaped text is deliberately
+    // preserved: an arbitrary custom brand is indistinguishable from user data.
+    let visibleParts = parts
+      .map(part => part
+        .split('\n')
+        .filter(line => !isSignedFormatBFooterLine(line))
+        .join('\n'))
+      .filter(part => !!part.trim());
+    // Marker-less legacy compatibility is intentionally tail-only. Old
+    // botmux footers were always last; applying this heuristic in the middle
+    // of a foreign card would turn a footer-shaped body note into data loss.
+    if (visibleParts.length > 0) {
+      const lastIndex = visibleParts.length - 1;
+      const lines = visibleParts[lastIndex].split('\n');
+      let lastLine = lines.length - 1;
+      while (lastLine >= 0 && !lines[lastLine].trim()) lastLine--;
+      if (lastLine >= 0 && isLegacyFormatBFooterLine(lines[lastLine])) {
+        lines.splice(lastLine, 1);
+        visibleParts[lastIndex] = lines.join('\n');
+        visibleParts = visibleParts.filter(part => !!part.trim());
+      }
+    }
+    const cleaned = visibleParts.join('\n');
     return cleaned || '[卡片]';
   } catch {
     return '[卡片]';
@@ -961,16 +1086,17 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
 
   const tag = el.tag;
 
-  // botmux card footer: the only element rendered as a small grey notation
-  // (text_size 'notation_small_v2' + a grey <font> wrapper). Drop it
-  // structurally — brand-agnostic, so a peer bot's *custom* brandLabel footer
-  // is stripped from cross-bot / quote / history prompts without us needing to
-  // know its label (the receiving bot can't see the sender's config). The
-  // repo-URL line filter below still covers the default brand in the simplified
-  // Format A representation, which carries no text_size.
-  if ((tag === 'markdown' || tag === 'div' || tag === 'plain_text') && el.text_size === 'notation_small_v2') {
-    const c = el.text?.content ?? el.content ?? '';
-    if (/color=['"]grey['"]/i.test(c)) return;
+  // The public element id alone is not ownership proof: third-party cards may
+  // collide with it. New botmux footers carry all four invariants together.
+  const elementText = el.text?.content ?? el.content;
+  if (
+    el.element_id === REPLY_CARD_FOOTER_ELEMENT_ID
+    && tag === 'markdown'
+    && el.text_size === 'notation_small_v2'
+    && typeof elementText === 'string'
+    && isSignedFormatBFooterLine(elementText)
+  ) {
+    return;
   }
 
   // div / markdown / plain_text blocks

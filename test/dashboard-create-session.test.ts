@@ -57,9 +57,15 @@ vi.mock('../src/core/worker-pool.js', () => ({
   sweepDeadPidMarkers: vi.fn(),
   getCurrentCliVersion: vi.fn(() => 'test-cli-v1'),
   restoreUsageLimitRuntimeState: vi.fn(),
-  setActiveSessionSafe: vi.fn(async (map: Map<string, any>, k: string, ds: any) => { map.set(k, ds); }),
+  setActiveSessionIfActive: vi.fn((map: Map<string, any>, k: string, ds: any) => {
+    if (map.has(k) && map.get(k) !== ds) return false;
+    map.set(k, ds);
+    return true;
+  }),
+  setActiveSessionSafe: vi.fn(async (map: Map<string, any>, k: string, ds: any) => { map.set(k, ds); return true; }),
   getActiveSessionsRegistry: vi.fn(() => null),
   isRelayableRealSession: vi.fn(() => false),
+  isDisposableCommandScratch: vi.fn(() => true),
   closeSession: vi.fn(),
 }));
 
@@ -379,6 +385,35 @@ describe('spawnDashboardSession — guards', () => {
     await spawnDashboardSession(active, undefined, { larkAppId: APP, chatId: CHAT, content: 'a', column: 'backlog', role: 'solo' });
     const r2 = await spawnDashboardSession(active, undefined, { larkAppId: APP, chatId: CHAT, content: 'b', column: 'in_progress', role: 'solo' });
     expect(r2).toMatchObject({ ok: false, error: 'session_exists' });
+  });
+
+  it('refuses before posting a banner when a quarantined persisted row reserves the chat anchor', async () => {
+    store.set('quarantined-session', {
+      sessionId: 'quarantined-session',
+      chatId: CHAT,
+      rootMessageId: 'om_old_task',
+      scope: 'chat',
+      larkAppId: APP,
+      title: 'old task',
+      status: 'active',
+      createdAt: '2026-07-31T00:00:00.000Z',
+      restoreQuarantinedAt: '2026-07-31T00:01:00.000Z',
+    });
+    const active = new Map<string, DaemonSession>();
+
+    const result = await spawnDashboardSession(active, undefined, {
+      larkAppId: APP,
+      chatId: CHAT,
+      content: '不要创建第二条会话',
+      column: 'in_progress',
+      role: 'solo',
+      postBanner: true,
+    });
+
+    expect(result).toEqual({ ok: false, error: 'session_exists' });
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect([...store.keys()]).toEqual(['quarantined-session']);
+    expect(active.size).toBe(0);
   });
 });
 

@@ -6,6 +6,7 @@ import type { CodexAppThreadSummary } from '../../services/codex-app-threads.js'
 import type { DisplayMode, StreamStatus } from '../../types.js';
 import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
 import { t, type Locale } from '../../i18n/index.js';
+import { cardUsageFooterSegment, type CardUsageSnapshot } from './md-card.js';
 import { readGlobalConfig } from '../../global-config.js';
 import type { ConfigCardData } from '../../services/bot-config-store.js';
 import { isLocalCliOpenEnabled } from '../../services/local-cli-opener.js';
@@ -303,23 +304,26 @@ export function buildSessionCard(
   const cliName = getCliDisplayName(cliId ?? 'claude-code');
   const effectiveCliId = cliId ?? 'claude-code';
   const actionBase = { root_id: rootId, session_id: sessionId, cli_id: effectiveCliId };
-  const actions: any[] = [
-    {
+  const actions: any[] = [];
+  if (terminalUrl) {
+    actions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: t(showManageButtons ? 'card.btn.open_writable_terminal' : 'card.btn.open_terminal', undefined, locale) },
       type: 'primary',
       multi_url: terminalMultiUrl(terminalUrl),
-    },
-  ];
+    });
+  }
   if (!showManageButtons) {
     const localBtn = cliId ? localCliButton(effectiveCliId, actionBase, locale, localCliReady) : undefined;
     if (localBtn) actions.push(localBtn);
-    actions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
-      type: 'default',
-      value: { action: 'get_write_link', ...actionBase },
-    });
+    if (terminalUrl) {
+      actions.push({
+        tag: 'button',
+        text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
+        type: 'default',
+        value: { action: 'get_write_link', ...actionBase },
+      });
+    }
   }
   if (showManageButtons && !adoptMode) {
     actions.push({
@@ -665,9 +669,9 @@ function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState 
  *  by both {@link buildStreamingCard} and {@link buildPrivateSnapshotCard}. */
 function pushStreamBody(
   elements: any[],
-  opts: { status: StreamStatus; usageLimit?: CliUsageLimitState; displayMode: DisplayMode; imageKey?: string; cliName: string; locale?: Locale },
+  opts: { status: StreamStatus; usageLimit?: CliUsageLimitState; displayMode: DisplayMode; imageKey?: string; cliName: string; locale?: Locale; usage?: CardUsageSnapshot },
 ): void {
-  const { status, usageLimit, displayMode, imageKey, cliName, locale } = opts;
+  const { status, usageLimit, displayMode, imageKey, cliName, locale, usage } = opts;
   if (status === 'limited' && usageLimit) {
     elements.push({
       tag: 'markdown',
@@ -684,6 +688,17 @@ function pushStreamBody(
       elements.push({ tag: 'markdown', content: t('card.status.waiting_screenshot', undefined, locale) });
     }
     elements.push({ tag: 'hr' });
+  }
+  // Native Context / Token usage line (grey, small) when this bot displays usage
+  // on the streaming card. Missing metrics are omitted independently by
+  // cardUsageFooterSegment; a fully-empty snapshot renders nothing.
+  const usageSeg = usage ? cardUsageFooterSegment(usage, locale, 'streaming') : null;
+  if (usageSeg) {
+    elements.push({
+      tag: 'markdown',
+      text_size: 'notation_small_v2',
+      content: `<font color='grey'>${usageSeg}</font>`,
+    });
   }
 }
 
@@ -715,6 +730,7 @@ export function buildStreamingCard(
   usageLimit?: CliUsageLimitState,
   writableTerminalUrl?: string,
   localCliReady = false,
+  usage?: CardUsageSnapshot,
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = getCliDisplayName(effectiveCliId);
@@ -724,7 +740,7 @@ export function buildStreamingCard(
   const elements: any[] = [];
 
   // ── Output body (shared with the private snapshot card) ──────────────────
-  pushStreamBody(elements, { status, usageLimit, displayMode, imageKey, cliName, locale });
+  pushStreamBody(elements, { status, usageLimit, displayMode, imageKey, cliName, locale, usage });
 
   // ── Main control row: display toggle, mode toggle, terminal, manage ─────
   const headerActions: any[] = [];
@@ -751,12 +767,14 @@ export function buildStreamingCard(
       value: { action: 'refresh_screenshot', ...actionBase },
     });
   }
-  headerActions.push({
-    tag: 'button',
-    text: { tag: 'plain_text', content: t('card.btn.open_terminal', undefined, locale) },
-    type: 'primary',
-    multi_url: terminalMultiUrl(terminalUrl),
-  });
+  if (terminalUrl) {
+    headerActions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.open_terminal', undefined, locale) },
+      type: 'primary',
+      multi_url: terminalMultiUrl(terminalUrl),
+    });
+  }
   const localBtn = cliId ? localCliButton(effectiveCliId, actionBase, locale, localCliReady) : undefined;
   if (localBtn) headerActions.push(localBtn);
   if (status === 'limited' && usageLimit?.retryReady) {
@@ -767,12 +785,14 @@ export function buildStreamingCard(
       value: { action: 'retry_last_task', ...actionBase },
     });
   }
-  headerActions.push({
-    tag: 'button',
-    text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
-    type: 'default',
-    value: { action: 'get_write_link', ...actionBase },
-  });
+  if (terminalUrl) {
+    headerActions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
+      type: 'default',
+      value: { action: 'get_write_link', ...actionBase },
+    });
+  }
   if (adoptMode) {
     if (showTakeover) {
       headerActions.push({
@@ -858,9 +878,8 @@ export function buildStreamingCard(
  * Build a static "private snapshot" card for `/card` in private mode — sent via
  * the ephemeral API to one user at a time. Unlike {@link buildStreamingCard} it
  * is **never PATCH-updated** (ephemeral cards can't be), so it carries only a
- * one-shot snapshot of the terminal screenshot plus three buttons:
- *   • read-only "open terminal" link (a plain URL button — no callback);
- *   • "get write link", whose callback DMs the writable link to the clicker;
+ * one-shot snapshot of the terminal screenshot plus controls:
+ *   • when available, a read-only "open terminal" link and "get write link";
  *   • "close session", whose callback kills the session and (in private mode)
  *     sends the "closed" card ephemeral to the owner audience too — so the
  *     session title / CLI name / workingDir on it don't leak to the group.
@@ -916,9 +935,9 @@ export function buildPrivateSnapshotCard(
     }
   }
 
-  elements.push({
-    tag: 'action',
-    actions: [
+  const actions: any[] = [];
+  if (terminalUrl) {
+    actions.push(
       {
         tag: 'button',
         text: { tag: 'plain_text', content: t('card.btn.open_terminal', undefined, locale) },
@@ -931,17 +950,21 @@ export function buildPrivateSnapshotCard(
         type: 'default',
         value: { action: 'get_write_link', ...actionBase },
       },
-      {
-        tag: 'button',
-        text: { tag: 'plain_text', content: t('card.btn.close_session', undefined, locale) },
-        type: 'danger',
-        value: { action: 'close', ...actionBase },
-      },
-    ],
+    );
+  }
+  actions.push({
+    tag: 'button',
+    text: { tag: 'plain_text', content: t('card.btn.close_session', undefined, locale) },
+    type: 'danger',
+    value: { action: 'close', ...actionBase },
   });
+  elements.push({ tag: 'action', actions });
   elements.push({
     tag: 'note',
-    elements: [{ tag: 'lark_md', content: t('card.private.snapshot_note', undefined, locale) }],
+    elements: [{
+      tag: 'lark_md',
+      content: t(terminalUrl ? 'card.private.snapshot_note' : 'card.private.snapshot_note_no_terminal', undefined, locale),
+    }],
   });
 
   const card = {
@@ -1261,7 +1284,10 @@ export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
     type,
     text: { tag: 'plain_text', content: text },
     name: action,
-    form_action_type: 'submit',
+    // v2（schema 2.0）卡片的表单提交按钮用 action_type: 'form_submit'（与本文件其它 2.0 表单
+    // 一致，也是本卡最初 live 验证过的写法）。曾一度改成 v2 的 form_action_type: 'submit'（见
+    // 授权卡 UI 并排布局那次），实测点击授权按钮无任何反应——callback 不触发。故钉回 form_submit。
+    action_type: 'form_submit',
     value: { action, ...v },
   });
   const grantButtons: Array<Record<string, unknown>> = [
@@ -1386,11 +1412,7 @@ export function buildGrantNotifyCard(
 ): string {
   const entries = (Array.isArray(target) ? target : [target]).map(tt =>
     typeof tt === 'string' ? { openId: tt, name: undefined as string | undefined, isBot: false } : tt);
-  const at = entries.map(e =>
-    e.isBot && e.name && e.name.length > 0
-      ? e.name                                              // bot 有名字：纯文本，不 <at>（不唤醒对方）
-      : `<at id=${e.openId}></at>`,                          // 真人 / bot 无名字：@ 点名（bot 无名字时靠飞书据 open_id 展示身份，代价=可能一次空会话）
-  ).join(' ');
+  const at = renderGrantAtMentions(entries);
   let content = t(kind === 'chat' ? 'card.grant.notify_chat' : 'card.grant.notify_global', { at }, locale);
   if (quota !== undefined && quota > 0) content += t('card.grant.notify_quota_suffix', { n: quota }, locale);
   if (expiresAt !== undefined) {
@@ -1456,17 +1478,44 @@ function formatGrantExpiry(expiresAt: number, locale?: Locale): string {
   return new Date(expiresAt).toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN', { hour12: false });
 }
 
+/** 被授权目标的 @ 渲染：bot 有名字用纯文本(不 <at> 免唤醒对方)，真人/无名字 bot 用 <at> 点名。 */
+type GrantTargetEntry = { openId: string; name?: string; isBot?: boolean };
+function renderGrantAtMentions(target: string | string[] | GrantTargetEntry[]): string {
+  const entries = (Array.isArray(target) ? target : [target]).map(tt =>
+    typeof tt === 'string' ? { openId: tt, name: undefined as string | undefined, isBot: false } : tt);
+  return entries.map(e =>
+    e.isBot && e.name && e.name.length > 0
+      ? e.name
+      : `<at id=${e.openId}></at>`,
+  ).join(' ');
+}
+
+/** 授权处置后的终态卡（无按钮，防重复点击）。授权成功(chat/global)时**就地 patch 原卡**即为
+ *  此卡：正文直接 @ 被授权人 + 额度/有效期,一张卡既是结果态又 ping 到 ta,无需再单独发通知卡或
+ *  撤回原卡（见申晗 2026-07-31 反馈）。deny 或无 targets 时回落到不带 @ 的简单状态文案。 */
 export function buildGrantResultCard(
   kind: 'chat' | 'global' | 'deny',
   locale?: Locale,
   quota?: number,
   expiresAt?: number,
+  targets?: string | string[] | GrantTargetEntry[],
 ): string {
-  const key = kind === 'chat' ? 'card.grant.result_chat' : kind === 'global' ? 'card.grant.result_global' : 'card.grant.result_deny';
-  let content = t(key, undefined, locale);
-  if (kind !== 'deny') {
-    if (expiresAt !== undefined) content += `\n${t('card.grant.result_expiry', { time: formatGrantExpiry(expiresAt, locale) }, locale)}`;
-    if (quota !== undefined) content += `\n${t('card.grant.result_quota', { n: quota }, locale)}`;
+  let content: string;
+  const at = targets !== undefined ? renderGrantAtMentions(targets) : '';
+  if (kind !== 'deny' && at) {
+    // 授权成功且有被授权人：复用 notify 文案（{at} 已获授权，发消息 @ 我即可 + 额度/有效期后缀），
+    // 让就地 patch 的原卡直接把授权成功通知 + @ping 合为一张。
+    content = t(kind === 'chat' ? 'card.grant.notify_chat' : 'card.grant.notify_global', { at }, locale);
+    if (quota !== undefined && quota > 0) content += t('card.grant.notify_quota_suffix', { n: quota }, locale);
+    if (expiresAt !== undefined) content += t('card.grant.notify_expiry_suffix', { time: formatGrantExpiry(expiresAt, locale) }, locale);
+  } else {
+    // deny / 无 targets 回落：简单状态态（无 @）。
+    const key = kind === 'chat' ? 'card.grant.result_chat' : kind === 'global' ? 'card.grant.result_global' : 'card.grant.result_deny';
+    content = t(key, undefined, locale);
+    if (kind !== 'deny') {
+      if (expiresAt !== undefined) content += `\n${t('card.grant.result_expiry', { time: formatGrantExpiry(expiresAt, locale) }, locale)}`;
+      if (quota !== undefined) content += `\n${t('card.grant.result_quota', { n: quota }, locale)}`;
+    }
   }
   const card = {
     schema: '2.0',
@@ -1622,6 +1671,24 @@ export function buildTuiPromptResolvedCard(selectedText: string, locale?: Locale
       {
         tag: 'div',
         text: { tag: 'lark_md', content: `**${escapeMd(selectedText)}**` },
+      },
+    ],
+  };
+  return JSON.stringify(card);
+}
+
+/** Build a terminal failure state when worker/backend input was not confirmed. */
+export function buildTuiPromptFailedCard(message: string, locale?: Locale): string {
+  const card = {
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: t('card.status.failed', undefined, locale) },
+      template: 'red',
+    },
+    elements: [
+      {
+        tag: 'div',
+        text: { tag: 'lark_md', content: escapeMd(message) },
       },
     ],
   };

@@ -20,6 +20,7 @@ import {
   buildAdoptBlockedCard,
   buildPrivateSnapshotCard,
   buildConfigCard,
+  buildTuiPromptFailedCard,
   getCliDisplayName,
 } from '../src/im/lark/card-builder.js';
 import type { RelayPickerEntry } from '../src/im/lark/card-builder.js';
@@ -62,6 +63,18 @@ function buttonTexts(actions: any[]): string[] {
     .filter((a: any) => a.tag === 'button')
     .map((a: any) => a.text.content);
 }
+
+describe('buildTuiPromptFailedCard', () => {
+  it('renders an explicit red terminal state for unconfirmed TUI delivery', () => {
+    const card = parse(buildTuiPromptFailedCard('Input was not delivered', 'en'));
+
+    expect(card.header).toMatchObject({
+      template: 'red',
+      title: { content: 'Failed' },
+    });
+    expect(card.elements[0].text.content).toBe('Input was not delivered');
+  });
+});
 
 function allActions(card: any): any[] {
   return card.elements
@@ -182,7 +195,7 @@ describe('getCliDisplayName', () => {
 });
 
 describe('buildConfigCard', () => {
-  it('renders silentTurnReactions as a card-behaviour toggle', () => {
+  it('renders card-behaviour toggles', () => {
     const card = parse(buildConfigCard({
       larkAppId: 'app_cfg',
       botName: 'Config Bot',
@@ -217,6 +230,14 @@ describe('buildConfigCard', () => {
     expect(toggle.value.action).toBe('config_toggle');
     expect(toggle.type).toBe('primary');
     expect(toggle.text.content).toContain('Disable status reactions');
+
+    // usageDisplay is an enum (streaming/footer/off), configured via dashboard
+    // and `/botconfig set` — like skillInjection it is intentionally NOT a
+    // config-card boolean quick-toggle.
+    const usageToggle = allActions(card).find(
+      (a: any) => a.value?.field === 'usageDisplay' || a.value?.field === 'showUsageInCardFooter',
+    );
+    expect(usageToggle).toBeFalsy();
   });
 });
 
@@ -308,6 +329,17 @@ describe('buildSessionCard', () => {
       expect(linkBtn.text.content).toContain('获取操作链接');
       expect(linkBtn.value.root_id).toBe(ROOT);
       expect(linkBtn.value.session_id).toBe(SID);
+    });
+
+    it('keeps native attach and close but hides Web Terminal controls without a URL', () => {
+      enableLocalCliOpen();
+      const card = parse(buildSessionCard(SID, ROOT, '', TITLE, 'codex', false, false, 'en', true));
+      const actions = findActions(card);
+
+      expect(actions.some((a: any) => a.multi_url)).toBe(false);
+      expect(actions.some((a: any) => a.value?.action === 'get_write_link')).toBe(false);
+      expect(actions.some((a: any) => a.value?.action === 'open_local_cli')).toBe(true);
+      expect(actions.some((a: any) => a.value?.action === 'close')).toBe(true);
     });
 
     it('includes Open Codex beside Web Terminal for codex sessions only', () => {
@@ -649,6 +681,67 @@ describe('buildStreamingCard', () => {
     });
   });
 
+  // ── Native usage line (Context / Token) ────────────────────────────────
+
+  describe('usage snapshot on the streaming card body', () => {
+    const USAGE = {
+      context: { usedTokens: 159_816, windowTokens: 258_400, percentUsed: 62 },
+      tokens: { in: 3_739_570, out: 23_299 },
+    };
+
+    it('renders a grey Context / Token line when a usage snapshot is supplied', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, CONTENT, 'working', 'codex', 'hidden',
+        undefined, undefined, false, false, 'en', undefined, undefined, false, USAGE,
+      ));
+      const md = card.elements.filter((e: any) => e.tag === 'markdown');
+      const usageEl = md.find((e: any) => typeof e.content === 'string' && e.content.includes('Context'));
+      expect(usageEl).toBeTruthy();
+      expect(usageEl.content).toContain('159.8K/258.4K (62%)');
+      expect(usageEl.content).toContain('↑3.7M');
+      expect(usageEl.content).toContain('↓23.3K');
+      expect(usageEl.content).toContain("color='grey'");
+    });
+
+    it('omits the usage line entirely when no snapshot is supplied', () => {
+      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, CONTENT, 'working', 'codex', 'hidden'));
+      const hasUsage = card.elements.some(
+        (e: any) => e.tag === 'markdown' && typeof e.content === 'string'
+          && (e.content.includes('Context') || e.content.includes('Tokens')),
+      );
+      expect(hasUsage).toBe(false);
+    });
+
+    it('renders only the present metric (context missing → cumulative token only)', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, CONTENT, 'working', 'codex', 'hidden',
+        undefined, undefined, false, false, 'en', undefined, undefined, false,
+        { context: null, tokens: { in: 1_200, out: 3_400 } },
+      ));
+      const md = card.elements.filter((e: any) => e.tag === 'markdown');
+      // Streaming variant labels cumulative token "Total" (en); no 本轮 line
+      // here because turnTokens was not supplied.
+      const usageEl = md.find((e: any) => typeof e.content === 'string' && e.content.includes('Total'));
+      expect(usageEl).toBeTruthy();
+      expect(usageEl.content).not.toContain('Context');
+      expect(usageEl.content).not.toContain('This turn');
+      expect(usageEl.content).toContain('↑1.2K');
+    });
+
+    it('renders nothing for a fully-empty snapshot (unsupported CLI)', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, CONTENT, 'working', 'gemini', 'hidden',
+        undefined, undefined, false, false, 'en', undefined, undefined, false,
+        { context: null, tokens: null },
+      ));
+      const hasUsage = card.elements.some(
+        (e: any) => e.tag === 'markdown' && typeof e.content === 'string'
+          && (e.content.includes('Context') || e.content.includes('Tokens')),
+      );
+      expect(hasUsage).toBe(false);
+    });
+  });
+
   // ── Screenshot display mode ────────────────────────────────────────────
 
   describe('screenshot display mode', () => {
@@ -727,6 +820,22 @@ describe('buildStreamingCard', () => {
       expect(linkBtn).toBeDefined();
       expect(linkBtn.value.root_id).toBe(ROOT);
       expect(linkBtn.value.session_id).toBe(SID);
+    });
+
+    it('hides Web Terminal controls when the backend has no terminal URL', () => {
+      enableLocalCliOpen();
+      const card = parse(buildStreamingCard(
+        SID, ROOT, '', TITLE, '', 'idle', 'codex', 'hidden',
+        undefined, undefined, false, false, 'en', undefined, undefined, true,
+      ));
+      const actions = findActions(card);
+
+      expect(actions.some((a: any) => a.multi_url)).toBe(false);
+      expect(actions.some((a: any) => a.value?.action === 'get_write_link')).toBe(false);
+      // Native local opening (for example `zmx attach`) stays available.
+      expect(actions.some((a: any) => a.value?.action === 'open_local_cli')).toBe(true);
+      expect(actions.some((a: any) => a.value?.action === 'toggle_display')).toBe(true);
+      expect(actions.some((a: any) => a.value?.action === 'close')).toBe(true);
     });
 
     it('should include close button with danger type', () => {
@@ -1481,6 +1590,19 @@ describe('buildPrivateSnapshotCard', () => {
     const btns = allButtons(card);
     expect(btns.some((b: any) => b.value?.action === 'open_local_cli')).toBe(false);
     expect(btns.map((b: any) => b.value?.action ?? 'url')).toEqual(['url', 'get_write_link', 'close']);
+  });
+
+  it('keeps the snapshot and close control but hides terminal links when unavailable', () => {
+    const card = parse(buildPrivateSnapshotCard(
+      '', 'my session', 'idle', 'codex', undefined, 'plain zmx history',
+      'sess-9', 'om_anchor', 'en',
+    ));
+    const btns = allButtons(card);
+
+    expect(btns.map((b: any) => b.value?.action ?? 'url')).toEqual(['close']);
+    expect(JSON.stringify(card)).toContain('plain zmx history');
+    expect(JSON.stringify(card)).toContain('static snapshot');
+    expect(JSON.stringify(card)).not.toContain('Open Web Terminal');
   });
 
   it('callback buttons carry root_id/session_id/cli_id for handler resolution', () => {
