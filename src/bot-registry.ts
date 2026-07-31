@@ -1372,7 +1372,14 @@ export interface BotConfig {
 
 export interface BotState {
   config: BotConfig;
-  client: Lark.Client;
+  /** The Lark SDK client — NULL for apiOnly (core-only) bots: they have no
+   *  Feishu credential (empty appSecret), and the SDK's Client ctor throws
+   *  "appSecret or clientAssertionProvider is required" on an empty secret. An
+   *  apiOnly bot never needs it (getBotClient throws LarkTransportDisabledError
+   *  before returning it), so we skip construction entirely rather than feed the
+   *  SDK a placeholder. Every consumer reaches it via getBotClient (which gates
+   *  apiOnly) or getAllBotClients (which filters apiOnly), so the null is unreachable. */
+  client: Lark.Client | null;
   botOpenId?: string;
   botName?: string;       // Lark app display name (from /bot/v3/info)
   botAvatarUrl?: string;  // Lark app avatar URL (from /bot/v3/info)
@@ -1474,14 +1481,22 @@ const larkLogger = {
 };
 
 export function registerBot(cfg: BotConfig): BotState {
-  const client = new Lark.Client({
-    appId: cfg.larkAppId,
-    appSecret: cfg.larkAppSecret,
-    // brand → SDK domain。缺省走 feishu，国际版租户走 larksuite.com。
-    // 这一行同时修好了所有经由 SDK 的调用（发消息 / 文件 / contact 等）。
-    domain: sdkDomain(normalizeBrand(cfg.brand)),
-    logger: larkLogger,
-  });
+  // apiOnly (core-only) bots have NO Feishu credential (empty appSecret). The Lark
+  // SDK Client ctor throws "appSecret or clientAssertionProvider is required" on an
+  // empty secret, so constructing it would fatal the whole daemon at boot — the
+  // exact failure riff hit in a clean sandbox. An apiOnly bot never uses the client
+  // (getBotClient throws LarkTransportDisabledError first; getAllBotClients filters
+  // apiOnly), so leave it null. Zero Feishu transport is the whole contract.
+  const client = cfg.apiOnly === true
+    ? null
+    : new Lark.Client({
+        appId: cfg.larkAppId,
+        appSecret: cfg.larkAppSecret,
+        // brand → SDK domain。缺省走 feishu，国际版租户走 larksuite.com。
+        // 这一行同时修好了所有经由 SDK 的调用（发消息 / 文件 / contact 等）。
+        domain: sdkDomain(normalizeBrand(cfg.brand)),
+        logger: larkLogger,
+      });
   const state: BotState = {
     config: cfg,
     client,
@@ -1517,6 +1532,13 @@ export function getBotClient(larkAppId: string): Lark.Client {
   // first); reaching it is genuine misuse and must fail loud, not silently.
   if (bot.config.apiOnly === true) {
     throw new LarkTransportDisabledError(larkAppId, 'getBotClient');
+  }
+  // Non-apiOnly bots always have a constructed client (registerBot builds one for
+  // every non-apiOnly config). The null-guard is defensive — a null here would mean
+  // a misconfigured bot slipped the apiOnly gate, which must fail loud, not NPE deep
+  // in an SDK call.
+  if (!bot.client) {
+    throw new Error(`Bot ${larkAppId} has no Lark client (apiOnly misconfiguration)`);
   }
   return bot.client;
 }

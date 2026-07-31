@@ -72,6 +72,19 @@ describe('registerBot', () => {
     expect(client.opts.appSecret).toBe('secret_001');
   });
 
+  it('does NOT construct a Lark Client for an apiOnly bot (empty secret would throw in the real SDK)', () => {
+    // Regression (riff clean-sandbox boot): apiOnly bots have appSecret='' and the
+    // real Lark SDK ctor throws "appSecret or clientAssertionProvider is required",
+    // fataling core-only at boot. registerBot must skip construction entirely — the
+    // client is null and never used (getBotClient throws LarkTransportDisabledError,
+    // getAllBotClients filters apiOnly). NOTE the suite's FakeClient never throws, so
+    // this asserts the SKIP (client===null), which is what makes the real SDK safe.
+    const state = mod.registerBot({ larkAppId: 'local_riff', larkAppSecret: '', apiOnly: true, cliId: 'codex-app' } as any);
+    expect(state.client).toBeNull();
+    // getBotClient still fail-closes for apiOnly (never returns the null).
+    expect(() => mod.getBotClient('local_riff')).toThrow(/LarkTransportDisabled|core-only|apiOnly|transport/i);
+  });
+
   it('should default the SDK Client domain to feishu when brand is unset', () => {
     const state = mod.registerBot(makeCfg());
     const client = state.client as unknown as { opts: Record<string, unknown> };
