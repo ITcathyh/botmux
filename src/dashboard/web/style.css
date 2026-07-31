@@ -21798,17 +21798,12 @@ dialog select[multiple]:hover:not(:disabled) {
   height: 28px;
   min-height: 28px;
   padding: 0;
-  overflow: hidden;
-  /* icon-only button: hide the text label, render ✎ via ::before centered */
+  /* icon-only button: an inline SVG pencil (centered by flex on the base rule) */
   font-size: 0;
-  line-height: 0;
 }
 
-.bot-defaults-page .bd-name-edit::before {
-  content: "✎";
+.bot-defaults-page .bd-name-edit > svg {
   display: block;
-  font-size: 14px;
-  line-height: 1;
 }
 
 .bot-defaults-page .bd-tab-bar {
@@ -21982,6 +21977,23 @@ dialog select[multiple]:hover:not(:disabled) {
 
 .bot-defaults-page .bd-tab-grid .bd-subsection-title {
   font-size: 12px;
+}
+
+/* Inside a tile, a section note is a descriptive paragraph, not a short inline
+   caption. The global rule makes a title-followed-by-note render inline
+   (title inline-flex + note inline-block, left-margin) — fine for a short note,
+   but a long paragraph (e.g. the sandbox deny-by-default explainer) then wraps
+   cramped beside the title. Force them to stack: title on its own line, note
+   as a full-width block below it. */
+.bot-defaults-page .bd-tab-grid :where(.bd-section-title, .bd-subsection-title):has(+ .bd-section-note) {
+  display: block;
+  margin-bottom: 4px;
+}
+
+.bot-defaults-page .bd-tab-grid :where(.bd-section-title, .bd-subsection-title) + .bd-section-note {
+  display: block;
+  max-width: none;
+  margin: 0 0 8px;
 }
 
 /* A .bd-subsection carries a dashed top border to divide it from a sibling

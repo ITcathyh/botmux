@@ -1036,7 +1036,12 @@ function BotProfileIdentity(props: { bot: BotDefaultsRow; cli: string; patchBot:
             aria-label={tr('botDefaults.renameTitle')}
             onClick={() => setEditMode(true)}
           >
-            {tr('botDefaults.renameAction')}
+            {/* Inline pencil SVG instead of a ✎ text glyph: the glyph's ink is
+                asymmetric within its em-box so flexbox centering left it visibly
+                off-center. An SVG centers by geometry. */}
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M11.5 2.5l2 2L6 12l-2.5.5L4 10z" />
+            </svg>
           </button>
         </div>
       ) : (
