@@ -66,10 +66,11 @@ export function parseGrantQuota(text: string, mentions: any[]): { ok: true; quot
  * 本 bot 是否「只是作为 /grant、/revoke 的目标」被 @（@ 出现在命令词之后），
  * 而不是被前导 @ 点名执行命令的操作 bot。命中（仅目标）返回 true，调用方应静默放手——
  * 否则异主目标 bot 会误回 owner_only、同主目标 bot 会把自己剔空后误开整群授权。
- * 实现细节（text/post 双形态、key 前缀歧义规避）见 mention-targets.ts。
+ * 实现细节（text/post 双形态、key 前缀歧义规避、open_id + app_id 双判据）见 mention-targets.ts。
+ * botAppId（本 bot larkAppId）让 guard 也认 app_id 形态的本 bot @（协作 bot 常以 app_id 被 @）。
  */
-export function isGrantTargetOnly(message: any, botOpenId: string | undefined): boolean {
-  return isCommandTargetOnly(message, botOpenId, GRANT_CMD_PATTERN);
+export function isGrantTargetOnly(message: any, botOpenId: string | undefined, botAppId?: string): boolean {
+  return isCommandTargetOnly(message, botOpenId, GRANT_CMD_PATTERN, botAppId);
 }
 
 /** 返回 true 表示已拦截（不再进入路由/spawn）。 */
@@ -89,7 +90,7 @@ export async function tryHandleGrantCommand(
   // 常见于 owner 用 `/grant @bot` 授权另一个 bot 在本群协作）→ 这条命令是发给前导 @ 的
   // 操作 bot 的，本 bot 的 daemon 必须放手：既不能回 owner_only（异主 bot 会误报「仅 owner
   // 可使用 /grant」），也不能把自己从 targets 剔空后误判成裸 /grant 给整群开授权。
-  if (isGrantTargetOnly(message, getBotOpenId(larkAppId))) {
+  if (isGrantTargetOnly(message, getBotOpenId(larkAppId), larkAppId)) {
     logger.debug(`[grant:${larkAppId}] ignoring /grant|/revoke where this bot is only a target`);
     return true;  // 拦截（不喂 CLI），但不回复、不改授权——命令属于操作 bot
   }

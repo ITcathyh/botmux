@@ -125,8 +125,9 @@ export async function tryHandleInviteCommand(
       .catch(err => logger.debug(`invite ${key} reply failed: ${err}`));
 
   // 本 bot 只是作为 /invite 的【目标】被 @（`@OperatorBot /invite @ThisBot`）→ 命令属于
-  // 前导 @ 的操作 bot，本 bot 必须静默放手（同 /grant 的 target-only 守卫）。
-  if (isCommandTargetOnly(message, myOpenId, INVITE_CMD_PATTERN)) {
+  // 前导 @ 的操作 bot，本 bot 必须静默放手（同 /grant 的 target-only 守卫）。传 larkAppId
+  // 让 guard 也认 app_id 形态的本 bot @（群外/协作 bot 常以 app_id 被 @，只认 open_id 会漏判）。
+  if (isCommandTargetOnly(message, myOpenId, INVITE_CMD_PATTERN, larkAppId)) {
     logger.debug(`[invite:${larkAppId}] ignoring /invite where this bot is only a target`);
     return true;
   }

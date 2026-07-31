@@ -13,7 +13,7 @@
  * 从 grant-command.ts 提炼泛化（2026-07 /invite 落地时）；grant 的对外导出
  * （parseGrantTargets / isGrantTargetOnly / stripAllMentions）保持原样委托到这里。
  */
-import { mentionOpenId, mentionIdentity } from './message-parser.js';
+import { mentionIdentity } from './message-parser.js';
 
 /** 命令正则必须带 `\b` 边界、不带 g 标志（exec/index 语义依赖）。 */
 export type CommandPattern = RegExp;
@@ -124,19 +124,32 @@ function parsePostAtMentions(message: any, botOpenId: string | undefined, cmdPat
  * 点名执行命令的操作 bot。命中（仅目标）返回 true，调用方应静默放手——否则
  * 目标 bot 会误回 owner_only / 把自己剔空后误执行。
  *
+ * 本 bot 的身份判据要**同时**认 open_id 与 app_id：飞书对「群外 / 协作 bot」的 @
+ * 常以 `{id_type:'app_id', id:'cli_xxx'}` 形态下发（无 open_id），只认 open_id 会
+ * 漏判 `@OperatorBot /cmd @ThisBot(app_id 形态)` → guard 不命中 → 目标 bot 误回
+ * owner_only / 已在群（实测 blocker，2026-07 /invite app_id 支持）。botAppId 即本
+ * bot 的 larkAppId（app_id 形态自我识别用）。
+ *
  * text 与 post（富文本）两种消息形态都覆盖（同 parseTargetsAfterCommand）：
  *  - text：{"text":"@_user_1 /cmd @_user_2"}，@ 是占位符 key；用「key 后不接数字」
  *    的边界锁定整 token，规避 @_user_1 / @_user_10 这类 key 前缀歧义。
  *  - post：@ 是独立的 `at` 节点（不在 text 里、mentions 可能为空），按文档节点
  *    顺序比较本 bot 的 `at` 节点与含命令词的 text 节点的先后。
  */
-export function isCommandTargetOnly(message: any, botOpenId: string | undefined, cmdPattern: CommandPattern): boolean {
-  if (!botOpenId) return false;
+export function isCommandTargetOnly(
+  message: any, botOpenId: string | undefined, cmdPattern: CommandPattern, botAppId?: string,
+): boolean {
+  if (!botOpenId && !botAppId) return false;
+  /** 该 mention 是否指向本 bot（open_id 或 app_id 任一命中）。 */
+  const isMe = (m: any): boolean => {
+    const { openId, appId } = mentionIdentity(m);
+    return (!!botOpenId && openId === botOpenId) || (!!botAppId && appId === botAppId);
+  };
   let content: any;
   try { content = JSON.parse(message?.content ?? '{}'); } catch { return false; }
 
   if (typeof content?.text === 'string') {
-    const key = (message?.mentions ?? []).find((m: any) => mentionOpenId(m) === botOpenId)?.key;
+    const key = (message?.mentions ?? []).find(isMe)?.key;
     if (!key) return false;
     const cmdIdx = content.text.search(cmdPattern);
     const keyMatch = new RegExp(`${escapeRe(key)}(?!\\d)`).exec(content.text);
@@ -151,7 +164,8 @@ export function isCommandTargetOnly(message: any, botOpenId: string | undefined,
       if (!Array.isArray(para)) continue;
       for (const node of para) {
         if (cmdSeq < 0 && node?.tag === 'text' && cmdPattern.test(node.text ?? '')) cmdSeq = seq;
-        if (mySeq < 0 && node?.tag === 'at' && node.user_id === botOpenId) mySeq = seq;
+        // post at 节点：user_id 可能是本 bot 的 open_id（群内）或 app_id（cli_ 前缀，群外形态）。
+        if (mySeq < 0 && node?.tag === 'at' && node.user_id && (node.user_id === botOpenId || node.user_id === botAppId)) mySeq = seq;
         seq++;
       }
     }
