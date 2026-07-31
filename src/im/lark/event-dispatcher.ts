@@ -776,29 +776,6 @@ export function invalidateChatStats(larkAppId: string, chatId: string): void {
   }
 }
 
-/**
- * Invalidate group stats for the chat across EVERY locally-hosted bot.
- *
- * 飞书 `im.chat.member.bot.added/deleted_v1` 只推给「进群/被移出的那个 bot 自己
- * 的 app」,同群其他存量 bot 收不到——单 bot 失效对「拉了另一个 bot 进群」无效。
- * 但本 daemon 单进程托管全 fleet 且 chatStatsCache 是进程级共享的:任一本地
- * bot 收到自己的 bot.added/deleted 事件时,顺势清掉该群在所有本地 bot app
- * 视角下的缓存条目,fleet 内互相失效即告成立。
- *
- * 边界:拉进群的是【非本 daemon 的第三方 bot】时没有任何事件信号可达,该方向
- * 只能靠 relax 末条款的 mentionsAnotherMember 守卫 + TTL 兜底(见 relax 注释)。
- */
-export function invalidateChatStatsForAllLocalBots(chatId: string): void {
-  let cleared = 0;
-  for (const b of getAllBots()) {
-    const appId = b?.config?.larkAppId;
-    if (appId && chatStatsCache.delete(`${appId}:${chatId}`)) cleared++;
-  }
-  if (cleared > 0) {
-    logger.debug(`[group-stats] invalidated cached stats for ${chatId} across ${cleared} local bot(s): bot membership changed`);
-  }
-}
-
 /** Test-only: clear the group-stats cache between cases. */
 export function __resetChatStatsForTest(): void {
   chatStatsCache.clear();
@@ -3016,13 +2993,14 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       const chatIdForKey: string | undefined = data?.chat_id;
       const operatorForKey: string | undefined = data?.operator_id?.open_id;
       const eventKey = `im.chat.member.bot.added_v1:${larkAppId}:${eventIdForKey(data) ?? `${chatIdForKey ?? 'unknown'}:${operatorForKey ?? 'unknown'}`}`;
-      // 飞书只把 bot.added 推给「进群的那个 bot 自己的 app」——同群存量 bot 无
-      // 事件可收。因此这里必须扇出到 fleet 全 bot 视角对群缓存（缓存进程级共享）：
-      // 收到的是自己 fleet 内某个 bot 的进群,就把该群在所有本地 bot app 下的
-      // group-stats 条目一起清掉,让 1v1 放行在下一条消息就用 fresh 人数。
-      // 非 fleet 三方 bot 进群永远拿不到此事件,那方向靠 relax 末条款的
-      // mentionsAnotherMember 守卫 + TTL 兜底,不靠这里。
-      if (chatIdForKey) invalidateChatStatsForAllLocalBots(chatIdForKey);
+      // 飞书只把 bot.added 推给「进群的那个 bot 自己的 app」(官方文档语義,
+      // codex 复审证实),且生产是 PM2「一 bot 一 daemon 进程」(daemon.ts
+      // "Load the assigned bot (one daemon per bot)")——同群其他 bot 的缓存在
+      // 别的进程,这里够不到,只能清自己的 key。覆盖增量其实很小:新添进群
+      // 时本 bot 此前若恰有该群条目（曾被移出又拉回),避免带着上轮陈旧数放行。
+      // 「拉了别的 bot 进群→存量 bot 陈旧」方向无事件信号,靠 relax 末条款的
+      // mentionsAnotherMember 守卫 + TTL 兜底。
+      if (chatIdForKey) invalidateChatStats(larkAppId, chatIdForKey);
       scheduleAckSafeEvent(eventKey, async () => {
       try {
         const chatId: string | undefined = data?.chat_id;
@@ -3035,13 +3013,14 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       }
       }, 'bot-added event');
     },
-    // bot 被移出群（只推给被移出的 bot 自己的 app）=> 同样扇出失效 fleet 全视角。
-    // user.added/deleted_v1 则推给群内已订阅的所有 bot app,每个 bot 自己的 WS
-    // 都收到,只清自己那条即可。纯本地 map 删除,同步处理、即时 ACK,不进
-    // scheduleAckSafeEvent 的 work 队列;去重也不必要——失效是幂等的。
+    // bot.deleted 同样只推给被移出的 bot 自己的 app——清自己的 key 即可(语义
+    // 同 bot.added:进程边界上够不到兄弟 daemon;「别的 bot 离群→存量 bot
+    // 陈旧」靠①守卫+TTL)。user.added/deleted_v1 推给群内已订阅的所有 bot
+    // app,每个 bot 自己的 WS 都收到,各自清自己那条。纯本地 map 删除,同步
+    // 处理、即时 ACK,不进 work 队列;去重也不必要——失效是幂等的。
     'im.chat.member.bot.deleted_v1': (data: any) => {
       const chatId: string | undefined = data?.chat_id;
-      if (chatId) invalidateChatStatsForAllLocalBots(chatId);
+      if (chatId) invalidateChatStats(larkAppId, chatId);
     },
     'im.chat.member.user.added_v1': (data: any) => {
       const chatId: string | undefined = data?.chat_id;
