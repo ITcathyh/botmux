@@ -8,11 +8,12 @@
  *  - 仅 owner 可用（对齐 /grant 的权限模型）；
  *  - 命令词之后的 @ 才是目标（共享 mention-targets.ts 的位置解析）。
  *
- * 目标 mention → larkAppId 的解析不走群成员表（目标恰恰不在群里），改查
- * 部署级共享花名册 bots-info.json（每个 daemon 启动时 merge 写入），按显示名
- * 唯一匹配（大小写不敏感，与 /group 的 knownBotNames 判定同款）；重名 / 查无
- * 时按目标报错，并提示用 --app 直通。已在群内的目标（live 群 bot 成员表能
- * 对上的）跳过并报「已在群内」，幂等。
+ * 目标 mention → larkAppId 的解析不走群成员表（目标恰恰不在群里），而是
+ * 两级花名册兜底：先本机 bots-info.json（本部署），未命中再查「同团队」跨
+ * 部署目录 [[team-bot-directory]]（平台团队同步名册 + 联邦名册：本机托管
+ * federations.json + spoke 向 hub 现拉 /api/federation/roster）；两级都查
+ * 不到才 unresolved，并提示用 --app 直通。任一级别同名多 app → 报歧义。
+ * 已在群内的目标（live 群 bot 成员表能对上的）跳过并报「已在群内」，幂等。
  *
  * 拉人走 services/groups-store.ts 的 addBotToChat（proxy=本 bot），与 /group、
  * dashboard groups 面板、vc-agent 共用同一封装；批量失败时回退逐个拉（镜像
@@ -25,6 +26,8 @@ import { config } from '../../config.js';
 import { isBotMentioned, extractMessageTextForRouting } from './event-dispatcher.js';
 import { stripLeadingMentions } from './message-parser.js';
 import { addBotToChat } from '../../services/groups-store.js';
+import { fetchTeamBotDirectory, hasAnyTeamDirectorySource } from '../../services/team-bot-directory.js';
+import type { TeamBotMatch } from '../../services/team-bot-directory.js';
 import { listChatBotMembers, replyMessage } from './client.js';
 import type { ChatBotMember } from './client.js';
 import { localeForBot, t } from '../../i18n/index.js';
@@ -186,12 +189,16 @@ export async function tryHandleInviteCommand(
     (byLowerName.get(k) ?? byLowerName.set(k, []).get(k)!).push(e);
   }
   const nameOf = (appId: string) =>
-    botsInfo.find(e => e.larkAppId === appId)?.botName ?? rosterNameById.get(appId) ?? appId;
+    botsInfo.find(e => e.larkAppId === appId)?.botName ?? rosterNameById.get(appId) ?? resolvedNameById.get(appId) ?? appId;
+  /** 团队目录解析出的 appId → 展示名（本机花名册查不到的跨部署 bot，避免结果里退化成裸 appId）。 */
+  const resolvedNameById = new Map<string, string>();
 
   const toInvite: string[] = [];
   const already: string[] = [];
   const unresolved: string[] = [];
   const ambiguous: string[] = [];
+  /** 本地花名册查不到、需要拿团队目录再试一次的目标（跨部署「同团队」bot 走这里）。 */
+  const teamLookupTargets: Array<{ name: string }> = [];
 
   for (const tgt of mentionTargets) {
     // 已在群内：open_id 命中 live 成员表即跳过（app_id 形态目标无 open_id，靠下方 appId 分支的 rosterAppIds 判定）。
@@ -211,10 +218,46 @@ export async function tryHandleInviteCommand(
       else if (!toInvite.includes(appId)) toInvite.push(appId);
     } else if (candidates.length > 1) {
       ambiguous.push(t('cmd.invite.ambiguous_item', { name: tgt.name, apps: candidates.map(c => c.larkAppId).join('、') }, loc));
+    } else if (tgt.name) {
+      // 本机花名册没有 ≠ 查无此人：目标可能是「同团队」跨部署 bot（平台/联邦名册），
+      // 先攒起来，下面拿整目录批量再试。
+      teamLookupTargets.push({ name: tgt.name });
     } else {
       unresolved.push(tgt.name || tgt.openId);
     }
   }
+
+  // 团队目录兜底解析：平台团队同步名册 + 联邦（本地托管 + spoke→hub 现拉）。
+  // 目录一次装载、按名索引后复用，避免每个未知目标一次 hub HTTP。
+  if (teamLookupTargets.length > 0) {
+    let teamByLowerName = new Map<string, TeamBotMatch[]>();
+    if (hasAnyTeamDirectorySource(config.session.dataDir)) {
+      const dir = await fetchTeamBotDirectory(config.session.dataDir);
+      for (const m of dir) {
+        const k = m.botName.trim().toLowerCase();
+        (teamByLowerName.get(k) ?? teamByLowerName.set(k, []).get(k)!).push(m);
+      }
+    }
+    for (const lt of teamLookupTargets) {
+      const matches = teamByLowerName.get(lt.name.trim().toLowerCase()) ?? [];
+      const distinctAppIds = [...new Set(matches.map(m => m.larkAppId))];
+      if (distinctAppIds.length === 1) {
+        const appId = distinctAppIds[0];
+        resolvedNameById.set(appId, matches.find(m => m.larkAppId === appId)?.botName ?? lt.name);
+        if (appId === larkAppId || rosterAppIds.has(appId)) already.push(lt.name);
+        else if (!toInvite.includes(appId)) toInvite.push(appId);
+      } else if (distinctAppIds.length > 1) {
+        ambiguous.push(t('cmd.invite.ambiguous_item', {
+          name: lt.name,
+          apps: matches.filter(m => distinctAppIds.includes(m.larkAppId))
+            .map(m => `${m.larkAppId}(${m.source})`).join('、'),
+        }, loc));
+      } else {
+        unresolved.push(lt.name);
+      }
+    }
+  }
+
   for (const appId of args.appIds) {
     if (appId === larkAppId || rosterAppIds.has(appId)) already.push(nameOf(appId));
     else if (!toInvite.includes(appId)) toInvite.push(appId);
