@@ -97,12 +97,23 @@ export interface BridgeGateInput {
 
 const BRIDGE_SEND_PREVIEW_MAX_CHARS = 4_000;
 
+/** Bounded, newline-preserving copy of a `botmux send` body for dashboard
+ *  previews. Unlike the fingerprint normaliser (which collapses ALL whitespace
+ *  incl. newlines into single spaces — right for dedup, wrong for display), this
+ *  keeps line breaks so the dashboard can render the reply's Markdown structure
+ *  (paragraphs / lists / code blocks). Horizontal runs of spaces/tabs within a
+ *  line are collapsed and trailing spaces trimmed to keep the stored copy tidy;
+ *  blank-line runs are capped at one to bound size without flattening structure. */
 export function buildBridgeSendPreviewText(content: string): string | undefined {
-  const normalized = normaliseForFingerprint(content);
-  if (!normalized) return undefined;
-  return normalized.length > BRIDGE_SEND_PREVIEW_MAX_CHARS
-    ? `${normalized.slice(0, BRIDGE_SEND_PREVIEW_MAX_CHARS - 1)}…`
-    : normalized;
+  const tidy = String(content ?? '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[^\S\n]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  if (!tidy) return undefined;
+  return tidy.length > BRIDGE_SEND_PREVIEW_MAX_CHARS
+    ? `${tidy.slice(0, BRIDGE_SEND_PREVIEW_MAX_CHARS - 1)}…`
+    : tidy;
 }
 
 export function buildBridgeSendMarkerContent(
@@ -111,8 +122,11 @@ export function buildBridgeSendMarkerContent(
   const normalized = normaliseForFingerprint(content);
   if (!normalized) return undefined;
   return {
+    // Length stays fingerprint-normalized: the fallback gate compares it against
+    // normalise(finalText).length, so it must not count preview-only newlines.
     contentLength: normalized.length,
-    previewText: buildBridgeSendPreviewText(normalized),
+    // Preview keeps newlines — derive it from the raw body, NOT `normalized`.
+    previewText: buildBridgeSendPreviewText(content),
   };
 }
 

@@ -31,18 +31,30 @@ function compactPreviewText(value: unknown, limit: number): string {
   return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
 }
 
+/** Length-bound while preserving newlines — feeds the overlay, which renders
+ * Markdown. The single-line card summary keeps using compactPreviewText(). */
+function compactMultilinePreview(value: unknown, limit: number): string {
+  const text = String(value ?? '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[^\S\n]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  if (!text) return '';
+  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+}
+
 /** Latest user/bot exchange for a session card. A bot preview is shown only
  * when it is newer than the latest user input; otherwise the card communicates
  * the still-waiting state with the user line alone. */
 export function sessionExchangePreview(row: Record<string, any>): SessionExchangePreview {
-  const userFullText = compactPreviewText(
+  const userFullText = compactMultilinePreview(
     row.previewUserFullText
       ?? row.previewUserText
       ?? '',
     4_000,
   );
   const botFullText = row.previewBotState === 'replied'
-    ? compactPreviewText(row.previewBotFullText ?? row.previewBotText ?? '', 4_000)
+    ? compactMultilinePreview(row.previewBotFullText ?? row.previewBotText ?? '', 4_000)
     : '';
   return {
     userText: compactPreviewText(userFullText, 120),
