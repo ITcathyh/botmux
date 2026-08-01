@@ -68,6 +68,19 @@ describe('readLocalTeamBotDirectory（平台名册 + 本机托管联邦）', () 
     expect(readLocalTeamBotDirectory(dir)).toEqual([]);
     expect(hasAnyTeamDirectorySource(dir)).toBe(false);
   });
+
+  it('P2: excludes core-only federation bots (larkTransportEnabled===false), keeps true/undefined', () => {
+    writeHostedFederations({
+      default: [{ deploymentId: 'dep_1', name: 'remote', syncToken: 'x', joinedAt: 1, lastSeenAt: 2, bots: [
+        { larkAppId: 'cli_core', botName: 'CoreOnly', cliId: 'claude-code', larkTransportEnabled: false },   // 无飞书传输 → 不能入群
+        { larkAppId: 'cli_normal', botName: 'Normal', cliId: 'claude-code', larkTransportEnabled: true },
+        { larkAppId: 'cli_legacy', botName: 'Legacy', cliId: 'claude-code' },                                 // undefined=旧版 → 按可传输保留
+      ] }],
+    });
+    const out = readLocalTeamBotDirectory(dir);
+    expect(out.map(b => b.larkAppId).sort()).toEqual(['cli_legacy', 'cli_normal']);
+    expect(out.find(b => b.larkAppId === 'cli_core')).toBeUndefined();
+  });
 });
 
 describe('fetchRemoteHubBotDirectory（spoke→hub HTTP）', () => {
@@ -104,6 +117,17 @@ describe('fetchRemoteHubBotDirectory（spoke→hub HTTP）', () => {
     writeMemberships({ 'http://hub::default': { hubUrl: 'http://hub', teamId: 'default', teamName: 'a', syncToken: 't', deploymentId: 'd', joinedAt: 1 } });
     const fetcher = vi.fn(async () => ({ ok: false, status: 403, json: async () => ({ ok: false, error: 'unknown_token' }) }));
     expect(await fetchRemoteHubBotDirectory(dir, { fetcher })).toEqual([]);
+  });
+
+  it('P2: excludes core-only hub-roster bots (larkTransportEnabled===false), keeps true/undefined', async () => {
+    writeMemberships({ 'http://hub::default': { hubUrl: 'http://hub', teamId: 'default', teamName: 'a', syncToken: 't', deploymentId: 'd', joinedAt: 1 } });
+    const fetcher = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ ok: true, bots: [
+      { larkAppId: 'cli_core', name: 'CoreOnly', larkTransportEnabled: false },
+      { larkAppId: 'cli_normal', name: 'Normal', larkTransportEnabled: true },
+      { larkAppId: 'cli_legacy', name: 'Legacy' },   // undefined → 保留
+    ] }) }));
+    const out = await fetchRemoteHubBotDirectory(dir, { fetcher });
+    expect(out.map(b => b.larkAppId).sort()).toEqual(['cli_legacy', 'cli_normal']);
   });
 });
 

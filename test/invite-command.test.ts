@@ -236,8 +236,9 @@ describe('tryHandleInviteCommand — 解析与拉人', () => {
     expect(addBotMock).not.toHaveBeenCalled();
     const out = String(replyMock.mock.calls.at(-1)![2]);
     expect(out).toContain('多个机器人');
-    expect(out).toContain('cli_dup1');
-    expect(out).toContain('cli_dup2');
+    // 本机同名多候选：候选带来源标注（local），与跨源歧义同款格式。
+    expect(out).toContain('cli_dup1(local)');
+    expect(out).toContain('cli_dup2(local)');
   });
 
   it('--app bypasses name resolution (also works for bots outside the roster)', async () => {
@@ -537,9 +538,9 @@ describe('tryHandleInviteCommand — 团队目录兜底解析（跨部署「同�
     }
   });
 
-  it('local bots-info hit wins and does NOT consult the team directory (no HTTP even with memberships)', async () => {
+  it('local-only hit with NO team sources resolves without any HTTP', async () => {
     writeBotsInfo([{ larkAppId: 'cli_codex', botName: 'Codex' }]);
-    writeMemberships();
+    // 无 memberships / 平台名册 / 托管联邦 → hasAnyTeamDirectorySource=false → 不发 HTTP。
     const fetchStub = vi.fn();
     vi.stubGlobal('fetch', fetchStub as any);
     try {
@@ -549,5 +550,41 @@ describe('tryHandleInviteCommand — 团队目录兜底解析（跨部署「同�
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+
+  it('local hit + team sources present: STILL consults the directory (cannot assume local is unique), resolves to local when team adds no rival', async () => {
+    writeBotsInfo([{ larkAppId: 'cli_codex', botName: 'Codex' }]);
+    writeMemberships();                              // 有团队源 → 必须查目录核对唯一性
+    const fetchStub = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ ok: true, bots: [] }) }));
+    vi.stubGlobal('fetch', fetchStub as any);
+    try {
+      expect(await tryHandleInviteCommand('b1', inviteMessage(), OWNER)).toBe(true);
+      expect(addBotMock).toHaveBeenCalledWith('b1', 'oc_1', ['cli_codex']);
+      expect(fetchStub).toHaveBeenCalled();          // 关键：不再因「本机命中」短路跳过团队目录
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('P1 regression: local name hit + DIFFERENT-app same name in team directory → ambiguous, nothing added (no silent wrong-bot pull)', async () => {
+    // 本机 Codex→cli_local；团队里 Codex→cli_remote（用户 @ 的可能正是远端那个，但
+    // mention 没带 app_id）。修复前：本机恰 1 个候选就静默拉 cli_local。修复后：合并
+    // 去重后有 2 个不同 app → 报歧义，一个都不拉。
+    writeBotsInfo([{ larkAppId: 'cli_local', botName: 'Codex' }]);
+    writePlatformSync([{ appId: 'cli_remote', name: 'Codex' }]);
+    expect(await tryHandleInviteCommand('b1', inviteMessage(), OWNER)).toBe(true);
+    expect(addBotMock).not.toHaveBeenCalled();
+    const out = String(replyMock.mock.calls.at(-1)![2]);
+    expect(out).toContain('多个机器人');
+    expect(out).toContain('cli_local(local)');
+    expect(out).toContain('cli_remote(platform:t1)');
+  });
+
+  it('P1: same appId in both local roster and team directory → deduped to ONE, resolves (not spurious ambiguity)', async () => {
+    // 同一个 app 同时在本机花名册和平台名册出现，不能误报歧义。
+    writeBotsInfo([{ larkAppId: 'cli_codex', botName: 'Codex' }]);
+    writePlatformSync([{ appId: 'cli_codex', name: 'Codex' }]);
+    expect(await tryHandleInviteCommand('b1', inviteMessage(), OWNER)).toBe(true);
+    expect(addBotMock).toHaveBeenCalledWith('b1', 'oc_1', ['cli_codex']);
   });
 });

@@ -21,11 +21,25 @@
  * 纯解析用途：这里只给出名字→appId 的映射，不构成任何授权变更——被拉进
  * 群的团队 bot 本来就享有既有 team-trust 语义（talk 免 grant），/invite
  * 只是完成成员变更动作本身。
+ *
+ * ⚠️ **能力边界**：core-only / apiOnly（`larkTransportEnabled === false`）的 bot
+ * 没有飞书传输身份，既不能作群成员也不能作群创建者（#668 的硬不变量）。这类
+ * bot 必须从目录里剔除——否则 /invite 会尝试把一个进不了飞书群的 app 拉进去，
+ * 留下收不到事件的「死 bot」。与既有拉群路径（dashboard.ts 用
+ * `buildFederatedRoster(...).bots.filter(b => b.larkTransportEnabled === false)`
+ * 过滤）同源。`undefined`=旧版 spoke 未上报能力 → 按可传输（legacy normal）保留。
+ * 平台团队同步名册（PlatformTeamBot）没有该能力字段，其成员一律按可传输对待。
  */
 import { listPlatformTeams } from './platform-team-store.js';
 import { listAllFederatedDeployments } from './federation-store.js';
 import { listMemberships } from './federation-membership-store.js';
 import { logger } from '../utils/logger.js';
+
+/** #668 能力边界：只有显式 `false`（core-only/apiOnly，无飞书传输）不可入群；
+ *  `true` 或 `undefined`（旧版未上报）按可传输保留。 */
+function isNoTransport(larkTransportEnabled: unknown): boolean {
+  return larkTransportEnabled === false;
+}
 
 export interface TeamBotMatch {
   larkAppId: string;
@@ -54,7 +68,8 @@ export function readLocalTeamBotDirectory(dataDir: string): TeamBotMatch[] {
 
   for (const { teamId, deployment } of listAllFederatedDeployments(dataDir)) {
     for (const b of deployment.bots) {
-      if (b?.botName && b.larkAppId) {
+      // #668：core-only/apiOnly（transport=false）不能作群成员 → 不进目录。
+      if (b?.botName && b.larkAppId && !isNoTransport(b.larkTransportEnabled)) {
         out.push({ larkAppId: b.larkAppId, botName: b.botName, source: `federation:${teamId}/${deployment.name}` });
       }
     }
@@ -84,7 +99,9 @@ export async function fetchRemoteHubBotDirectory(
       }
       for (const b of j.bots) {
         const bname = typeof b?.name === 'string' ? b.name : '';
-        if (bname && typeof b?.larkAppId === 'string' && b.larkAppId) {
+        // #668：hub roster 也带 larkTransportEnabled（buildFederatedRoster 透传）——
+        // 显式 false 的 core-only bot 不能作群成员，剔除。
+        if (bname && typeof b?.larkAppId === 'string' && b.larkAppId && !isNoTransport(b?.larkTransportEnabled)) {
           const dep = typeof b?.deployment?.name === 'string' ? `${m.hubUrl}/${b.deployment.name}` : m.hubUrl;
           out.push({ larkAppId: b.larkAppId, botName: bname, source: dep });
         }
