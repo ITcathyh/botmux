@@ -1965,11 +1965,22 @@ function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; wrap
   };
 }
 
-function liveBots(): { larkAppId: string; botName: string; cliId?: string }[] {
+function liveBots(): { larkAppId: string; botName: string; cliId?: string; larkTransportEnabled?: boolean }[] {
   const ids = configuredCliIds();
+  // core-only (apiOnly) bots have no Feishu transport → flag them so the
+  // aggregated roster (and any spoke pulling it) can exclude them from group
+  // membership/creation (#668). Mirror federation-spoke-api's spoke-side advert.
+  // Config unreadable → leave transport undefined (caller treats as normal),
+  // matching the dashboard's existing isNoTransportBot fallback semantics.
+  let apiOnlyIds: Set<string> | undefined;
+  try { apiOnlyIds = new Set(loadBotConfigs().filter(b => b.apiOnly === true).map(b => b.larkAppId)); }
+  catch { apiOnlyIds = undefined; }
   return registry.list().map(d => {
     const b = withConfiguredCliId(d, ids);
-    return { larkAppId: b.larkAppId, botName: b.botName, cliId: b.cliId };
+    return {
+      larkAppId: b.larkAppId, botName: b.botName, cliId: b.cliId,
+      larkTransportEnabled: apiOnlyIds ? !apiOnlyIds.has(b.larkAppId) : undefined,
+    };
   });
 }
 

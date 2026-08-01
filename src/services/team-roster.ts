@@ -22,6 +22,11 @@ export interface TeamRosterBot {
   hasTeamRole: boolean;
   /** Owner for grouping by person; null if unassigned. unionId is the key, name for display. */
   owner: { unionId?: string; openId?: string; name?: string } | null;
+  /** Feishu transport capability of THIS local bot. Only populated when the
+   *  caller passes `liveBots` (the live registry knows apiOnly); false = core-only
+   *  (no Feishu transport → cannot be a group member/creator, #668). undefined =
+   *  unknown (bots-info.json fallback path, or a legacy caller) → treat as normal. */
+  larkTransportEnabled?: boolean;
 }
 
 export interface TeamRoster {
@@ -47,7 +52,7 @@ function hasTeamRoleFile(dataDir: string, larkAppId: string): boolean {
 
 /** A currently-running bot from the live daemon registry (authoritative for
  *  "what's running" — unlike bots-info.json which is a racy, probe-lagged file). */
-export interface LiveBot { larkAppId: string; botName?: string | null; cliId?: string }
+export interface LiveBot { larkAppId: string; botName?: string | null; cliId?: string; larkTransportEnabled?: boolean }
 
 /**
  * @param configOrder optional list of larkAppIds in bots.json (config) order;
@@ -61,6 +66,9 @@ export function buildTeamRoster(dataDir: string, teamId: string = DEFAULT_TEAM_I
   const team = getTeam(dataDir, teamId) ?? getDefaultTeam(dataDir);
   const info = readBotsInfo(dataDir);
   let entries: BotInfoEntry[];
+  // Transport capability per appId — only known when the live registry is passed
+  // (bots-info.json doesn't carry apiOnly). Absent → undefined → treated as normal.
+  const transportByAppId = new Map<string, boolean | undefined>();
   if (liveBots !== undefined) {
     // Live registry is the source of truth WHEN PROVIDED — including an empty
     // array (no daemons running ⇒ empty roster). Never fall back to a stale
@@ -70,6 +78,7 @@ export function buildTeamRoster(dataDir: string, teamId: string = DEFAULT_TEAM_I
     const byId = new Map(info.map(e => [e.larkAppId, e]));
     entries = liveBots.map(lb => {
       const ex = byId.get(lb.larkAppId);
+      transportByAppId.set(lb.larkAppId, lb.larkTransportEnabled);
       return {
         larkAppId: lb.larkAppId,
         botOpenId: ex?.botOpenId ?? null,
@@ -95,6 +104,7 @@ export function buildTeamRoster(dataDir: string, teamId: string = DEFAULT_TEAM_I
       capability: getBotCapability(dataDir, b.larkAppId),
       hasTeamRole: hasTeamRoleFile(dataDir, b.larkAppId),
       owner: o ? { unionId: o.unionId, openId: o.openId, name: o.name } : null,
+      larkTransportEnabled: transportByAppId.get(b.larkAppId),
     };
   });
   return { team: { id: team.id, name: team.name, memberCount: team.members.length }, bots };

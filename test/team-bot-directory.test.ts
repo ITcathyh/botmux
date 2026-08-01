@@ -10,6 +10,7 @@ import {
   readLocalTeamBotDirectory, fetchRemoteHubBotDirectory, fetchTeamBotDirectory,
   hasAnyTeamDirectorySource,
 } from '../src/services/team-bot-directory.js';
+import { buildFederatedRoster } from '../src/services/federation-roster.js';
 
 let dir: string;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'team-bot-dir-')); });
@@ -128,6 +129,30 @@ describe('fetchRemoteHubBotDirectory（spoke→hub HTTP）', () => {
     ] }) }));
     const out = await fetchRemoteHubBotDirectory(dir, { fetcher });
     expect(out.map(b => b.larkAppId).sort()).toEqual(['cli_legacy', 'cli_normal']);
+  });
+
+  it('P2 end-to-end (producer→consumer): a HUB-LOCAL apiOnly bot from real buildFederatedRoster is excluded from the spoke directory', async () => {
+    // Codex round-2 requirement: don't just hand-forge hub JSON with `false` —
+    // wire the REAL producer (buildFederatedRoster, hub side) into the REAL
+    // consumer (fetchRemoteHubBotDirectory, spoke side). Catches the producer
+    // omitting larkTransportEnabled on hub-LOCAL bots.
+    const hubDir = mkdtempSync(join(tmpdir(), 'hub-side-'));
+    try {
+      // Hub's live registry: one normal + one core-only (apiOnly) LOCAL bot.
+      const hubRoster = buildFederatedRoster(hubDir, 'default', undefined, undefined, [
+        { larkAppId: 'cli_hub_normal', botName: 'HubNormal', cliId: 'claude-code', larkTransportEnabled: true },
+        { larkAppId: 'cli_hub_core', botName: 'HubCore', cliId: 'claude-code', larkTransportEnabled: false },
+      ]);
+      // Spoke joined this hub; the hub answers /roster with its REAL aggregated payload.
+      writeMemberships({ 'http://hub::default': { hubUrl: 'http://hub', teamId: 'default', teamName: 'a', syncToken: 't', deploymentId: 'd', joinedAt: 1 } });
+      const fetcher = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ ok: true, ...hubRoster }) }));
+      const out = await fetchRemoteHubBotDirectory(dir, { fetcher });
+      // The hub-local core-only bot must NOT reach the spoke's directory.
+      expect(out.map(b => b.larkAppId).sort()).toEqual(['cli_hub_normal']);
+      expect(out.find(b => b.larkAppId === 'cli_hub_core')).toBeUndefined();
+    } finally {
+      rmSync(hubDir, { recursive: true, force: true });
+    }
   });
 });
 
