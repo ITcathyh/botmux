@@ -4581,8 +4581,10 @@ async function adoptCodexNotifierEvent(
     // 卡在「正在创建/提交」。因此丢弃一旦发布即为终态——用「取消并请重发」的显式
     // 语义告知用户,而非假装能恢复。
     // 判断是否有「已收下但尚未真正送达 CLI」的用户输入会被下面的 clear 抹掉
-    // (见 notifierAdoptWouldDropInput,覆盖选仓挂起期缓冲 + 选仓刚提交的启动窗
-    // 两个窗口,都不拿 pendingRepo 当前置)。有则记录已丢弃,如实告知用户。
+    // (见 notifierAdoptWouldDropInput:repo-select 镜像字段只在 pendingRepo===true
+    // 计入——立即启动路径也播种这些字段但已 fork 送达,不能误判;pendingRawInput/
+    // pendingFollowUpInput 独立于 pendingRepo,覆盖选仓刚提交等 prompt_ready 的启动窗)。
+    // 有则记录已丢弃,如实告知用户。
     bufferedInputDropped = notifierAdoptWouldDropInput(ds);
     clearPendingRepoStateForNotifierAdopt(ds);
 

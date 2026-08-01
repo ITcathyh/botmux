@@ -9,10 +9,12 @@
  *       bogus green「已接管」over a half-rewritten / relayed session.
  *
  *  P2 · notifierAdoptWouldDropInput — the "would clear drop undelivered input?"
- *       predicate must NOT gate on pendingRepo: input buffered in the just-
- *       committed launch window (pendingRepo=false, pendingRawInput/
- *       pendingFollowUpInput still waiting on prompt_ready) is just as real as
- *       the repo-select pending buffer.
+ *       predicate splits by state semantics: repo-select mirror fields
+ *       (pendingPrompt/etc) count ONLY while pendingRepo===true (the immediate-
+ *       launch path also seeds them but has already forked/delivered), while
+ *       pendingRawInput/pendingFollowUpInput are checked independently of
+ *       pendingRepo — they are the real just-committed launch window still
+ *       waiting on prompt_ready.
  *
  * Run: pnpm vitest run test/codex-notifier-adopt-race.test.ts
  */
