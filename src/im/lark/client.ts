@@ -14,6 +14,7 @@ import { getBotCapability } from '../../services/bot-profile-store.js';
 import { resolveTeamRoleFile } from '../../core/role-resolver.js';
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
 import { canonicalMobileKey, isMobileEntry, normalizeMobileEntry } from '../../setup/bot-config-editor.js';
+import { stampBotmuxCallbackMarkers } from './callback-button-marker.js';
 
 type LarkRequestParams = Record<string, string | number | boolean | undefined>;
 
@@ -230,7 +231,9 @@ export async function sendMessage(
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendMessage');
   const c = getBotClient(larkAppId);
-  const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
+  const body = msgType === 'text'
+    ? JSON.stringify({ text: content })
+    : msgType === 'interactive' ? stampBotmuxCallbackMarkers(content) : content;
 
   let res: any;
   try {
@@ -291,7 +294,9 @@ export async function replyMessage(
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'replyMessage');
   const c = getBotClient(larkAppId);
-  const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
+  const body = msgType === 'text'
+    ? JSON.stringify({ text: content })
+    : msgType === 'interactive' ? stampBotmuxCallbackMarkers(content) : content;
 
   let res: any;
   try {
@@ -522,7 +527,17 @@ export async function sendUserMessage(
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendUserMessage');
   const c = getBotClient(larkAppId);
-  const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
+  // Stamp callback-button ownership markers on interactive DMs too: this is the
+  // FIFTH card egress surface (config / write-link / substitute / overload / …
+  // cards all DM their callback buttons through here). Without it a peer bot
+  // reading such a DM via history flattens the buttons into its prompt, and —
+  // worse — a future botmux DM button with a new action would leak past the
+  // parser's legacy wordlist. Shared `body` feeds BOTH branches below (plain
+  // create + deadline request), so one stamp covers both. Same total-function
+  // contract as send/reply/ephemeral/update: any JSON anomaly returns unchanged.
+  const body = msgType === 'text'
+    ? JSON.stringify({ text: content })
+    : msgType === 'interactive' ? stampBotmuxCallbackMarkers(content) : content;
   const data = {
     receive_id: openId,
     msg_type: msgType as any,
@@ -814,7 +829,7 @@ export async function sendEphemeralCard(
   const c = getBotClient(larkAppId);
   let card: unknown;
   try {
-    card = JSON.parse(cardJson);
+    card = JSON.parse(stampBotmuxCallbackMarkers(cardJson));
   } catch (err) {
     throw new Error(`Invalid ephemeral card JSON: ${err}`);
   }
@@ -867,7 +882,7 @@ export async function updateMessage(larkAppId: string, messageId: string, cardJs
   try {
     res = await c.im.v1.message.patch({
       path: { message_id: messageId },
-      data: { content: cardJson },
+      data: { content: stampBotmuxCallbackMarkers(cardJson) },
     });
   } catch (err: any) {
     if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) {

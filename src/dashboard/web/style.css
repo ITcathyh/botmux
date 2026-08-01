@@ -21749,8 +21749,12 @@ dialog select[multiple]:hover:not(:disabled) {
 .bot-defaults-page .bd-profile-head {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
+  grid-template-areas:
+    "avatar main"
+    "status status";
   align-items: center;
-  gap: 12px;
+  column-gap: 12px;
+  row-gap: 0; /* empty status row must add no vertical space (its own margin spaces it when present) */
   margin-bottom: 0;
   padding: 12px 14px;
   border: 0;
@@ -21758,6 +21762,22 @@ dialog select[multiple]:hover:not(:disabled) {
   background: transparent;
   box-shadow: none;
 }
+
+.bot-defaults-page .bd-profile-head > .bd-profile-avatar { grid-area: avatar; }
+.bot-defaults-page .bd-profile-head > .bd-profile-main { grid-area: main; }
+
+/* Avatar status is a full-width in-flow strip on the header's 2nd row — no
+   longer absolutely positioned under the small avatar (which overlapped the
+   name-status and bled into the tab bar). */
+.bot-defaults-page .bd-profile-head > .bd-avatar-status {
+  grid-area: status;
+  position: static;
+  min-width: 0;
+  max-width: none;
+  margin: 8px 0 0;
+  box-shadow: none;
+}
+.bot-defaults-page .bd-profile-head > .bd-avatar-status:empty { display: none; }
 
 :root[data-theme="dark"] .bot-defaults-page .bd-profile-head {
   border-color: transparent;
