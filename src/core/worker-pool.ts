@@ -805,62 +805,30 @@ function isRunnerDeliveryCli(cliId?: string): boolean {
 }
 
 function daemonCardFooterRecipientOpenId(ds: DaemonSession, effectiveCliId?: string): string | undefined {
-  // Runner-delivery CLIs (mira/mir) keep their existing dispatcher-oriented
-  // resolution below: their fallback card IS the only @-trigger channel for
-  // bot-to-bot handoffs, and the orchestration contract addresses the stable
-  // dispatcher (creatorOpenId / bot owner), not merely whoever spoke last.
-  // Do NOT fold them into the last-conversant path — that would silently
-  // change mira/mir handoff targets when a third party interjects mid-orch.
-  if (!isRunnerDeliveryCli(effectiveCliId)) {
-    // The daemon fallback card fires ONLY when the model did NOT call
-    // `botmux send` this turn (typically it forgot after a context compaction).
-    // In that state the model made no @ routing decision, so the safety-net
-    // card must itself @ back whoever this turn was replying to — otherwise a
-    // peer bot (or oncall caller) waiting on the reply is never re-triggered
-    // and the message effectively goes unaddressed. Prefer the last-conversant
-    // open_id: the SAME field that powers manual `--mention-back` (cli.ts),
-    // preserved even when the triggerer is a bot (unlike ownerOpenId, which the
-    // @-mention auto-create path nulls for bot senders). No participant-count
-    // gate here: unlike a model-authored send — where the model can pick an
-    // explicit --mention in a busy group — the fallback has no author to
-    // decide, so addressing the last conversant is the safest default (1v1 →
-    // the peer; group → whoever last spoke to us).
-    if (ds.session.quoteTargetSenderOpenId) return ds.session.quoteTargetSenderOpenId;
-    // No conversant recorded (e.g. an edge restore before any inbound turn).
-    // Fall back to the owner, but never to a known-bot owner: a bot owner here
-    // is a `@-mention auto-create` remnant (dispatching bot recorded as owner),
-    // not someone who actually asked — @-ing it would be a spurious ping.
-    return humanOwnerFooterRecipient(ds);
-  }
-
   const owner = ds.session.ownerOpenId;
   if (!owner) {
     // Mira / Mir run through botmux's stdout-runner and cannot execute
     // `botmux send` to @-trigger a peer bot. For bot-to-bot handoffs, address
     // the daemon fallback card back to the original dispatcher so orchestration
     // resumes (the card's real <at> is what re-wakes the dispatching bot).
-    if (ds.session.quoteTargetSenderIsBot && ds.session.creatorOpenId) {
+    if (isRunnerDeliveryCli(effectiveCliId) && ds.session.quoteTargetSenderIsBot && ds.session.creatorOpenId) {
       return ds.session.creatorOpenId;
     }
     return undefined;
   }
-  // Runner-delivery with a recorded owner: the fallback card is the only
-  // @-trigger channel (including the `/repo`-primed dispatch case where the
-  // dispatching bot is the owner), so address it directly.
-  return owner;
-}
-
-/** Owner open_id for a daemon fallback footer, but only when the owner is a
- *  human. A known-bot owner (an @-mention auto-create remnant) resolves to
- *  undefined so the safety-net card doesn't spuriously @ a bot that never
- *  actually asked. */
-function humanOwnerFooterRecipient(ds: DaemonSession): string | undefined {
-  const owner = ds.session.ownerOpenId;
-  if (!owner) return undefined;
   try {
-    if (loadKnownBotOpenIdsForApp(ds.larkAppId).has(owner)) return undefined;
-  } catch { /* cross-ref unreadable — treat owner as human below */ }
-  return owner;
+    if (loadKnownBotOpenIdsForApp(ds.larkAppId).has(owner)) {
+      // `/repo`-primed dispatch records the dispatching bot as owner (unlike
+      // the @-mention auto-create path, which nulls ownerOpenId for bot
+      // senders). Same constraint for the stdout-runner CLIs (mira/mir): the
+      // daemon fallback card is their only @-trigger channel, so address the
+      // dispatcher bot here too.
+      return isRunnerDeliveryCli(effectiveCliId) ? owner : undefined;
+    }
+    return owner;
+  } catch {
+    return owner;
+  }
 }
 
 export function clearUsageLimitState(ds: DaemonSession): void {

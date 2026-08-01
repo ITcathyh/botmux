@@ -7374,6 +7374,18 @@ async function cmdSend(rest: string[]): Promise<void> {
   });
   if (!mentionGate.ok) { console.error(mentionGate.error); process.exit(2); }
 
+  // Register bots so the Lark client works. MUST run before the participant
+  // gate below: that gate calls getGroupStats → getBotClient, which throws
+  // "Bot not registered" in this standalone `botmux send` process (a fresh
+  // process with an empty registry) — getGroupStats would then soft-fail to
+  // {999,999} and wrongly block --mention-back even in a true 1v1. registerBot
+  // is idempotent, so the downstream send path reuses these same clients.
+  // envPinnedRiffBot is re-registered LAST so a remote env credential is never
+  // clobbered by a stale bots.json entry for the same app.
+  const { registerBot, loadBotConfigs, findOncallChatForAnyBot } = await import('./bot-registry.js');
+  try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
+  if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
+
   // Participant gate for --mention-back: in a true 1v1 the triggerer is the
   // only counterpart so auto-@-ing them back is unambiguous, but once a third
   // party joins (humans + bots > 2) "who triggered this turn" is no longer
@@ -7417,11 +7429,6 @@ async function cmdSend(rest: string[]): Promise<void> {
   for (const p of [...videos, ...videoCovers]) {
     if (!statSync(p).isFile()) { console.error(`不是普通文件: ${p}`); process.exit(1); }
   }
-
-  // Register bots so Lark client works
-  const { registerBot, loadBotConfigs, findOncallChatForAnyBot } = await import('./bot-registry.js');
-  try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
-  if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
 
   const { sendMessage, replyMessage, uploadImage, uploadFile, MessageWithdrawnError } = await import('./im/lark/client.js');
   const appId = s.larkAppId!;

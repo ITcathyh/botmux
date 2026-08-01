@@ -200,10 +200,15 @@ export interface MentionBackParticipantArgs {
  * we force the model to make an explicit `--mention <ou:Name>` decision rather
  * than blindly @-ing the last speaker.
  *
- * Note: this gates the MODEL-authored `botmux send --mention-back` only. The
- * daemon fallback card (daemonCardFooterRecipientOpenId) is intentionally NOT
- * gated — as a safety net for a model that forgot to send, it must still
- * address the last conversant so a waiting peer is re-triggered.
+ * Note: this gates the MODEL-authored `botmux send --mention-back` only — the
+ * clear-headed path where the model chose to reply and can instead pick an
+ * explicit `--mention` in a busy group. The daemon fallback card
+ * (daemonCardFooterRecipientOpenId) is a separate, un-gated path that addresses
+ * the session owner: it fires only when the model made NO routing decision at
+ * all (forgot to send), so there is no reliable "who triggered this turn" to
+ * honour, and guessing the last conversant would mis-@ a peer bot on a purely
+ * local turn. Owner is the safe default there; real bot-to-bot handoffs go
+ * through this explicit `--mention` path.
  *
  * p2p short-circuits to `false` (no API round-trip). The caller passes
  * getGroupStats' worst-case `{999,999}` soft-failure fallback, which yields
@@ -214,7 +219,6 @@ export function shouldBlockMentionBackByParticipants(args: MentionBackParticipan
   if (args.chatType === 'p2p') return false;
   return args.userCount + args.botCount > 2;
 }
-
 
 /**
  * Agent "raise-hand" attention flag for `botmux send --attention[=kind]`.
