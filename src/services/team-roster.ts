@@ -34,6 +34,30 @@ export interface TeamRoster {
   bots: TeamRosterBot[];
 }
 
+/**
+ * Compute the per-bot Feishu-transport flag for a set of live bots, given the
+ * set of apiOnly (core-only) appIds read from config.
+ *
+ * ⚠️ FAIL-CLOSED on config-read failure. When `apiOnlyIds` is `null` (config
+ * couldn't be read), we cannot confirm any bot HAS transport, so every bot this
+ * round is flagged `larkTransportEnabled: false`. This roster is federated to a
+ * REMOTE hub/spoke that has no local config to double-check against — so
+ * mislabeling a core-only bot as normal (fail-open) would let it be invited into
+ * a group it can't join (#668). Mirror federation-spoke-api's spoke-side advert,
+ * NOT the dashboard's local isNoTransportBot (which fails open only because it
+ * has a second local config-read backstop right beside it).
+ *
+ * Healthy path (`apiOnlyIds` is a Set): per-bot `!apiOnlyIds.has(id)`.
+ */
+export function resolveLiveBotTransport<T extends { larkAppId: string }>(
+  bots: T[], apiOnlyIds: Set<string> | null,
+): Array<T & { larkTransportEnabled: boolean }> {
+  return bots.map(b => ({
+    ...b,
+    larkTransportEnabled: apiOnlyIds ? !apiOnlyIds.has(b.larkAppId) : false,
+  }));
+}
+
 interface BotInfoEntry { larkAppId: string; botOpenId: string | null; botName: string | null; cliId: string }
 
 function readBotsInfo(dataDir: string): BotInfoEntry[] {
