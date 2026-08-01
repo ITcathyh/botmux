@@ -183,6 +183,34 @@ describe('dashboard sessions filters', () => {
     expect(css).toContain('user-select: text;');
   });
 
+  it('vertically centers the details toggle beside the exchange instead of absolute-positioning it', () => {
+    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
+    const block = (selector: string): string => {
+      const start = css.indexOf(`${selector} {`);
+      expect(start).toBeGreaterThan(-1);
+      return css.slice(start, css.indexOf('}', start));
+    };
+
+    // Wrap lays out [exchange | details] as a centered flex row so the toggle
+    // tracks the content's vertical center — a single-line preview no longer
+    // leaves the button floating at a fixed top offset.
+    const wrap = block('.session-card-exchange-wrap');
+    expect(wrap).toContain('display: flex;');
+    expect(wrap).toContain('align-items: center;');
+
+    // The toggle must no longer be pulled out of flow: absolute + a fixed
+    // `top` was exactly what made it sit too high on short cards.
+    const details = block('.session-card-exchange-details');
+    expect(details).not.toContain('position: absolute;');
+    expect(details).not.toContain('top:');
+    expect(details).toContain('align-self: center;');
+
+    // The exchange box keeps symmetric padding now that it no longer reserves
+    // a right gutter for an absolutely-positioned button.
+    const exchange = block('.session-card-exchange');
+    expect(exchange).not.toContain('padding: 7px 32px 7px 8px;');
+  });
+
   it('wires @ completion and pasted-image previews into the create-session composer', () => {
     const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
 

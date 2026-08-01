@@ -2710,14 +2710,18 @@ button.primary {
 
 .session-card-exchange-wrap {
   position: relative;
+  display: flex;
+  align-items: center;
+  gap: 4px;
   min-width: 0;
 }
 
 .session-card-exchange {
   display: grid;
   gap: 5px;
+  flex: 1 1 auto;
   min-width: 0;
-  padding: 7px 32px 7px 8px;
+  padding: 7px 8px;
   border: 1px solid color-mix(in srgb, var(--border) 76%, transparent);
   border-radius: var(--radius-sm);
   background: color-mix(in srgb, var(--surface) 78%, transparent);
@@ -2735,13 +2739,12 @@ button.primary {
 }
 
 .session-card-exchange-details {
-  position: absolute;
-  top: 9px;
-  right: 7px;
-  width: 22px;
-  min-width: 22px;
-  height: 22px;
-  min-height: 22px;
+  flex: 0 0 auto;
+  align-self: center;
+  width: 20px;
+  min-width: 20px;
+  height: 20px;
+  min-height: 20px;
   padding: 0;
   display: inline-grid;
   place-items: center;
