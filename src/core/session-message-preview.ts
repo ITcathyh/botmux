@@ -61,7 +61,8 @@ function compactMultiline(value: unknown, limit: number): string {
     .replace(/\r\n?/g, '\n')
     .replace(/[^\S\n]+\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
-    .trim();
+    .replace(/^\n+/, '')
+    .replace(/\s+$/, '');
   if (!text) return '';
   return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
 }

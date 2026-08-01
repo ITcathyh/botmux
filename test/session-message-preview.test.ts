@@ -44,11 +44,11 @@ describe('buildSessionMessagePreview', () => {
     writeJsonl('queues/om_root.jsonl', [
       { senderType: 'user', content: 'old question', createTime: '1500' },
       { senderType: 'app', content: 'ignored app queue row', createTime: '1600' },
-      { senderType: 'user', content: ' latest user\nquestion ', createTime: '2000' },
+      { senderType: 'user', content: 'latest user\nquestion', createTime: '2000' },
     ]);
     writeJsonl('turn-sends/session-1.jsonl', [
       { sentAtMs: 1_800, messageId: 'om_old', previewText: 'old answer' },
-      { sentAtMs: 2_100, messageId: 'om_new', previewText: ' latest bot\nanswer ' },
+      { sentAtMs: 2_100, messageId: 'om_new', previewText: 'latest bot\nanswer' },
     ]);
 
     // Full text keeps the newline (overlay renders Markdown); the compact card

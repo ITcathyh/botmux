@@ -2861,6 +2861,13 @@ button.primary {
   text-decoration: underline;
   overflow-wrap: anywhere;
 }
+/* Markdown images are downgraded to a non-fetching text placeholder (no auto
+ * <img> request); the alt becomes an opt-in click-through link for safe schemes. */
+.session-card-exchange-img {
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
 .session-card-exchange-md code {
   padding: 1px 4px;
   border-radius: 4px;

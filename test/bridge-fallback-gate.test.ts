@@ -22,10 +22,11 @@ const markerForContent = (sentAtMs: number, content: string): BridgeSendMarker =
 describe('buildBridgeSendMarkerContent', () => {
   it('keeps normalized length semantics and a newline-preserving dashboard preview', () => {
     // contentLength stays fingerprint-normalized (gate compares against
-    // normalise(final).length); previewText keeps the line break for display.
+    // normalise(final).length); previewText keeps line breaks AND leading
+    // indentation for display (indented code / nested markdown).
     expect(buildBridgeSendMarkerContent('  hello\n  bot  ')).toEqual({
       contentLength: normalise('  hello\n  bot  ').length,
-      previewText: 'hello\n  bot',
+      previewText: '  hello\n  bot',
     });
   });
 
@@ -47,10 +48,13 @@ describe('buildBridgeSendMarkerContent', () => {
     expect(preview.split('\n').length).toBe(reply.split('\n').length);
   });
 
-  it('trims trailing line whitespace but keeps leading indentation and single newlines', () => {
-    // Trailing spaces before a newline go; a leading indent (nested list / code)
-    // stays; a lone newline is kept (markdown-it breaks:true renders it as <br>).
-    expect(buildBridgeSendPreviewText('  spoken   \nreply  ')).toBe('spoken\nreply');
+  it('trims trailing line whitespace and boundary blank lines but keeps FIRST-line indentation', () => {
+    // Trailing spaces before a newline go, boundary blank lines collapse, but a
+    // leading indent on the FIRST line survives (indented code / nested list) —
+    // a plain .trim() used to eat it. A lone newline is kept (breaks:true → <br>).
+    expect(buildBridgeSendPreviewText('  spoken   \nreply  ')).toBe('  spoken\nreply');
+    expect(buildBridgeSendPreviewText('    indented code\n    line two')).toBe('    indented code\n    line two');
+    expect(buildBridgeSendPreviewText('\n\n  body\n')).toBe('  body');
     expect(buildBridgeSendPreviewText('a\n\n\n\nb')).toBe('a\n\nb');
   });
 

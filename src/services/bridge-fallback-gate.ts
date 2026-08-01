@@ -109,7 +109,8 @@ export function buildBridgeSendPreviewText(content: string): string | undefined 
     .replace(/\r\n?/g, '\n')
     .replace(/[^\S\n]+\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
-    .trim();
+    .replace(/^\n+/, '')
+    .replace(/\s+$/, '');
   if (!tidy) return undefined;
   return tidy.length > BRIDGE_SEND_PREVIEW_MAX_CHARS
     ? `${tidy.slice(0, BRIDGE_SEND_PREVIEW_MAX_CHARS - 1)}…`
