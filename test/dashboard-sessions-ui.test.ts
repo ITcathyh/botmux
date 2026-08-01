@@ -161,21 +161,19 @@ describe('dashboard sessions filters', () => {
     const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
 
     expect(page).toContain('className="session-card-exchange"');
-    expect(page).toContain("t('sessions.preview.latestExchange')");
     expect(page).toContain("t('sessions.history.user')");
     expect(page).toContain("t('sessions.history.bot')");
     expect(page).toContain('className="session-card-exchange-tooltip"');
     expect(page).toContain('role="tooltip"');
-    expect(page).toContain('className="session-card-exchange-details"');
     expect(page).toContain("t('sessions.preview.showFull')");
     expect(page).toContain('aria-expanded={open}');
     expect(page).toContain('onPointerEnter={event => {');
     expect(page).toContain("if (event.key === 'Escape') hide();");
-    expect(page).toContain('<p>{exchange.userFullText}</p>');
-    expect(page).toContain('<p>{exchange.botFullText}</p>');
+    // Card summary stays plain-text (2-line clamp); the overlay renders Markdown.
+    expect(page).toContain('<p>{exchange.userText}</p>');
+    expect(page).toContain('<p>{exchange.botText}</p>');
     expect(css).toContain('.session-card-exchange-line > p');
     expect(css).toContain('-webkit-line-clamp: 2');
-    expect(css).toContain('.session-card-exchange-details {');
     expect(css).toContain('.session-card-exchange-tooltip {');
     expect(css).toContain('position: fixed;');
     expect(css).toContain('.session-card-exchange-tooltip-scroll {');
@@ -183,32 +181,52 @@ describe('dashboard sessions filters', () => {
     expect(css).toContain('user-select: text;');
   });
 
-  it('vertically centers the details toggle beside the exchange instead of absolute-positioning it', () => {
+  it('renders the full-exchange overlay as sanitized Markdown, not raw text', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
     const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
-    const block = (selector: string): string => {
-      const start = css.indexOf(`${selector} {`);
-      expect(start).toBeGreaterThan(-1);
-      return css.slice(start, css.indexOf('}', start));
-    };
+    const md = readFileSync(new URL('../src/dashboard/web/preview-markdown.ts', import.meta.url), 'utf8');
 
-    // Wrap lays out [exchange | details] as a centered flex row so the toggle
-    // tracks the content's vertical center — a single-line preview no longer
-    // leaves the button floating at a fixed top offset.
-    const wrap = block('.session-card-exchange-wrap');
-    expect(wrap).toContain('display: flex;');
-    expect(wrap).toContain('align-items: center;');
+    // The overlay renders both sides through the Markdown helper (raw HTML off
+    // for XSS safety), replacing the old raw `<p>{fullText}</p>` nodes.
+    expect(page).toContain("import { previewMarkdownHtml } from './preview-markdown.js'");
+    expect(page).toContain('previewMarkdownHtml(exchange.userFullText)');
+    expect(page).toContain('previewMarkdownHtml(exchange.botFullText)');
+    expect(page).toContain('className="session-card-exchange-md"');
+    expect(page).not.toContain('<p>{exchange.userFullText}</p>');
+    expect(page).not.toContain('<p>{exchange.botFullText}</p>');
 
-    // The toggle must no longer be pulled out of flow: absolute + a fixed
-    // `top` was exactly what made it sit too high on short cards.
-    const details = block('.session-card-exchange-details');
-    expect(details).not.toContain('position: absolute;');
-    expect(details).not.toContain('top:');
-    expect(details).toContain('align-self: center;');
+    // Reuses markdown-it with the same hardening insights.ts applies: no raw
+    // HTML, links forced to a safe scheme, and a plain-text escape fallback.
+    expect(md).toContain("new MarkdownIt({ html: false");
+    expect(md).toContain('validateLink');
+    expect(md).toContain("attrSet('rel', 'noopener noreferrer nofollow')");
+    expect(md).toContain('escapeHtml');
 
-    // The exchange box keeps symmetric padding now that it no longer reserves
-    // a right gutter for an absolutely-positioned button.
-    const exchange = block('.session-card-exchange');
-    expect(exchange).not.toContain('padding: 7px 32px 7px 8px;');
+    // Overlay Markdown body is styled with dashboard tokens (no new palette).
+    expect(css).toContain('.session-card-exchange-md');
+  });
+
+  it('drops the ••• details button and makes the preview body itself the toggle', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
+    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
+
+    // The dedicated ••• button is gone entirely — content + markup + styles.
+    expect(page).not.toContain('•••');
+    expect(page).not.toContain('session-card-exchange-details');
+    expect(css).not.toContain('.session-card-exchange-details');
+
+    // The exchange body itself is now the toggle: keyboard + pointer reachable,
+    // so touch users (no hover) and keyboard users keep a way to open the
+    // overlay that the ••• button used to provide.
+    const exchangeStart = page.indexOf('className="session-card-exchange"');
+    expect(exchangeStart).toBeGreaterThan(-1);
+    const exchangeAttrs = page.slice(exchangeStart - 400, exchangeStart + 400);
+    expect(exchangeAttrs).toContain('role="button"');
+    expect(exchangeAttrs).toContain('tabIndex={0}');
+    // Enter/Space toggles the overlay for keyboard users.
+    expect(page).toContain("event.key === 'Enter' || event.key === ' '");
+    expect(css).toContain('.session-card-exchange {');
+    expect(css).toContain('cursor: pointer;');
   });
 
   it('wires @ completion and pasted-image previews into the create-session composer', () => {

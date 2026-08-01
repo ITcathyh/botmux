@@ -78,6 +78,7 @@ import {
   type PickerBot,
   type SessionTopicGroup,
 } from './sessions.js';
+import { previewMarkdownHtml } from './preview-markdown.js';
 import { addMonitorRoomSessionIds, monitorRoomUrl } from './monitor-room-store.js';
 import { dashboardShellAllowsWebTerminal } from './client-shell.js';
 import { CreateActionButton, DropdownMenu, LoadingState } from './dashboard-components.js';
@@ -1006,7 +1007,6 @@ type SessionExchangePreviewValue = ReturnType<typeof sessionExchangePreview>;
 function SessionExchangePreview(props: { exchange: SessionExchangePreviewValue }): React.JSX.Element | null {
   const { exchange } = props;
   const triggerRef = useRef<HTMLDivElement>(null);
-  const detailsRef = useRef<HTMLButtonElement>(null);
   const tooltipRef = useRef<HTMLDivElement>(null);
   const hideTimerRef = useRef<number | null>(null);
   const [open, setOpen] = useState(false);
@@ -1079,7 +1079,6 @@ function SessionExchangePreview(props: { exchange: SessionExchangePreviewValue }
       if (!(target instanceof Node)) return;
       if (
         triggerRef.current?.contains(target)
-        || detailsRef.current?.contains(target)
         || tooltipRef.current?.contains(target)
       ) return;
       hide();
@@ -1102,12 +1101,29 @@ function SessionExchangePreview(props: { exchange: SessionExchangePreviewValue }
         <div
           ref={triggerRef}
           className="session-card-exchange"
-          aria-label={t('sessions.preview.latestExchange')}
+          role="button"
+          tabIndex={0}
+          aria-label={t('sessions.preview.showFull')}
+          aria-describedby={open ? tooltipId : undefined}
+          aria-expanded={open}
+          onClick={event => {
+            event.stopPropagation();
+            open ? hide() : show();
+          }}
+          onFocus={show}
+          onBlur={scheduleHide}
           onPointerEnter={event => {
             if (event.pointerType !== 'touch') show();
           }}
           onPointerLeave={event => {
             if (event.pointerType !== 'touch') scheduleHide();
+          }}
+          onKeyDown={event => {
+            if (event.key === 'Escape') hide();
+            else if (event.key === 'Enter' || event.key === ' ') {
+              event.preventDefault();
+              open ? hide() : show();
+            }
           }}
         >
           {exchange.userText ? (
@@ -1123,31 +1139,6 @@ function SessionExchangePreview(props: { exchange: SessionExchangePreviewValue }
             </div>
           ) : null}
         </div>
-        <button
-          ref={detailsRef}
-          type="button"
-          className="session-card-exchange-details"
-          aria-label={t('sessions.preview.showFull')}
-          aria-describedby={open ? tooltipId : undefined}
-          aria-expanded={open}
-          onClick={event => {
-            event.stopPropagation();
-          show();
-          }}
-          onFocus={show}
-          onBlur={scheduleHide}
-          onPointerEnter={event => {
-            if (event.pointerType !== 'touch') show();
-          }}
-          onPointerLeave={event => {
-            if (event.pointerType !== 'touch') scheduleHide();
-          }}
-          onKeyDown={event => {
-            if (event.key === 'Escape') hide();
-          }}
-        >
-          <span aria-hidden="true">•••</span>
-        </button>
       </div>
       {open && typeof document !== 'undefined' ? createPortal(
         <div
@@ -1170,13 +1161,13 @@ function SessionExchangePreview(props: { exchange: SessionExchangePreviewValue }
             {exchange.userFullText ? (
               <div className="session-card-exchange-tooltip-line">
                 <span>{t('sessions.history.user')}</span>
-                <p>{exchange.userFullText}</p>
+                <div className="session-card-exchange-md" dangerouslySetInnerHTML={rawHtml(previewMarkdownHtml(exchange.userFullText))} />
               </div>
             ) : null}
             {exchange.botFullText ? (
               <div className="session-card-exchange-tooltip-line bot">
                 <span>{t('sessions.history.bot')}</span>
-                <p>{exchange.botFullText}</p>
+                <div className="session-card-exchange-md" dangerouslySetInnerHTML={rawHtml(previewMarkdownHtml(exchange.botFullText))} />
               </div>
             ) : null}
           </div>
