@@ -312,7 +312,13 @@ export const TRANSFER_DETACH_FENCE_PICKER_MS = 8_000;
 // worker exits within a few ms of the ACK.
 const TRANSFER_DETACH_POST_ACK_KILL_MS = 300;
 const TRANSFER_FORCE_EXIT_MS = 500;
-const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN'] as const;
+// Keys the daemon must NOT propagate into a forked worker. GH tokens are the
+// bot's, not the agent's. BOTMUX_PM2_GRACEFUL_EXIT_CODE is pm2's private
+// graceful-exit sentinel for the daemon/dashboard cores only (see
+// pm2-graceful-exit.ts): a worker (or the CLI child it forks — redactChildEnv
+// strips it there too) that inherited it would exit 90 instead of 0 on a
+// clean foreground stop, which a supervisor reads as a crash.
+const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN', 'BOTMUX_PM2_GRACEFUL_EXIT_CODE'] as const;
 
 function workerForkEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
