@@ -24,7 +24,7 @@ import { chatAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
-import { killWorker, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart } from './worker-pool.js';
+import { closeSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart, isSessionTransferring } from './worker-pool.js';
 import {
   expandHome,
   getSessionWorkingDir,
@@ -1209,7 +1209,9 @@ export async function handleTermLinkCommand(
   }
 
   const channel = await deliverWritableTerminalCardTo(ds, senderOpenId);
-  if (channel === 'not_ready') {
+  if (channel === 'unsupported') {
+    await reply(t('cmd.term.unsupported', undefined, loc));
+  } else if (channel === 'not_ready') {
     await reply(t('cmd.term.not_ready', undefined, loc));
   } else if (channel === 'failed') {
     await reply(t('cmd.term.failed', undefined, loc));
@@ -1277,13 +1279,18 @@ export async function handleCommand(
           // Capture the closed-session card BEFORE killWorker/closeSession —
           // it reads the live session's identity off `ds`.
           const card = buildClosedSessionCard(ds, loc);
-          killWorker(ds);
-          sessionStore.closeSession(ds.session.sessionId);
-          publishClosedSessionPatch(
-            ds.session.sessionId,
-            ds.session.closedAt ? Date.parse(ds.session.closedAt) : undefined,
-          );
-          activeSessions.delete(sessionKey(rootId, larkAppId!));
+          const activeKey = sessionKey(rootId, larkAppId!);
+          try {
+            await closeSession(ds.session.sessionId);
+          } catch (err) {
+            logger.error(`[${logTag}] Refused /close because backing teardown was not verified: ${err}`);
+            await sessionReply(
+              rootId,
+              `⚠️ 会话关闭失败，已保留 active 记录以便重试：${err instanceof Error ? err.message : String(err)}`,
+            );
+            break;
+          }
+          if (activeSessions.get(activeKey) === ds) activeSessions.delete(activeKey);
           // 「会话已关闭」卡片优先「仅自己可见」：普通群里走 ephemeral 只发给执行
           // /close 的本人；话题群不支持 ephemeral(18053) 时回退为正常的群内可见回复
           // ——与流式卡片上「关闭会话」按钮的送达方式保持一致。
@@ -1358,6 +1365,10 @@ export async function handleCommand(
             await sessionReply(rootId, t('card.action.adopt_no_restart', undefined, loc));
             break;
           }
+          if (isSessionTransferring(ds)) {
+            await sessionReply(rootId, t('cmd.session.transfer_in_progress', undefined, loc));
+            break;
+          }
           const cliName = getCliDisplayName(getBot(ds.larkAppId).config.cliId);
           requestSessionRestart(ds, {
             source: 'slash',
@@ -1380,6 +1391,10 @@ export async function handleCommand(
         }
         if (!ds) {
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+          break;
+        }
+        if (isSessionTransferring(ds)) {
+          await sessionReply(rootId, t('cmd.session.transfer_in_progress', undefined, loc));
           break;
         }
         const validation = validateWorkingDir(targetPath, loc, { autoCreate: true });
@@ -1416,7 +1431,7 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.rename.usage', undefined, loc));
           break;
         }
-        const updated = updateSessionTitle(ds.session, rawTitle);
+        const updated = updateSessionTitle(ds.session, rawTitle, 'user');
         if (!updated.ok) {
           await sessionReply(rootId, t('cmd.rename.usage', undefined, loc));
           break;
@@ -1436,7 +1451,6 @@ export async function handleCommand(
         logger.info(`[${logTag}] Session renamed by /rename: ${updated.title} (agentSync=${agentSync.status})`);
         break;
       }
-
       case '/repo': {
         const repoArg = message.content.replace(/^\/repo\s*/, '').trim();
 
@@ -1624,6 +1638,18 @@ export async function handleCommand(
             // anchor — expected; `/close` the new one first, or use the
             // command.) Mirrors the `/close` case above.
             //
+            // ZMX close is identity/generation verified and may refuse. Prove
+            // teardown before claiming the card or mutating any state so a
+            // refusal leaves the current session fully retryable.
+            try {
+              teardownAuthoritativePersistentBackingBeforeClose(ds!);
+            } catch (err) {
+              const reason = err instanceof Error ? err.message : String(err);
+              logger.warn(`[${logTag}] Repo switch refused because backing teardown was not proven: ${reason}`);
+              await sessionReply(rootId, t('cmd.repo.switch_close_failed', { error: reason }, loc));
+              return false;
+            }
+
             // Claim any open repo card BEFORE killWorker / await so a concurrent
             // card click cannot double-switch while this text path runs.
             //
@@ -1633,6 +1659,8 @@ export async function handleCommand(
             // the new repo's cwd. The new repo is pinned onto the fresh session
             // below instead.
             const claimedCard = claimCurrentRepoCard(ds!, undefined);
+            const oldSession = ds!.session;
+            const oldSessionId = oldSession.sessionId;
             const closedCard = buildClosedSessionCard(ds!, loc);
             killWorker(ds!);
             sessionStore.closeSession(ds!.session.sessionId);
@@ -1648,7 +1676,12 @@ export async function handleCommand(
               () => sessionReply(rootId, closedCard, 'interactive'),
             );
 
-            const oldSession = ds!.session;
+            const stillOwnsGeneration = activeSessions.get(sessionKey(rootId, larkAppId!)) === ds
+              && ds!.session === oldSession;
+            if (!stillOwnsGeneration) {
+              logger.warn(`[${logTag}] Repo switch cancelled after closing ${oldSessionId.substring(0, 8)}; routing generation changed during card delivery`);
+              return false;
+            }
             // `rootId` is the routing anchor. For chat-scope sessions it is the
             // `oc_...` chat id, not the traceable `om_...` message root stored on
             // Session. Preserve the old identity and explicitly persist scope so
@@ -2367,6 +2400,10 @@ export async function handleCommand(
 
       case '/adopt': {
         const adoptArgs = message.content.replace(/^\/adopt\s*/i, '').trim();
+        if (ds && isSessionTransferring(ds)) {
+          await sessionReply(rootId, t('cmd.session.transfer_in_progress', undefined, loc));
+          break;
+        }
         if (ds?.adoptedFrom) {
           const adopted = ds.adoptedFrom;
           const cliName = getCliDisplayName(adopted.cliId ?? 'claude-code');
@@ -2386,6 +2423,8 @@ export async function handleCommand(
         }
 
         const botCliId = botCfgForAdopt?.cliId;
+        const adoptSession = ds?.session;
+        const adoptAnchor = ds ? sessionAnchorId(ds) : undefined;
 
         // Discover every supported backend, but only offer live sessions for
         // this bot's configured CLI. A Pi bot must not show Codex/TRAE panes:
@@ -2412,6 +2451,20 @@ export async function handleCommand(
         const resumable = botCliId
           ? await discoverResumableSessionsForBot(botCliId, botCfgForAdopt?.cliPathOverride, activeSessions)
           : [];
+        if (
+          ds
+          && adoptSession
+          && adoptAnchor
+          && (
+            ds.session !== adoptSession
+            || ds.session.status !== 'active'
+            || activeSessions.get(sessionKey(adoptAnchor, ds.larkAppId)) !== ds
+            || isSessionTransferring(ds)
+          )
+        ) {
+          await sessionReply(rootId, t('cmd.session.transfer_in_progress', undefined, loc));
+          break;
+        }
 
         if (sessions.length === 0 && resumable.length === 0) {
           await sessionReply(rootId, t('cmd.adopt.no_sessions', undefined, loc));
@@ -3445,6 +3498,8 @@ async function handleCodexAppAdoptCommand(
     deps.sessionReply(rid, content, msgType, larkAppId);
   const loc: Locale = localeForBot(ds.larkAppId ?? larkAppId);
   const botCfg = getBot(ds.larkAppId).config;
+  const sourceSession = ds.session;
+  const sourceAnchor = sessionAnchorId(ds);
 
   let threads: CodexAppThreadSummary[];
   try {
@@ -3455,6 +3510,15 @@ async function handleCodexAppAdoptCommand(
     });
   } catch (err: any) {
     await sessionReply(rootId, t('cmd.codex_app_adopt.list_failed', { error: err?.message ?? String(err) }, loc));
+    return;
+  }
+  if (
+    ds.session !== sourceSession
+    || ds.session.status !== 'active'
+    || deps.activeSessions.get(sessionKey(sourceAnchor, ds.larkAppId)) !== ds
+    || isSessionTransferring(ds)
+  ) {
+    await sessionReply(rootId, t('cmd.session.transfer_in_progress', undefined, loc));
     return;
   }
 
@@ -3527,6 +3591,10 @@ export async function startCodexAppThreadSession(
     deps.sessionReply(rid, content, msgType, larkAppId);
   const loc: Locale = localeForBot(ds.larkAppId ?? larkAppId);
   const title = codexAppThreadTitle(thread);
+  if (isSessionTransferring(ds)) {
+    await sessionReply(sessionAnchorId(ds), t('cmd.session.transfer_in_progress', undefined, loc));
+    return;
+  }
 
   if (await blockTakeoverWhilePendingRepo(ds, sessionReply)) return;
 
@@ -3557,6 +3625,10 @@ export async function startAdoptSession(
   const sessionReply = (rid: string, content: string, msgType?: string) =>
     deps.sessionReply(rid, content, msgType, larkAppId);
   const loc: Locale = localeForBot(ds.larkAppId ?? larkAppId);
+  if (isSessionTransferring(ds)) {
+    await sessionReply(sessionAnchorId(ds), t('cmd.session.transfer_in_progress', undefined, loc));
+    return;
+  }
 
   const zellij = isZellijTarget(target);
   if (!zellij && target.source === 'herdr' && target.herdrSessionName && target.herdrAgentName) {
@@ -3677,6 +3749,10 @@ export async function startResumeImportSession(
     deps.sessionReply(rid, content, msgType, larkAppId);
   const loc: Locale = localeForBot(ds.larkAppId ?? larkAppId);
   const project = target.cwd.split('/').pop() || target.cwd;
+  if (isSessionTransferring(ds)) {
+    await sessionReply(sessionAnchorId(ds), t('cmd.session.transfer_in_progress', undefined, loc));
+    return;
+  }
 
   if (await blockTakeoverWhilePendingRepo(ds, sessionReply)) return;
 

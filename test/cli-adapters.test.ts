@@ -23,6 +23,7 @@ vi.mock('node:child_process', () => ({
 }));
 
 import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
+import { TERMINAL_CANCEL_COOLDOWN_MS } from '../src/adapters/backend/critical-control-key.js';
 import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
 import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
@@ -914,6 +915,38 @@ describe('oh-my-pi buildArgs', () => {
     await expect(adapter.writeInput(pty, 'x'.repeat(1200))).resolves.toEqual({ submitted: false });
 
     expect(events).toEqual(['text:524', 'text:524', 'keys:C-c']);
+  });
+
+  it('keeps its recovery Ctrl+C outside the backend-injected cancel window', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-28T00:00:00.000Z'));
+    try {
+      const isolatedAdapter = createOhMyPiAdapter('/usr/bin/omp');
+      const events: Array<{ key: string; at: number }> = [];
+      const backendCancelAt = Date.now();
+      const pty = {
+        write() {},
+        sendText() { return false; },
+        sendSpecialKeys(...keys: string[]) {
+          events.push({ key: keys.join(','), at: Date.now() });
+          return true;
+        },
+        lastInjectedCancelAt: backendCancelAt,
+      } as PtyHandle & { readonly lastInjectedCancelAt: number };
+
+      const write = isolatedAdapter.writeInput(pty, 'ambiguous paste');
+      await vi.advanceTimersByTimeAsync(TERMINAL_CANCEL_COOLDOWN_MS - 1);
+      expect(events).toEqual([]);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(write).resolves.toEqual({ submitted: false });
+      expect(events).toEqual([{
+        key: 'C-c',
+        at: backendCancelAt + TERMINAL_CANCEL_COOLDOWN_MS,
+      }]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('clears the OMP composer when Enter retries are all dropped', async () => {

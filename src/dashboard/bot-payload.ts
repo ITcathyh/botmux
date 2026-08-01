@@ -1,5 +1,6 @@
 import { defaultSummaryRangePrefs, summaryRangeFromLegacyContentTriggers } from '../services/summary-range-store.js';
 import { selectionKeyForBot } from '../setup/cli-selection.js';
+import { normalizeUsageDisplay } from '../bot-registry.js';
 
 export interface DashboardBotDescriptor {
   larkAppId: string;
@@ -55,6 +56,8 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     readIsolation: j?.readIsolation === true,
     readIsolationSupported: j?.readIsolationSupported === true,
     backendType: typeof j?.backendType === 'string' ? j.backendType : null,
+    usageDisplay: normalizeUsageDisplay(j ?? {}),
+    usageSupported: j?.usageSupported === true,
     disableStreamingCard: j?.disableStreamingCard === true,
     silentTurnReactions: j?.silentTurnReactions === true,
     codexAppCleanInput: j?.codexAppCleanInput === true,

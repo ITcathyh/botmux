@@ -56,6 +56,7 @@ vi.mock('../src/bot-registry.js', () => ({
     botName: 'TestBot',
   })),
   getAllBots: vi.fn(() => []),
+  getLoadedConfigPath: vi.fn(() => '/home/u/.botmux/bots.json'),
   loadBotConfigs: vi.fn(() => [{
     larkAppId: 'app_test',
     larkAppSecret: 'secret',
