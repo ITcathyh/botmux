@@ -8,6 +8,8 @@ import {
   initialOverloadCardState,
   computeOverloadThresholds,
   parseOverloadEnvFloat,
+  isValidEnterLoadRatio,
+  isValidEnterMemUsedFrac,
   isOverloadAlertTarget,
   OVERLOAD_ACTION_CLEAN_STOPPED,
   OVERLOAD_ACTION_SUSPEND_IDLE,
@@ -260,9 +262,9 @@ describe('overload nonce (one-shot per action)', () => {
 });
 
 describe('parseOverloadEnvFloat', () => {
-  it('parses a valid non-negative number', () => {
+  it('parses a valid non-negative number (default predicate allows 0)', () => {
     expect(parseOverloadEnvFloat('2.5', 1)).toBe(2.5);
-    expect(parseOverloadEnvFloat('0', 1)).toBe(0);
+    expect(parseOverloadEnvFloat('0', 1)).toBe(0); // 0 is legal for exit lines / minReAlertMs
   });
   it('falls back on unset / blank / non-finite / negative', () => {
     expect(parseOverloadEnvFloat(undefined, 1.5)).toBe(1.5);
@@ -270,6 +272,13 @@ describe('parseOverloadEnvFloat', () => {
     expect(parseOverloadEnvFloat('abc', 1.5)).toBe(1.5);
     expect(parseOverloadEnvFloat('-3', 1.5)).toBe(1.5);
     expect(parseOverloadEnvFloat('NaN', 1.5)).toBe(1.5);
+  });
+  it('honours a stricter isValid predicate (enter thresholds reject 0 / out-of-range)', () => {
+    expect(parseOverloadEnvFloat('0', 1.5, isValidEnterLoadRatio)).toBe(1.5); // load must be > 0
+    expect(parseOverloadEnvFloat('2', 1.5, isValidEnterLoadRatio)).toBe(2);
+    expect(parseOverloadEnvFloat('0', 0.9, isValidEnterMemUsedFrac)).toBe(0.9); // mem must be > 0
+    expect(parseOverloadEnvFloat('1.5', 0.9, isValidEnterMemUsedFrac)).toBe(0.9); // mem must be <= 1
+    expect(parseOverloadEnvFloat('0.8', 0.9, isValidEnterMemUsedFrac)).toBe(0.8);
   });
 });
 
@@ -313,6 +322,30 @@ describe('computeOverloadThresholds — enter priority (env > config > default)'
     });
     expect(t.enterLoadRatio).toBe(DEFAULT_OVERLOAD_THRESHOLDS.enterLoadRatio);
     expect(t.enterMemUsedFrac).toBe(DEFAULT_OVERLOAD_THRESHOLDS.enterMemUsedFrac);
+  });
+
+  it('rejects a degenerate env enter=0 (would break hysteresis / flap) and falls back', () => {
+    // enter load 0 → 95% clamp is still 0, so "exit strictly below enter" is
+    // impossible; enter mem 0 additionally flaps entered/recovered every tick.
+    const t = computeOverloadThresholds({
+      cpuCount: 8,
+      configEnterLoadRatio: 2.0,
+      configEnterMemUsedFrac: 0.8,
+      env: { enterLoadRatio: '0', enterMemUsedFrac: '0' },
+    });
+    // env was invalid → fall back to the (valid) config values, NOT 0.
+    expect(t.enterLoadRatio).toBe(2.0);
+    expect(t.enterMemUsedFrac).toBe(0.8);
+  });
+
+  it('rejects an env enter mem > 1 (never triggers) and falls back to default', () => {
+    const t = computeOverloadThresholds({ cpuCount: 8, env: { enterMemUsedFrac: '1.5' } });
+    expect(t.enterMemUsedFrac).toBe(DEFAULT_OVERLOAD_THRESHOLDS.enterMemUsedFrac);
+  });
+
+  it('accepts a full-memory enter of exactly 1.0 (boundary)', () => {
+    const t = computeOverloadThresholds({ cpuCount: 8, env: { enterMemUsedFrac: '1' } });
+    expect(t.enterMemUsedFrac).toBe(1);
   });
 
   it('clamps cpuCount to at least 1', () => {
@@ -386,6 +419,7 @@ describe('isOverloadAlertTarget — machine-level target gating', () => {
 
   it('true only when enabled AND this daemon is the named target', () => {
     expect(isOverloadAlertTarget({ enabled: true, targetBotAppId: SELF }, SELF)).toBe(true);
+    expect(isOverloadAlertTarget({ enabled: true, targetBotAppId: SELF }, { larkAppId: SELF })).toBe(true);
   });
 
   it('false when disabled, even if this daemon is the target', () => {
@@ -400,6 +434,15 @@ describe('isOverloadAlertTarget — machine-level target gating', () => {
     expect(isOverloadAlertTarget({ enabled: true }, SELF)).toBe(false);
     expect(isOverloadAlertTarget({}, SELF)).toBe(false);
     expect(isOverloadAlertTarget(undefined, SELF)).toBe(false);
+  });
+
+  it('FAIL-CLOSED on apiOnly: an apiOnly bot never samples even if named as target', () => {
+    // A hand-edited config or pre-apiOnly-aware migration could name an apiOnly
+    // bot; it has no Feishu transport so it must not advance the state machine
+    // and then silently drop the DM.
+    expect(isOverloadAlertTarget({ enabled: true, targetBotAppId: SELF }, { larkAppId: SELF, apiOnly: true })).toBe(false);
+    // Non-apiOnly (explicit false / omitted) still samples.
+    expect(isOverloadAlertTarget({ enabled: true, targetBotAppId: SELF }, { larkAppId: SELF, apiOnly: false })).toBe(true);
   });
 
   it('models the target-switch → state-reset gate: non-target ticks are gated off', () => {

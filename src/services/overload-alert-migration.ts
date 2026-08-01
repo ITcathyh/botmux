@@ -34,16 +34,24 @@
  * migration only moves the source of truth; the new watcher ignores the old key.
  * Never throws — a failed/partial migration must not brick daemon startup.
  */
-import { readGlobalConfig, writeHostOverloadAlertConfig, globalConfigPath } from '../global-config.js';
+import { readGlobalConfig, writeHostOverloadAlertConfig, globalConfigPath, invalidateGlobalConfigCache } from '../global-config.js';
 import { getBotCardPrefs, updateBotCardPrefs } from './card-prefs-store.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 import { logger } from '../utils/logger.js';
 
 /**
- * @param allBotAppIds every bot app id known to this host (from bots.json).
- * Order-independent: the target is chosen by sorted app id for determinism.
+ * @param allBots every bot known to this host (from bots.json), each with its
+ * `larkAppId` and `apiOnly` flag. apiOnly (core-only) bots are EXCLUDED as
+ * migration candidates: they have no Feishu transport and can never DM an admin,
+ * so migrating one to `enabled=true` would produce an undeliverable target (and
+ * by sort order could even shadow a perfectly good non-apiOnly bot). The runtime
+ * `isOverloadAlertTarget` fail-closes on apiOnly too, as a backstop for
+ * hand-edited configs. Order-independent: the target is chosen by sorted app id
+ * for determinism.
  */
-export async function migrateOverloadAlertAtStartup(allBotAppIds: string[]): Promise<void> {
+export async function migrateOverloadAlertAtStartup(
+  allBots: Array<{ larkAppId: string; apiOnly?: boolean }>,
+): Promise<void> {
   try {
     // Fast path outside the lock: already migrated → skip (the common case on
     // every boot after the first).
@@ -51,7 +59,10 @@ export async function migrateOverloadAlertAtStartup(allBotAppIds: string[]): Pro
 
     // Which bots have the legacy per-bot toggle on? Read is lock-free (each
     // getBotCardPrefs reads bots.json); the decision + writes happen under lock.
-    const legacyOn = allBotAppIds
+    // apiOnly bots are skipped — they can't deliver the DM (see above).
+    const legacyOn = allBots
+      .filter(bot => bot.apiOnly !== true)
+      .map(bot => bot.larkAppId)
       .filter(appId => {
         try { return getBotCardPrefs(appId).overloadAlert === true; }
         catch { return false; }
@@ -70,10 +81,16 @@ export async function migrateOverloadAlertAtStartup(allBotAppIds: string[]): Pro
     }
 
     // Serialize the migration across concurrently-booting daemons on the global
-    // config file's lock; re-check inside so exactly one performs it.
+    // config file's lock; re-check inside so exactly one performs it. The
+    // lock-outer fast-path read above may have primed the 2s TTL read cache with
+    // a pre-write snapshot, so invalidate it FIRST — otherwise a daemon that
+    // acquires the lock after an earlier one already wrote could still read a
+    // stale "absent" and re-write, clobbering a selection the user saved in that
+    // same window. invalidate → read from disk → decide.
     let didWrite = false;
     withFileLockSync(globalConfigPath(), () => {
-      if (readGlobalConfig().hostOverloadAlert !== undefined) return; // another daemon won
+      invalidateGlobalConfigCache();
+      if (readGlobalConfig().hostOverloadAlert !== undefined) return; // another daemon won (or a user saved)
       // Write global FIRST so a crash here still leaves a valid enabled config.
       writeHostOverloadAlertConfig({ enabled: true, targetBotAppId: target });
       didWrite = true;

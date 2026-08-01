@@ -1179,7 +1179,11 @@ export function HostOverloadAlertSettingsEditor(props: {
     })),
   ], [props.value.botOptions, tr]);
   const selectedBot = props.value.botOptions.find(bot => bot.larkAppId === props.value.targetBotAppId);
-  const showDetails = props.value.enabled || !!props.value.targetBotAppId;
+  // Always show the target/threshold editor — even in the fresh default state
+  // (disabled + no target). Gating it behind enabled||target would deadlock a
+  // brand-new install: the dropdown would be hidden AND the toggle disabled
+  // (see below), leaving no way to pick a target. The toggle stays disabled
+  // until a target is chosen; the editor is how you choose one.
   // Local draft for the threshold inputs so typing doesn't fire a save per keystroke.
   const [loadDraft, setLoadDraft] = useState(String(props.value.enterLoadRatio));
   const [memDraft, setMemDraft] = useState(String(Math.round(props.value.enterMemUsedFrac * 100)));
@@ -1207,8 +1211,7 @@ export function HostOverloadAlertSettingsEditor(props: {
         disabled={controlsDisabled || (!props.value.enabled && !props.value.targetBotAppId)}
         onChange={value => { void props.onSave({ enabled: value }); }}
       />
-      {showDetails ? (
-        <div className="settings-codex-notifier-details">
+      <div className="settings-codex-notifier-details">
           <div className="settings-field-row">
             <FieldTitle help={tr('settings.hostOverloadAlertTargetHelp')}>{tr('settings.hostOverloadAlertTarget')}</FieldTitle>
             <DropdownMenu
@@ -1257,7 +1260,6 @@ export function HostOverloadAlertSettingsEditor(props: {
             <p className="hint-warn-inline">{tr('settings.hostOverloadAlertRecipientUnverified')}</p>
           ) : null}
         </div>
-      ) : null}
     </>
   );
 }

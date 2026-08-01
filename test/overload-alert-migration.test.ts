@@ -8,7 +8,7 @@
  * observable without standing up a bot registry.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -57,8 +57,11 @@ describe('migrateOverloadAlertAtStartup', () => {
     rmSync(home, { recursive: true, force: true });
   });
 
+  // Convenience: build the {larkAppId, apiOnly?}[] the migration now takes.
+  const bots = (...ids: string[]) => ids.map(larkAppId => ({ larkAppId }));
+
   it('no legacy toggle on → leaves the global config unset (feature stays off)', async () => {
-    await migrateOverloadAlertAtStartup(['cli_a', 'cli_b']);
+    await migrateOverloadAlertAtStartup(bots('cli_a', 'cli_b'));
     invalidateGlobalConfigCache();
     expect(readGlobalConfig().hostOverloadAlert).toBeUndefined();
     expect(clearedPrefs).toEqual([]);
@@ -66,7 +69,7 @@ describe('migrateOverloadAlertAtStartup', () => {
 
   it('exactly one legacy bot on → becomes the enabled notifier target and its pref is cleared', async () => {
     legacyOverloadAlert.set('cli_b', true);
-    await migrateOverloadAlertAtStartup(['cli_a', 'cli_b', 'cli_c']);
+    await migrateOverloadAlertAtStartup(bots('cli_a', 'cli_b', 'cli_c'));
     invalidateGlobalConfigCache();
     expect(readGlobalConfig().hostOverloadAlert).toEqual({ enabled: true, targetBotAppId: 'cli_b' });
     expect(clearedPrefs).toEqual([{ appId: 'cli_b', patch: { overloadAlert: false } }]);
@@ -76,7 +79,7 @@ describe('migrateOverloadAlertAtStartup', () => {
     legacyOverloadAlert.set('cli_z', true);
     legacyOverloadAlert.set('cli_a', true);
     legacyOverloadAlert.set('cli_m', true);
-    await migrateOverloadAlertAtStartup(['cli_z', 'cli_a', 'cli_m']);
+    await migrateOverloadAlertAtStartup(bots('cli_z', 'cli_a', 'cli_m'));
     invalidateGlobalConfigCache();
     // Sorted → cli_a wins deterministically regardless of input order.
     expect(readGlobalConfig().hostOverloadAlert).toEqual({ enabled: true, targetBotAppId: 'cli_a' });
@@ -87,18 +90,64 @@ describe('migrateOverloadAlertAtStartup', () => {
     expect(warned).toContain('cli_a');
   });
 
+  it('EXCLUDES apiOnly bots as candidates (an apiOnly bot can never DM)', async () => {
+    // cli_a is apiOnly + legacy-on; by sort order it would win, but it has no
+    // Feishu transport → skip it and migrate the next eligible bot instead.
+    legacyOverloadAlert.set('cli_a', true);
+    legacyOverloadAlert.set('cli_b', true);
+    await migrateOverloadAlertAtStartup([
+      { larkAppId: 'cli_a', apiOnly: true },
+      { larkAppId: 'cli_b', apiOnly: false },
+    ]);
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().hostOverloadAlert).toEqual({ enabled: true, targetBotAppId: 'cli_b' });
+    // Only the eligible bot's pref is cleared; the apiOnly one is left untouched.
+    expect(clearedPrefs).toEqual([{ appId: 'cli_b', patch: { overloadAlert: false } }]);
+  });
+
+  it('leaves the feature off when the ONLY legacy-on bot is apiOnly (no eligible target)', async () => {
+    legacyOverloadAlert.set('cli_a', true);
+    await migrateOverloadAlertAtStartup([{ larkAppId: 'cli_a', apiOnly: true }]);
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().hostOverloadAlert).toBeUndefined();
+    expect(clearedPrefs).toEqual([]);
+  });
+
   it('idempotent: a second run after migration is a no-op (does not re-clear or overwrite)', async () => {
     legacyOverloadAlert.set('cli_b', true);
-    await migrateOverloadAlertAtStartup(['cli_a', 'cli_b']);
+    await migrateOverloadAlertAtStartup(bots('cli_a', 'cli_b'));
     invalidateGlobalConfigCache();
     const first = readGlobalConfig().hostOverloadAlert;
     clearedPrefs.length = 0;
 
-    await migrateOverloadAlertAtStartup(['cli_a', 'cli_b']);
+    await migrateOverloadAlertAtStartup(bots('cli_a', 'cli_b'));
     invalidateGlobalConfigCache();
     expect(readGlobalConfig().hostOverloadAlert).toEqual(first);
     // Fast-path skip: no further pref clears on the second run.
     expect(clearedPrefs).toEqual([]);
+  });
+
+  it('lock-inner re-check sees a concurrent write through the stale TTL cache (no duplicate write / clobber)', async () => {
+    // The race codex flagged: this daemon primes the 2s read cache with a
+    // pre-write "absent" snapshot, THEN another PROCESS saves a user selection
+    // straight to config.json (which cannot invalidate our in-process cache).
+    // The migration must invalidate the cache INSIDE the lock, see the fresh
+    // disk value, and bail — not overwrite the user's choice.
+    legacyOverloadAlert.set('cli_b', true);
+    readGlobalConfig(); // prime the TTL cache: hostOverloadAlert === undefined
+    // Cross-process write: bypass global-config's writers so our cache stays stale.
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      hostOverloadAlert: { enabled: true, targetBotAppId: 'cli_user_pick' },
+    }));
+    // Sanity: without invalidation the cache still reports absent (proves the
+    // fast-path read alone would wrongly proceed to migrate).
+    expect(readGlobalConfig().hostOverloadAlert).toBeUndefined();
+
+    await migrateOverloadAlertAtStartup(bots('cli_a', 'cli_b'));
+    invalidateGlobalConfigCache();
+    // Lock-inner invalidate → fresh read → user's choice preserved, not clobbered.
+    expect(readGlobalConfig().hostOverloadAlert).toEqual({ enabled: true, targetBotAppId: 'cli_user_pick' });
+    expect(clearedPrefs).toEqual([]); // migration bailed → nothing cleared
   });
 
   it('does not run when hostOverloadAlert is already present (even if a legacy toggle lingers)', async () => {
@@ -106,7 +155,7 @@ describe('migrateOverloadAlertAtStartup', () => {
     invalidateGlobalConfigCache();
     legacyOverloadAlert.set('cli_b', true);
 
-    await migrateOverloadAlertAtStartup(['cli_a', 'cli_b']);
+    await migrateOverloadAlertAtStartup(bots('cli_a', 'cli_b'));
     invalidateGlobalConfigCache();
     // Global untouched; the pre-existing (disabled) config wins over the legacy toggle.
     expect(readGlobalConfig().hostOverloadAlert).toEqual({ enabled: false });
@@ -118,7 +167,7 @@ describe('migrateOverloadAlertAtStartup', () => {
     const store = await import('../src/services/card-prefs-store.js');
     vi.mocked(store.updateBotCardPrefs).mockRejectedValueOnce(new Error('disk full'));
 
-    await expect(migrateOverloadAlertAtStartup(['cli_b'])).resolves.toBeUndefined();
+    await expect(migrateOverloadAlertAtStartup(bots('cli_b'))).resolves.toBeUndefined();
     invalidateGlobalConfigCache();
     // The global write (which happens FIRST) still landed.
     expect(readGlobalConfig().hostOverloadAlert).toEqual({ enabled: true, targetBotAppId: 'cli_b' });

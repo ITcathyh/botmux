@@ -57,14 +57,28 @@ export const DEFAULT_OVERLOAD_THRESHOLDS: Omit<OverloadThresholds, 'cpuCount'> =
   minReAlertMs: 15 * 60_000,
 };
 
-/** Parse a non-negative finite float from a raw env string; blank/garbage →
- *  `fallback`. Shared by {@link computeOverloadThresholds} so env-override
- *  precedence is testable without a live `process.env`. */
-export function parseOverloadEnvFloat(raw: string | undefined, fallback: number): number {
+/** Parse a finite float from a raw env string; blank/garbage/failing-`isValid`
+ *  → `fallback`. `isValid` defaults to non-negative (right for exit lines +
+ *  minReAlertMs, where 0 is a legal "off"/"immediate" value); the enter
+ *  thresholds pass stricter predicates (load must be > 0, mem must be in (0,1])
+ *  so a degenerate `enter=0` can't sneak in — at enter=0 the 95% hysteresis
+ *  clamp is still 0, breaking "exit strictly below enter" and (for mem) flapping
+ *  entered/recovered every tick. Shared by {@link computeOverloadThresholds} so
+ *  env-override precedence is testable without a live `process.env`. */
+export function parseOverloadEnvFloat(
+  raw: string | undefined,
+  fallback: number,
+  isValid: (n: number) => boolean = (n) => n >= 0,
+): number {
   if (raw === undefined || raw.trim() === '') return fallback;
   const n = Number(raw);
-  return Number.isFinite(n) && n >= 0 ? n : fallback;
+  return Number.isFinite(n) && isValid(n) ? n : fallback;
 }
+
+/** Validity predicates for the two enter dimensions — exported so tests + the
+ *  config/applier layers can share the exact same rule (single source of truth). */
+export const isValidEnterLoadRatio = (n: number): boolean => Number.isFinite(n) && n > 0;
+export const isValidEnterMemUsedFrac = (n: number): boolean => Number.isFinite(n) && n > 0 && n <= 1;
 
 /**
  * Should THIS daemon sample host pressure and own the overload alert?
@@ -75,19 +89,29 @@ export function parseOverloadEnvFloat(raw: string | undefined, fallback: number)
  * Every other daemon must no-op AND reset its local state, so that when the
  * target later switches TO this bot the state machine starts clean (no stale
  * "already overloaded" edge from a previous ownership). Pure predicate over the
- * config + this daemon's app id — the reset is the caller's responsibility.
+ * config + this daemon's identity — the reset is the caller's responsibility.
+ *
+ * FAIL-CLOSED on apiOnly: a core-only (apiOnly) bot has no Feishu transport, so
+ * it can never DM an admin. Even if a hand-edited config or a pre-`apiOnly`-aware
+ * migration names an apiOnly bot as the target, this daemon must NOT sample —
+ * it would advance the state machine and then silently drop every alert. The
+ * migration also excludes apiOnly candidates; this is the runtime backstop for
+ * configs that bypass it.
  *
  * @param alertCfg the global `hostOverloadAlert` block (or {} when unset).
- * @param selfLarkAppId this daemon's bot app id.
+ * @param self this daemon's identity: `larkAppId` + whether it's apiOnly.
  */
 export function isOverloadAlertTarget(
   alertCfg: { enabled?: boolean; targetBotAppId?: string } | undefined,
-  selfLarkAppId: string,
+  self: { larkAppId: string; apiOnly?: boolean } | string,
 ): boolean {
   if (!alertCfg) return false;
+  const selfAppId = typeof self === 'string' ? self : self.larkAppId;
+  const selfApiOnly = typeof self === 'string' ? false : self.apiOnly === true;
+  if (selfApiOnly) return false; // apiOnly bots can't deliver a DM — never sample.
   return alertCfg.enabled === true
     && typeof alertCfg.targetBotAppId === 'string'
-    && alertCfg.targetBotAppId === selfLarkAppId;
+    && alertCfg.targetBotAppId === selfAppId;
 }
 
 /** Raw inputs for {@link computeOverloadThresholds}: the host CPU count, the
@@ -127,16 +151,18 @@ export interface OverloadThresholdInputs {
 export function computeOverloadThresholds(inputs: OverloadThresholdInputs): OverloadThresholds {
   const cpuCount = Math.max(1, inputs.cpuCount || 1);
   const env = inputs.env ?? {};
-  const cfgEnterLoad = typeof inputs.configEnterLoadRatio === 'number'
-    && Number.isFinite(inputs.configEnterLoadRatio) && inputs.configEnterLoadRatio > 0
+  // Config enter values are re-validated with the SAME per-dimension predicates
+  // as env (load > 0, mem in (0,1]) so a bad persisted value falls through to
+  // the built-in default instead of poisoning the derived exit line.
+  const cfgEnterLoad = typeof inputs.configEnterLoadRatio === 'number' && isValidEnterLoadRatio(inputs.configEnterLoadRatio)
     ? inputs.configEnterLoadRatio : DEFAULT_OVERLOAD_THRESHOLDS.enterLoadRatio;
-  const cfgEnterMem = typeof inputs.configEnterMemUsedFrac === 'number'
-    && Number.isFinite(inputs.configEnterMemUsedFrac)
-    && inputs.configEnterMemUsedFrac > 0 && inputs.configEnterMemUsedFrac <= 1
+  const cfgEnterMem = typeof inputs.configEnterMemUsedFrac === 'number' && isValidEnterMemUsedFrac(inputs.configEnterMemUsedFrac)
     ? inputs.configEnterMemUsedFrac : DEFAULT_OVERLOAD_THRESHOLDS.enterMemUsedFrac;
-  const enterLoadRatio = parseOverloadEnvFloat(env.enterLoadRatio, cfgEnterLoad);
+  // Enter thresholds: env wins, but only if it passes the strict predicate;
+  // otherwise fall back to the (already-validated) config/default value.
+  const enterLoadRatio = parseOverloadEnvFloat(env.enterLoadRatio, cfgEnterLoad, isValidEnterLoadRatio);
   let exitLoadRatio = parseOverloadEnvFloat(env.exitLoadRatio, DEFAULT_OVERLOAD_THRESHOLDS.exitLoadRatio);
-  const enterMemUsedFrac = parseOverloadEnvFloat(env.enterMemUsedFrac, cfgEnterMem);
+  const enterMemUsedFrac = parseOverloadEnvFloat(env.enterMemUsedFrac, cfgEnterMem, isValidEnterMemUsedFrac);
   let exitMemUsedFrac = parseOverloadEnvFloat(env.exitMemUsedFrac, DEFAULT_OVERLOAD_THRESHOLDS.exitMemUsedFrac);
   const HYSTERESIS_MARGIN = 0.95; // exit = 95% of enter when misconfigured
   if (exitLoadRatio >= enterLoadRatio) {

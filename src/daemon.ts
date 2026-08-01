@@ -18490,7 +18490,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // running in a separate node process) so dashboard event bus stays in sync.
   scheduleStore.setScheduleScope(cfg.larkAppId);
   migrateSharedSchedulesAtStartup(botConfigs.map(b => b.larkAppId), botConfigs[0]?.larkAppId ?? cfg.larkAppId);
-  void migrateOverloadAlertAtStartup(botConfigs.map(b => b.larkAppId));
+  void migrateOverloadAlertAtStartup(botConfigs.map(b => ({ larkAppId: b.larkAppId, apiOnly: b.apiOnly })));
   scheduleStore.startExternalWriteWatcher();
   logger.info(`Bot ${idx}/${botConfigs.length}: ${cfg.larkAppId} (cli: ${cfg.cliId})`)
   setAskCardDispatcher(createLarkAskCardDispatcher());
@@ -19265,7 +19265,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         // daemon samples. When disabled, or the target is another bot / unset,
         // reset local state so a later re-enable starts clean (no stale edge).
         const alertCfg = readGlobalConfig().hostOverloadAlert ?? {};
-        if (!isOverloadAlertTarget(alertCfg, cfg.larkAppId)) { overloadState = INITIAL_OVERLOAD_STATE; return; }
+        if (!isOverloadAlertTarget(alertCfg, { larkAppId: cfg.larkAppId, apiOnly: cfg.apiOnly })) { overloadState = INITIAL_OVERLOAD_STATE; return; }
         // Re-read thresholds each tick so live config edits (enter load/mem)
         // take effect on the next sample without a restart.
         const overloadThresholds = resolveOverloadThresholds();
