@@ -38,11 +38,36 @@ vi.mock('../src/core/worker-pool.js', async () => {
   };
 });
 
+// The integration test drives adoptCodexNotifierEvent through its real control
+// flow; stub the one network hop (message→chat lookup) and the bot config read.
+vi.mock('../src/im/lark/client.js', async () => {
+  const actual = await vi.importActual<any>('../src/im/lark/client.js');
+  return {
+    ...actual,
+    getMessageChatId: vi.fn(async () => 'oc_dm'),
+  };
+});
+
+vi.mock('../src/bot-registry.js', async () => {
+  const actual = await vi.importActual<any>('../src/bot-registry.js');
+  return {
+    ...actual,
+    getBot: vi.fn(() => ({
+      config: { larkAppId: 'cli_app', cliId: 'codex-app', p2pMode: 'chat', cliPathOverride: undefined },
+      botName: 'TestBot',
+      botOpenId: 'ou_bot',
+    })),
+  };
+});
+
 import {
   __testOnly_notifierAdoptStaleOrTransferring as staleOrTransferring,
   __testOnly_notifierAdoptWouldDropInput as wouldDropInput,
   __testOnly_clearPendingRepoStateForNotifierAdopt as clearForAdopt,
+  __testOnly_adoptCodexNotifierEvent as adoptEvent,
+  __testOnly_activeSessions as activeSessions,
 } from '../src/daemon.js';
+import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 const KEY = 'oc_dm:cli_app';
@@ -146,6 +171,39 @@ describe('P2 · notifierAdoptWouldDropInput', () => {
     } as any);
     expect(wouldDropInput(ds)).toBe(false);
   });
+
+  // ─── P2 regression: the immediate-launch (pinned/defaultWorkingDir) path ───
+  // seeds pendingPrompt/pendingCodexAppText/pendingAttachments as MIRROR fields,
+  // forks, and clears only pendingTurnId — leaving those fields on an already-
+  // delivered session with pendingRepo=false. Flagging them would wrongly warn
+  // "message not delivered, resend" → user re-runs a possibly non-idempotent
+  // command. So repo-select mirror fields must ONLY count when pendingRepo===true.
+  it('pinned launch residue: pendingPrompt with pendingRepo=false → false (already delivered)', () => {
+    const ds = makeDs({ pendingRepo: false, pendingPrompt: 'already ran' } as any);
+    expect(wouldDropInput(ds)).toBe(false);
+  });
+
+  it('pinned launch residue: pendingCodexAppText with pendingRepo=false → false', () => {
+    const ds = makeDs({ pendingRepo: false, pendingCodexAppText: 'ran visible text' } as any);
+    expect(wouldDropInput(ds)).toBe(false);
+  });
+
+  it('pinned launch residue: pendingAttachments with pendingRepo=false → false', () => {
+    const ds = makeDs({ pendingRepo: false, pendingAttachments: [{ key: 'img_1' }] } as any);
+    expect(wouldDropInput(ds)).toBe(false);
+  });
+
+  it('pinned launch residue: pendingFollowUps with pendingRepo=false → false', () => {
+    const ds = makeDs({ pendingRepo: false, pendingFollowUps: ['a', 'b'] } as any);
+    expect(wouldDropInput(ds)).toBe(false);
+  });
+
+  it('raw/follow-up stay independent: pendingRawInput true even alongside pendingRepo=false residue', () => {
+    // The launch window that IS real: raw input still awaiting prompt_ready,
+    // coexisting with an already-delivered pendingPrompt mirror. raw wins → true.
+    const ds = makeDs({ pendingRepo: false, pendingPrompt: 'delivered', pendingRawInput: '/status' } as any);
+    expect(wouldDropInput(ds)).toBe(true);
+  });
 });
 
 describe('P2 · clear actually removes what the predicate flagged', () => {
@@ -163,5 +221,60 @@ describe('P2 · clear actually removes what the predicate flagged', () => {
     expect(ds.pendingRawInput).toBeUndefined();
     expect(ds.pendingFollowUpInput).toBeUndefined();
     expect(ds.pendingRepo).toBe(false);
+  });
+});
+
+// ─── P2#2 integration: guard placement OUTSIDE the launch branch ────────────
+// A pure-helper test cannot prove WHERE the transfer guard sits. Drive the real
+// adoptCodexNotifierEvent control flow with a session that is ALREADY on the
+// target thread with a live worker (so the launch/re-fork branch is skipped
+// entirely). Only an out-of-branch guard can still catch an in-flight transfer.
+describe('P2#2 · adoptCodexNotifierEvent transfer guard (integration)', () => {
+  const EVENT = {
+    eventId: 'e'.repeat(64),
+    type: 'codex_task_completed',
+    source: 'codex-app',
+    threadId: 'thread-live',
+    nativeTurnId: 'nt-1',
+    status: 'completed',
+    cwd: '/repos/live',
+    title: 'Live task',
+    finalPreview: 'done',
+  } as any;
+
+  function liveAdoptedDs(): DaemonSession {
+    // Same thread as EVENT + a live worker → the `cliSessionId !== threadId ||
+    // !worker || worker.killed` launch branch is FALSE (skipped).
+    return makeDs({
+      session: { sessionId: 'sid-live', status: 'active', cliSessionId: 'thread-live' } as any,
+      worker: { killed: false } as any,
+      workingDir: '/repos/live',
+    });
+  }
+
+  beforeEach(() => {
+    mocks.transferring = new WeakSet();
+    activeSessions.clear();
+  });
+
+  it('same-thread live worker + /relay transferring → throws, NOT a green success card', async () => {
+    const ds = liveAdoptedDs();
+    activeSessions.set(sessionKey('oc_dm', 'cli_app'), ds);
+    mocks.transferring.add(ds); // relay in progress on this exact session
+
+    const ctrl = new AbortController();
+    await expect(
+      adoptEvent('cli_app', EVENT, 'om_card', 'ou_owner', ctrl.signal, Date.now() + 2200),
+    ).rejects.toThrow(/转移/); // "该会话正在转移，暂时无法接管…"
+  });
+
+  it('same-thread live worker + NOT transferring → returns the green adopt card (idempotent re-click)', async () => {
+    const ds = liveAdoptedDs();
+    activeSessions.set(sessionKey('oc_dm', 'cli_app'), ds);
+    // no transfer gate → the out-of-branch guard is a no-op
+
+    const ctrl = new AbortController();
+    const card = await adoptEvent('cli_app', EVENT, 'om_card', 'ou_owner', ctrl.signal, Date.now() + 2200);
+    expect(JSON.stringify(card)).toContain('已接管');
   });
 });

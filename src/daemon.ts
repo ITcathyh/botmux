@@ -4391,24 +4391,39 @@ function notifierAdoptStaleOrTransferring(
 
 /**
  * P2 predicate: would clearPendingRepoStateForNotifierAdopt drop user input that
- * was accepted but not yet delivered to the CLI? Covers BOTH windows, neither of
- * which may gate on pendingRepo:
- *  (1) repo-select pending (pendingRepo=true): buffered in pendingPrompt /
- *      pendingFollowUps / pendingAttachments / pendingRawInput / pendingCodexAppText.
- *  (2) just-committed launch window (pendingRepo=false): commitRepoSelection has
- *      already set pendingRepo=false and forked the worker, but pendingRawInput /
- *      pendingFollowUpInput still wait on the new worker's prompt_ready to send.
- *      A takeover here must NOT silently drop them just because pendingRepo=false.
+ * was accepted but not yet delivered to the CLI? Two DISTINCT windows with
+ * different gating — do NOT collapse them:
+ *
+ *  (1) repo-select pending buffer — ONLY meaningful while pendingRepo===true.
+ *      pendingPrompt / pendingCodexAppText / pendingAttachments / pendingFollowUps
+ *      are the message stashed for the deferred post-repo-selection fork. But the
+ *      pinned/defaultWorkingDir immediate-launch path (daemon.ts ~16031/17325)
+ *      ALSO seeds these same mirror fields, then forks and clears only
+ *      pendingTurnId (~16097/17387) — leaving pendingPrompt/etc behind on an
+ *      already-delivered session with pendingRepo=false. Gating on pendingRepo
+ *      here is what stops us from warning "message not delivered, resend" about
+ *      a prompt the worker already ran (which would make the user re-run a
+ *      non-idempotent command).
+ *
+ *  (2) just-committed launch window — INDEPENDENT of pendingRepo. commitRepoSelection
+ *      set pendingRepo=false and forked, but pendingRawInput / pendingFollowUpInput
+ *      still wait on the new worker's prompt_ready to actually send. These are the
+ *      only fields that legitimately represent undelivered input while
+ *      pendingRepo=false, so they are checked unconditionally. (The immediate-launch
+ *      path never populates them — it forks with the prompt as a direct argument.)
  */
 function notifierAdoptWouldDropInput(ds: DaemonSession): boolean {
-  return (
+  const repoSelectBuffered = ds.pendingRepo === true && (
     (ds.pendingPrompt?.trim().length ?? 0) > 0
     || (ds.pendingFollowUps?.length ?? 0) > 0
     || (ds.pendingAttachments?.length ?? 0) > 0
-    || (ds.pendingRawInput?.trim().length ?? 0) > 0
     || (ds.pendingCodexAppText?.trim().length ?? 0) > 0
-    || (ds.pendingFollowUpInput?.cliInput?.trim().length ?? 0) > 0
   );
+  // Undelivered regardless of pendingRepo (awaiting prompt_ready on a forked worker).
+  const undeliveredLaunchInput =
+    (ds.pendingRawInput?.trim().length ?? 0) > 0
+    || (ds.pendingFollowUpInput?.cliInput?.trim().length ?? 0) > 0;
+  return repoSelectBuffered || undeliveredLaunchInput;
 }
 
 /**
@@ -4508,6 +4523,17 @@ async function adoptCodexNotifierEvent(
       await closeSessionHelper(session.sessionId);
       throw new Error('通知所在会话路由被一条待处理的持久会话占用');
     }
+  }
+
+  // Transfer guard OUTSIDE the launch branch. If the session is already on the
+  // target thread with a live worker, the branch below is skipped entirely —
+  // but a concurrent /relay could still be moving this session's routing away.
+  // Returning a green「已接管，可继续」while the route is migrating is a lie.
+  // Fail-closed here first (a freshly-created ds has no transfer gate, so this
+  // is a no-op for the new-session path); the launch branch keeps its own
+  // post-await revalidation for the drift that can open during its awaits.
+  if (isSessionTransferring(ds)) {
+    throw new Error('该会话正在转移，暂时无法接管；请转移完成后在完成通知卡上重试');
   }
 
   let bufferedInputDropped = false;
@@ -4611,6 +4637,7 @@ async function adoptCodexNotifierEvent(
 export const __testOnly_notifierAdoptStaleOrTransferring = notifierAdoptStaleOrTransferring;
 export const __testOnly_notifierAdoptWouldDropInput = notifierAdoptWouldDropInput;
 export const __testOnly_clearPendingRepoStateForNotifierAdopt = clearPendingRepoStateForNotifierAdopt;
+export const __testOnly_adoptCodexNotifierEvent = adoptCodexNotifierEvent;
 
 const handleCodexNotifierCardAction = createCodexNotifierCardActionHandler({
   getExpectedOwnerOpenId: larkAppId =>
