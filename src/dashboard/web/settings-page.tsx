@@ -45,6 +45,22 @@ interface DashboardSettings {
     workerOnline: boolean;
     lastError: { at: string; message: string; retryAt: string } | null;
   };
+  hostOverloadAlert: {
+    enabled: boolean;
+    targetBotAppId: string | null;
+    enterLoadRatio: number;
+    enterMemUsedFrac: number;
+    botOptions: Array<{
+      larkAppId: string;
+      botName: string | null;
+      cliId: string;
+      apiOnly: boolean;
+      recipientConfigured: boolean;
+      recipientVerified: boolean;
+      recipientHint: string | null;
+    }>;
+    targetDaemonOnline: boolean;
+  };
   noVisibleOutputHint: boolean;
   vcMeetingAgent: {
     enabled: boolean;
@@ -162,6 +178,20 @@ function parseSettings(s: any): DashboardSettings {
         && typeof s.codexNotifier.lastError.message === 'string'
         ? s.codexNotifier.lastError
         : null,
+    },
+    hostOverloadAlert: {
+      enabled: s?.hostOverloadAlert?.enabled === true,
+      targetBotAppId: typeof s?.hostOverloadAlert?.targetBotAppId === 'string'
+        ? s.hostOverloadAlert.targetBotAppId
+        : null,
+      enterLoadRatio: typeof s?.hostOverloadAlert?.enterLoadRatio === 'number'
+        ? s.hostOverloadAlert.enterLoadRatio
+        : 1.5,
+      enterMemUsedFrac: typeof s?.hostOverloadAlert?.enterMemUsedFrac === 'number'
+        ? s.hostOverloadAlert.enterMemUsedFrac
+        : 0.92,
+      botOptions: Array.isArray(s?.hostOverloadAlert?.botOptions) ? s.hostOverloadAlert.botOptions : [],
+      targetDaemonOnline: s?.hostOverloadAlert?.targetDaemonOnline === true,
     },
     noVisibleOutputHint: s?.noVisibleOutputHint === true,
     vcMeetingAgent: {
@@ -578,6 +608,13 @@ function SettingsBody(props: {
       s => ({ ...s, codexNotifier: { ...s.codexNotifier, ...patch } }),
     );
   };
+  const saveHostOverloadAlert = (patch: Partial<Pick<DashboardSettings['hostOverloadAlert'], 'enabled' | 'targetBotAppId' | 'enterLoadRatio' | 'enterMemUsedFrac'>>) => {
+    return props.onSave(
+      'hostOverloadAlert',
+      { hostOverloadAlert: patch },
+      s => ({ ...s, hostOverloadAlert: { ...s.hostOverloadAlert, ...patch } }),
+    );
+  };
   const repoModeOptions = useMemo(() => [
     { value: 'all' as const, label: tr('settings.repoPickerModeAll') },
     { value: 'repos' as const, label: tr('settings.repoPickerModeRepos') },
@@ -711,6 +748,12 @@ function SettingsBody(props: {
             disabled={dis}
             saving={savingKey === 'codexNotifier'}
             onSave={saveCodexNotifier}
+          />
+          <HostOverloadAlertSettingsEditor
+            value={settings.hostOverloadAlert}
+            disabled={dis}
+            saving={savingKey === 'hostOverloadAlert'}
+            onSave={saveHostOverloadAlert}
           />
           <ToggleRow
             title={tr('settings.noVisibleOutputHint')}
@@ -1111,6 +1154,107 @@ export function CodexNotifierSettingsEditor(props: {
                 {tr('settings.codexNotifierPending', { count: props.value.pendingCount })}
               </p>
             ) : null
+          ) : null}
+        </div>
+      ) : null}
+    </>
+  );
+}
+
+export function HostOverloadAlertSettingsEditor(props: {
+  value: DashboardSettings['hostOverloadAlert'];
+  disabled: boolean;
+  saving: boolean;
+  onSave(
+    patch: Partial<Pick<DashboardSettings['hostOverloadAlert'], 'enabled' | 'targetBotAppId' | 'enterLoadRatio' | 'enterMemUsedFrac'>>,
+  ): Promise<void> | void;
+}) {
+  const tr = useT();
+  const controlsDisabled = props.disabled || props.saving;
+  const botOptions = useMemo(() => [
+    { value: '', label: tr('settings.hostOverloadAlertTargetPlaceholder') },
+    ...props.value.botOptions.map(bot => ({
+      value: bot.larkAppId,
+      label: [bot.botName || bot.larkAppId, bot.cliId].filter(Boolean).join(' · '),
+    })),
+  ], [props.value.botOptions, tr]);
+  const selectedBot = props.value.botOptions.find(bot => bot.larkAppId === props.value.targetBotAppId);
+  const showDetails = props.value.enabled || !!props.value.targetBotAppId;
+  // Local draft for the threshold inputs so typing doesn't fire a save per keystroke.
+  const [loadDraft, setLoadDraft] = useState(String(props.value.enterLoadRatio));
+  const [memDraft, setMemDraft] = useState(String(Math.round(props.value.enterMemUsedFrac * 100)));
+  useEffect(() => { setLoadDraft(String(props.value.enterLoadRatio)); }, [props.value.enterLoadRatio]);
+  useEffect(() => { setMemDraft(String(Math.round(props.value.enterMemUsedFrac * 100))); }, [props.value.enterMemUsedFrac]);
+
+  const commitLoad = () => {
+    const n = Number(loadDraft);
+    if (Number.isFinite(n) && n > 0 && n !== props.value.enterLoadRatio) void props.onSave({ enterLoadRatio: n });
+    else setLoadDraft(String(props.value.enterLoadRatio));
+  };
+  const commitMem = () => {
+    const pct = Number(memDraft);
+    const frac = pct / 100;
+    if (Number.isFinite(pct) && pct > 0 && pct <= 100 && frac !== props.value.enterMemUsedFrac) void props.onSave({ enterMemUsedFrac: frac });
+    else setMemDraft(String(Math.round(props.value.enterMemUsedFrac * 100)));
+  };
+
+  return (
+    <>
+      <ToggleRow
+        title={tr('settings.hostOverloadAlert')}
+        help={tr('settings.hostOverloadAlertHelp')}
+        checked={props.value.enabled}
+        disabled={controlsDisabled || (!props.value.enabled && !props.value.targetBotAppId)}
+        onChange={value => { void props.onSave({ enabled: value }); }}
+      />
+      {showDetails ? (
+        <div className="settings-codex-notifier-details">
+          <div className="settings-field-row">
+            <FieldTitle help={tr('settings.hostOverloadAlertTargetHelp')}>{tr('settings.hostOverloadAlertTarget')}</FieldTitle>
+            <DropdownMenu
+              className="settings-field-menu"
+              ariaLabel={tr('settings.hostOverloadAlertTarget')}
+              disabled={controlsDisabled}
+              searchable
+              value={props.value.targetBotAppId ?? ''}
+              label={dropdownLabel(botOptions, props.value.targetBotAppId ?? '')}
+              options={botOptions}
+              onChange={value => { void props.onSave({ targetBotAppId: value || null }); }}
+            />
+          </div>
+          {selectedBot?.recipientHint ? (
+            <p className="settings-subfield-hint">
+              {tr('settings.hostOverloadAlertRecipient', { recipient: selectedBot.recipientHint })}
+            </p>
+          ) : null}
+          <div className="settings-field-row">
+            <FieldTitle help={tr('settings.hostOverloadAlertEnterLoadHelp')}>{tr('settings.hostOverloadAlertEnterLoad')}</FieldTitle>
+            <input
+              type="number" min={0.1} step={0.1} className="settings-text-input"
+              value={loadDraft} disabled={controlsDisabled}
+              onChange={e => setLoadDraft(e.currentTarget.value)}
+              onBlur={commitLoad}
+              onKeyDown={e => { if (e.key === 'Enter') commitLoad(); }}
+            />
+          </div>
+          <div className="settings-field-row">
+            <FieldTitle help={tr('settings.hostOverloadAlertEnterMemHelp')}>{tr('settings.hostOverloadAlertEnterMem')}</FieldTitle>
+            <input
+              type="number" min={1} max={100} step={1} className="settings-text-input"
+              value={memDraft} disabled={controlsDisabled}
+              onChange={e => setMemDraft(e.currentTarget.value)}
+              onBlur={commitMem}
+              onKeyDown={e => { if (e.key === 'Enter') commitMem(); }}
+            />
+          </div>
+          {!props.value.targetBotAppId ? (
+            <p className="hint-warn-inline">{tr('settings.hostOverloadAlertTargetRequired')}</p>
+          ) : selectedBot?.recipientConfigured !== true ? (
+            <p className="hint-warn-inline">{tr('settings.hostOverloadAlertRecipientMissing')}</p>
+          ) : !props.value.targetDaemonOnline ? (
+            <p className="hint-warn-inline">{tr('settings.hostOverloadAlertTargetOffline')}</p>
+          ) : selectedBot?.recipientVerified !== true ? (
+            <p className="hint-warn-inline">{tr('settings.hostOverloadAlertRecipientUnverified')}</p>
           ) : null}
         </div>
       ) : null}

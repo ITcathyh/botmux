@@ -28,8 +28,9 @@ import {
   buildOverloadAlertCard,
   buildOverloadRecoveredCard,
   initialOverloadCardState,
-  DEFAULT_OVERLOAD_THRESHOLDS,
   INITIAL_OVERLOAD_STATE,
+  computeOverloadThresholds,
+  isOverloadAlertTarget,
   type OverloadState,
   type OverloadThresholds,
 } from './core/host-overload-alert.js';
@@ -18188,14 +18189,6 @@ function resolvePrimaryOwnerOpenId(larkAppId: string): string | undefined {
   }
 }
 
-/** Parse a positive float env override, falling back to `dflt` when unset/invalid. */
-function envFloat(name: string, dflt: number): number {
-  const raw = process.env[name];
-  if (raw === undefined || raw.trim() === '') return dflt;
-  const n = Number(raw);
-  return Number.isFinite(n) && n >= 0 ? n : dflt;
-}
-
 /**
  * Host-overload thresholds, seeded from module defaults and overridable via env
  * so an operator can tune sensitivity without a code change:
@@ -18207,44 +18200,24 @@ function envFloat(name: string, dflt: number): number {
  * but are inert (reading passes swap=undefined).
  */
 function resolveOverloadThresholds(): OverloadThresholds {
-  const cpuCount = Math.max(1, cpus().length || 1);
-  // Priority for the enter thresholds: env > global config (hostOverloadAlert)
-  // > built-in default. Exit lines derive from enter with hysteresis below.
+  // Enter thresholds priority (env > global config > default) + hysteresis-safe
+  // exit derivation live in the pure computeOverloadThresholds() so they can be
+  // unit-tested without importing this side-effectful module. We only gather the
+  // impure inputs (CPU count, persisted config, env strings) here.
   const cfg = readGlobalConfig().hostOverloadAlert ?? {};
-  const cfgEnterLoad = typeof cfg.enterLoadRatio === 'number' && Number.isFinite(cfg.enterLoadRatio) && cfg.enterLoadRatio > 0
-    ? cfg.enterLoadRatio : DEFAULT_OVERLOAD_THRESHOLDS.enterLoadRatio;
-  const cfgEnterMem = typeof cfg.enterMemUsedFrac === 'number' && Number.isFinite(cfg.enterMemUsedFrac) && cfg.enterMemUsedFrac > 0 && cfg.enterMemUsedFrac <= 1
-    ? cfg.enterMemUsedFrac : DEFAULT_OVERLOAD_THRESHOLDS.enterMemUsedFrac;
-  const enterLoadRatio = envFloat('BOTMUX_OVERLOAD_ENTER_LOAD_RATIO', cfgEnterLoad);
-  let exitLoadRatio = envFloat('BOTMUX_OVERLOAD_EXIT_LOAD_RATIO', DEFAULT_OVERLOAD_THRESHOLDS.exitLoadRatio);
-  const enterMemUsedFrac = envFloat('BOTMUX_OVERLOAD_ENTER_MEM_FRAC', cfgEnterMem);
-  let exitMemUsedFrac = envFloat('BOTMUX_OVERLOAD_EXIT_MEM_FRAC', DEFAULT_OVERLOAD_THRESHOLDS.exitMemUsedFrac);
-  // Hysteresis only works when the recover line sits STRICTLY below the enter
-  // line. Clamping a misconfigured exit down to *equal* enter is not enough: at
-  // enter == exit the enter test (mem `>=`) and the recover test (mem `<=`) both
-  // fire at the exact threshold, so a reading pinned there flaps entered/
-  // recovered every tick. Force a small gap below enter (5%) and warn.
-  const HYSTERESIS_MARGIN = 0.95; // exit = 95% of enter when misconfigured
-  if (exitLoadRatio >= enterLoadRatio) {
-    const clamped = enterLoadRatio * HYSTERESIS_MARGIN;
-    logger.warn(`[overload] BOTMUX_OVERLOAD_EXIT_LOAD_RATIO (${exitLoadRatio}) >= ENTER (${enterLoadRatio}); clamping exit to ${clamped}`);
-    exitLoadRatio = clamped;
-  }
-  if (exitMemUsedFrac >= enterMemUsedFrac) {
-    const clamped = enterMemUsedFrac * HYSTERESIS_MARGIN;
-    logger.warn(`[overload] BOTMUX_OVERLOAD_EXIT_MEM_FRAC (${exitMemUsedFrac}) >= ENTER (${enterMemUsedFrac}); clamping exit to ${clamped}`);
-    exitMemUsedFrac = clamped;
-  }
-  return {
-    cpuCount,
-    enterLoadRatio,
-    exitLoadRatio,
-    enterMemUsedFrac,
-    exitMemUsedFrac,
-    enterSwapUsedFrac: DEFAULT_OVERLOAD_THRESHOLDS.enterSwapUsedFrac,
-    exitSwapUsedFrac: DEFAULT_OVERLOAD_THRESHOLDS.exitSwapUsedFrac,
-    minReAlertMs: envFloat('BOTMUX_OVERLOAD_MIN_REALERT_MS', DEFAULT_OVERLOAD_THRESHOLDS.minReAlertMs),
-  };
+  return computeOverloadThresholds({
+    cpuCount: cpus().length || 1,
+    configEnterLoadRatio: cfg.enterLoadRatio,
+    configEnterMemUsedFrac: cfg.enterMemUsedFrac,
+    env: {
+      enterLoadRatio: process.env.BOTMUX_OVERLOAD_ENTER_LOAD_RATIO,
+      exitLoadRatio: process.env.BOTMUX_OVERLOAD_EXIT_LOAD_RATIO,
+      enterMemUsedFrac: process.env.BOTMUX_OVERLOAD_ENTER_MEM_FRAC,
+      exitMemUsedFrac: process.env.BOTMUX_OVERLOAD_EXIT_MEM_FRAC,
+      minReAlertMs: process.env.BOTMUX_OVERLOAD_MIN_REALERT_MS,
+    },
+    warn: (message) => logger.warn(message),
+  });
 }
 
 /**
@@ -19292,10 +19265,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         // daemon samples. When disabled, or the target is another bot / unset,
         // reset local state so a later re-enable starts clean (no stale edge).
         const alertCfg = readGlobalConfig().hostOverloadAlert ?? {};
-        const isTarget = alertCfg.enabled === true
-          && typeof alertCfg.targetBotAppId === 'string'
-          && alertCfg.targetBotAppId === cfg.larkAppId;
-        if (!isTarget) { overloadState = INITIAL_OVERLOAD_STATE; return; }
+        if (!isOverloadAlertTarget(alertCfg, cfg.larkAppId)) { overloadState = INITIAL_OVERLOAD_STATE; return; }
         // Re-read thresholds each tick so live config edits (enter load/mem)
         // take effect on the next sample without a restart.
         const overloadThresholds = resolveOverloadThresholds();

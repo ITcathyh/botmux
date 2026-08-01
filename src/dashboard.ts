@@ -83,6 +83,7 @@ import {
   type RollbackVersionsResult,
 } from './core/update-check.js';
 import { GITHUB_REPO } from './core/restart-report.js';
+import { DEFAULT_OVERLOAD_THRESHOLDS } from './core/host-overload-alert.js';
 import { spawnDetachedRestart, globalInstallUpdateLockTarget, globalInstallUpdateCwd } from './core/maintenance.js';
 import {
   detectGlobalInstallManager,
@@ -530,6 +531,24 @@ interface ResolvedDashboardSettings {
     workerOnline: boolean;
     lastError: { at: string; message: string; retryAt: string } | null;
   };
+  /** Machine-wide host-overload alert. Default OFF. Delivered by the selected
+   *  notifier bot's daemon (any non-apiOnly bot with a resolvable admin). */
+  hostOverloadAlert: {
+    enabled: boolean;
+    targetBotAppId: string | null;
+    enterLoadRatio: number;
+    enterMemUsedFrac: number;
+    botOptions: Array<{
+      larkAppId: string;
+      botName: string | null;
+      cliId: string;
+      apiOnly: boolean;
+      recipientConfigured: boolean;
+      recipientVerified: boolean;
+      recipientHint: string | null;
+    }>;
+    targetDaemonOnline: boolean;
+  };
   /** Experimental anti-resend guidance in botmux routing hints. Default OFF. */
   noVisibleOutputHint: boolean;
   /** Machine-wide VC meeting listener kill-switch. Default ON. */
@@ -648,6 +667,54 @@ function codexNotifierBotOptions(): ResolvedDashboardSettings['codexNotifier']['
           larkAppId: bot.larkAppId,
           botName: bot.displayName ?? onlineByAppId.get(bot.larkAppId)?.botName ?? bot.name ?? null,
           cliId: onlineByAppId.get(bot.larkAppId)?.cliId ?? bot.cliId,
+          ...resolveCodexNotifierRecipientView(bot.allowedUsers, resolvedOwners),
+        };
+      });
+  } catch {
+    return [];
+  }
+}
+
+/** Validate an overload-alert notifier bot. Unlike codexNotifier this is NOT
+ *  codex-only — any non-apiOnly bot that can resolve an admin recipient works.
+ *  On enable (requireReady) the target daemon must be online, else the alert
+ *  can't be delivered (this feature is best-effort, no outbox). */
+async function validateHostOverloadAlertTargetBotAppId(
+  appId: string,
+  options: { requireReady?: boolean } = {},
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  try {
+    const bot = loadBotConfigs().find(candidate => candidate.larkAppId === appId);
+    if (!bot) return { ok: false, error: 'hostOverloadAlert_target_unknown' };
+    if (bot.apiOnly === true) return { ok: false, error: 'hostOverloadAlert_target_apiOnly' };
+    if (!(bot.allowedUsers ?? []).some(user => typeof user === 'string' && user.trim())) {
+      return { ok: false, error: 'hostOverloadAlert_target_owner_missing' };
+    }
+    if (options.requireReady !== true) return { ok: true };
+    const daemon = registry.list().find(candidate => candidate.larkAppId === appId);
+    if (!daemon) return { ok: false, error: 'hostOverloadAlert_target_offline' };
+    const resolvedOwners = daemon.resolvedAllowedUsers ?? [];
+    if (!hasResolvedCodexNotifierRecipient(resolvedOwners)) {
+      return { ok: false, error: 'hostOverloadAlert_target_owner_missing' };
+    }
+    return { ok: true };
+  } catch {
+    return { ok: false, error: 'hostOverloadAlert_target_unknown' };
+  }
+}
+
+function hostOverloadAlertBotOptions(): ResolvedDashboardSettings['hostOverloadAlert']['botOptions'] {
+  try {
+    const onlineByAppId = new Map(registry.list().map(bot => [bot.larkAppId, bot] as const));
+    return loadBotConfigs()
+      .filter(bot => bot.apiOnly !== true) // apiOnly bots can't send Feishu messages
+      .map(bot => {
+        const resolvedOwners = onlineByAppId.get(bot.larkAppId)?.resolvedAllowedUsers ?? [];
+        return {
+          larkAppId: bot.larkAppId,
+          botName: bot.displayName ?? onlineByAppId.get(bot.larkAppId)?.botName ?? bot.name ?? null,
+          cliId: onlineByAppId.get(bot.larkAppId)?.cliId ?? bot.cliId,
+          apiOnly: bot.apiOnly === true,
           ...resolveCodexNotifierRecipientView(bot.allowedUsers, resolvedOwners),
         };
       });
@@ -1080,6 +1147,15 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
       workerOnline: isCodexNotifierWorkerStateFresh(codexNotifierState),
       lastError: codexNotifierState?.lastError ?? null,
     },
+    hostOverloadAlert: {
+      enabled: global.hostOverloadAlert?.enabled === true,
+      targetBotAppId: global.hostOverloadAlert?.targetBotAppId ?? null,
+      enterLoadRatio: global.hostOverloadAlert?.enterLoadRatio ?? DEFAULT_OVERLOAD_THRESHOLDS.enterLoadRatio,
+      enterMemUsedFrac: global.hostOverloadAlert?.enterMemUsedFrac ?? DEFAULT_OVERLOAD_THRESHOLDS.enterMemUsedFrac,
+      botOptions: hostOverloadAlertBotOptions(),
+      targetDaemonOnline: !!global.hostOverloadAlert?.targetBotAppId
+        && registry.list().some(bot => bot.larkAppId === global.hostOverloadAlert?.targetBotAppId),
+    },
     noVisibleOutputHint: dashboard.noVisibleOutputHint === true, // default OFF; opt-in anti-resend guidance
     vcMeetingAgent: {
       enabled: global.vcMeetingAgent?.enabled !== false,
@@ -1113,6 +1189,7 @@ const settingsWriteApplierDeps = defaultSettingsWriteApplierDeps(resolveDashboar
 settingsWriteApplierDeps.syncVcMeetingListenerBotConfig = syncVcMeetingListenerBotConfig;
 settingsWriteApplierDeps.validateVcMeetingListenerBotAppId = validateVcMeetingListenerBotAppId;
 settingsWriteApplierDeps.validateCodexNotifierTargetBotAppId = validateCodexNotifierTargetBotAppId;
+settingsWriteApplierDeps.validateHostOverloadAlertTargetBotAppId = validateHostOverloadAlertTargetBotAppId;
 
 /** Helper to render a {status, body} HandlerResult through `res`. */
 function writeHandlerResult(res: import('node:http').ServerResponse, result: GroupsHandlerResult): void {
