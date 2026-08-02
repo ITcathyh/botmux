@@ -319,6 +319,17 @@ describe('codex buildArgs', () => {
     expect(args).not.toContain('--codex-bin');
   });
 
+  it('bypasses the interactive hook-trust gate right after the approval/sandbox bypass', () => {
+    // codex 0.14x adds a "Press t to trust" gate for the botmux-installed
+    // ~/.codex/hooks.json hooks; a headless pane can never press `t`, so without
+    // this flag the first Lark turn wedges. It is a DISTINCT flag from the
+    // approval/sandbox bypass — assert both are present and adjacent.
+    const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false });
+    expect(args).toContain('--dangerously-bypass-hook-trust');
+    expect(args.indexOf('--dangerously-bypass-hook-trust'))
+      .toBe(args.indexOf('--dangerously-bypass-approvals-and-sandbox') + 1);
+  });
+
   it('injects botmux session id through Codex shell environment policy', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false });
     const idx = args.indexOf('-c');
@@ -342,6 +353,9 @@ describe('codex buildArgs', () => {
     expect(args.indexOf('thread-abc')).toBeGreaterThan(cIdx);
     // no interactive-paste bypass flag leaks into the viewer args
     expect(args).not.toContain('--dangerously-bypass-approvals-and-sandbox');
+    // the app-server (behind --remote) rejects --dangerously-bypass-hook-trust and
+    // runs enabled hooks without a trust gate anyway, so it must NOT leak here either
+    expect(args).not.toContain('--dangerously-bypass-hook-trust');
   });
 
   it('traex RPC mode: same --remote viewer args + update-check disabled', () => {
@@ -390,6 +404,7 @@ describe('codex buildArgs', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false, workingDir: '/repo/root' });
     expect(args).toEqual([
       '--dangerously-bypass-approvals-and-sandbox',
+      '--dangerously-bypass-hook-trust',
       '--no-alt-screen',
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"',
@@ -411,6 +426,8 @@ describe('codex buildArgs', () => {
       '-C',
       '/repo/root',
     ]);
+    // a restricted bot must not silently gain hook trust either
+    expect(args).not.toContain('--dangerously-bypass-hook-trust');
   });
 
   it('always disables the startup update picker for botmux-managed launches', () => {
