@@ -204,6 +204,20 @@ export interface DashboardGlobalConfig {
    *  see config.ts `codexRpcInputDefault`. A per-bot `codexRpcInput: true` still
    *  force-enables regardless of this global default. */
   codexRpcInput?: boolean;
+  /** Whether botmux auto-bypasses Codex's interactive hook-trust gate ("Press t
+   *  to trust") for Codex-family plain-TUI launches (codex / traex). Codex 0.14x
+   *  gates the botmux-installed ~/.codex/hooks.json behind a manual trust prompt,
+   *  and every botmux upgrade rewrites the hook script → its hash changes → the
+   *  gate re-fires; a botmux-managed pane has no human to press `t`, so the first
+   *  turn wedges. When enabled, the adapter passes `--dangerously-bypass-hook-trust`.
+   *  Default ON (ABSENT ⇒ ON — only an explicit `false` disables): a headless
+   *  fleet needs it to not wedge. This is a SEPARATE knob from the approval/sandbox
+   *  bypass: the flag trusts ALL hook sources codex sees (user/project/plugin), not
+   *  only botmux's, so an operator who does not want project/plugin `.codex/hooks.json`
+   *  auto-trusted can turn it off. Still ANDed with the per-bot `!disableCliBypass`
+   *  fail-closed lower bound (a restricted bot never gets it regardless). Read live
+   *  by the daemon — see config.ts `bypassCodexHookTrust`. */
+  bypassCodexHookTrust?: boolean;
   /** Experimental: inject the "no visible output" anti-resend guidance into the
    *  botmux routing hints. Counters Claude Code (≥2.1.212) thinking-only nudges
    *  that make a model resend after a silent `botmux send`-only turn. Default OFF
@@ -337,6 +351,10 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   const herdrTraexPlugin = readHerdrTraexPlugin(d.herdrTraexPlugin);
   if (herdrTraexPlugin) out.herdrTraexPlugin = herdrTraexPlugin;
   if (typeof d.codexRpcInput === 'boolean') out.codexRpcInput = d.codexRpcInput;
+  // Round-trip an explicit boolean either way. Absent stays absent — the live
+  // getter (config.ts `bypassCodexHookTrust`) treats absent as ON, so we must
+  // preserve a stored `false` to let an operator disable it.
+  if (typeof d.bypassCodexHookTrust === 'boolean') out.bypassCodexHookTrust = d.bypassCodexHookTrust;
   if (typeof d.noVisibleOutputHint === 'boolean') out.noVisibleOutputHint = d.noVisibleOutputHint;
   return Object.keys(out).length > 0 ? out : undefined;
 }

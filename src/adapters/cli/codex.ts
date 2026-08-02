@@ -154,7 +154,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.codex'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, reasoningEffort, disableCliBypass, readIsolation, remoteWsUrl, remoteThreadId }) {
+    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, reasoningEffort, disableCliBypass, bypassHookTrust, readIsolation, remoteWsUrl, remoteThreadId }) {
       // Hybrid RPC input mode: attach this TUI to the botmux-owned app-server
       // thread. User input is delivered out-of-band via JSON-RPC (turn/start,
       // see codex-rpc-engine + worker), so the pane is a pure viewer — no paste
@@ -172,22 +172,22 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       // So spawn args are unchanged — keep bypass so codex's own nested sandbox
       // is OFF and the outer Seatbelt profile is the sole enforcer.
       const baseArgs = [
-        ...(!disableCliBypass ? [
-          '--dangerously-bypass-approvals-and-sandbox',
-          // Codex 0.14x added a second interactive gate AFTER folder trust: the
-          // botmux-installed UserPromptSubmit/SessionStart hooks in ~/.codex/hooks.json
-          // must be manually trusted ("Press t to trust"), and every botmux upgrade
-          // rewrites codex-hook.sh → its trusted_hash changes → the gate re-fires. A
-          // botmux-managed pane has no human at its PTY to press `t`, so the first Lark
-          // turn wedges forever. NOTE: this gate is interactive-TUI-only — codex
-          // exec/app-server run enabled hooks without it, and `codex app-server` does
-          // NOT accept this flag (rejects it / `-c bypass_hook_trust`), so it belongs
-          // ONLY here and NOT on the --remote RPC viewer or codex-app app-server spawns.
-          // --dangerously-bypass-approvals-and-sandbox does NOT cover this; it is a
-          // distinct flag. Keep it tied to the existing bypass decision: restricted
-          // (disableCliBypass) bots must not silently gain hook trust. Mirrors traex.ts.
-          '--dangerously-bypass-hook-trust',
-        ] : []),
+        ...(!disableCliBypass ? ['--dangerously-bypass-approvals-and-sandbox'] : []),
+        // Codex 0.14x added a second interactive gate AFTER folder trust: the
+        // botmux-installed UserPromptSubmit/SessionStart hooks in ~/.codex/hooks.json
+        // must be manually trusted ("Press t to trust"), and every botmux upgrade
+        // rewrites codex-hook.sh → its trusted_hash changes → the gate re-fires. A
+        // botmux-managed plain-TUI pane has no human at its PTY to press `t`, so the
+        // first Lark turn wedges forever (this is the ONLY launch path that shows the
+        // gate — this branch never runs for --remote/app-server; see the early return
+        // above — and codex exec/app-server don't accept the flag anyway).
+        //
+        // This is a SEPARATE knob from the approval/sandbox bypass: the flag trusts
+        // ALL hook sources codex sees (user/project/plugin), not only botmux's, so it
+        // is gated by its own global toggle `bypassHookTrust` (default ON, operator can
+        // disable) — expressing "approvals bypassed, hook-trust review kept". Still
+        // ANDed with `!disableCliBypass`: a restricted bot never gets it regardless.
+        ...(!disableCliBypass && bypassHookTrust ? ['--dangerously-bypass-hook-trust'] : []),
         '--no-alt-screen',
         '-c',
         `shell_environment_policy.set.BOTMUX_SESSION_ID=${JSON.stringify(sessionId)}`,

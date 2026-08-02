@@ -42,10 +42,11 @@ const CODEX_HAS_TRUST_DIALOG = codexEmitsTrustDialog();
 // ─── Constants (match production worker.ts) ─────────────────────────────────
 
 const CODEX_BIN = 'codex';
-// Mirror production codex.ts baseArgs: bypass both the approval/sandbox gate AND
-// the 0.14x interactive hook-trust gate ("Press t to trust"). Without the latter
-// the not-version-gated "control" test below wedges on codex ≥0.14x whenever the
-// botmux hooks in ~/.codex/hooks.json are modified-since-last-trusted.
+// Mirror production codex.ts baseArgs for the DEFAULT launch (bypassCodexHookTrust
+// toggle ON, unrestricted bot): bypass both the approval/sandbox gate AND the 0.14x
+// interactive hook-trust gate ("Press t to trust"). Without the latter the
+// not-version-gated "control" test below wedges on codex ≥0.14x whenever the botmux
+// hooks in ~/.codex/hooks.json are modified-since-last-trusted.
 const CODEX_ARGS = ['--no-alt-screen', '--dangerously-bypass-approvals-and-sandbox', '--dangerously-bypass-hook-trust'];
 const PTY_COLS = 300;
 const PTY_ROWS = 50;
