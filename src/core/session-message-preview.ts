@@ -52,6 +52,21 @@ function compactText(value: unknown, limit: number): string {
   return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
 }
 
+/** Length-bound a value while PRESERVING newlines, so the overlay can render
+ * the reply's Markdown structure. Horizontal whitespace is tidied but line
+ * breaks survive — the compact single-line card summary keeps using
+ * compactText(). */
+function compactMultiline(value: unknown, limit: number): string {
+  const text = String(value ?? '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[^\S\n]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/^\n+/, '')
+    .replace(/\s+$/, '');
+  if (!text) return '';
+  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+}
+
 /** Read a bounded JSONL tail. A partial first line is discarded when the file
  * is larger than the read window; malformed/truncated rows are skipped. */
 function readLatestJsonlRow(path: string, kind: PreviewRowKind): JsonRow | undefined {
@@ -100,11 +115,11 @@ function readLatestJsonlRow(path: string, kind: PreviewRowKind): JsonRow | undef
       ? kind === 'user'
         ? {
             senderType: 'user',
-            content: compactText(latest.content, FULL_PREVIEW_LENGTH),
+            content: compactMultiline(latest.content, FULL_PREVIEW_LENGTH),
             createTime: latest.createTime,
           }
         : {
-            previewText: compactText(latest.previewText, FULL_PREVIEW_LENGTH),
+            previewText: compactMultiline(latest.previewText, FULL_PREVIEW_LENGTH),
             sentAtMs: latest.sentAtMs,
           }
       : undefined;
@@ -174,11 +189,11 @@ export function buildSessionMessagePreview(session: Session): SessionMessagePrev
       )
     : undefined;
 
-  const userFullText = compactText(
+  const userFullText = compactMultiline(
     latestUser?.content ?? session.lastUserPrompt ?? '',
     FULL_PREVIEW_LENGTH,
   );
-  const botFullText = compactText(latestBot?.previewText ?? '', FULL_PREVIEW_LENGTH);
+  const botFullText = compactMultiline(latestBot?.previewText ?? '', FULL_PREVIEW_LENGTH);
   const previewUserAt = userFullText
     ? (numberOrUndefined(latestUser?.createTime) ?? sessionActivityAt(session))
     : undefined;

@@ -19,6 +19,11 @@ import { config } from '../config.js';
 import { readGlobalConfig } from '../global-config.js';
 import * as sessionStore from '../services/session-store.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
+import {
+  markMessageListenerRunPreviewFailed,
+  markMessageListenerRunPreviewReplied,
+  markMessageListenerRunPreviewRunning,
+} from '../services/message-listener-run-preview-store.js';
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
 import { fallbackTurnId, isSubstituteTurn } from './reply-target.js';
 import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError } from '../im/lark/client.js';
@@ -4181,6 +4186,9 @@ function setupWorkerHandlers(
         }
         if (recordDispatchInputCommit(ds.session, msg.turnId, workerGeneration)) {
           sessionStore.updateSession(ds.session);
+          if (msg.turnId.startsWith('mlrp_turn_')) {
+            markMessageListenerRunPreviewRunning(msg.turnId);
+          }
         } else {
           logger.warn(`[${t}] Ignored unbound input commit turn=${msg.turnId.slice(0, 16)}`);
         }
@@ -4667,12 +4675,18 @@ function setupWorkerHandlers(
             source: 'screen_update',
             content: msg.content,
           });
-          // Usage ledger + turn reactions: idle/limited edges are turn
-          // boundaries. Append the token delta, and flip this turn's pending ✋
-          // reactions to ✅ (best-effort, never blocks the status pipeline).
+          // Usage ledger: any settle-to-idle/limited edge records the delta.
+          // Turn reactions are stricter — only flip ✋→✅ after a real busy
+          // period (working/analyzing). Cold-start starting→idle (or the first
+          // prompt-ready before the turn has gone working) must NOT DONE a
+          // message that is still about to be / just being processed. Grok
+          // card-off sessions hit this when the ready-gate settle fired idle
+          // ~seconds after GoGoGo while the CLI was still running the prompt.
           if (ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited') {
             recordUsageForDaemonSession(ds);
-            void finishTurnReactions(ds);
+            if (prevStatus === 'working' || prevStatus === 'analyzing') {
+              void finishTurnReactions(ds);
+            }
           }
           if (
             ds.lastScreenStatus === 'idle'
@@ -5433,6 +5447,16 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'explicit_reply_observed': {
+        if (msg.turnId.startsWith('mlrp_turn_')) {
+          markMessageListenerRunPreviewReplied(msg.turnId, {
+            sessionId: ds.session.sessionId,
+            replyMessageId: msg.messageId,
+          });
+        }
+        break;
+      }
+
       case 'user_notify': {
         logger.warn(`[${t}] Worker user_notify: ${msg.message}`);
         emitSessionLifecycleHook(ds, 'session.requires_attention', {
@@ -5496,6 +5520,12 @@ function setupWorkerHandlers(
           // The durable receipt remains non-terminal and can be reconciled;
           // never let a projection/store failure crash the worker IPC loop.
           logger.error(`[${t}] Failed to persist turn_terminal for ${msg.turnId.substring(0, 8)}: ${err.message}`);
+        }
+        if (msg.turnId.startsWith('mlrp_turn_') && msg.status !== 'completed') {
+          markMessageListenerRunPreviewFailed(msg.turnId, {
+            sessionId: msg.sessionId,
+            error: msg.errorCode ?? msg.status,
+          });
         }
         try {
           await cb.onDeferredScheduleTurnSettled?.(ds, { turnId: msg.turnId, source: 'terminal' });
@@ -5616,6 +5646,9 @@ function setupWorkerHandlers(
         if (ds.usageLimit) {
           clearUsageLimitState(ds);
           if (ds.lastScreenStatus === 'limited') ds.lastScreenStatus = 'idle';
+        }
+        if (msg.turnId.startsWith('mlrp_turn_')) {
+          markMessageListenerRunPreviewRunning(msg.turnId);
         }
         deliverFinalOutput(ds, msg, t, 0, ownsLifecycleMutation);
         break;
@@ -5790,7 +5823,8 @@ function shouldDropMismatchedHermesFinalOutput(
 /**
  * Turn-end half of the two-phase turn reactions (auto-on for card-off sessions,
  * i.e. streaming card disabled). The 冲! "received" reactions are added per-message at the daemon
- * acceptance point (`noteTurnReceived`); when the worker next returns to idle we
+ * acceptance point (`noteTurnReceived`); the screen_update handler calls this
+ * only on working|analyzing → idle|limited (not cold-start starting→idle), to
  * flip every pending ✋ on this session to ✅ DONE and clear the list. When
  * silentTurnReactions is enabled after a ✋ has already landed, we only remove
  * that received reaction and do not add DONE. Binding the start to the message
@@ -6188,6 +6222,12 @@ function deliverFinalOutput(
       );
       if (!stillCurrent()) return;
       recordPrimaryOutput(messageId);
+      if (msg.turnId.startsWith('mlrp_turn_')) {
+        markMessageListenerRunPreviewReplied(msg.turnId, {
+          sessionId: ds.session.sessionId,
+          replyMessageId: messageId,
+        });
+      }
       if (preparedListenerReply?.kind === 'send' || preparedListenerReply?.kind === 'succeeded') {
         finishVcMeetingImReply(config.session.dataDir, preparedListenerReply.ref, messageId);
       }
@@ -6206,6 +6246,12 @@ function deliverFinalOutput(
       const next = attempt + 1;
       if (next >= FINAL_OUTPUT_RETRY_BACKOFF_MS.length) {
         logger.error(`[${t}] Bridge final_output gave up after ${next} attempts (turn ${msg.turnId.substring(0, 8)}): ${err.message}`);
+        if (msg.turnId.startsWith('mlrp_turn_')) {
+          markMessageListenerRunPreviewFailed(msg.turnId, {
+            sessionId: ds.session.sessionId,
+            error: err.message,
+          });
+        }
         // Don't commit the dedup marker — leave room for any future
         // retransmit (e.g. daemon restart that re-fires the IPC).
         return;

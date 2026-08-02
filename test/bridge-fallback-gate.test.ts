@@ -20,10 +20,13 @@ const markerForContent = (sentAtMs: number, content: string): BridgeSendMarker =
 };
 
 describe('buildBridgeSendMarkerContent', () => {
-  it('keeps normalized length semantics and adds a bounded dashboard preview', () => {
+  it('keeps normalized length semantics and a newline-preserving dashboard preview', () => {
+    // contentLength stays fingerprint-normalized (gate compares against
+    // normalise(final).length); previewText keeps line breaks AND leading
+    // indentation for display (indented code / nested markdown).
     expect(buildBridgeSendMarkerContent('  hello\n  bot  ')).toEqual({
       contentLength: normalise('  hello\n  bot  ').length,
-      previewText: 'hello bot',
+      previewText: '  hello\n  bot',
     });
   });
 
@@ -35,8 +38,24 @@ describe('buildBridgeSendMarkerContent', () => {
     expect(marker.previewText?.endsWith('…')).toBe(true);
   });
 
-  it('can add preview text without changing legacy marker suppression semantics', () => {
-    expect(buildBridgeSendPreviewText('  spoken\nreply  ')).toBe('spoken reply');
+  it('preserves paragraph / list / code-block structure for Markdown rendering', () => {
+    const reply = 'intro line\n\n- item one\n- item two\n\n```bash\nls -la\n```\n\ndone';
+    const preview = buildBridgeSendPreviewText(reply)!;
+    // Blank-line paragraph breaks, list rows and fenced code all survive so the
+    // dashboard overlay can render them; only fingerprint length is flattened.
+    expect(preview).toContain('\n\n- item one\n- item two');
+    expect(preview).toContain('```bash\nls -la\n```');
+    expect(preview.split('\n').length).toBe(reply.split('\n').length);
+  });
+
+  it('trims trailing line whitespace and boundary blank lines but keeps FIRST-line indentation', () => {
+    // Trailing spaces before a newline go, boundary blank lines collapse, but a
+    // leading indent on the FIRST line survives (indented code / nested list) —
+    // a plain .trim() used to eat it. A lone newline is kept (breaks:true → <br>).
+    expect(buildBridgeSendPreviewText('  spoken   \nreply  ')).toBe('  spoken\nreply');
+    expect(buildBridgeSendPreviewText('    indented code\n    line two')).toBe('    indented code\n    line two');
+    expect(buildBridgeSendPreviewText('\n\n  body\n')).toBe('  body');
+    expect(buildBridgeSendPreviewText('a\n\n\n\nb')).toBe('a\n\nb');
   });
 
 });

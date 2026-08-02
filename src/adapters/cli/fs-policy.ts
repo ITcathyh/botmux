@@ -77,6 +77,11 @@ export interface FsPolicyContext {
   sessionId?: string;
   /** This bot's BOT_HOME (`<botmuxHome>/bots/<appId>`) — always readWrite. */
   botHome: string;
+  /** This bot's OWN role-library subtree (`<roleLibraryRoot>/<appId>`) — readWrite.
+   *  Optional: absent when the subtree does not exist (bot never used roles) or
+   *  when building a non-session policy. See the emission site for why the whole
+   *  subtree — not just the active role dir — has to be writable. */
+  roleLibrarySubtree?: string;
   /** True when the CLI's data root is redirected into BOT_HOME
    *  (CLAUDE_CONFIG_DIR / CODEX_HOME). False → cliDataPaths are exposed rw. */
   redirectedCliData: boolean;
@@ -513,7 +518,10 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     }
   }
 
-  candidates.push(...(ctx.platform === 'darwin' ? darwinBaseline(ctx.homeDir) : linuxBaseline(ctx.homeDir)));
+  // Hoisted into a named const (vs the upstream inline `candidates.push(...)`)
+  // because roleLibAccess() below inspects baseline's DENY entries.
+  const baseline = ctx.platform === 'darwin' ? darwinBaseline(ctx.homeDir) : linuxBaseline(ctx.homeDir);
+  candidates.push(...baseline);
 
   // Adapter-declared surfaces.
   push(ctx.execPaths, 'readOnly', 'adapter');
@@ -529,6 +537,73 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // the authority roots for a no-transport turn (dropAuthority is identity when
   // larkTransport). botHome is always kept — it's the sanctioned carve-out.
   push([...dropAuthority([ctx.workingDir]), ctx.botHome], 'readWrite', 'internal');
+  // Own role-library subtree (`~/botmux-roles/<self>`). workingDir alone covers
+  // only the ACTIVE role dir, which silently disables the whole role system
+  // under sandbox: 「切换角色/有哪些角色」enumerates the sibling role dirs and
+  // reads each `.botmux-dir.json`, 「新建角色」writes `users/<openId>/<slug>/`
+  // and copies the library-root `_role-protocol.md` into it, and after a switch
+  // 「沉淀知识」writes `knowledge/` + `.botmux-dir.json` in the NEW role dir —
+  // all of them outside the pre-switch workingDir. readWrite (not readOnly) for
+  // that last reason: a read-only grant looks fine through switch+enumerate and
+  // only EPERMs later, at the knowledge write.
+  // Scoped to `<appId>` on purpose — NOT the shared library root: a sibling
+  // bot's roles (and its users' private role dirs) stay denied by construction,
+  // so cross-bot read isolation is preserved. (`validateRoleLibraryPath` narrows
+  // `botmux role switch` to the same `<root>/<appId>` boundary, so the daemon-side
+  // check and this fs-side grant agree — but the fs rule stands on its own: it
+  // still holds for a session pointed elsewhere by other means.)
+  // …and it never OVERRIDES a covering deny/readOnly. Source rank only settles
+  // conflicts on the SAME path — different paths are always decided by depth — so
+  // a shallower `deny: ["~/botmux-roles"]` (or `readOnly:`) would otherwise be
+  // silently re-opened/upgraded at `<appId>` by this deeper internal rule. An
+  // owner who locks the library must get a locked library, not a hole in it:
+  //   covering deny (baseline / user / mandatory, path OR mandatory regex) → no rule
+  //   covering readOnly (user / mandatoryReadOnly)                         → readOnly
+  // A readOnly grant still lets the role system enumerate + switch; only the
+  // knowledge write fails — strictly closer to what the owner asked for than
+  // either silently upgrading to rw or dropping the rule entirely.
+  // Asymmetry on purpose: baseline DENY counts (a ceiling), baseline readOnly does
+  // NOT (a floor internal grants are meant to lift — e.g. toolchain dirs).
+  // NO-TRANSPORT GATE: a core-only (apiOnly) / HTTP-virtual session has no Feishu
+  // sender identity and no business with the role system, so it gets NO grant at
+  // all. This is an EXPLICIT gate, not a consequence of dropAuthority /
+  // authorityRoots — the role library (`~/botmux-roles`) is deliberately NOT one
+  // of the authority roots (those are Feishu-credential dirs), and roleLibAccess
+  // reads ctx.mandatoryDenyPaths, not the local authorityRoots list, so the
+  // suppression above would never reach it. (This gate only withholds the SPECIAL
+  // whole-subtree grant; it does not by itself make the role library unreadable —
+  // a no-transport workingDir=~ still covers it via the parent grant. The claim is
+  // narrow: "no extra role-library rw is injected for a no-transport turn".)
+  const roleLibAccess = (raw: string): FsAccess | null => {
+    const p = normalizeFsPath(raw);
+    if (!p) return null; // unusable path → no rule (mergeFsRules would drop it anyway)
+    const covered = (paths: readonly string[] | undefined) =>
+      (paths ?? []).map(normalizeFsPath).some((d) => !!d && coversPath(d, p));
+    if (covered([
+      ...baseline.filter(r => r.access === 'deny').map(r => r.path),
+      ...(ctx.userPaths?.deny ?? []),
+      ...(ctx.mandatoryDenyPaths ?? []),
+    ])) return null;
+    // Regex denies: Seatbelt emits them after every path allow (deny wins there),
+    // but compileToBwrap does not consume denyRegexes at all — Linux has no such
+    // backstop, so an rw grant inside a regex-denied tree would simply win. Today
+    // mandatoryDenyRegexes only ever point at BOT_HOME credential sidecars, never
+    // at the role library; this keeps that from silently becoming a hole.
+    // KNOWN BOUNDARY (codex review): this tests the subtree ROOT, which catches
+    // ancestor-shaped regexes (the only shape botmux generates) but NOT one that
+    // matches only a DESCENDANT (`<subtree>/secret$`) — regex-vs-subtree
+    // intersection is not decidable from a prefix. Closing it properly means
+    // either emitting a concrete deny path alongside every internal regex, or
+    // making compileToBwrap consume denyRegexes (a pre-existing gap that applies
+    // to EVERY rw grant — workingDir, botHome, … — not just this one).
+    for (const rx of ctx.mandatoryDenyRegexes ?? []) {
+      try { if (new RegExp(rx).test(p)) return null; } catch { /* unusable regex: not a grant decision */ }
+    }
+    if (covered([...(ctx.userPaths?.readOnly ?? []), ...(ctx.mandatoryReadOnlyPaths ?? [])])) return 'readOnly';
+    return 'readWrite';
+  };
+  const roleLibGrant = larkTransport && ctx.roleLibrarySubtree ? roleLibAccess(ctx.roleLibrarySubtree) : null;
+  if (roleLibGrant) push([ctx.roleLibrarySubtree!], roleLibGrant, 'internal');
   push(ctx.outbox ? [ctx.outbox] : [], 'readWrite', 'internal');
   push(dropAuthority(ctx.extraWritePaths), 'readWrite', 'internal');
   push(dropAuthority(ctx.readonlyRoots), 'readOnly', 'internal');

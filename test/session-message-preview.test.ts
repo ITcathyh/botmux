@@ -44,22 +44,47 @@ describe('buildSessionMessagePreview', () => {
     writeJsonl('queues/om_root.jsonl', [
       { senderType: 'user', content: 'old question', createTime: '1500' },
       { senderType: 'app', content: 'ignored app queue row', createTime: '1600' },
-      { senderType: 'user', content: ' latest   user\nquestion ', createTime: '2000' },
+      { senderType: 'user', content: 'latest user\nquestion', createTime: '2000' },
     ]);
     writeJsonl('turn-sends/session-1.jsonl', [
       { sentAtMs: 1_800, messageId: 'om_old', previewText: 'old answer' },
-      { sentAtMs: 2_100, messageId: 'om_new', previewText: ' latest   bot\nanswer ' },
+      { sentAtMs: 2_100, messageId: 'om_new', previewText: 'latest bot\nanswer' },
     ]);
 
+    // Full text keeps the newline (overlay renders Markdown); the compact card
+    // summary flattens it to a single line.
     expect(buildSessionMessagePreview(session())).toEqual({
       previewUserText: 'latest user question',
       previewBotText: 'latest bot answer',
-      previewUserFullText: 'latest user question',
-      previewBotFullText: 'latest bot answer',
+      previewUserFullText: 'latest user\nquestion',
+      previewBotFullText: 'latest bot\nanswer',
       previewUserAt: 2_000,
       previewBotAt: 2_100,
       previewBotState: 'replied',
     });
+  });
+
+  it('preserves multi-line Markdown structure in full text while flattening the summary', () => {
+    writeJsonl('queues/om_root.jsonl', [
+      { senderType: 'user', content: 'please summarize', createTime: '3000' },
+    ]);
+    writeJsonl('turn-sends/session-1.jsonl', [
+      {
+        sentAtMs: 3_100,
+        previewText: 'intro paragraph\n\n- point one\n- point two\n\n```bash\nls -la\n```\n\nwrap up',
+      },
+    ]);
+
+    const preview = buildSessionMessagePreview(session());
+    // Overlay full text keeps blank-line paragraph breaks, list rows and the
+    // fenced code block so the dashboard can render real Markdown.
+    expect(preview.previewBotFullText).toBe(
+      'intro paragraph\n\n- point one\n- point two\n\n```bash\nls -la\n```\n\nwrap up',
+    );
+    // The 2-line card summary collapses everything onto a single line.
+    expect(preview.previewBotText).not.toContain('\n');
+    expect(preview.previewBotText).toContain('intro paragraph');
+    expect(preview.previewBotState).toBe('replied');
   });
 
   it('marks a stale bot marker as waiting for the latest user message', () => {

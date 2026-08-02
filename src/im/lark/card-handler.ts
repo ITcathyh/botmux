@@ -765,6 +765,18 @@ export async function runAutoWorktreeCommit(deps: {
     const wt = await maybeCreateDefaultWorktree(larkAppId, baseDir, {
       isBotDefaultDir: true, title, prompt, locale: localeForBot(larkAppId), notify,
     });
+    // The pendingRepo placeholder can legitimately be consumed WHILE this
+    // up-to-30s build runs — e.g. the Codex-notifier「继续处理」callback adopts
+    // the same DM session and clears pendingRepo before we get here. If we now
+    // funneled into commitRepoSelection, its mid-session branch would kill the
+    // freshly-adopted worker and replace it with a botmux-owned worktree
+    // session. Bail on the late result instead: the takeover already owns the
+    // session. (commitRepoSelection also re-checks pendingRepo under its claim,
+    // but that check runs after an await — fence here before any mutation.)
+    if (!ds.pendingRepo) {
+      logger.info(`[${tag(ds)}] auto-worktree completion ignored — pendingRepo already consumed (session taken over)`);
+      return;
+    }
     // Commit even on fallback (wt.dir === baseDir) — the session must still start.
     // commitRepoSelection has its own /close + generation guards and, for a
     // pendingRepo session, folds any messages buffered during creation (pendingPrompt

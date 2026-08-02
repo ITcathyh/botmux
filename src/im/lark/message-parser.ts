@@ -4,6 +4,7 @@ import { logger } from '../../utils/logger.js';
 import {
   REPLY_CARD_FOOTER_ELEMENT_ID,
 } from './reply-card-footer-signature.js';
+import { hasBotmuxCallbackMarker } from './callback-button-marker.js';
 
 // Event data structure from WSClient im.message.receive_v1
 // sender is at data top-level, NOT inside data.message
@@ -11,6 +12,7 @@ interface RawEventData {
   sender: {
     sender_id: {
       open_id?: string;
+      app_id?: string;
       user_id?: string;
       union_id?: string;
     };
@@ -111,6 +113,77 @@ export function mentionIdentity(m: {
     else if (m.id_type === 'app_id') out.appId = id;
   }
   return out;
+}
+
+/** id_type across both shapes Lark uses (snake_case REST, camelCase legacy). */
+export function mentionIdType(m: any): string | undefined {
+  if (!m || typeof m !== 'object') return undefined;
+  if (typeof m.id_type === 'string') return m.id_type;
+  if (typeof m.idType === 'string') return m.idType;
+  return undefined;
+}
+
+/**
+ * Extract a bot mention's app_id across ALL shapes Lark has been observed to
+ * use. app_id-form bot mentions must never flow through mentionOpenId() (which
+ * is persisted/used as an open_id), so they are matched separately:
+ *   1. top-level camelCase `m.appId`
+ *   2. top-level snake_case `m.app_id`
+ *   3. string `m.id` with id_type === 'app_id' (REST bare-string OR legacy)
+ *   4. object `m.id.app_id`
+ * Keep this exhaustive: the realtime @-gate (isBotMentioned) depends on it, so
+ * dropping a shape silently un-@'s a bot in that shape.
+ */
+export function mentionAppId(m: any): string | undefined {
+  if (!m || typeof m !== 'object') return undefined;
+  if (typeof m.appId === 'string') return m.appId;
+  if (typeof m.app_id === 'string') return m.app_id;
+  const idType = mentionIdType(m);
+  if (idType === 'app_id' && typeof m.id === 'string') return m.id;
+  if (m.id && typeof m.id === 'object' && typeof m.id.app_id === 'string') return m.id.app_id;
+  return undefined;
+}
+
+/**
+ * Whether a message explicitly @mentions the given bot. SHARED single source of
+ * truth for the @-gate across every consumer (realtime routing's isBotMentioned,
+ * the 30s poll backfill, and the dashboard preview/run-preview collector) so the
+ * "explicit @ hands off to normal routing, not the listener" rule can never
+ * diverge between legs. Matches by open_id OR by app_id (via mentionAppId, which
+ * covers every observed app_id shape), and also scans post-content inline `at`
+ * tags (post messages may not populate `mentions`).
+ */
+export function messageMentionsBot(
+  message: { mentions?: any[]; content?: string; body?: { content?: string } } | null | undefined,
+  larkAppId: string | undefined,
+  botOpenId: string | undefined,
+): boolean {
+  if (!botOpenId && !larkAppId) return false;
+  const mentions: any[] = message?.mentions ?? [];
+  for (const m of mentions) {
+    if (botOpenId && mentionOpenId(m) === botOpenId) return true;
+    if (larkAppId && mentionAppId(m) === larkAppId) return true;
+  }
+  // Post-content inline `at` tags (bot-sent post messages may omit `mentions`).
+  // Realtime events carry the body in `content`; the REST message-list API
+  // (poll + dashboard preview/run-preview) carries it in `body.content` — read
+  // both so the @-gate is identical across all three legs.
+  if (botOpenId) {
+    const rawContent = message?.content ?? message?.body?.content;
+    try {
+      const content = JSON.parse(rawContent ?? '{}');
+      const inner = content.zh_cn ?? content.en_us ?? content;
+      if (Array.isArray(inner?.content)) {
+        for (const paragraph of inner.content) {
+          if (!Array.isArray(paragraph)) continue;
+          for (const node of paragraph) {
+            if (node?.tag === 'at' && node.user_id === botOpenId) return true;
+          }
+        }
+      }
+    } catch { /* ignore parse errors */ }
+  }
+  return false;
 }
 
 export function extractMentionIdentities(message: {
@@ -719,6 +792,22 @@ function isLegacyFormatBFooterLine(line: string): boolean {
     .test(inner);
 }
 
+function extractRenderedCardContent(rawContent: string): string | undefined {
+  const match = rawContent.match(/^\s*<card(?:\s+title="([^"]*)")?\s*>([\s\S]*)<\/card>\s*$/);
+  if (!match) return undefined;
+  const title = match[1]?.trim();
+  const body = match[2]
+    .split('\n')
+    .map(line => line.trimEnd())
+    .filter(line => !isSignedFormatBFooterLine(line))
+    .join('\n')
+    .trim();
+  return [
+    title ? `[卡片: ${title}]` : '',
+    body,
+  ].filter(Boolean).join('\n') || '[卡片]';
+}
+
 /**
  * Extract human-readable text from an interactive card.
  *
@@ -728,6 +817,9 @@ function isLegacyFormatBFooterLine(line: string): boolean {
  * (header/config/elements with tag objects) for locally-cached cards.
  */
 export function extractCardContent(rawContent: string, numberer?: ImgNumberer): string {
+  const rendered = extractRenderedCardContent(rawContent);
+  if (rendered !== undefined) return rendered;
+
   try {
     const card = JSON.parse(rawContent);
 
@@ -811,6 +903,7 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer): 
               // Same jump-URL policy as Format B: simple cards reach history
               // via the Format A list view WITHOUT a resolve pass, so dropping
               // the URL here would lose button links on that main path.
+              if (isBotmuxCallbackButton(node)) continue;
               const btnText = typeof node.text === 'string' ? node.text : node.text?.content;
               if (btnText) {
                 const url = buttonOpenUrl(node);
@@ -1026,6 +1119,58 @@ function firstNonEmptyString(...candidates: unknown[]): string | undefined {
   return undefined;
 }
 
+/** botmux's own card control buttons (🔊 语音总结 / 关闭会话 / 重启 / 配置 …) are
+ *  pure callbacks back into the daemon: when another bot reads the card
+ *  (history / cross-bot relay / quote), rendering them as `[🔊 语音总结]`
+ *  pollutes the receiving prompt with affordances it can never click, so
+ *  drop them structurally — same rationale as the botmux grey-footer strip
+ *  in extractElementText.
+ *
+ *  Primary detection is the egress-stamped ownership marker
+ *  (callback-button-marker.ts). This wordlist is the LEGACY fallback for
+ *  cards sent by pre-marker builds (chat history is long-lived), covering
+ *  every action dispatched by card-handler as of the fix — it is frozen;
+ *  new botmux buttons rely on the marker, not on growing this list.
+ *  Third-party cards' buttons (Argos 确认/创建群组…) stay: they carry no
+ *  marker and their `value` never uses botmux's action vocabulary. */
+const BOTMUX_INTERNAL_CARD_ACTIONS: ReadonlySet<string> = new Set([
+  // session / reply card controls (card-handler's actionType dispatch)
+  'close', 'disconnect', 'export_text', 'get_write_link', 'open_local_cli',
+  'open_local_terminal', 'refresh_screenshot', 'restart', 'resume',
+  'retry_last_task', 'takeover', 'term_action', 'toggle_display',
+  'toggle_stream', 'tui_keys', 'tui_text_input', 'voice_summary',
+  // pendingRepo gates
+  'repo_manual_submit', 'repo_worktree_submit', 'skip_repo',
+  'worktree_toggle_mode',
+  // config / grant / relay cards
+  'config_toggle', 'config_set', 'config_quota', 'config_text_open',
+  'config_text_save', 'grant_chat', 'grant_global', 'grant_deny',
+  'relay_search', 'relay_page', 'relay_select', 'relay_confirm',
+  // host-overload alert + codex notifier cards
+  'overload_noop', 'overload_clean_stopped', 'overload_suspend_idle',
+  'codex_notifier_continue', 'codex_notifier_open_app',
+]);
+
+/** True when the button is one of botmux's own callback buttons. Primary
+ *  signal: the egress-stamped ownership marker (see
+ *  callback-button-marker.ts) — future-proof against any new botmux action
+ *  name. Legacy fallback: cards sent by pre-marker builds are still
+ *  recognized via the internal action wordlist, in EITHER of the two real
+ *  payload shapes — legacy top-level `value.action` (session/config cards)
+ *  or v2 `behaviors:[{type:'callback', value.action}]` (reply-card voice
+ *  button inside column_set). A button that somehow carries BOTH a botmux
+ *  signal AND an open_url jump target is kept, since a real link is always
+ *  worth surfacing. */
+function isBotmuxCallbackButton(el: any): boolean {
+  if (buttonOpenUrl(el)) return false;
+  if (hasBotmuxCallbackMarker(el)) return true;
+  let action: unknown = el?.value?.action;
+  if (typeof action !== 'string' && Array.isArray(el?.behaviors)) {
+    action = el.behaviors.find((b: any) => b?.type === 'callback')?.value?.action;
+  }
+  return typeof action === 'string' && BOTMUX_INTERNAL_CARD_ACTIONS.has(action);
+}
+
 /** Resolve a card button's jump target across schema generations: v1 `url` /
  *  `multi_url`, v2 `behaviors: [{type:'open_url', default_url, pc_url, …}]`.
  *  Returns undefined for callback-only buttons (they have no followable URL). */
@@ -1121,7 +1266,9 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   // Jump buttons carry their target as v1 `url`/`multi_url` or v2 `behaviors`
   // open_url; keep it so the reader can actually follow the link (e.g. Argos
   // [分析报告] → the report URL). Callback buttons have no URL and stay bare.
+  // botmux's own callback buttons (🔊 语音总结 …) are dropped entirely.
   if (tag === 'button') {
+    if (isBotmuxCallbackButton(el)) return;
     const btnText = typeof el.text === 'string' ? el.text : el.text?.content;
     if (btnText) {
       const url = buttonOpenUrl(el);

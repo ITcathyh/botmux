@@ -6,6 +6,7 @@ import {
   useId,
   useLayoutEffect,
   useMemo,
+  useReducer,
   useRef,
   useState,
   type DragEvent,
@@ -72,12 +73,15 @@ import {
   sessionTopicKey,
   sessionStatusText,
   shouldOpenWritableTerminal,
+  previewOverlayReducer,
+  previewOverlayInitialState,
   terminalHref,
   tokenCount,
   type BoardColumnId,
   type PickerBot,
   type SessionTopicGroup,
 } from './sessions.js';
+import { previewMarkdownHtml } from './preview-markdown.js';
 import { addMonitorRoomSessionIds, monitorRoomUrl } from './monitor-room-store.js';
 import { dashboardShellAllowsWebTerminal } from './client-shell.js';
 import { CreateActionButton, DropdownMenu, LoadingState } from './dashboard-components.js';
@@ -1006,10 +1010,14 @@ type SessionExchangePreviewValue = ReturnType<typeof sessionExchangePreview>;
 function SessionExchangePreview(props: { exchange: SessionExchangePreviewValue }): React.JSX.Element | null {
   const { exchange } = props;
   const triggerRef = useRef<HTMLDivElement>(null);
-  const detailsRef = useRef<HTMLButtonElement>(null);
   const tooltipRef = useRef<HTMLDivElement>(null);
   const hideTimerRef = useRef<number | null>(null);
-  const [open, setOpen] = useState(false);
+  // open + one-shot focus-suppress live in one reducer (see sessions.ts) so the
+  // Escape→refocus race is driven by the SAME transitions the unit tests cover:
+  // Escape closes and arms suppress, and the trigger's refocus consumes it
+  // instead of reopening.
+  const [overlay, dispatch] = useReducer(previewOverlayReducer, previewOverlayInitialState);
+  const open = overlay.open;
   const [position, setPosition] = useState<{
     left: number;
     placement: 'top' | 'bottom';
@@ -1024,11 +1032,11 @@ function SessionExchangePreview(props: { exchange: SessionExchangePreviewValue }
   }, []);
   const show = useCallback(() => {
     clearHide();
-    setOpen(true);
+    dispatch('open');
   }, [clearHide]);
   const hide = useCallback(() => {
     clearHide();
-    setOpen(false);
+    dispatch('close');
     setPosition(null);
   }, [clearHide]);
   const scheduleHide = useCallback(() => {
@@ -1079,7 +1087,6 @@ function SessionExchangePreview(props: { exchange: SessionExchangePreviewValue }
       if (!(target instanceof Node)) return;
       if (
         triggerRef.current?.contains(target)
-        || detailsRef.current?.contains(target)
         || tooltipRef.current?.contains(target)
       ) return;
       hide();
@@ -1102,12 +1109,35 @@ function SessionExchangePreview(props: { exchange: SessionExchangePreviewValue }
         <div
           ref={triggerRef}
           className="session-card-exchange"
-          aria-label={t('sessions.preview.latestExchange')}
+          role="button"
+          tabIndex={0}
+          aria-label={t('sessions.preview.showFull')}
+          aria-haspopup="dialog"
+          aria-controls={open ? tooltipId : undefined}
+          aria-expanded={open}
+          onClick={event => {
+            event.stopPropagation();
+            open ? hide() : show();
+          }}
+          onFocus={() => {
+            // Reducer consumes the one-shot suppress armed by Escape, so a
+            // programmatic refocus after Escape does not reopen the overlay.
+            clearHide();
+            dispatch('focus');
+          }}
+          onBlur={scheduleHide}
           onPointerEnter={event => {
             if (event.pointerType !== 'touch') show();
           }}
           onPointerLeave={event => {
             if (event.pointerType !== 'touch') scheduleHide();
+          }}
+          onKeyDown={event => {
+            if (event.key === 'Escape') hide();
+            else if (event.key === 'Enter' || event.key === ' ') {
+              event.preventDefault();
+              open ? hide() : show();
+            }
           }}
         >
           {exchange.userText ? (
@@ -1123,38 +1153,14 @@ function SessionExchangePreview(props: { exchange: SessionExchangePreviewValue }
             </div>
           ) : null}
         </div>
-        <button
-          ref={detailsRef}
-          type="button"
-          className="session-card-exchange-details"
-          aria-label={t('sessions.preview.showFull')}
-          aria-describedby={open ? tooltipId : undefined}
-          aria-expanded={open}
-          onClick={event => {
-            event.stopPropagation();
-          show();
-          }}
-          onFocus={show}
-          onBlur={scheduleHide}
-          onPointerEnter={event => {
-            if (event.pointerType !== 'touch') show();
-          }}
-          onPointerLeave={event => {
-            if (event.pointerType !== 'touch') scheduleHide();
-          }}
-          onKeyDown={event => {
-            if (event.key === 'Escape') hide();
-          }}
-        >
-          <span aria-hidden="true">•••</span>
-        </button>
       </div>
       {open && typeof document !== 'undefined' ? createPortal(
         <div
           ref={tooltipRef}
           id={tooltipId}
           className="session-card-exchange-tooltip"
-          role="tooltip"
+          role="dialog"
+          aria-label={t('sessions.preview.latestExchange')}
           data-placement={position?.placement ?? 'top'}
           style={{
             left: position?.left ?? -10_000,
@@ -1165,18 +1171,40 @@ function SessionExchangePreview(props: { exchange: SessionExchangePreviewValue }
           onPointerLeave={event => {
             if (event.pointerType !== 'touch') scheduleHide();
           }}
+          // Keyboard: Tab into a rendered Markdown link keeps the overlay open
+          // (focus entering the panel cancels the trigger's blur-close timer);
+          // it only closes once focus leaves the panel entirely. Escape closes
+          // and returns focus to the trigger.
+          onFocusCapture={clearHide}
+          onBlur={event => {
+            const next = event.relatedTarget as Node | null;
+            if (next && (tooltipRef.current?.contains(next) || triggerRef.current?.contains(next))) return;
+            scheduleHide();
+          }}
+          onKeyDown={event => {
+            if (event.key === 'Escape') {
+              event.stopPropagation();
+              // Close + arm the one-shot suppress, THEN refocus the trigger; its
+              // focus handler dispatches 'focus', which the reducer consumes
+              // (no reopen). Order is race-free because suppress is reducer state.
+              clearHide();
+              dispatch('escape-refocus');
+              setPosition(null);
+              triggerRef.current?.focus();
+            }
+          }}
         >
           <div className="session-card-exchange-tooltip-scroll">
             {exchange.userFullText ? (
               <div className="session-card-exchange-tooltip-line">
                 <span>{t('sessions.history.user')}</span>
-                <p>{exchange.userFullText}</p>
+                <div className="session-card-exchange-md" dangerouslySetInnerHTML={rawHtml(previewMarkdownHtml(exchange.userFullText))} />
               </div>
             ) : null}
             {exchange.botFullText ? (
               <div className="session-card-exchange-tooltip-line bot">
                 <span>{t('sessions.history.bot')}</span>
-                <p>{exchange.botFullText}</p>
+                <div className="session-card-exchange-md" dangerouslySetInnerHTML={rawHtml(previewMarkdownHtml(exchange.botFullText))} />
               </div>
             ) : null}
           </div>

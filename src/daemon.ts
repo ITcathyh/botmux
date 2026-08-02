@@ -28,8 +28,9 @@ import {
   buildOverloadAlertCard,
   buildOverloadRecoveredCard,
   initialOverloadCardState,
-  DEFAULT_OVERLOAD_THRESHOLDS,
   INITIAL_OVERLOAD_STATE,
+  computeOverloadThresholds,
+  isOverloadAlertTarget,
   type OverloadState,
   type OverloadThresholds,
 } from './core/host-overload-alert.js';
@@ -76,6 +77,7 @@ import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
 import * as scheduleStore from './services/schedule-store.js';
 import { migrateSharedSchedulesAtStartup } from './services/schedule-split-migration.js';
+import { migrateOverloadAlertAtStartup } from './services/overload-alert-migration.js';
 import * as messageQueue from './services/message-queue.js';
 import { emitHookEvent, emitHookEventLocal, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
@@ -190,6 +192,7 @@ import {
   extractBotmuxLarkNativeSessionTitlePrompt,
 } from './core/session-title.js';
 import { settleDeferredScheduleRun } from './core/deferred-schedule-settlement.js';
+import { renderMessageListenerPrompt } from './services/message-listener.js';
 import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { HerdrBackend } from './adapters/backend/herdr-backend.js';
@@ -327,7 +330,7 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
   try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
-import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, grantCommandRestriction, isKnownPeerBot, checkRequiredScopes, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, grantCommandRestriction, isKnownPeerBot, checkRequiredScopes, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
 import { getDocSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, putDocSubscription, removeDocSubscription, setDocCommentPollCursor, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
@@ -3086,12 +3089,23 @@ export async function enforceMessageQuotaForCliInput(
   senderUnionId?: string,
   memberUnionId?: string,
   chatType?: 'group' | 'p2p',
+  botSender?: boolean,
+  opts?: { listenerAuthorized?: boolean },
 ): Promise<boolean> {
+  if (opts?.listenerAuthorized) return true;
   // senderUnionId（bot-locked）让 evaluateTalk 认出跨部署团队 peer bot（teamBot 腿）；
   // memberUnionId（可为真人 union）走 teamMember 腿——否则外部闸门/群闸门放进来的
   // 团队 bot 或团队成员消息会在这里复查处被静默丢弃（#332 端到端断点，人腿同理）。
   // chatType 同理：不传的话，p2pOpen 放行的私聊消息会在这道复查里被丢掉（同一个断点）。
-  const ev = evaluateTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId, chatType);
+  //
+  // botSender：这条消息的发送方是飞书盖章的 bot（sender_type ∈ app|bot，或 cross-ref
+  // 认识的自家 peer）。命中时必须与 dispatcher 的外层闸用**同一个谓词** evaluateBotTalk，
+  // 否则「团队拉群 + sender 没带 union_id」这条路径会外层放行、这里静默丢弃——比弹卡
+  // 更糟：owner 以为授权生效了，消息凭空消失（#332 同款断点的最后一截）。
+  // 不传（人的路径）→ 原样走 evaluateTalk，语义不变。
+  const ev = botSender
+    ? evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId)
+    : evaluateTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId, chatType);
   if (!ev.allowed) {
     logger.debug(`[quota:${larkAppId}] dropping message ${messageId.substring(0, 12)} from non-allowed sender ${senderOpenId?.substring(0, 12) ?? '?'}`);
     return false;
@@ -3543,6 +3557,8 @@ interface V3SavedWorkflowImInvocation {
   teamTrustUnionId?: string;
   /** Raw sender union_id may independently grant the configured teamMember leg. */
   memberUnionId?: string;
+  /** 发起方是飞书盖章的 bot → talk 复查走 evaluateBotTalk（与 dispatcher 外层同源）。 */
+  botSender?: boolean;
 }
 
 const v3DistillationGenerationInFlight = new Map<string, Promise<void>>();
@@ -3768,6 +3784,7 @@ async function handleV3SavedWorkflowCommandIfAny(
     initiatorOpenId,
     teamTrustUnionId,
     memberUnionId,
+    botSender,
   } = invocation;
   const command = parseV3SavedWorkflowCommand(content);
   if (!command) return false;
@@ -3821,6 +3838,7 @@ async function handleV3SavedWorkflowCommandIfAny(
       teamTrustUnionId,
       memberUnionId,
       chatType,
+      botSender,
     ),
   });
   if (!policy.ok) {
@@ -4349,6 +4367,105 @@ async function deliverCodexNotifierEvent(
   }
 }
 
+/**
+ * P1 revalidation for the Codex-notifier「继续处理」takeover. After the dynamic
+ * import + AbortSignal await inside adoptCodexNotifierEvent, a concurrent path may
+ * have moved the ground: a `/relay` transfer opened its input gate (the starter
+ * would then fail-closed with a bare `return` our no-op sessionReply swallows,
+ * and the outer handler would render a bogus green「已接管」over a half-rewritten
+ * session), or the session was /close'd / swapped / re-created under this key.
+ * Returns true when the takeover MUST abort before mutating any state — so the
+ * caller can throw with zero side effects and no buffered input dropped.
+ */
+function notifierAdoptStaleOrTransferring(
+  ds: DaemonSession,
+  sessions: Map<string, DaemonSession>,
+  activeKey: string,
+  genSessionId: string,
+): boolean {
+  return (
+    sessions.get(activeKey) !== ds
+    || ds.session.sessionId !== genSessionId
+    || ds.session.status !== 'active'
+    || isSessionTransferring(ds)
+  );
+}
+
+/**
+ * P2 predicate: would clearPendingRepoStateForNotifierAdopt drop user input that
+ * was accepted but not yet delivered to the CLI? Two DISTINCT windows with
+ * different gating — do NOT collapse them:
+ *
+ *  (1) repo-select pending buffer — ONLY meaningful while pendingRepo===true.
+ *      pendingPrompt / pendingCodexAppText / pendingAttachments / pendingFollowUps
+ *      are the message stashed for the deferred post-repo-selection fork. But the
+ *      pinned/defaultWorkingDir immediate-launch path (daemon.ts ~16031/17325)
+ *      ALSO seeds these same mirror fields, then forks and clears only
+ *      pendingTurnId (~16097/17387) — leaving pendingPrompt/etc behind on an
+ *      already-delivered session with pendingRepo=false. Gating on pendingRepo
+ *      here is what stops us from warning "message not delivered, resend" about
+ *      a prompt the worker already ran (which would make the user re-run a
+ *      non-idempotent command).
+ *
+ *  (2) just-committed launch window — INDEPENDENT of pendingRepo. commitRepoSelection
+ *      set pendingRepo=false and forked, but pendingRawInput / pendingFollowUpInput
+ *      still wait on the new worker's prompt_ready to actually send. These are the
+ *      only fields that legitimately represent undelivered input while
+ *      pendingRepo=false, so they are checked unconditionally. (The immediate-launch
+ *      path never populates them — it forks with the prompt as a direct argument.)
+ */
+function notifierAdoptWouldDropInput(ds: DaemonSession): boolean {
+  const repoSelectBuffered = ds.pendingRepo === true && (
+    (ds.pendingPrompt?.trim().length ?? 0) > 0
+    || (ds.pendingFollowUps?.length ?? 0) > 0
+    || (ds.pendingAttachments?.length ?? 0) > 0
+    || (ds.pendingCodexAppText?.trim().length ?? 0) > 0
+  );
+  // Undelivered regardless of pendingRepo (awaiting prompt_ready on a forked worker).
+  const undeliveredLaunchInput =
+    (ds.pendingRawInput?.trim().length ?? 0) > 0
+    || (ds.pendingFollowUpInput?.cliInput?.trim().length ?? 0) > 0;
+  return repoSelectBuffered || undeliveredLaunchInput;
+}
+
+/**
+ * Fully retire an in-memory repo-select placeholder when the Codex-notifier
+ * 「继续处理」callback takes over the DM session. The legacy inline clear only
+ * reset six fields and left `repoCardMessageId`, `pendingFollowUps`,
+ * `pendingRepoCommitInFlight`, `worktreeCreating`, attachments, mentions, raw
+ * input, etc. behind — a stale repo-card click or a late auto-worktree
+ * completion could then act on the just-adopted session. Clear the whole
+ * pending-repo surface so no residue survives the takeover. Buffered/undelivered
+ * user input (repo-select buffer AND the pendingRawInput/pendingFollowUpInput a
+ * just-committed session is still waiting to send on prompt_ready) is dropped
+ * here — the drop is terminal (never rolled back, since concurrent background
+ * tasks may already have observed pendingRepo=false); the caller tells the user
+ * their input was cancelled on both the success and failure card.
+ */
+function clearPendingRepoStateForNotifierAdopt(ds: DaemonSession): void {
+  ds.pendingRepo = false;
+  ds.pendingRepoCommitInFlight = false;
+  ds.worktreeCreating = false;
+  ds.repoCardMessageId = undefined;
+  ds.pendingPrompt = undefined;
+  ds.pendingTurnId = undefined;
+  ds.pendingRawInput = undefined;
+  ds.pendingRawTurnId = undefined;
+  ds.pendingFollowUpInput = undefined;
+  ds.pendingAttachments = undefined;
+  ds.pendingMentions = undefined;
+  ds.pendingSubstituteTrigger = undefined;
+  ds.pendingSubstituteControlCard = undefined;
+  ds.pendingSender = undefined;
+  ds.pendingFollowUps = undefined;
+  ds.pendingFollowUpTurnId = undefined;
+  ds.pendingCodexAppText = undefined;
+  ds.pendingCodexAppApplicationContext = undefined;
+  ds.pendingCodexAppMessageContext = undefined;
+  ds.pendingCodexAppFollowUps = undefined;
+  ds.pendingCodexAppFollowUpContexts = undefined;
+}
+
 async function adoptCodexNotifierEvent(
   larkAppId: string,
   event: CodexTaskCompletedEvent,
@@ -4410,7 +4527,38 @@ async function adoptCodexNotifierEvent(
     }
   }
 
+  // Transfer guard OUTSIDE the launch branch. If the session is already on the
+  // target thread with a live worker, the branch below is skipped entirely —
+  // but a concurrent /relay could still be moving this session's routing away.
+  // Returning a green「已接管，可继续」while the route is migrating is a lie.
+  // Fail-closed here first (a freshly-created ds has no transfer gate, so this
+  // is a no-op for the new-session path); the launch branch keeps its own
+  // post-await revalidation for the drift that can open during its awaits.
+  if (isSessionTransferring(ds)) {
+    throw new Error('该会话正在转移，暂时无法接管；请转移完成后在完成通知卡上重试');
+  }
+
+  let bufferedInputDropped = false;
+  // Snapshot the session identity BEFORE the throwable/deadline-bound awaits
+  // below. If the session is closed, swapped, or re-created under this active
+  // key while we await, the post-await revalidation must detect the drift.
+  const adoptGenSessionId = ds.session.sessionId;
   if (ds.session.cliSessionId !== event.threadId || !ds.worker || ds.worker.killed) {
+    // Do the two throwable, deadline-sensitive steps FIRST, before mutating any
+    // session/pending state: the dynamic import and the 2.2s AbortSignal check.
+    // If either fails here nothing has been touched, so no rollback is needed
+    // and the buffered repo-select input is left intact for a retry.
+    const { startCodexAppThreadSession } = await import('./core/command-handler.js');
+    signal.throwIfAborted();
+
+    // Re-validate AFTER the awaits and BEFORE mutating anything (see
+    // notifierAdoptStaleOrTransferring): a concurrent /relay transfer or a
+    // /close/swap/re-create under this key must fail the takeover explicitly
+    // rather than half-rewrite the session and report a bogus green success.
+    if (notifierAdoptStaleOrTransferring(ds, activeSessions, activeKey, adoptGenSessionId)) {
+      throw new Error('该会话正在转移或已变更，无法接管；请稍后在完成通知卡上重试');
+    }
+
     // 接管原生 Codex App 线程时固定为纯 codex-app 启动，不能继承通知 Bot 的
     // wrapper/model；这些配置针对普通 CLI，会错误包装 app-server runner。
     ds.session.cliId = 'codex-app';
@@ -4419,12 +4567,28 @@ async function adoptCodexNotifierEvent(
     delete ds.session.model;
     ds.session.agentFrozen = true;
     sessionStore.updateSession(ds.session);
-    ds.pendingRepo = false;
-    ds.pendingPrompt = undefined;
-    ds.pendingTurnId = undefined;
-    ds.pendingCodexAppText = undefined;
-    ds.pendingCodexAppApplicationContext = undefined;
-    ds.pendingCodexAppMessageContext = undefined;
+
+    // 默认 flat DM(p2pMode=chat)下这条按钮回调复用同一私聊的现有会话。若该会话
+    // 恰好停在「待选仓库」挂起态且已缓冲一条尚未提交的输入，接管会消费掉
+    // pendingRepo(#669 的守卫要求接管前 pendingRepo 必须为 false)。旧逻辑只清了
+    // 部分字段并静默丢弃缓冲输入。这里完整清空全部 pending 状态(否则残留的
+    // repoCardMessageId/pendingFollowUps/worktreeCreating 等会让旧选仓卡二次点击、
+    // 迟到 auto-worktree 完成误操作已接管会话——见 runAutoWorktreeCommit 的
+    // pendingRepo 护栏),并记录「缓冲输入已丢弃」以便如实告知用户。
+    //
+    // 不做 pending 快照回滚:clear 之后 startCodexAppThreadSession 的 async guard
+    // 会让出微任务,迟到 auto-worktree / 正在 prepare 的 commit 可能已观察到
+    // pendingRepo=false 而正常结束并在 finally 清掉 in-flight 标志;此时若把
+    // pendingRepo=true/worktreeCreating=true 快照复活,后台任务已不在,会话会永久
+    // 卡在「正在创建/提交」。因此丢弃一旦发布即为终态——用「取消并请重发」的显式
+    // 语义告知用户,而非假装能恢复。
+    // 判断是否有「已收下但尚未真正送达 CLI」的用户输入会被下面的 clear 抹掉
+    // (见 notifierAdoptWouldDropInput:repo-select 镜像字段只在 pendingRepo===true
+    // 计入——立即启动路径也播种这些字段但已 fork 送达,不能误判;pendingRawInput/
+    // pendingFollowUpInput 独立于 pendingRepo,覆盖选仓刚提交等 prompt_ready 的启动窗)。
+    // 有则记录已丢弃,如实告知用户。
+    bufferedInputDropped = notifierAdoptWouldDropInput(ds);
+    clearPendingRepoStateForNotifierAdopt(ds);
 
     // 完成事件已经携带恢复所需的原生 threadId/cwd。按钮回调不再额外启动一次
     // app-server 做非必要的元数据刷新，避免子进程把飞书回调拖过截止时间。
@@ -4436,31 +4600,48 @@ async function adoptCodexNotifierEvent(
       status: event.status,
     };
 
-    const { startCodexAppThreadSession } = await import('./core/command-handler.js');
-    signal.throwIfAborted();
-    await startCodexNotifierAdoptionSession(
-      startCodexAppThreadSession,
-      target,
-      ds,
-      {
-        activeSessions,
-        sessionReply,
-        getActiveCount,
-        lastRepoScan,
-      },
-      larkAppId,
-      cardMessageId,
-    );
+    try {
+      await startCodexNotifierAdoptionSession(
+        startCodexAppThreadSession,
+        target,
+        ds,
+        {
+          activeSessions,
+          sessionReply,
+          getActiveCount,
+          lastRepoScan,
+        },
+        larkAppId,
+        cardMessageId,
+      );
+    } catch (err) {
+      // 接管失败/超时:pending 已清空且不回滚(见上)。若曾丢弃过缓冲/未送达输入,把「已取消、
+      // 请重发」前置到抛给外层的错误里——外层用它渲染失败卡,用户就不会以为原消息还
+      // 在队列里等着(否则失败卡只说"接管失败请重试",缓冲却已没了=静默丢失)。
+      if (bufferedInputDropped) {
+        const detail = err instanceof Error ? err.message : String(err);
+        throw new Error(`你此前发送但尚未送达的消息已取消，请在接管成功后重新发送。（接管未完成：${detail}）`);
+      }
+      throw err;
+    }
   }
 
+  const baseAdoptNotice = scope === 'chat'
+    ? '现在可以直接在当前私聊继续发送指令；需要操作终端时，请点击会话卡内的「获取操作链接」。'
+    : '请在本卡片的话题中继续发送指令；需要操作终端时，请点击话题会话卡内的「获取操作链接」。';
   return buildCodexNotifierResultCard(
     '已接管 Codex App 任务',
-    scope === 'chat'
-      ? '现在可以直接在当前私聊继续发送指令；需要操作终端时，请点击会话卡内的「获取操作链接」。'
-      : '请在本卡片的话题中继续发送指令；需要操作终端时，请点击话题会话卡内的「获取操作链接」。',
+    bufferedInputDropped
+      ? `⚠️ 你此前发送但尚未送达的消息未随本次接管发送，请重新发送一次。\n\n${baseAdoptNotice}`
+      : baseAdoptNotice,
     'green',
   );
 }
+
+export const __testOnly_notifierAdoptStaleOrTransferring = notifierAdoptStaleOrTransferring;
+export const __testOnly_notifierAdoptWouldDropInput = notifierAdoptWouldDropInput;
+export const __testOnly_clearPendingRepoStateForNotifierAdopt = clearPendingRepoStateForNotifierAdopt;
+export const __testOnly_adoptCodexNotifierEvent = adoptCodexNotifierEvent;
 
 const handleCodexNotifierCardAction = createCodexNotifierCardActionHandler({
   getExpectedOwnerOpenId: larkAppId =>
@@ -15051,7 +15232,22 @@ async function resolvePinnedWorkingDir(ctx: {
   chatId: string;
   chatType: 'group' | 'p2p';
   larkAppId: string;
+  listenerWorkingDir?: string;
 }) {
+  if (ctx.listenerWorkingDir) {
+    const resolved = expandHome(ctx.listenerWorkingDir);
+    try {
+      if (statSync(resolved).isDirectory()) {
+        return {
+          pinnedWorkingDir: resolved,
+          oncallEntry: undefined,
+          inheritedFrom: null,
+          pinnedFromBotDefault: false,
+        };
+      }
+    } catch { /* fall through to normal resolution */ }
+    logger.warn(`[message-listener:${ctx.larkAppId}] listener workingDir invalid (${resolved}); falling back to normal resolution`);
+  }
   let oncallEntry = findOncallChat(ctx.larkAppId, ctx.chatId);
   if (!oncallEntry) {
     oncallEntry = await maybeAutoBindDefaultOncall(ctx.larkAppId, ctx.chatId, ctx.chatType);
@@ -15238,12 +15434,14 @@ async function startInitialPassthroughSession(args: {
   ownerOpenId: string | undefined;
   ownerUnionId: string | undefined;
   creatorOpenId: string | undefined;
+  /** 发起方是飞书盖章的 bot → talk 复查走 evaluateBotTalk（与 dispatcher 外层同源）。 */
+  botSender?: boolean;
 }): Promise<void> {
   const {
     larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId,
-    parsed, cmd, commandContent, senderOpenId, substitute, senderUnionId, memberUnionId, ownerOpenId, ownerUnionId, creatorOpenId,
+    parsed, cmd, commandContent, senderOpenId, substitute, senderUnionId, memberUnionId, ownerOpenId, ownerUnionId, creatorOpenId, botSender,
   } = args;
-  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId, memberUnionId, chatType)) {
+  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId, memberUnionId, chatType, botSender)) {
     return;
   }
 
@@ -15400,7 +15598,7 @@ function mergeVcMeetingApplicationContext(
 }
 
 async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
-  const { chatId, messageId, chatType, larkAppId, replyRootId, substituteTrigger } = ctx;
+  const { chatId, messageId, chatType, larkAppId, replyRootId, substituteTrigger, messageListener } = ctx;
   // scope/anchor are mutable here: `/t` / `/topic` may flip a 普通群 chat-scope
   // routing into thread-scope so the bot's first reply seeds a Lark thread.
   let scope = ctx.scope;
@@ -15487,9 +15685,18 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // operate），破坏「人绝不继承 bot 信任」的边界。旧联邦 team-bots 表结构上只收
   // bot（学习入口限 bot sender），这里对齐同一不变量。senderUnionId 本身保持原义
   //（人类会话的 ownerUnionId 还靠它）。
-  const teamTrustUnionId: string | undefined =
-    (data.sender?.sender_type === 'app' || data.sender?.sender_type === 'bot') ? senderUnionId : undefined;
+  // 飞书盖章的 bot 发送方。既锁 union 信任腿（下面的 teamTrustUnionId），也决定
+  // talk 复查走哪个谓词（evaluateBotTalk vs evaluateTalk）——两者必须同源，见
+  // enforceMessageQuotaForCliInput 的 botSender 说明。
+  const isBotSenderType = data.sender?.sender_type === 'app' || data.sender?.sender_type === 'bot';
+  const teamTrustUnionId: string | undefined = isBotSenderType ? senderUnionId : undefined;
   const botCfg = getBot(larkAppId).config;
+  const listenerPrompt = messageListener ? renderMessageListenerPrompt(messageListener) : undefined;
+  if (listenerPrompt) {
+    content = listenerPrompt;
+    parsed.content = listenerPrompt;
+    cmdContent = listenerPrompt;
+  }
   logger.info(`New session: "${content.substring(0, 60)}" (scope=${scope}, anchor=${anchor.substring(0, 12)}, resources: ${resources.length}, active: ${getActiveCount()}, messageId: ${messageId}, chatId: ${chatId})`);
   emitHookEvent('topic.new', {
     larkAppId,
@@ -15517,6 +15724,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     initiatorOpenId: senderOpenId,
     teamTrustUnionId,
     memberUnionId: senderUnionId,
+    botSender: isBotSenderType,
   })) {
     return;
   }
@@ -15605,6 +15813,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
           substitute: !!substituteTrigger,
           senderUnionId: teamTrustUnionId,
           memberUnionId: senderUnionId, // 原始 union（人腿），不锁 bot
+          botSender: isBotSenderType,
           // New-topic senders are humans here (mirrors the normal new-topic
           // spawn path, which assigns ownership unconditionally too).
           ownerOpenId: senderOpenId,
@@ -15624,7 +15833,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
       // which left a hole once per-chat grants flow through canTalk.
       // canRunDaemonCommand = canOperate ∪（cmd ∈ canTalkDaemonCommands && canTalk）：
       // bot 可通过名单把选定命令（如 /status）降到 canTalk；未配置时与 canOperate 全等。
-      if (!canRunDaemonCommand(larkAppId, chatId, senderOpenId, teamTrustUnionId, cmd, senderUnionId, chatType)) {
+      if (!canRunDaemonCommand(larkAppId, chatId, senderOpenId, teamTrustUnionId, cmd, senderUnionId, chatType, isBotSenderType)) {
         await sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
       }
@@ -15718,7 +15927,9 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     }
   }
 
-  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, teamTrustUnionId, senderUnionId, chatType)) {
+  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, teamTrustUnionId, senderUnionId, chatType, isBotSenderType, {
+    listenerAuthorized: !!messageListener,
+  })) {
     return;
   }
 
@@ -15776,7 +15987,14 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // Pin the working dir via the layered oncall / inherit / default lookup
   // (auto-binds a defaultOncall chat as a side effect). Shared with the
   // first-message `/repo` command branch so both paths stay consistent.
-  const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+  const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({
+    scope,
+    anchor,
+    chatId,
+    chatType,
+    larkAppId,
+    listenerWorkingDir: messageListener?.workingDir,
+  });
   // Auto-worktree: register PENDING (router buffers concurrent msgs, no force-fork)
   // and build the worktree off the critical path (willAutoWorktree / runAutoWorktreeCommit).
   const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
@@ -15791,7 +16009,8 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // For chat-scope, rootMessageId stores the seed message_id (audit only);
   // routing keys off chatId via sessionAnchorId(), so any value works.
   const rootIdForStore = scope === 'thread' ? anchor : messageId;
-  const session = sessionStore.createSession(chatId, rootIdForStore, parsed.content.substring(0, 50), chatType);
+  const initialTurnTitle = (messageListener?.replyCardTitle ?? (ctx.forwardSeedData ? followupContent : content)).substring(0, 50);
+  const session = sessionStore.createSession(chatId, rootIdForStore, initialTurnTitle, chatType);
   const now = Date.now();
   setDirectChatDisplayNameFromSender(session, chatType, newTopicSender);
   const groupChatName = await groupChatNamePromise;
@@ -15851,7 +16070,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     pendingSubstituteControlCard: shouldSendSubstituteControlCard,
     pendingSender: newTopicSender,
     ownerOpenId: senderOpenId,
-    currentTurnTitle: (ctx.forwardSeedData ? followupContent : content).substring(0, 50),
+    currentTurnTitle: initialTurnTitle,
     workingDir: pinnedWorkingDir,
   };
   if (pinnedWorkingDir) {
@@ -16613,6 +16832,7 @@ async function handleThreadReply(
     initiatorOpenId: threadSenderOpenId,
     teamTrustUnionId: threadTeamTrustUnionId,
     memberUnionId: threadSenderUnionId,
+    botSender: isBotSenderType || isForeignBot,
   })) {
     return;
   }
@@ -16689,6 +16909,7 @@ async function handleThreadReply(
           substitute: !!substituteTrigger,
           senderUnionId: threadTeamTrustUnionId,
           memberUnionId: threadSenderUnionId, // 原始 union（人腿），不锁 bot
+          botSender: isBotSenderType || isForeignBot,
           // Bot-started cold starts get no human owner (mirrors the auto-create
           // path) — see the ownership note on startInitialPassthroughSession.
           ownerOpenId: isForeignBot ? undefined : threadSenderOpenId,
@@ -16732,7 +16953,7 @@ async function handleThreadReply(
       // (see spawn-path gate above). Denies chat-granted users management commands.
       // canRunDaemonCommand：canTalkDaemonCommands 名单内的命令降到 canTalk，
       // 与 new-topic 路径的统一闸同款（未配置时与 canOperate 全等）。
-      if (!canRunDaemonCommand(larkAppId, effectiveThreadChatId, threadSenderOpenId, threadTeamTrustUnionId, cmd, threadSenderUnionId, ctxChatType)) {
+      if (!canRunDaemonCommand(larkAppId, effectiveThreadChatId, threadSenderOpenId, threadTeamTrustUnionId, cmd, threadSenderUnionId, ctxChatType, isBotSenderType || isForeignBot)) {
         sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
       }
@@ -16827,6 +17048,16 @@ async function handleThreadReply(
           askId: pendingAsk.askId,
           by: threadSenderOpenId,
           text: askReplyText,
+          // Actor context so the broker's talk check uses the same predicate as
+          // the dispatcher gate / quota recheck: a bot text-reply → evaluateBotTalk
+          // (covers team-拉群 with no union_id), a platform teamMember human →
+          // evaluateTalk's teamMember union leg. Omitting it (card clicks) degrades
+          // to the plain evaluateTalk(openId, chatType).
+          actor: {
+            botSender: isBotSenderType || isForeignBot,
+            senderUnionId: threadTeamTrustUnionId,
+            memberUnionId: threadSenderUnionId,
+          },
         });
         if (outcome === 'accepted') {
           logger.info(`[${anchor.substring(0, 12)}] ask custom reply accepted from ${threadSenderOpenId.substring(0, 12)}`);
@@ -16868,6 +17099,7 @@ async function handleThreadReply(
     threadTeamTrustUnionId,
     threadSenderUnionId,
     ctxChatType,
+    isBotSenderType || isForeignBot,
   )) {
     return;
   }
@@ -17957,14 +18189,6 @@ function resolvePrimaryOwnerOpenId(larkAppId: string): string | undefined {
   }
 }
 
-/** Parse a positive float env override, falling back to `dflt` when unset/invalid. */
-function envFloat(name: string, dflt: number): number {
-  const raw = process.env[name];
-  if (raw === undefined || raw.trim() === '') return dflt;
-  const n = Number(raw);
-  return Number.isFinite(n) && n >= 0 ? n : dflt;
-}
-
 /**
  * Host-overload thresholds, seeded from module defaults and overridable via env
  * so an operator can tune sensitivity without a code change:
@@ -17976,37 +18200,24 @@ function envFloat(name: string, dflt: number): number {
  * but are inert (reading passes swap=undefined).
  */
 function resolveOverloadThresholds(): OverloadThresholds {
-  const cpuCount = Math.max(1, cpus().length || 1);
-  const enterLoadRatio = envFloat('BOTMUX_OVERLOAD_ENTER_LOAD_RATIO', DEFAULT_OVERLOAD_THRESHOLDS.enterLoadRatio);
-  let exitLoadRatio = envFloat('BOTMUX_OVERLOAD_EXIT_LOAD_RATIO', DEFAULT_OVERLOAD_THRESHOLDS.exitLoadRatio);
-  const enterMemUsedFrac = envFloat('BOTMUX_OVERLOAD_ENTER_MEM_FRAC', DEFAULT_OVERLOAD_THRESHOLDS.enterMemUsedFrac);
-  let exitMemUsedFrac = envFloat('BOTMUX_OVERLOAD_EXIT_MEM_FRAC', DEFAULT_OVERLOAD_THRESHOLDS.exitMemUsedFrac);
-  // Hysteresis only works when the recover line sits STRICTLY below the enter
-  // line. Clamping a misconfigured exit down to *equal* enter is not enough: at
-  // enter == exit the enter test (mem `>=`) and the recover test (mem `<=`) both
-  // fire at the exact threshold, so a reading pinned there flaps entered/
-  // recovered every tick. Force a small gap below enter (5%) and warn.
-  const HYSTERESIS_MARGIN = 0.95; // exit = 95% of enter when misconfigured
-  if (exitLoadRatio >= enterLoadRatio) {
-    const clamped = enterLoadRatio * HYSTERESIS_MARGIN;
-    logger.warn(`[overload] BOTMUX_OVERLOAD_EXIT_LOAD_RATIO (${exitLoadRatio}) >= ENTER (${enterLoadRatio}); clamping exit to ${clamped}`);
-    exitLoadRatio = clamped;
-  }
-  if (exitMemUsedFrac >= enterMemUsedFrac) {
-    const clamped = enterMemUsedFrac * HYSTERESIS_MARGIN;
-    logger.warn(`[overload] BOTMUX_OVERLOAD_EXIT_MEM_FRAC (${exitMemUsedFrac}) >= ENTER (${enterMemUsedFrac}); clamping exit to ${clamped}`);
-    exitMemUsedFrac = clamped;
-  }
-  return {
-    cpuCount,
-    enterLoadRatio,
-    exitLoadRatio,
-    enterMemUsedFrac,
-    exitMemUsedFrac,
-    enterSwapUsedFrac: DEFAULT_OVERLOAD_THRESHOLDS.enterSwapUsedFrac,
-    exitSwapUsedFrac: DEFAULT_OVERLOAD_THRESHOLDS.exitSwapUsedFrac,
-    minReAlertMs: envFloat('BOTMUX_OVERLOAD_MIN_REALERT_MS', DEFAULT_OVERLOAD_THRESHOLDS.minReAlertMs),
-  };
+  // Enter thresholds priority (env > global config > default) + hysteresis-safe
+  // exit derivation live in the pure computeOverloadThresholds() so they can be
+  // unit-tested without importing this side-effectful module. We only gather the
+  // impure inputs (CPU count, persisted config, env strings) here.
+  const cfg = readGlobalConfig().hostOverloadAlert ?? {};
+  return computeOverloadThresholds({
+    cpuCount: cpus().length || 1,
+    configEnterLoadRatio: cfg.enterLoadRatio,
+    configEnterMemUsedFrac: cfg.enterMemUsedFrac,
+    env: {
+      enterLoadRatio: process.env.BOTMUX_OVERLOAD_ENTER_LOAD_RATIO,
+      exitLoadRatio: process.env.BOTMUX_OVERLOAD_EXIT_LOAD_RATIO,
+      enterMemUsedFrac: process.env.BOTMUX_OVERLOAD_ENTER_MEM_FRAC,
+      exitMemUsedFrac: process.env.BOTMUX_OVERLOAD_EXIT_MEM_FRAC,
+      minReAlertMs: process.env.BOTMUX_OVERLOAD_MIN_REALERT_MS,
+    },
+    warn: (message) => logger.warn(message),
+  });
 }
 
 /**
@@ -18279,12 +18490,21 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // running in a separate node process) so dashboard event bus stays in sync.
   scheduleStore.setScheduleScope(cfg.larkAppId);
   migrateSharedSchedulesAtStartup(botConfigs.map(b => b.larkAppId), botConfigs[0]?.larkAppId ?? cfg.larkAppId);
+  void migrateOverloadAlertAtStartup(botConfigs.map(b => ({ larkAppId: b.larkAppId, apiOnly: b.apiOnly })));
   scheduleStore.startExternalWriteWatcher();
   logger.info(`Bot ${idx}/${botConfigs.length}: ${cfg.larkAppId} (cli: ${cfg.cliId})`)
   setAskCardDispatcher(createLarkAskCardDispatcher());
   // Honour the bot's canTalk gate for `botmux ask` answers: a clicker who may
   // address the bot in this chat may answer an implicit-approver ask.
-  setAskCanTalkChecker((appId, chatId, openId, chatType) => evaluateTalk(appId, chatId, openId, undefined, undefined, chatType).allowed);
+  //
+  // 分派逻辑在 evaluateAskAnswerTalk（生产共用真源）：actor 透传时（文字作答路径）
+  // bot → evaluateBotTalk、人 → evaluateTalk 的完整模型（teamMember 走 memberUnionId
+  // 腿）；不传 actor（卡片点击路径，飞书 card-action 回调无 sender union/bot 标记）→
+  // 退化为纯 evaluateTalk(openId, chatType)，与改动前语义一致。三条分派由
+  // test/ask-answer-talk-dispatch.test.ts 直接咬住。
+  setAskCanTalkChecker((appId, chatId, openId, chatType, actor) =>
+    evaluateAskAnswerTalk(appId, chatId, openId, chatType, actor),
+  );
 
   writePidFile();
   const memoryDiagnostics = startMemoryDiagnostics();
@@ -19025,26 +19245,30 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }, 5_000).unref?.();
   }
 
-  // Host-overload watcher. Enabled per-bot via the `overloadAlert` config toggle
-  // (dashboard → Groups & Bots → bot card), NOT hardcoded to the primary daemon:
-  // any one bot can be designated the machine's alerter. load/mem are host-wide,
-  // so if more than one bot has it on, a cross-process file lock keyed on the
-  // overload episode ensures the machine only DMs once per edge (whichever bot's
-  // daemon wins the lock speaks). Reads os.loadavg()[2] + mem every 30s; on a
-  // healthy→overloaded or overloaded→healthy edge it DMs that bot's owner.
-  // Hysteresis + a min re-alert window (see host-overload-alert.ts) keep a load
-  // hovering near the line from spamming. Set BOTMUX_OVERLOAD_ALERT=0 to force
-  // the whole feature off regardless of per-bot config.
+  // Host-overload watcher. Machine-level: enabled via the GLOBAL config
+  // `hostOverloadAlert` (dashboard → Global Settings), which names one "notifier
+  // bot". ONLY that bot's own daemon samples + advances the state machine + DMs
+  // (it runs on this host, so no cross-daemon delivery queue is needed) — other
+  // daemons no-op and keep their state cleared. load/mem are host-wide; the
+  // cross-process episode lock is kept purely as a belt-and-suspenders guard
+  // (e.g. a stale duplicate daemon for the same bot). Reads os.loadavg()[2] +
+  // mem every 30s; on a healthy→overloaded or overloaded→healthy edge it DMs the
+  // notifier bot's admin. Hysteresis + a min re-alert window (see
+  // host-overload-alert.ts) keep a load near the line from spamming. Set
+  // BOTMUX_OVERLOAD_ALERT=0 to force the whole feature off regardless of config.
   if (process.env.BOTMUX_OVERLOAD_ALERT !== '0') {
-    const overloadThresholds = resolveOverloadThresholds();
     let overloadState: OverloadState = INITIAL_OVERLOAD_STATE;
     const overloadTimer = setInterval(() => {
       void (async () => {
       try {
-        // Per-bot热开关：关了就不采样，但 timer 常驻，用户在 web 打开后下个 tick 即生效。
-        let enabled = false;
-        try { enabled = getBot(cfg.larkAppId).config.overloadAlert === true; } catch { enabled = false; }
-        if (!enabled) { overloadState = INITIAL_OVERLOAD_STATE; return; }
+        // Global hot switch + target gating: only the selected notifier bot's
+        // daemon samples. When disabled, or the target is another bot / unset,
+        // reset local state so a later re-enable starts clean (no stale edge).
+        const alertCfg = readGlobalConfig().hostOverloadAlert ?? {};
+        if (!isOverloadAlertTarget(alertCfg, { larkAppId: cfg.larkAppId, apiOnly: cfg.apiOnly })) { overloadState = INITIAL_OVERLOAD_STATE; return; }
+        // Re-read thresholds each tick so live config edits (enter load/mem)
+        // take effect on the next sample without a restart.
+        const overloadThresholds = resolveOverloadThresholds();
 
         const reading = {
           load15: loadavg()[2] ?? 0,
@@ -19055,11 +19279,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         overloadState = nextState;
         if (!action) return;
 
-        // Machine-wide de-dup: multiple bots may have the toggle on, but the
-        // host is one machine. Claim a short-lived episode lock so only one bot
-        // DMs per edge. Losing the claim = another bot already alerted this edge.
+        // Belt-and-suspenders de-dup: normally only the target daemon reaches
+        // here, but a stale duplicate daemon for the same bot could double-fire.
+        // Claim a short-lived episode lock so the host DMs once per edge.
         if (!claimOverloadEpisode(action.kind)) {
-          logger.info(`[overload] ${action.kind} edge already claimed by a sibling bot; skipping DM (${cfg.larkAppId})`);
+          logger.info(`[overload] ${action.kind} edge already claimed; skipping DM (${cfg.larkAppId})`);
           return;
         }
         const ownerOpenId = resolvePrimaryOwnerOpenId(cfg.larkAppId);

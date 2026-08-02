@@ -743,7 +743,7 @@ function BotDefaultsCard(props: {
             <section className="bd-tile">
               <CrossBotSection bot={bot} putCardPref={putCardPref} />
             </section>
-            <section className="bd-tile"><SessionCapSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
+            <section className="bd-tile"><SessionCapSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><StartupCommandsSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><SummaryTriggerSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
@@ -904,6 +904,7 @@ function BotAvatarControl(props: { bot: BotDefaultsRow; name: string; patchBot: 
   }
 
   return (
+    <>
     <div className="bd-profile-avatar bd-avatar-editable" data-avatar-control>
       <button
         type="button"
@@ -929,14 +930,6 @@ function BotAvatarControl(props: { bot: BotDefaultsRow; name: string; patchBot: 
           void handleFile(file);
         }}
       />
-      {status ? (
-        <small className={statusClass(status, 'bd-avatar-status')} data-avatar-status>
-          {status.text}
-          {loginVisible ? (
-            <button type="button" className="bd-feishu-login" data-action="feishu-login-avatar" onClick={() => setLoginOpen(true)}>{tr('feishuLogin.entry')}</button>
-          ) : null}
-        </small>
-      ) : null}
       {loginOpen ? (
         <FeishuLoginModal
           onClose={() => setLoginOpen(false)}
@@ -948,6 +941,18 @@ function BotAvatarControl(props: { bot: BotDefaultsRow; name: string; patchBot: 
         />
       ) : null}
     </div>
+    {/* Status renders as a full-width in-flow strip on the header's second grid
+        row (not absolutely positioned under the avatar), so it never overlaps
+        the name-status or the tab bar below. */}
+    {status ? (
+      <small className={statusClass(status, 'bd-avatar-status')} data-avatar-status>
+        {status.text}
+        {loginVisible ? (
+          <button type="button" className="bd-feishu-login" data-action="feishu-login-avatar" onClick={() => setLoginOpen(true)}>{tr('feishuLogin.entry')}</button>
+        ) : null}
+      </small>
+    ) : null}
+    </>
   );
 }
 
@@ -2651,6 +2656,7 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
   const [replyMode, setReplyMode] = useState<'thread' | 'quote'>(initial?.replyMode === 'quote' ? 'quote' : 'thread');
   const [controlCard, setControlCard] = useState(initial?.disableControlCard !== true);
   const [chatsText, setChatsText] = useState(() => formatSubstituteChats(initial?.chats));
+  const [excludedChatsText, setExcludedChatsText] = useState(() => formatSubstituteChats(initial?.excludedChats));
   // 话题群相关开关缺省开：只有显式 false 才是关（与 normalize 语义一致）。
   const [topicGroups, setTopicGroups] = useState(initial?.topicGroups !== false);
   const [topicActiveSessionTrigger, setTopicActiveSessionTrigger] = useState(initial?.topicActiveSessionTrigger !== false);
@@ -2744,13 +2750,14 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
     setReplyMode(next?.replyMode === 'quote' ? 'quote' : 'thread');
     setControlCard(next?.disableControlCard !== true);
     setChatsText(formatSubstituteChats(next?.chats));
+    setExcludedChatsText(formatSubstituteChats(next?.excludedChats));
     setTopicGroups(next?.topicGroups !== false);
     setTopicActiveSessionTrigger(next?.topicActiveSessionTrigger !== false);
     const targets = next?.targets ?? [];
     setTargetRows(targets.length ? targets.map(target => makeTargetDraft(target)) : [makeTargetDraft()]);
   }, [props.bot.larkAppId, props.bot.substituteMode]);
 
-  async function save(body: { enabled: boolean; targets: BotSubstituteTarget[]; disclosure?: 'prefix' | 'none'; chats?: string[]; replyMode?: 'thread' | 'quote'; disableControlCard?: boolean; topicGroups?: boolean; topicActiveSessionTrigger?: boolean }): Promise<void> {
+  async function save(body: { enabled: boolean; targets: BotSubstituteTarget[]; disclosure?: 'prefix' | 'none'; chats?: string[]; excludedChats?: string[]; replyMode?: 'thread' | 'quote'; disableControlCard?: boolean; topicGroups?: boolean; topicActiveSessionTrigger?: boolean }): Promise<void> {
     setBusy(true);
     setStatus(null);
     try {
@@ -2771,6 +2778,7 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
         setReplyMode(next?.replyMode === 'quote' ? 'quote' : 'thread');
         setControlCard(next?.disableControlCard !== true);
         setChatsText(formatSubstituteChats(next?.chats));
+        setExcludedChatsText(formatSubstituteChats(next?.excludedChats));
         setTopicGroups(next?.topicGroups !== false);
         setTopicActiveSessionTrigger(next?.topicActiveSessionTrigger !== false);
         if (resolution.length) {
@@ -2843,7 +2851,7 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
       setStatus({ text: `✗ ${tr('botDefaults.substituteTargetsInvalid')}` });
       return;
     }
-    void save({ enabled, targets, disclosure, chats: parseSubstituteChats(chatsText), replyMode, disableControlCard: !controlCard, topicGroups, topicActiveSessionTrigger });
+    void save({ enabled, targets, disclosure, chats: parseSubstituteChats(chatsText), excludedChats: parseSubstituteChats(excludedChatsText), replyMode, disableControlCard: !controlCard, topicGroups, topicActiveSessionTrigger });
   }
 
   const disclosureOptions: DropdownFieldOption<'prefix' | 'none'>[] = [
@@ -2926,6 +2934,19 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
             value={chatsText}
             disabled={busy}
             onChange={event => setChatsText(event.currentTarget.value)}
+          />
+        </label>
+      </div>
+      <div className="bd-row">
+        <label>
+          <FieldTitle help={tr('botDefaults.substituteExcludedChatsHelp')}>{tr('botDefaults.substituteExcludedChats')}</FieldTitle>
+          <textarea
+            data-input="substituteExcludedChats"
+            rows={3}
+            placeholder={tr('botDefaults.substituteExcludedChatsPlaceholder')}
+            value={excludedChatsText}
+            disabled={busy}
+            onChange={event => setExcludedChatsText(event.currentTarget.value)}
           />
         </label>
       </div>
@@ -3060,7 +3081,7 @@ function mentionMode(bot: BotDefaultsRow): string {
     : 'always';
 }
 
-function SessionCapSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
+function SessionCapSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const initial = typeof props.bot.maxLiveWorkers === 'number' ? props.bot.maxLiveWorkers : null;
   const logical = Number.isFinite(props.bot.logicalSessionCount) ? Number(props.bot.logicalSessionCount) : 0;
@@ -3071,39 +3092,12 @@ function SessionCapSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; put
   const [input, setInput] = useState(initial == null ? '' : String(initial));
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
-  const [overloadAlert, setOverloadAlert] = useState(props.bot.overloadAlert === true);
-  const [overloadBusy, setOverloadBusy] = useState(false);
 
   useEffect(() => {
     const next = typeof props.bot.maxLiveWorkers === 'number' ? props.bot.maxLiveWorkers : null;
     setCap(next);
     setInput(next == null ? '' : String(next));
   }, [props.bot.maxLiveWorkers]);
-
-  useEffect(() => {
-    setOverloadAlert(props.bot.overloadAlert === true);
-  }, [props.bot.overloadAlert]);
-
-  async function saveOverloadAlert(next: boolean): Promise<void> {
-    setOverloadBusy(true);
-    setStatus(null);
-    setOverloadAlert(next); // optimistic
-    try {
-      const res = await props.putCardPref({ overloadAlert: next });
-      if (res.ok && res.body.ok) {
-        props.patchBot(props.bot.larkAppId, { overloadAlert: next });
-        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
-      } else {
-        setOverloadAlert(!next); // revert
-        setStatus({ text: `✗ ${responseErrorText(res)}` });
-      }
-    } catch (e: any) {
-      setOverloadAlert(!next); // revert
-      setStatus({ text: `✗ ${caughtErrorText(e)}` });
-    } finally {
-      setOverloadBusy(false);
-    }
-  }
 
   async function save(value: number | null): Promise<void> {
     setStatus(null);
@@ -3136,8 +3130,8 @@ function SessionCapSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; put
   }
 
   return (
-    <div className="bd-subsection">
-      <h4 className="bd-subsection-title">{tr('botDefaults.sectionSessionCap')}</h4>
+    <section className="bd-section">
+      <h3 className="bd-section-title">{tr('botDefaults.sectionSessionCap')}</h3>
       <div className="bd-row bd-quota">
         <label>
           <FieldTitle help={tr('botDefaults.maxLiveWorkersHelp')}>{tr('botDefaults.maxLiveWorkers')}</FieldTitle>
@@ -3156,15 +3150,7 @@ function SessionCapSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; put
         <button type="button" data-action="off-session-cap" disabled={busy} onClick={() => { setInput(''); void save(null); }}>{tr('botDefaults.maxLiveWorkersOff')}</button>
         <StatusSpan status={status} attr={{ 'data-session-cap-status': '' }} />
       </div>
-      <ToggleRow
-        checked={overloadAlert}
-        disabled={overloadBusy}
-        dataAction="toggle-overload-alert"
-        title={tr('botDefaults.overloadAlert')}
-        help={tr('botDefaults.overloadAlertHelp')}
-        onChange={checked => void saveOverloadAlert(checked)}
-      />
-    </div>
+    </section>
   );
 }
 
@@ -3197,8 +3183,8 @@ function StartupCommandsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
   }
 
   return (
-    <div className="bd-subsection">
-      <h4 className="bd-subsection-title"><FieldTitle help={tr('botDefaults.startupCommandsHelp')}>{tr('botDefaults.sectionStartupCommands')}</FieldTitle></h4>
+    <section className="bd-section">
+      <h3 className="bd-section-title"><FieldTitle help={tr('botDefaults.startupCommandsHelp')}>{tr('botDefaults.sectionStartupCommands')}</FieldTitle></h3>
       <textarea
         data-input="startupCommands"
         rows={3}
@@ -3211,7 +3197,7 @@ function StartupCommandsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
         <button type="button" className="primary" data-action="save-startup-commands" disabled={busy} onClick={() => void save()}>{tr('botDefaults.startupCommandsSave')}</button>
         <StatusSpan status={status} attr={{ 'data-startup-commands-status': '' }} />
       </div>
-    </div>
+    </section>
   );
 }
 

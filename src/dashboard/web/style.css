@@ -2716,11 +2716,13 @@ button.primary {
 .session-card-exchange {
   display: grid;
   gap: 5px;
+  flex: 1 1 auto;
   min-width: 0;
-  padding: 7px 32px 7px 8px;
+  padding: 7px 8px;
   border: 1px solid color-mix(in srgb, var(--border) 76%, transparent);
   border-radius: var(--radius-sm);
   background: color-mix(in srgb, var(--surface) 78%, transparent);
+  cursor: pointer;
 }
 
 .session-card-exchange:hover,
@@ -2732,40 +2734,6 @@ button.primary {
 .session-card-exchange:focus-visible {
   outline: 2px solid color-mix(in srgb, var(--accent) 58%, transparent);
   outline-offset: 2px;
-}
-
-.session-card-exchange-details {
-  position: absolute;
-  top: 9px;
-  right: 7px;
-  width: 22px;
-  min-width: 22px;
-  height: 22px;
-  min-height: 22px;
-  padding: 0;
-  display: inline-grid;
-  place-items: center;
-  border: 0;
-  border-radius: 50%;
-  background: transparent;
-  color: var(--faint);
-  font-size: 11px;
-  font-weight: 800;
-  line-height: 1;
-  letter-spacing: -1px;
-  cursor: pointer;
-}
-
-.session-card-exchange-details:hover,
-.session-card-exchange-details:focus-visible,
-.session-card-exchange-details[aria-expanded="true"] {
-  background: color-mix(in srgb, var(--accent) 14%, transparent);
-  color: var(--accent);
-}
-
-.session-card-exchange-details:focus-visible {
-  outline: 2px solid color-mix(in srgb, var(--accent) 58%, transparent);
-  outline-offset: 1px;
 }
 
 .session-card-exchange-line {
@@ -2853,7 +2821,8 @@ button.primary {
   color: var(--accent);
 }
 
-.session-card-exchange-tooltip-line > p {
+.session-card-exchange-tooltip-line > p,
+.session-card-exchange-md {
   min-width: 0;
   margin: 0;
   color: var(--fg);
@@ -2861,6 +2830,74 @@ button.primary {
   line-height: 1.55;
   overflow-wrap: anywhere;
   user-select: text;
+}
+
+/* Markdown rendered inside the full-exchange overlay. Scoped tight so bot
+ * replies read as formatting (bold / code / lists / links) without importing
+ * a new palette — dashboard tokens only. Compact block spacing keeps a long
+ * reply legible in the scrollable overlay. */
+.session-card-exchange-md > :first-child { margin-top: 0; }
+.session-card-exchange-md > :last-child { margin-bottom: 0; }
+.session-card-exchange-md p { margin: 0 0 6px; }
+.session-card-exchange-md ul,
+.session-card-exchange-md ol { margin: 0 0 6px; padding-left: 18px; }
+.session-card-exchange-md li { margin: 1px 0; }
+.session-card-exchange-md li > p { margin: 0; }
+.session-card-exchange-md h1,
+.session-card-exchange-md h2,
+.session-card-exchange-md h3,
+.session-card-exchange-md h4,
+.session-card-exchange-md h5,
+.session-card-exchange-md h6 {
+  margin: 8px 0 4px;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+.session-card-exchange-md strong { font-weight: 700; }
+.session-card-exchange-md em { font-style: italic; }
+.session-card-exchange-md a {
+  color: var(--accent);
+  text-decoration: underline;
+  overflow-wrap: anywhere;
+}
+/* Markdown images are downgraded to a non-fetching text placeholder (no auto
+ * <img> request); the alt becomes an opt-in click-through link for safe schemes. */
+.session-card-exchange-img {
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.session-card-exchange-md code {
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--fg) 10%, transparent);
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 11px;
+}
+.session-card-exchange-md pre {
+  margin: 0 0 6px;
+  padding: 8px 10px;
+  overflow-x: auto;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+}
+.session-card-exchange-md pre code {
+  padding: 0;
+  background: transparent;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.session-card-exchange-md blockquote {
+  margin: 0 0 6px;
+  padding-left: 10px;
+  border-left: 2px solid color-mix(in srgb, var(--accent) 40%, var(--border));
+  color: var(--muted);
+}
+.session-card-exchange-md hr {
+  margin: 8px 0;
+  border: 0;
+  border-top: 1px solid var(--border-soft);
 }
 
 .session-card-time {
@@ -6492,6 +6529,8 @@ dialog.onboarding-dialog::backdrop {
   .sidebar {
     position: static;
     height: auto;
+    /* 窄屏恢复块级流：sidebar 变顶部横向导航条，不需要宽屏那套 flex column 纵向分配。 */
+    display: block;
     padding: 12px;
     border-right: 0;
     border-bottom: 1px solid var(--border);
@@ -6908,6 +6947,15 @@ dialog.onboarding-dialog::backdrop {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.roles-bot-badges {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 4px;
+  flex: 0 0 auto;
+  max-width: 112px;
+}
 
 /* ─── Badges ─── */
 .roles-badge {
@@ -6925,6 +6973,11 @@ dialog.onboarding-dialog::backdrop {
 .roles-badge.no-role {
   background: var(--bg-soft);
   color: var(--faint);
+}
+.roles-badge.has-listener {
+  border-color: color-mix(in srgb, var(--accent) 28%, transparent);
+  background: color-mix(in srgb, var(--accent) 10%, var(--surface));
+  color: var(--accent);
 }
 .roles-profile-match {
   display: inline-flex;
@@ -7053,6 +7106,492 @@ dialog.onboarding-dialog::backdrop {
   color: var(--faint);
   flex: 1 1 240px;
   min-width: 160px;
+}
+.roles-editor-switch {
+  align-self: flex-start;
+}
+.roles-listener-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+}
+.roles-listener-editor > .loading-state {
+  min-height: 44px;
+}
+.roles-listener-enabled {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  width: fit-content;
+  max-width: 100%;
+  min-height: var(--button-height);
+  padding: 0 var(--button-padding-x);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-full);
+  background: var(--surface);
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+  user-select: none;
+}
+.roles-listener-enabled input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+.roles-listener-enabled .filter-toggle-switch {
+  position: relative;
+  flex: none;
+  width: 31px;
+  height: 18px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--muted) 12%, var(--surface));
+}
+.roles-listener-enabled .filter-toggle-switch::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 3px;
+  width: 12px;
+  height: 12px;
+  border-radius: var(--radius-full);
+  background: var(--faint);
+  transform: translateY(-50%);
+  transition:
+    background-color 150ms ease,
+    transform 150ms ease;
+}
+.roles-listener-enabled:has(input:checked) {
+  background: color-mix(in srgb, var(--muted) 12%, var(--surface));
+  color: var(--accent);
+}
+.roles-listener-enabled:has(input:checked) .filter-toggle-switch {
+  border-color: color-mix(in srgb, var(--accent) 44%, var(--border-soft));
+  background: color-mix(in srgb, var(--accent) 16%, var(--surface));
+}
+.roles-listener-enabled:has(input:checked) .filter-toggle-switch::after {
+  background: var(--accent);
+  transform: translate(13px, -50%);
+}
+.roles-listener-scope-help {
+  margin: -6px 0 0;
+  max-width: 760px;
+  color: var(--faint);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.roles-listener-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.roles-listener-field {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+.roles-listener-field input[type="text"] {
+  width: 100%;
+  min-width: 0;
+  height: var(--button-height);
+  padding: 0 var(--button-padding-x);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: var(--surface-muted);
+  color: var(--fg);
+  box-sizing: border-box;
+}
+.roles-listener-field input[type="text"]:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.roles-listener-policy-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+.roles-listener-policy {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--surface-muted) 28%, transparent);
+}
+.roles-listener-chip,
+.roles-listener-checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 0 9px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-full);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.roles-listener-chip input,
+.roles-listener-checkbox input {
+  margin: 0;
+}
+#roles-listener-prompt {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 180px;
+  font-family: var(--mono);
+  font-size: 13px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  resize: vertical;
+  line-height: 1.55;
+  background: var(--surface-muted);
+  color: var(--fg);
+  tab-size: 2;
+}
+#roles-listener-prompt:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.roles-listener-preview-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--surface-muted) 22%, transparent);
+}
+.roles-listener-preview-head {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+  min-width: 0;
+}
+.roles-listener-preview-head small {
+  color: var(--muted);
+}
+.roles-listener-preview-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  justify-content: flex-end;
+}
+.roles-listener-preview-actions label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+.roles-listener-preview-actions select {
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--fg);
+}
+.roles-listener-preview-actions button {
+  min-height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 700;
+}
+.roles-listener-preview-actions button.primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--on-accent);
+}
+.roles-listener-preview-actions button:disabled {
+  opacity: .55;
+  cursor: not-allowed;
+}
+.roles-listener-preview-summary,
+.roles-listener-preview-empty,
+.roles-listener-preview-error {
+  color: var(--muted);
+  font-size: 12px;
+}
+.roles-listener-preview-error {
+  color: var(--danger);
+}
+.roles-listener-preview-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+}
+.roles-listener-preview-item {
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+.roles-listener-preview-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.roles-listener-preview-meta span {
+  max-width: 100%;
+  padding: 2px 6px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-full);
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.roles-listener-preview-meta span.ok {
+  color: var(--success);
+}
+.roles-listener-preview-meta span.running,
+.roles-listener-preview-meta span.triggered {
+  color: var(--accent);
+}
+.roles-listener-preview-meta span.error {
+  color: var(--danger);
+}
+.roles-listener-preview-run-detail {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: -2px 0 6px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.roles-listener-preview-run-detail span,
+.roles-listener-preview-run-detail strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.roles-listener-preview-run-detail strong {
+  color: var(--danger);
+  font-weight: 600;
+}
+.roles-listener-preview-sender,
+.roles-listener-preview-time,
+.roles-listener-preview-title {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 8px;
+  align-items: baseline;
+  margin-bottom: 4px;
+  font-size: 12px;
+}
+.roles-listener-preview-sender span,
+.roles-listener-preview-time span,
+.roles-listener-preview-title span,
+.roles-listener-preview-content-label {
+  color: var(--faint);
+}
+.roles-listener-preview-sender strong,
+.roles-listener-preview-time strong,
+.roles-listener-preview-title strong {
+  min-width: 0;
+  color: var(--fg);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.roles-listener-preview-content-label {
+  margin: 6px 0 3px;
+  font-size: 12px;
+}
+.roles-listener-preview-item pre {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.roles-listener-members {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+.roles-listener-members-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border-soft);
+  background: color-mix(in srgb, var(--surface-muted) 38%, transparent);
+}
+.roles-listener-members-head .roles-profile-section-title {
+  margin-bottom: 0;
+}
+.roles-listener-members-head small {
+  color: var(--faint);
+  font-size: 11px;
+  line-height: 1.4;
+  text-align: right;
+}
+.roles-listener-target-tabs {
+  align-self: flex-start;
+  margin: 10px 12px 0;
+}
+.roles-listener-filter-toolbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+  padding: 10px 12px 0;
+}
+.roles-listener-filter-toolbar input[type="search"] {
+  width: 100%;
+  min-width: 0;
+  height: var(--button-height);
+  padding: 0 var(--button-padding-x);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: var(--surface-muted);
+  color: var(--fg);
+  box-sizing: border-box;
+}
+.roles-listener-filter-toolbar input[type="search"]:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.roles-listener-clear-search {
+  width: var(--button-height);
+  min-width: var(--button-height);
+  height: var(--button-height);
+  padding: 0;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 18px;
+  line-height: 1;
+}
+.roles-listener-select-all {
+  min-height: var(--button-height);
+  padding: 0 var(--button-padding-x);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.roles-listener-bulkbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 10px 12px 0;
+  padding: 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--surface-muted) 45%, transparent);
+}
+.roles-listener-bulkbar > span {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+.roles-listener-member-list {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+}
+.roles-listener-member {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+.roles-listener-member-select {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+}
+.roles-listener-member-select input {
+  margin: 0;
+}
+.roles-listener-member-main {
+  min-width: 0;
+}
+.roles-listener-member-main strong {
+  display: block;
+  color: var(--fg);
+  font-size: 13px;
+  line-height: 1.35;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.roles-listener-member-main span {
+  display: block;
+  margin-top: 2px;
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.roles-listener-member-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-full);
+  background: var(--surface-muted);
+}
+.roles-listener-member-actions button {
+  min-height: 26px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: var(--radius-full);
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+.roles-listener-member-actions button.active,
+.roles-listener-member-actions button[aria-pressed="true"] {
+  background: color-mix(in srgb, var(--muted) 12%, var(--surface));
+  color: var(--accent);
+}
+.roles-listener-member-actions button:disabled,
+.roles-listener-select-all:disabled {
+  cursor: not-allowed;
+  opacity: .55;
 }
 .roles-profile-detail {
   gap: 16px;
@@ -7269,6 +7808,17 @@ dialog.onboarding-dialog::backdrop {
   .roles-profile-apply-controls {
     grid-template-columns: 1fr;
   }
+  .roles-listener-grid {
+    grid-template-columns: 1fr;
+  }
+  .roles-listener-member {
+    grid-template-columns: 1fr;
+  }
+  .roles-listener-member-actions {
+    justify-self: start;
+    max-width: 100%;
+    overflow-x: auto;
+  }
 }
 
 .v3-terminal-frame { display: block; width: 100%; height: 460px; border: 0; border-top: 1px solid var(--border); background: #0d1117; }
@@ -7389,6 +7939,10 @@ dialog.onboarding-dialog::backdrop {
   position: sticky;
   top: calc(var(--topbar-height) + 16px);
   height: 100%;
+  /* flex column so 创建按钮常驻顶部、导航区占满剩余高度并在矮屏（异形屏）内部纵向滚动，
+     而不是整块溢出被下面的 overflow:hidden 裁掉且无法滚动。 */
+  display: flex;
+  flex-direction: column;
   margin: 0;
   padding: 12px;
   border: 1px solid var(--border);
@@ -7412,6 +7966,7 @@ dialog.onboarding-dialog::backdrop {
 .sidebar-create-actions {
   display: grid;
   gap: 4px;
+  flex: 0 0 auto;
   margin-bottom: 10px;
   padding-bottom: 10px;
   border-bottom: 1px solid var(--border-soft);
@@ -7471,6 +8026,10 @@ button.sidebar-create-btn:focus-visible {
 
 .sidebar-nav {
   gap: 2px;
+  /* 占满 create-actions 之外的剩余高度；min-height:0 让它能收缩到比内容矮，
+     从而 overflow-y:auto 在矮屏（异形屏）真正触发纵向滚动而不是被父级裁掉。 */
+  flex: 1 1 auto;
+  min-height: 0;
   margin-top: 0;
   overflow-x: hidden;
   overflow-y: auto;
@@ -17817,7 +18376,42 @@ form.dashboard-toolbar > input[type="text"]:focus {
 }
 
 .settings-group-main .settings-group-card {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  /* Waterfall (masonry) via CSS multi-column so a tall block (e.g. 实验性配置)
+     no longer strands its row-neighbours (本地白板 / 仓库选择) with a big empty
+     gap below — short blocks pack directly under the tall one in the next
+     column. Blocks are independent (no cross-column state), so pure CSS columns
+     are safe here; break-inside:avoid keeps each block whole. Overrides the grid
+     display from the shared .settings-group-card rule above.
+     `columns: <width> <count>` caps at 3 columns but drops to 2/1 when the
+     viewport is too narrow to give each column its min width — otherwise an
+     odd-ratio ("异形屏") narrow-but-wide screen would force 3 skinny columns and
+     the block content (wide toggle labels / field-row controls) overflows into
+     the neighbouring column. */
+  display: block;
+  columns: 300px 3;
+  column-gap: 18px;
+}
+
+.settings-group-main .settings-group-card > .settings-block {
+  break-inside: avoid;
+  /* column layout has no row gap; space blocks with margin instead of grid gap */
+  margin: 0 0 18px;
+  /* avoid the 1px column-fragment wobble some engines show on avoid blocks */
+  display: inline-block;
+  width: 100%;
+}
+
+/* 瀑布流窄列（~1/3 宽）里，label+控件并排的 field-row 放不下：长标题（如
+   「负载进入阈值（load15 / 核数）」）会把 1fr 标题列压到 ~109px，标题文字
+   overflow:visible 溢出盖到右侧 input 上。窄列里改单列堆叠（标题在上、控件占满下一行），
+   与移动端 field-row 的处理一致，彻底消除标题与控件的重叠。 */
+.settings-group-main .settings-group-card .settings-field-row {
+  grid-template-columns: 1fr;
+  gap: 6px 12px;
+  align-items: start;
+}
+.settings-group-main .settings-group-card .settings-field-row .ui-field-title {
+  min-width: 0;
 }
 
 .settings-group-main .settings-vc-block {
@@ -18410,7 +19004,10 @@ input.office-proxy-input[type="text"]:not([type=checkbox]):not([type=radio]):not
     grid-auto-rows: auto;
   }
 
-  .settings-group-main .settings-group-card,
+  .settings-group-main .settings-group-card {
+    column-count: 1;
+  }
+
   .settings-group-ops .settings-group-card {
     grid-template-columns: 1fr;
   }
@@ -21749,8 +22346,12 @@ dialog select[multiple]:hover:not(:disabled) {
 .bot-defaults-page .bd-profile-head {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
+  grid-template-areas:
+    "avatar main"
+    "status status";
   align-items: center;
-  gap: 12px;
+  column-gap: 12px;
+  row-gap: 0; /* empty status row must add no vertical space (its own margin spaces it when present) */
   margin-bottom: 0;
   padding: 12px 14px;
   border: 0;
@@ -21758,6 +22359,22 @@ dialog select[multiple]:hover:not(:disabled) {
   background: transparent;
   box-shadow: none;
 }
+
+.bot-defaults-page .bd-profile-head > .bd-profile-avatar { grid-area: avatar; }
+.bot-defaults-page .bd-profile-head > .bd-profile-main { grid-area: main; }
+
+/* Avatar status is a full-width in-flow strip on the header's 2nd row — no
+   longer absolutely positioned under the small avatar (which overlapped the
+   name-status and bled into the tab bar). */
+.bot-defaults-page .bd-profile-head > .bd-avatar-status {
+  grid-area: status;
+  position: static;
+  min-width: 0;
+  max-width: none;
+  margin: 8px 0 0;
+  box-shadow: none;
+}
+.bot-defaults-page .bd-profile-head > .bd-avatar-status:empty { display: none; }
 
 :root[data-theme="dark"] .bot-defaults-page .bd-profile-head {
   border-color: transparent;
@@ -22393,6 +23010,18 @@ dialog select[multiple]:hover:not(:disabled) {
 
 .bot-defaults-page .bd-role-inject-menu {
   min-width: 148px;
+}
+
+/* Bot-config toggle-rows all carry a single-line label, so the switch should
+   sit vertically centered against it. The base .toggle-row uses
+   align-items:flex-start (for multi-line labels elsewhere, e.g. plugin/settings
+   pages), which top-aligns the 20px switch above the single text line and looks
+   misaligned here. Center them within this page only. */
+.bot-defaults-page .toggle-row {
+  align-items: center;
+}
+.bot-defaults-page .toggle-row .switch {
+  margin-top: 0;
 }
 
 .bot-defaults-page .bd-tile :where(input[type="text"], input[type="number"], textarea) {

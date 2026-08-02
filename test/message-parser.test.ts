@@ -7,8 +7,9 @@
  * Run:  pnpm vitest run test/message-parser.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { parseApiMessage, extractResources, parseEventMessage, stripLeadingMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, mentionOpenId, CARD_EMBEDDED_PLACEHOLDER } from '../src/im/lark/message-parser.js';
+import { parseApiMessage, extractResources, parseEventMessage, stripLeadingMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, mentionOpenId, messageMentionsBot, CARD_EMBEDDED_PLACEHOLDER } from '../src/im/lark/message-parser.js';
 import { buildMarkdownCard, buildReplyCardFooter } from '../src/im/lark/md-card.js';
+import { stampBotmuxCallbackMarkers, hasBotmuxCallbackMarker, BOTMUX_CALLBACK_MARKER_KEY } from '../src/im/lark/callback-button-marker.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -804,6 +805,217 @@ describe('Interactive card parsing: footer stripped structurally (custom brand)'
   });
 });
 
+// ─── botmux internal callback buttons are stripped from flattened text ────
+
+describe('botmux internal callback buttons (🔊 语音总结 …) dropped from prompt', () => {
+  // botmux reply/session cards carry callback buttons whose only affordance is
+  // a callback into the sender bot's daemon. Flattening them as `[🔊 语音总结]`
+  // leaks unusable chrome into peer bots' prompts (history / cross-bot relay /
+  // quote) — the receiving bot can never click them. They are identified
+  // structurally by `value.action` from botmux's internal vocabulary + no
+  // jump URL; third-party and valueless buttons stay.
+  it('Format B: drops the production voice-summary button (column_set + behaviors callback), keeps the reply body', () => {
+    // Exact shape the cli.ts reply path builds: the button lives inside a
+    // column_set's auto-width column and carries its action under
+    // behaviors:[{type:'callback', value}] — NOT top-level value.
+    const card = {
+      body: { elements: [
+        { tag: 'markdown', content: '这是机器人的回复内容' },
+        { tag: 'hr' },
+        { tag: 'column_set', flex_mode: 'none', columns: [
+          { tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center',
+            elements: [{ tag: 'markdown', text_size: 'notation_small_v2', content: ' ' }] },
+          { tag: 'column', width: 'auto', vertical_align: 'center', elements: [{
+            tag: 'button',
+            text: { tag: 'plain_text', content: '🔊 语音总结' },
+            type: 'default',
+            behaviors: [{
+              type: 'callback',
+              value: { action: 'voice_summary', session_id: 's1', root_id: 'om_1', lark_app_id: 'cli_a1', chat_id: 'oc_1' },
+            }],
+          }] },
+        ] },
+      ] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('这是机器人的回复内容');
+    expect(result.content).not.toContain('语音总结');
+  });
+
+  it('Format B: drops session-card controls (关闭会话/重启), keeps third-party callbacks', () => {
+    const card = {
+      body: { elements: [
+        { tag: 'action', actions: [
+          { tag: 'button', text: { tag: 'plain_text', content: '❌ 关闭会话' },
+            value: { action: 'close', session_id: 's1' } },
+          { tag: 'button', text: { tag: 'plain_text', content: '🔄 重启' },
+            value: { action: 'restart', session_id: 's1' } },
+          // Third-party card button with its own callback vocabulary — kept.
+          { tag: 'button', text: { tag: 'plain_text', content: '确认' },
+            value: { action: 'ack_alarm', rule_id: 'r1' } },
+          // Button with no value at all — always kept.
+          { tag: 'button', text: { tag: 'plain_text', content: '🖥️ 打开终端' } },
+        ] },
+      ] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).not.toContain('关闭会话');
+    expect(result.content).not.toContain('重启');
+    expect(result.content).toContain('[确认]');
+    expect(result.content).toContain('[🖥️ 打开终端]');
+  });
+
+  it('Format B: real buildReplyCardFooter + real voice button — neither chrome leaks', () => {
+    // End-to-end sanity with the REAL builders: footer signature strip (master)
+    // and callback-button strip (this change) must jointly leave only the body.
+    const footer = buildReplyCardFooter({ recipientOpenIds: ['ou_55cda5a6c00f49eef42043a7746499b4'] })!;
+    const card = {
+      body: { elements: [
+        { tag: 'markdown', content: '修复已完成，详见上面。' },
+        { tag: 'hr' },
+        { tag: 'column_set', flex_mode: 'none', columns: [
+          { tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center',
+            elements: [footer.element] },
+          { tag: 'column', width: 'auto', vertical_align: 'center', elements: [{
+            tag: 'button',
+            text: { tag: 'plain_text', content: '🔊 语音总结' },
+            type: 'default',
+            behaviors: [{
+              type: 'callback',
+              value: { action: 'voice_summary', session_id: 's1', root_id: 'om_1', lark_app_id: 'cli_a1', chat_id: 'oc_1' },
+            }],
+          }] },
+        ] },
+      ] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('修复已完成，详见上面。');
+    expect(result.content).not.toContain('语音总结');
+    expect(result.content).not.toContain('发送给');
+    expect(result.content).not.toContain('botmux');
+  });
+
+  it('Format B: a jump-URL button is kept even under a botmux action name', () => {
+    // A real link always wins over the cleanup heuristic — the open_url
+    // behavior means the reader can actually follow it.
+    const card = {
+      body: { elements: [
+        { tag: 'button', text: { tag: 'plain_text', content: '分析报告' },
+          value: { action: 'voice_summary', session_id: 's1' },
+          behaviors: [{ type: 'open_url', default_url: 'https://example.com/report' }] },
+      ] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('[分析报告](https://example.com/report)');
+  });
+
+  it('Format A: drops the voice-summary button while keeping bare buttons', () => {
+    // Format A is the API simplified list view; nodes keep `value` when the
+    // card supplies it, so the same structural filter applies.
+    const card = {
+      title: '回复',
+      elements: [[
+        { tag: 'text', text: '回复正文' },
+        { tag: 'button', text: '🔊 语音总结',
+          value: { action: 'voice_summary', session_id: 's1' } },
+        { tag: 'button', text: 'Option A', type: 'primary' },
+      ]],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('回复正文');
+    expect(result.content).not.toContain('语音总结');
+    expect(result.content).toContain('[Option A]');
+  });
+
+  it('marker path: a stamped button is dropped even with an UNKNOWN action (future-proof)', () => {
+    // The egress stamp (`__bm_cb`) is the long-term contract: a future botmux
+    // button with an action the legacy wordlist has never heard of must still
+    // be stripped, WITHOUT anyone updating the wordlist.
+    const card = {
+      body: { elements: [
+        { tag: 'button', text: { tag: 'plain_text', content: '🆕 未来按钮' },
+          value: { action: 'some_future_action', __bm_cb: 1 } },
+      ] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).not.toContain('未来按钮');
+  });
+
+  it('roundtrip: every callback button in a real egress-stamped card vanishes, jump URL stays', () => {
+    // Full pipeline: stampBotmuxCallbackMarkers (what client.ts applies on
+    // send/reply/ephemeral/update) → parseApiMessage (what the peer bot sees).
+    // A custom-brand bot with a session card and a voice-reply card must leak
+    // zero callback chrome while its genuine jump button survives.
+    const sessionCard = JSON.stringify({
+      body: { elements: [
+        { tag: 'markdown', content: '会话正文' },
+        { tag: 'action', actions: [
+          { tag: 'button', text: { tag: 'plain_text', content: '❌ 关闭会话' },
+            type: 'danger', value: { action: 'close', session_id: 's1' } },
+          { tag: 'button', text: { tag: 'plain_text', content: '🆕 某未来功能' },
+            value: { action: 'totally_new_action', session_id: 's1' } },
+          { tag: 'button', text: { tag: 'plain_text', content: '📄 打开报告' },
+            behaviors: [{ type: 'open_url', default_url: 'https://example.com/report' }] },
+        ] },
+      ] },
+    });
+    const stamped = stampBotmuxCallbackMarkers(sessionCard);
+    const result = parseApiMessage(makeMsg('interactive', stamped));
+    expect(result.content).toContain('会话正文');
+    expect(result.content).not.toContain('关闭会话');
+    expect(result.content).not.toContain('某未来功能');   // unknown action — marker wins
+    expect(result.content).toContain('[📄 打开报告](https://example.com/report)');
+    // sanity: the stamp actually fired (not passing by accident)
+    expect(stamped).toContain('__bm_cb');
+  });
+});
+
+// ─── stampBotmuxCallbackMarkers: egress stamp unit behavior ───────────────
+
+describe('stampBotmuxCallbackMarkers (egress choke-point stamp)', () => {
+  it('stamps legacy top-level value and v2 behaviors callback, skips jump buttons', () => {
+    const card = JSON.stringify({
+      body: { elements: [
+        { tag: 'button', text: { tag: 'plain_text', content: 'A' }, value: { action: 'close', session_id: 's' } },
+        { tag: 'button', text: { tag: 'plain_text', content: 'B' },
+          behaviors: [{ type: 'callback', value: { action: 'voice_summary' } }] },
+        { tag: 'button', text: { tag: 'plain_text', content: 'C' }, value: { action: 'cfg' },
+          behaviors: [{ type: 'open_url', default_url: 'https://example.com' }] },
+      ] },
+    });
+    const out = JSON.parse(stampBotmuxCallbackMarkers(card));
+    const [a, b, c] = out.body.elements;
+    expect(a.value[BOTMUX_CALLBACK_MARKER_KEY]).toBe(1);
+    expect(b.behaviors[0].value[BOTMUX_CALLBACK_MARKER_KEY]).toBe(1);
+    // jump button untouched: its value must stay marker-free
+    expect(c.value[BOTMUX_CALLBACK_MARKER_KEY]).toBeUndefined();
+    expect(hasBotmuxCallbackMarker(a)).toBe(true);
+    expect(hasBotmuxCallbackMarker(b)).toBe(true);
+    expect(hasBotmuxCallbackMarker(c)).toBe(false);
+  });
+
+  it('reaches buttons nested in column_set / i18n sections', () => {
+    const card = JSON.stringify({
+      body: { elements: [{ tag: 'column_set', columns: [
+        { tag: 'column', elements: [{ tag: 'button', text: { tag: 'plain_text', content: 'X' },
+          behaviors: [{ type: 'callback', value: { action: 'voice_summary' } }] }] },
+      ] }] },
+      i18n_elements: { zh_cn: [{ tag: 'button', text: { tag: 'plain_text', content: 'Y' }, value: { action: 'close' } }] },
+    });
+    const out = JSON.parse(stampBotmuxCallbackMarkers(card));
+    const nested = out.body.elements[0].columns[0].elements[0];
+    expect(nested.behaviors[0].value[BOTMUX_CALLBACK_MARKER_KEY]).toBe(1);
+    expect(out.i18n_elements.zh_cn[0].value[BOTMUX_CALLBACK_MARKER_KEY]).toBe(1);
+  });
+
+  it('is idempotent and tolerates non-JSON input unchanged', () => {
+    const card = JSON.stringify({ body: { elements: [{ tag: 'button', text: { tag: 'plain_text', content: 'A' }, value: { action: 'close' } }] } });
+    const once = stampBotmuxCallbackMarkers(card);
+    expect(stampBotmuxCallbackMarkers(once)).toBe(once);
+    expect(stampBotmuxCallbackMarkers('not-json{')).toBe('not-json{');
+  });
+});
+
 // ─── mergeCardText: A+B union ─────────────────────────────────────────────
 
 describe('mergeCardText', () => {
@@ -1354,5 +1566,55 @@ describe('parseEventMessage: mention identity formats', () => {
       idType: 'app_id',
     });
     expect(parsed.mentions?.[0].openId).toBeUndefined();
+  });
+});
+
+// ─── messageMentionsBot: single-source @-gate across realtime/poll/preview ──
+// Regression guard: this replaced three ad-hoc @-detections. It MUST recognize
+// every mention shape the old realtime code did (5 app_id forms + open_id, WS
+// object + REST bare-string) and scan inline `at` tags in BOTH content (realtime
+// event) and body.content (REST message-list). Table-driven so a dropped shape
+// announces itself.
+describe('messageMentionsBot', () => {
+  const BOT_OPEN = 'ou_this_bot';
+  const BOT_APP = 'cli_this_bot';
+
+  const matchCases: Array<[string, any]> = [
+    ['WS object open_id', { mentions: [{ id: { open_id: BOT_OPEN } }] }],
+    ['REST bare-string open_id + id_type', { mentions: [{ id: BOT_OPEN, id_type: 'open_id' }] }],
+    ['REST bare-string open_id (no id_type)', { mentions: [{ id: BOT_OPEN }] }],
+    ['app_id: top-level snake_case', { mentions: [{ app_id: BOT_APP }] }],
+    ['app_id: top-level camelCase', { mentions: [{ appId: BOT_APP }] }],
+    ['app_id: id string + id_type', { mentions: [{ id: BOT_APP, id_type: 'app_id' }] }],
+    ['app_id: id string + camelCase idType', { mentions: [{ id: BOT_APP, idType: 'app_id' }] }],
+    ['app_id: id object', { mentions: [{ id: { app_id: BOT_APP } }] }],
+    ['inline at in realtime content', { content: JSON.stringify({ zh_cn: { content: [[{ tag: 'at', user_id: BOT_OPEN }]] } }) }],
+    ['inline at in REST body.content', { body: { content: JSON.stringify({ zh_cn: { content: [[{ tag: 'at', user_id: BOT_OPEN }]] } }) } }],
+  ];
+  for (const [label, message] of matchCases) {
+    it(`matches: ${label}`, () => {
+      expect(messageMentionsBot(message, BOT_APP, BOT_OPEN)).toBe(true);
+    });
+  }
+
+  const noMatchCases: Array<[string, any]> = [
+    ['a different user open_id', { mentions: [{ id: { open_id: 'ou_someone_else' } }] }],
+    ['a different bot app_id', { mentions: [{ app_id: 'cli_other_bot' }] }],
+    ['no mentions and no inline at', { content: JSON.stringify({ text: 'hello' }) }],
+    ['inline at for another user', { body: { content: JSON.stringify({ zh_cn: { content: [[{ tag: 'at', user_id: 'ou_someone_else' }]] } }) } }],
+    ['empty message', {}],
+  ];
+  for (const [label, message] of noMatchCases) {
+    it(`does not match: ${label}`, () => {
+      expect(messageMentionsBot(message, BOT_APP, BOT_OPEN)).toBe(false);
+    });
+  }
+
+  it('returns false when neither botOpenId nor larkAppId is known', () => {
+    expect(messageMentionsBot({ mentions: [{ id: { open_id: BOT_OPEN } }] }, undefined, undefined)).toBe(false);
+  });
+
+  it('matches an app_id mention even when botOpenId is not yet resolved', () => {
+    expect(messageMentionsBot({ mentions: [{ app_id: BOT_APP }] }, BOT_APP, undefined)).toBe(true);
   });
 });
