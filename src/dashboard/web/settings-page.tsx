@@ -749,18 +749,20 @@ function SettingsBody(props: {
             saving={savingKey === 'codexNotifier'}
             onSave={saveCodexNotifier}
           />
-          <HostOverloadAlertSettingsEditor
-            value={settings.hostOverloadAlert}
-            disabled={dis}
-            saving={savingKey === 'hostOverloadAlert'}
-            onSave={saveHostOverloadAlert}
-          />
           <ToggleRow
             title={tr('settings.noVisibleOutputHint')}
             help={tr('settings.noVisibleOutputHintHelp')}
             checked={settings.noVisibleOutputHint}
             disabled={dis || savingKey === 'noVisibleOutputHint'}
             onChange={value => saveBoolean('noVisibleOutputHint', value)}
+          />
+        </SettingsBlock>
+        <SettingsBlock title={tr('settings.sectionHostOverloadAlert')}>
+          <HostOverloadAlertSettingsEditor
+            value={settings.hostOverloadAlert}
+            disabled={dis}
+            saving={savingKey === 'hostOverloadAlert'}
+            onSave={saveHostOverloadAlert}
           />
         </SettingsBlock>
         <SettingsBlock title={tr('settings.sectionWhiteboard')}>

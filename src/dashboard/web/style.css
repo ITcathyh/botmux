@@ -18365,7 +18365,24 @@ form.dashboard-toolbar > input[type="text"]:focus {
 }
 
 .settings-group-main .settings-group-card {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  /* Waterfall (masonry) via CSS multi-column so a tall block (e.g. 实验性配置)
+     no longer strands its row-neighbours (本地白板 / 仓库选择) with a big empty
+     gap below — short blocks pack directly under the tall one in the next
+     column. Blocks are independent (no cross-column state), so pure CSS columns
+     are safe here; break-inside:avoid keeps each block whole. Overrides the grid
+     display from the shared .settings-group-card rule above. */
+  display: block;
+  column-count: 3;
+  column-gap: 18px;
+}
+
+.settings-group-main .settings-group-card > .settings-block {
+  break-inside: avoid;
+  /* column layout has no row gap; space blocks with margin instead of grid gap */
+  margin: 0 0 18px;
+  /* avoid the 1px column-fragment wobble some engines show on avoid blocks */
+  display: inline-block;
+  width: 100%;
 }
 
 .settings-group-main .settings-vc-block {
@@ -18958,7 +18975,10 @@ input.office-proxy-input[type="text"]:not([type=checkbox]):not([type=radio]):not
     grid-auto-rows: auto;
   }
 
-  .settings-group-main .settings-group-card,
+  .settings-group-main .settings-group-card {
+    column-count: 1;
+  }
+
   .settings-group-ops .settings-group-card {
     grid-template-columns: 1fr;
   }
