@@ -174,13 +174,13 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       const baseArgs = [
         ...(!disableCliBypass ? ['--dangerously-bypass-approvals-and-sandbox'] : []),
         // Codex 0.14x added a second interactive gate AFTER folder trust: the
-        // botmux-installed UserPromptSubmit/SessionStart hooks in ~/.codex/hooks.json
+        // botmux-installed UserPromptSubmit + Stop hooks in ~/.codex/hooks.json
         // must be manually trusted ("Press t to trust"), and every botmux upgrade
         // rewrites codex-hook.sh → its trusted_hash changes → the gate re-fires. A
         // botmux-managed plain-TUI pane has no human at its PTY to press `t`, so the
-        // first Lark turn wedges forever (this is the ONLY launch path that shows the
-        // gate — this branch never runs for --remote/app-server; see the early return
-        // above — and codex exec/app-server don't accept the flag anyway).
+        // first Lark turn wedges forever. This gate is TUI-only: this branch never
+        // runs for --remote (see the early return above), and the app-server rejects
+        // the flag. (`codex exec` DOES accept it, but botmux never launches exec.)
         //
         // This is a SEPARATE knob from the approval/sandbox bypass: the flag trusts
         // ALL hook sources codex sees (user/project/plugin), not only botmux's, so it

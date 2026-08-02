@@ -168,6 +168,21 @@ describe('applySettingsWrite happy paths', () => {
     expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ noVisibleOutputHint: true });
   });
 
+  it('writes bypassCodexHookTrust=false (the disable path — the whole point of a default-ON toggle)', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ bypassCodexHookTrust: false }, deps);
+    expect(r.ok).toBe(true);
+    // Must persist the explicit false so the default-ON getter (`!== false`) sees it.
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ bypassCodexHookTrust: false });
+  });
+
+  it('writes bypassCodexHookTrust=true (re-enable) through the dashboard segment', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ bypassCodexHookTrust: true }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ bypassCodexHookTrust: true });
+  });
+
   it('writes herdrTraexPlugin opt-in and trims source/ref through the dashboard segment', async () => {
     const deps = makeDeps();
     const r = await applySettingsWrite({
@@ -405,6 +420,15 @@ describe('applySettingsWrite — validation errors', () => {
     expect(r.ok).toBe(false);
     if (r.ok) throw new Error('expected failure');
     expect(r.error).toBe('invalid_noVisibleOutputHint');
+    expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
+  });
+
+  it('rejects non-boolean bypassCodexHookTrust → invalid_bypassCodexHookTrust', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ bypassCodexHookTrust: 'no' }, deps);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('expected failure');
+    expect(r.error).toBe('invalid_bypassCodexHookTrust');
     expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
   });
 

@@ -25,6 +25,7 @@ interface DashboardSettings {
     recommendedRef: string;
   };
   codexRpcInput: boolean;
+  bypassCodexHookTrust: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -141,6 +142,8 @@ function parseSettings(s: any): DashboardSettings {
       recommendedRef: typeof s?.herdrTraexPlugin?.recommendedRef === 'string' ? s.herdrTraexPlugin.recommendedRef : '',
     },
     codexRpcInput: s?.codexRpcInput === true,
+    // default ON — only an explicit persisted false disables (matches server snapshot)
+    bypassCodexHookTrust: s?.bypassCodexHookTrust !== false,
     codexNotifier: {
       enabled: s?.codexNotifier?.enabled === true,
       targetBotAppId: typeof s?.codexNotifier?.targetBotAppId === 'string'
@@ -558,7 +561,7 @@ function SettingsBody(props: {
   const autoUpdateDisabled = !canWrite || settings.localDevInstall || !settings.autoUpdateSupported;
   const autoRestartDisabled = !canWrite || settings.maintenance.autoUpdate?.enabled !== true;
 
-  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'noVisibleOutputHint' | 'remoteAccess', value: boolean) => {
+  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'bypassCodexHookTrust' | 'noVisibleOutputHint' | 'remoteAccess', value: boolean) => {
     void props.onSave(key, { [key]: value }, s => ({ ...s, [key]: value }));
   };
   const saveHerdrTraexPlugin = (patch: Partial<Pick<DashboardSettings['herdrTraexPlugin'], 'enabled' | 'source' | 'ref'>>) => {
@@ -695,6 +698,13 @@ function SettingsBody(props: {
             checked={settings.codexRpcInput}
             disabled={dis || savingKey === 'codexRpcInput'}
             onChange={value => saveBoolean('codexRpcInput', value)}
+          />
+          <ToggleRow
+            title={tr('settings.bypassCodexHookTrust')}
+            help={tr('settings.bypassCodexHookTrustHelp')}
+            checked={settings.bypassCodexHookTrust}
+            disabled={dis || savingKey === 'bypassCodexHookTrust'}
+            onChange={value => saveBoolean('bypassCodexHookTrust', value)}
           />
           <CodexNotifierSettingsEditor
             value={settings.codexNotifier}
