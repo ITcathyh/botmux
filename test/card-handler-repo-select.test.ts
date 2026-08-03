@@ -239,6 +239,37 @@ function makeWorktreeSubmitEvent(branch = '', paths?: string[], operator = OWNER
   };
 }
 
+function makeTraexInitEvent(
+  action: 'traex_init_start' | 'traex_init_cancel',
+  opts: {
+    operator?: string;
+    repo?: string;
+    worktree?: string;
+    manualPath?: string;
+    mode?: 'traex' | 'forge-pipeline' | 'forge-pilot';
+    prompt?: string;
+  } = {},
+) {
+  return {
+    operator: { open_id: opts.operator ?? OWNER },
+    action: {
+      value: {
+        action,
+        root_id: ROOT_ID,
+        nonce: 'nonce-traex',
+        ...(opts.mode ? { mode: opts.mode } : {}),
+      },
+      form_value: {
+        ...(opts.prompt !== undefined ? { initial_prompt: opts.prompt } : {}),
+        ...(opts.repo ? { traex_init_target: `dir:${opts.repo}` } : {}),
+        ...(opts.worktree ? { traex_init_target: `worktree:${opts.worktree}` } : {}),
+        ...(opts.manualPath ? { traex_init_manual_path: opts.manualPath } : {}),
+      },
+    },
+    context: { open_message_id: 'om_card' },
+  };
+}
+
 function deferred<T>() {
   let resolve!: (v: T) => void;
   let reject!: (e: unknown) => void;
@@ -928,6 +959,126 @@ describe('repo select card — plain switch', () => {
     expect(killWorker).not.toHaveBeenCalled();
     expect(ds.workingDir).not.toBe('/etc');
     expect(ds.session.workingDir).toBe('/repos/gamma');
+  });
+});
+
+describe('TraeX 统一初始化卡', () => {
+  function makeTraexDs(): DaemonSession {
+    const ds = makeDs({
+      pendingRepo: true,
+      pendingPrompt: '[上下文]原始任务',
+      pendingTurnId: 'om_initial_turn',
+      pendingCodexAppText: '原始任务',
+      worker: null,
+    });
+    ds.pendingTraexInitialization = {
+      nonce: 'nonce-traex',
+      ownerOpenId: OWNER,
+      originalPrompt: '原始任务',
+      promptPrefix: '[上下文]',
+      selection: {
+        kind: 'directory',
+        path: '/repos/alpha',
+        label: 'alpha (master)',
+        pinWorkingDir: true,
+      },
+    };
+    return ds;
+  }
+
+  beforeEach(() => {
+    vi.mocked(getBot).mockImplementation(() => ({
+      config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'traex' },
+      resolvedAllowedUsers: [],
+      botName: 'traex-bot',
+      botOpenId: 'ou_bot',
+    }) as any);
+  });
+
+  it('Forge Pipeline 一次提交仓库、运行方式和编辑后的提示词', async () => {
+    const ds = makeTraexDs();
+    const { deps } = makeDeps(ds);
+
+    const result = await handleCardAction(
+      makeTraexInitEvent('traex_init_start', {
+        mode: 'forge-pipeline',
+        prompt: '  修复导出按钮  ',
+        repo: '/repos/beta',
+      }),
+      deps,
+      APP_ID,
+    );
+
+    expect(result?.toast?.type).toBe('success');
+    expect(buildNewTopicCliInput).toHaveBeenCalledWith(
+      '[上下文]$forge-pipeline\n修复导出按钮',
+      ds.session.sessionId,
+      'traex',
+      undefined,
+      undefined,
+      undefined,
+      [],
+      undefined,
+      expect.any(Object),
+      expect.any(String),
+      undefined,
+      expect.any(Object),
+    );
+    expect(forkWorker).toHaveBeenCalledWith(
+      ds,
+      { content: 'mock-prompt' },
+      { turnId: 'om_initial_turn' },
+    );
+    expect(ds.workingDir).toBe('/repos/beta');
+    expect(ds.pendingRepo).toBe(false);
+    expect(ds.pendingTraexInitialization).toBeUndefined();
+  });
+
+  it('非发起人不能操作，空提示词不启动，成功后重复提交不会再次 fork', async () => {
+    const ds = makeTraexDs();
+    const { deps } = makeDeps(ds);
+
+    const denied = await handleCardAction(
+      makeTraexInitEvent('traex_init_start', {
+        operator: 'ou_other',
+        mode: 'forge-pilot',
+        prompt: '任务',
+      }),
+      deps,
+      APP_ID,
+    );
+    expect(denied?.toast?.content).toContain('仅本次会话的发起人');
+    expect(forkWorker).not.toHaveBeenCalled();
+
+    const empty = await handleCardAction(
+      makeTraexInitEvent('traex_init_start', {
+        mode: 'forge-pilot',
+        prompt: '   ',
+      }),
+      deps,
+      APP_ID,
+    );
+    expect(empty?.toast?.content).toContain('不能为空');
+    expect(forkWorker).not.toHaveBeenCalled();
+
+    await handleCardAction(
+      makeTraexInitEvent('traex_init_start', {
+        mode: 'forge-pilot',
+        prompt: '实现任务',
+      }),
+      deps,
+      APP_ID,
+    );
+    const duplicate = await handleCardAction(
+      makeTraexInitEvent('traex_init_start', {
+        mode: 'forge-pilot',
+        prompt: '实现任务',
+      }),
+      deps,
+      APP_ID,
+    );
+    expect(duplicate?.toast?.content).toContain('已失效');
+    expect(forkWorker).toHaveBeenCalledTimes(1);
   });
 });
 

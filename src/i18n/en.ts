@@ -78,6 +78,33 @@ export const messages: Record<string, string> = {
   'card.repo.worktree_rolled_back': 'Worktree creation failed on {repo}: {error}. Rolled back {count} worktree(s) already created in this batch.',
   'card.repo.toast_worktree_creating': 'Creating worktree — will post in the thread when done…',
 
+  // ─── TraeX first-turn initialization card ───────────────────────────────
+  'card.traex_init.title': '🚀 Initialize TraeX Session',
+  'card.traex_init.intro': 'Confirm the working directory, run mode, and initial prompt before starting the agent.',
+  'card.traex_init.selected_dir': 'Selected:',
+  'card.traex_init.selection_worktree': 'New worktree: {name}',
+  'card.traex_init.selection_auto_worktree': '{path} (a worktree will be created automatically)',
+  'card.traex_init.repo_placeholder': 'Select an existing repo / worktree',
+  'card.traex_init.worktree_placeholder': 'Select a repo and create a worktree',
+  'card.traex_init.target_placeholder': 'Select a working directory or create a worktree from a repo',
+  'card.traex_init.manual_placeholder': 'Enter a working directory and press Enter',
+  'card.traex_init.prompt_label': 'Initial prompt',
+  'card.traex_init.prompt_placeholder': 'Describe the task, scope, and acceptance criteria',
+  'card.traex_init.start_traex': 'Plain TraeX',
+  'card.traex_init.start_pipeline': 'Forge Pipeline',
+  'card.traex_init.start_pilot': 'Forge Pilot',
+  'card.traex_init.cancel': 'Cancel initialization',
+  'card.traex_init.prompt_empty': 'The initial prompt cannot be empty',
+  'card.traex_init.prompt_too_long': 'The initial prompt is limited to 4000 characters',
+  'card.traex_init.owner_only': 'Only the session creator can operate this initialization card',
+  'card.traex_init.expired': 'This initialization card has expired. Send a new message to start again.',
+  'card.traex_init.in_progress': 'The session is already being initialized',
+  'card.traex_init.repo_not_found': 'The selected repository no longer exists. Choose again.',
+  'card.traex_init.repo_selected': 'Working directory selected: {path}',
+  'card.traex_init.worktree_selected': 'A new worktree will be created from {name}',
+  'card.traex_init.cancelled_title': 'Initialization cancelled',
+  'card.traex_init.cancelled_body': 'This TraeX session was not started. Send a new message to try again.',
+
   // Platform team hall check-in (bot-only group, visible to bots only)
   'platform.hall_announce': '🤖 Team check-in: this bot is online (registers its union_id, no reply needed)',
 
@@ -824,6 +851,7 @@ export const messages: Record<string, string> = {
   'daemon.cmd_needs_active_cli': '{cmd} needs an active CLI process; no running session in this topic.',
   'daemon.enriched_mentions_label': '@mentions in this message:',
   'daemon.choose_repo_first': 'Pick a repo from the card above first — your message is queued and will be sent once a repo is chosen.',
+  'daemon.complete_traex_init_first': 'Confirm the working directory, run mode, and prompt in the initialization card above first. Your new message is queued and will be included when the session starts.',
   'daemon.worktree_building_wait': 'Creating a worktree (includes a git fetch, may take a few seconds) — your message is queued and will be sent together once it is ready.',
 
   // ─── /dashboard command group (PR3 C1) ─────────────────────────────────

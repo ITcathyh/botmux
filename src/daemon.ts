@@ -108,6 +108,7 @@ import type { CliId } from './adapters/cli/types.js';
 import * as scheduler from './core/scheduler.js';
 import { scanProjects, scanMultipleProjects } from './services/project-scanner.js';
 import { buildQuotaExhaustedCard, buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
+import { buildTraexInitializationCard } from './im/lark/traex-initialization-card.js';
 import { isLocalCliOpenReady } from './services/local-cli-opener.js';
 import { RECEIVED_REACTION_EMOJI_TYPE, SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE } from './core/pending-response.js';
 import { t as tr, botLocale, localeForBot } from './i18n/index.js';
@@ -4447,6 +4448,7 @@ function clearPendingRepoStateForNotifierAdopt(ds: DaemonSession): void {
   ds.pendingRepoCommitInFlight = false;
   ds.worktreeCreating = false;
   ds.repoCardMessageId = undefined;
+  ds.pendingTraexInitialization = undefined;
   ds.pendingPrompt = undefined;
   ds.pendingTurnId = undefined;
   ds.pendingRawInput = undefined;
@@ -16107,6 +16109,59 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     return;
   }
 
+  // TraeX 人工首轮先走统一初始化卡：仓库、运行方式和可编辑首轮提示词一次确认，
+  // 确认前绝不 fork worker。Bot/监听器/替身/显式 Forge 指令保留既有直达路径，
+  // 避免自动化入口等待一个永远不会发生的人工点击，也保留专家快捷用法。
+  const explicitForgePrompt = /^\s*[$/]forge-(?:pipeline|pilot)\b/i.test(content);
+  const shouldShowTraexInitialization =
+    botCfg.cliId === 'traex'
+    && !isBotSenderType
+    && !messageListener
+    && !substituteTrigger
+    && !workflowGrillPrompt
+    && !explicitForgePrompt;
+  if (shouldShowTraexInitialization) {
+    if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+    const scanDirs = getProjectScanDirs(ds).filter(dir => existsSync(dir));
+    const projects = scanDirs.length > 0
+      ? scanMultipleProjects(scanDirs, 3, repoPickerScanOptions())
+      : [];
+    if (projects.length > 0) lastRepoScan.set(chatId, projects);
+    const currentPath = pinnedWorkingDir ?? getSessionWorkingDir(ds);
+    const currentProject = projects.find(project => project.path === currentPath);
+    ds.pendingRepo = true;
+    ds.pendingTraexInitialization = {
+      nonce: randomUUID(),
+      ownerOpenId: senderOpenId,
+      originalPrompt: content,
+      promptPrefix: topicThreadContext + codexAppQuoteContext + codexAppApplicationContext,
+      selection: autoWt && pinnedWorkingDir
+        ? {
+            kind: 'auto-worktree',
+            path: pinnedWorkingDir,
+            label: currentProject?.name ?? pinnedWorkingDir,
+          }
+        : {
+            kind: 'directory',
+            path: currentPath,
+            label: currentProject
+              ? `${currentProject.name} (${currentProject.branch})`
+              : currentPath,
+            pinWorkingDir: !!pinnedWorkingDir,
+          },
+    };
+    const cardJson = buildTraexInitializationCard({
+      rootId: anchor,
+      pending: ds.pendingTraexInitialization,
+      projects,
+      locale: localeForBot(larkAppId),
+    });
+    ds.repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
+    announcePendingRepoSession(ds);
+    logger.info(`[${tag(ds)}] Waiting for TraeX initialization (projects=${projects.length}, cwd=${currentPath})`);
+    return;
+  }
+
   // Auto-worktree: session is registered PENDING; build the worktree off the
   // critical path, then commitRepoSelection pins it + forks (folding in any
   // messages buffered during creation). detach → return immediately.
@@ -17250,7 +17305,9 @@ async function handleThreadReply(
     // instead of the misleading "pick a repo from the card above".
     const pendingReplyKey = (ds.worktreeCreating || ds.pendingRepoCommitInFlight)
       ? 'daemon.worktree_building_wait'
-      : 'daemon.choose_repo_first';
+      : ds.pendingTraexInitialization
+        ? 'daemon.complete_traex_init_first'
+        : 'daemon.choose_repo_first';
     await sessionReply(anchor, tr(pendingReplyKey, undefined, localeForBot(larkAppId)), 'text', larkAppId);
     return;
   }
@@ -17395,6 +17452,54 @@ async function handleThreadReply(
           sender: autoCreateSender,
         });
       }
+      return;
+    }
+
+    const explicitForgePrompt = /^\s*[$/]forge-(?:pipeline|pilot)\b/i.test(parsed.content);
+    const shouldShowTraexInitialization =
+      botCfg.cliId === 'traex'
+      && !isForeignBot
+      && !substituteTrigger
+      && !explicitForgePrompt;
+    if (shouldShowTraexInitialization) {
+      if (await replyInvalidWorkingDirs(anchor, larkAppId, newDs)) return;
+      const scanDirs = getProjectScanDirs(newDs).filter(dir => existsSync(dir));
+      const projects = scanDirs.length > 0
+        ? scanMultipleProjects(scanDirs, 3, repoPickerScanOptions())
+        : [];
+      if (projects.length > 0) lastRepoScan.set(autoCreateChatId, projects);
+      const currentPath = pinnedWorkingDir ?? getSessionWorkingDir(newDs);
+      const currentProject = projects.find(project => project.path === currentPath);
+      newDs.pendingRepo = true;
+      newDs.pendingTraexInitialization = {
+        nonce: randomUUID(),
+        ownerOpenId,
+        originalPrompt: parsed.content,
+        promptPrefix: codexAppMessageContext + codexAppApplicationContext,
+        selection: autoWt && pinnedWorkingDir
+          ? {
+              kind: 'auto-worktree',
+              path: pinnedWorkingDir,
+              label: currentProject?.name ?? pinnedWorkingDir,
+            }
+          : {
+              kind: 'directory',
+              path: currentPath,
+              label: currentProject
+                ? `${currentProject.name} (${currentProject.branch})`
+                : currentPath,
+              pinWorkingDir: !!pinnedWorkingDir,
+            },
+      };
+      const cardJson = buildTraexInitializationCard({
+        rootId: anchor,
+        pending: newDs.pendingTraexInitialization,
+        projects,
+        locale: localeForBot(larkAppId),
+      });
+      newDs.repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
+      announcePendingRepoSession(newDs);
+      logger.info(`[${tag(newDs)}] Waiting for TraeX initialization after reply auto-create (projects=${projects.length}, cwd=${currentPath})`);
       return;
     }
 

@@ -81,6 +81,33 @@ export const messages: Record<string, string> = {
   'card.repo.worktree_rolled_back': '{repo} 创建 worktree 失败：{error}。已回滚本批次此前创建的 {count} 个 worktree。',
   'card.repo.toast_worktree_creating': '正在创建 worktree，完成后会在话题里通知…',
 
+  // ─── TraeX 首轮初始化卡 ─────────────────────────────────────────────────
+  'card.traex_init.title': '🚀 初始化 TraeX 会话',
+  'card.traex_init.intro': '在启动 Agent 前统一确认工作目录、运行方式和初始提示词。',
+  'card.traex_init.selected_dir': '当前选择：',
+  'card.traex_init.selection_worktree': '新建 worktree：{name}',
+  'card.traex_init.selection_auto_worktree': '{path}（将自动创建 worktree）',
+  'card.traex_init.repo_placeholder': '选择已有仓库 / worktree',
+  'card.traex_init.worktree_placeholder': '选择仓库，新建 worktree 后启动',
+  'card.traex_init.target_placeholder': '选择工作目录，或选择仓库新建 worktree',
+  'card.traex_init.manual_placeholder': '手动输入工作目录，回车确认',
+  'card.traex_init.prompt_label': '初始提示词',
+  'card.traex_init.prompt_placeholder': '描述要完成的任务、范围和验收标准',
+  'card.traex_init.start_traex': '普通 TraeX',
+  'card.traex_init.start_pipeline': 'Forge Pipeline',
+  'card.traex_init.start_pilot': 'Forge Pilot',
+  'card.traex_init.cancel': '取消初始化',
+  'card.traex_init.prompt_empty': '初始提示词不能为空',
+  'card.traex_init.prompt_too_long': '初始提示词最多 4000 个字符',
+  'card.traex_init.owner_only': '仅本次会话的发起人可操作初始化卡',
+  'card.traex_init.expired': '初始化卡已失效，请重新发送消息创建会话',
+  'card.traex_init.in_progress': '会话正在初始化，请勿重复提交',
+  'card.traex_init.repo_not_found': '所选仓库已不存在，请重新选择',
+  'card.traex_init.repo_selected': '已选择工作目录：{path}',
+  'card.traex_init.worktree_selected': '已选择从 {name} 新建 worktree',
+  'card.traex_init.cancelled_title': '初始化已取消',
+  'card.traex_init.cancelled_body': '这次 TraeX 会话没有启动。发送新消息即可重新开始。',
+
   // 平台团队大厅打卡（bot-only 群，仅 bot 可见）
   'platform.hall_announce': '🤖 团队登记打卡：本 bot 上线（登记身份 union_id 用，无需回复）',
 
@@ -827,6 +854,7 @@ export const messages: Record<string, string> = {
   'daemon.cmd_needs_active_cli': '{cmd} 需要活跃的 CLI 进程，当前话题无运行中的会话。',
   'daemon.enriched_mentions_label': '消息中的 @mention：',
   'daemon.choose_repo_first': '请先在上方卡片中选择仓库，您的消息已暂存，选择后会自动发送。',
+  'daemon.complete_traex_init_first': '请先在上方初始化卡中确认工作目录、运行方式和提示词。新消息已暂存，启动时会一并发送。',
   'daemon.worktree_building_wait': '正在创建 worktree（含 git fetch，可能需要几秒），您的消息已暂存，创建完成后会自动一并发送。',
 
   // ─── /dashboard command group (PR3 C1) ─────────────────────────────────

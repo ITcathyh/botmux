@@ -327,6 +327,33 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(ds?.session.nativeSessionTitle).toBe('[BotMux·Lark] /workflow new 修复首轮授权');
   });
 
+  it('TraeX human new topic returns one initialization card and does not fork before confirmation', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'traex',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+
+    await handleNewTopic(
+      makeEventData('om_traex_init', '实现统一初始化卡'),
+      makeCtx('om_traex_init', 'om_traex_init'),
+    );
+
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(repliedText()).toContain('初始化 TraeX 会话');
+    expect(repliedText()).toContain('Forge Pipeline');
+    const ds = activeSessions.get(sessionKey('om_traex_init', APP));
+    expect(ds?.pendingRepo).toBe(true);
+    expect(ds?.pendingTraexInitialization?.originalPrompt).toBe('实现统一初始化卡');
+    expect(ds?.pendingTraexInitialization?.selection).toMatchObject({
+      kind: 'directory',
+      path: '/tmp',
+    });
+  });
+
   it('uses the group name for mention-only sessions on both creation paths', async () => {
     const bot = registerBot({
       larkAppId: APP,
@@ -368,6 +395,27 @@ describe('/rename production routing — must not pre-create a session (review P
 
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
     expect(mocks.forkWorker.mock.calls[0]?.[2]).toEqual({ turnId: 'om_workflow_reply' });
+  });
+
+  it('TraeX thread safety-net also waits on the unified initialization card', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'traex',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+
+    await handleThreadReply(
+      makeEventData('om_traex_reply', '排查初始化问题', 'om_traex_root'),
+      makeCtx('om_traex_root', 'om_traex_reply'),
+    );
+
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(repliedText()).toContain('初始化 TraeX 会话');
+    const ds = activeSessions.get(sessionKey('om_traex_root', APP));
+    expect(ds?.pendingTraexInitialization?.originalPrompt).toBe('排查初始化问题');
   });
 
   it('live passthrough binds raw input and reply metadata to the accepted message', async () => {

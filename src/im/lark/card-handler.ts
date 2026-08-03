@@ -107,6 +107,16 @@ import {
   openLocalCliInIterm,
   preflightLocalCliOpen,
 } from '../../services/local-cli-opener.js';
+import {
+  buildTraexInitializationPrompt,
+  normalizeTraexInitialPrompt,
+  normalizeTraexInitializationMode,
+} from '../../core/traex-initialization.js';
+import {
+  buildTraexInitializationCancelledCard,
+  TRAEX_INIT_ACTION_CANCEL,
+  TRAEX_INIT_ACTION_START,
+} from './traex-initialization-card.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -547,6 +557,7 @@ export async function commitRepoSelection(
       // Durable, one-shot: the CLI is up but has never received a real user turn.
       // Set after the fork so a throwing fork leaves the session untouched.
       if (emptyStart) markInitialUserTurnPending(ds);
+      ds.pendingTraexInitialization = undefined;
       ds.pendingPrompt = undefined;
       ds.pendingCodexAppText = undefined;
       ds.pendingCodexAppApplicationContext = undefined;
@@ -1653,7 +1664,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     );
   }
 
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', TRAEX_INIT_ACTION_START, TRAEX_INIT_ACTION_CANCEL, 'retry_last_task', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`
@@ -1680,7 +1691,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // （影响该 bot 所有后续会话），属管理动作，必须走 canOperate，不能让 talk-only/
     // chat-granted 用户借「开自己的 pending 卡」绕过去改 bot 配置。
     const pendingRepoOwnerException =
-      (value.action === 'skip_repo' || value.action === 'repo_manual_submit' || value.action === 'repo_worktree_submit') && !!ds?.pendingRepo &&
+      (value.action === 'skip_repo'
+        || value.action === 'repo_manual_submit'
+        || value.action === 'repo_worktree_submit'
+        || value.action === TRAEX_INIT_ACTION_START
+        || value.action === TRAEX_INIT_ACTION_CANCEL) && !!ds?.pendingRepo &&
       !!operatorOpenId && operatorOpenId === ds.session.ownerOpenId;
     if (effectiveAppId) {
       if (!pendingRepoOwnerException && !canOperate(effectiveAppId, chatId, operatorOpenId)) {
@@ -1740,6 +1755,152 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         content: 'v2 workflow 已下线；旧卡片不再可操作，请迁移定义后使用 /workflow。',
       },
     };
+  }
+
+  if (value?.action && (
+    value.action === TRAEX_INIT_ACTION_START
+    || value.action === TRAEX_INIT_ACTION_CANCEL
+  )) {
+    const rootId = value.root_id;
+    const ds = rootId && larkAppId
+      ? getSessionByActionValue(activeSessions, rootId, larkAppId, value.session_id, value.action)
+      : undefined;
+    const loc = localeForBot(ds?.larkAppId ?? larkAppId);
+    const pending = ds?.pendingTraexInitialization;
+    if (!ds || !pending || pending.nonce !== value.nonce || !ds.pendingRepo) {
+      return { toast: { type: 'warning', content: t('card.traex_init.expired', undefined, loc) } };
+    }
+    if (!operatorOpenId || operatorOpenId !== pending.ownerOpenId || operatorOpenId !== ds.session.ownerOpenId) {
+      return { toast: { type: 'warning', content: t('card.traex_init.owner_only', undefined, loc) } };
+    }
+    if (cardMessageId && !isActiveRepoCard(ds, cardMessageId)) {
+      return { toast: { type: 'warning', content: t('card.traex_init.expired', undefined, loc) } };
+    }
+    if (pending.commitInFlight || ds.pendingRepoCommitInFlight || ds.worktreeCreating) {
+      return { toast: { type: 'info', content: t('card.traex_init.in_progress', undefined, loc) } };
+    }
+
+    if (value.action === TRAEX_INIT_ACTION_CANCEL) {
+      pending.commitInFlight = true;
+      ds.pendingTraexInitialization = undefined;
+      ds.pendingRepo = false;
+      markRepoCardConsumed(ds, cardMessageId ?? ds.repoCardMessageId);
+      ds.repoCardMessageId = undefined;
+      activeSessions.delete(sessionKey(rootId, ds.larkAppId));
+      sessionStore.closeSession(ds.session.sessionId);
+      publishClosedSessionPatch(
+        ds.session.sessionId,
+        ds.session.closedAt ? Date.parse(ds.session.closedAt) : undefined,
+      );
+      return JSON.parse(buildTraexInitializationCancelledCard(loc));
+    }
+
+    const mode = normalizeTraexInitializationMode(value.mode);
+    const normalizedPrompt = normalizeTraexInitialPrompt(action?.form_value?.initial_prompt);
+    if (!mode) {
+      return { toast: { type: 'error', content: t('card.traex_init.expired', undefined, loc) } };
+    }
+    if (!normalizedPrompt.ok) {
+      const key = normalizedPrompt.error === 'empty'
+        ? 'card.traex_init.prompt_empty'
+        : 'card.traex_init.prompt_too_long';
+      return { toast: { type: 'error', content: t(key, undefined, loc) } };
+    }
+
+    const formValue = action?.form_value ?? {};
+    const manualPath = typeof formValue.traex_init_manual_path === 'string'
+      ? formValue.traex_init_manual_path.trim()
+      : '';
+    const selectedTarget = typeof formValue.traex_init_target === 'string'
+      ? formValue.traex_init_target
+      : '';
+    const projects = lastRepoScan.get(ds.chatId) ?? [];
+    if (manualPath) {
+      const validation = validateWorkingDir(manualPath, loc);
+      if (!validation.ok) {
+        return { toast: { type: 'error', content: validation.error } };
+      }
+      pending.selection = {
+        kind: 'directory',
+        path: validation.resolvedPath,
+        label: validation.resolvedPath,
+        pinWorkingDir: true,
+      };
+    } else if (selectedTarget.startsWith('worktree:')) {
+      const selectedWorktreePath = selectedTarget.slice('worktree:'.length);
+      const project = projects.find(item => item.path === selectedWorktreePath && item.type === 'repo');
+      if (!project) {
+        return { toast: { type: 'error', content: t('card.traex_init.repo_not_found', undefined, loc) } };
+      }
+      pending.selection = { kind: 'worktree', repoPaths: [project.path], label: project.name };
+    } else if (selectedTarget.startsWith('dir:')) {
+      const selectedRepoPath = selectedTarget.slice('dir:'.length);
+      const project = projects.find(item => item.path === selectedRepoPath);
+      if (!project) {
+        return { toast: { type: 'error', content: t('card.traex_init.repo_not_found', undefined, loc) } };
+      }
+      pending.selection = {
+        kind: 'directory',
+        path: project.path,
+        label: `${project.name} (${project.branch})`,
+        pinWorkingDir: true,
+      };
+    }
+
+    ds.pendingPrompt = pending.promptPrefix + buildTraexInitializationPrompt(mode, normalizedPrompt.prompt);
+    ds.pendingCodexAppText = buildTraexInitializationPrompt(mode, normalizedPrompt.prompt);
+    pending.originalPrompt = normalizedPrompt.prompt;
+    ds.currentTurnTitle = normalizedPrompt.prompt.substring(0, 50);
+    const selection = pending.selection;
+
+    if (selection.kind === 'worktree') {
+      return await handleCardAction({
+        ...data,
+        action: {
+          option: selection.repoPaths[0],
+          value: {
+            key: 'repo_worktree',
+            root_id: rootId,
+            repo_worktree_paths_json: JSON.stringify(selection.repoPaths),
+            ...(selection.branch ? { branch: selection.branch } : {}),
+            ...(selection.parentPath ? { parent_path: selection.parentPath } : {}),
+          },
+        },
+      }, deps, larkAppId);
+    }
+
+    if (selection.kind === 'auto-worktree') {
+      void runAutoWorktreeCommit({
+        ds,
+        anchor: rootId,
+        larkAppId: ds.larkAppId,
+        baseDir: selection.path,
+        title: normalizedPrompt.prompt,
+        prompt: ds.pendingPrompt,
+        operatorOpenId,
+        activeSessions,
+        notify: message => sessionReply(rootId, message),
+      });
+      return { toast: { type: 'info', content: t('card.repo.toast_worktree_creating', undefined, loc) } };
+    }
+
+    pending.commitInFlight = true;
+    try {
+      await commitRepoSelection(
+        { ds, rootId, cardMessageId, larkAppId, operatorOpenId, activeSessions, sessionReply },
+        selection.path,
+        selection.label,
+        {
+          suppressConfirmReply: true,
+          pinWorkingDir: selection.pinWorkingDir,
+        },
+      );
+      return { toast: { type: 'success', content: t('card.status.starting', undefined, loc) } };
+    } catch (error) {
+      pending.commitInFlight = false;
+      logger.warn(`[${tag(ds)}] TraeX initialization failed before worker start: ${error instanceof Error ? error.message : String(error)}`);
+      return { toast: { type: 'error', content: t('card.status.failed', undefined, loc) } };
+    }
   }
 
   // Handle session card button actions (restart/close)
