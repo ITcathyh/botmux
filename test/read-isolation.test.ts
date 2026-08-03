@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import {
   evaluateReadIsolationGate,
@@ -9,6 +9,7 @@ import {
   buildCredentialIsolationRules,
   isolatedPaneReattachSafe,
   isolationPaneMarkerContent,
+  ISOLATION_PANE_MARKER_VERSION,
   botHomePath,
   buildCliExecutableReadCarveOuts,
   sendCredFilePath,
@@ -186,15 +187,56 @@ describe('isolatedPaneReattachSafe', () => {
     expect(isolatedPaneReattachSafe(JSON.stringify({ version: 1, bootId: 'old' }))).toBe(false);
     expect(isolatedPaneReattachSafe(JSON.stringify({ version: 2, bootId: 'old-mcp-policy' }))).toBe(false);
     expect(isolatedPaneReattachSafe(JSON.stringify({ version: 5, bootId: 'pre-device-policy' }))).toBe(false);
-    expect(isolatedPaneReattachSafe(JSON.stringify({ version: 7, bootId: 'missing-capabilities' }))).toBe(false);
     expect(isolatedPaneReattachSafe(JSON.stringify({
-      version: 7, bootId: 'unknown-capability', capabilities: ['credential', 'network'],
+      version: ISOLATION_PANE_MARKER_VERSION, bootId: 'missing-capabilities',
+    }))).toBe(false);
+    expect(isolatedPaneReattachSafe(JSON.stringify({
+      version: ISOLATION_PANE_MARKER_VERSION, bootId: 'unknown-capability', capabilities: ['credential', 'network'],
     }))).toBe(false);
     // No / blank marker → pane was NOT spawned isolated → unsafe (kill + cold-spawn).
     expect(isolatedPaneReattachSafe(null)).toBe(false);
     expect(isolatedPaneReattachSafe(undefined)).toBe(false);
     expect(isolatedPaneReattachSafe('')).toBe(false);
     expect(isolatedPaneReattachSafe('   ')).toBe(false);
+  });
+});
+
+// ─── cold-start migration: START-TIME env contract (bots.json EPERM fix) ──────
+
+/**
+ * Regression guard (2026-08-03). The bots.json-EPERM fix injects a NEW start-time
+ * env contract (BOTMUX_READ_ISOLATION / BOTMUX_API_ONLY) that only reaches a CLI
+ * at spawn. A warm reattach preserves the live process untouched, so a pane that
+ * was spawned by v3.8.0 — v7 marker, full capabilities, but a process carrying
+ * NEITHER env key — would be judged reattach-safe and keep crashing on the denied
+ * bots.json read after a plain `daemon:restart`. The marker version is the ONLY
+ * lever that turns such a pane from "warm reattach (keep old process)" into
+ * "kill + cold-spawn (inject the markers)". So bumping it past 7 is load-bearing,
+ * not cosmetic. If someone reverts the bump, this test goes red.
+ */
+describe('isolatedPaneReattachSafe — start-time contract bump forces cold respawn', () => {
+  // Exactly the shape codex reproduced: a v3.8.0 sandbox pane's marker.
+  const legacyV7Full = JSON.stringify({
+    version: 7,
+    bootId: 'old-v3.8-pane',
+    capabilities: ['credential', 'read', 'write'],
+  });
+
+  it('rejects a v7 pane even with FULL valid capabilities (its process lacks the new env markers)', () => {
+    expect(isolatedPaneReattachSafe(legacyV7Full, ['read', 'write'])).toBe(false);
+    expect(isolatedPaneReattachSafe(legacyV7Full, ['credential', 'read', 'write'])).toBe(false);
+  });
+
+  it('accepts a pane stamped with the current version (cold-spawned under the new contract)', () => {
+    const current = isolationPaneMarkerContent('fresh-boot', ['credential', 'read', 'write']);
+    expect(isolatedPaneReattachSafe(current, ['read', 'write'])).toBe(true);
+  });
+
+  it('has moved the version past 7 — the release that shipped without the env contract', () => {
+    // Pins the intent: v7 was the last version whose isolated processes could
+    // lack BOTMUX_READ_ISOLATION. Anything ≥ 8 is fine; reverting to ≤ 7 would
+    // silently warm-reattach those broken panes.
+    expect(ISOLATION_PANE_MARKER_VERSION).toBeGreaterThan(7);
   });
 });
 
@@ -274,5 +316,50 @@ describe('CLI protected capability wiring', () => {
     expect(vcSource).toContain(
       'const liveOrigin = resolveSessionContext(config.session.dataDir, receiverSessionId);',
     );
+  });
+});
+
+// ─── underReadIsolation ───────────────────────────────────────────────────
+
+/**
+ * Regression guard (2026-08-03 fleet P0, introduced by #668). Two earlier
+ * versions of this predicate were wrong and both are pinned here as negative
+ * cases, so a future "simplification" back to either one fails loudly.
+ */
+describe('underReadIsolation', () => {
+  const saved = { ...process.env };
+  afterEach(() => { process.env = { ...saved }; });
+
+  const load = async () => (await import('../src/adapters/cli/read-isolation.js')).underReadIsolation;
+
+  it('is true when the worker marked the child as sandboxed', async () => {
+    const underReadIsolation = await load();
+    process.env.BOTMUX_READ_ISOLATION = '1';
+    expect(underReadIsolation()).toBe(true);
+  });
+
+  it('is false on a plain host', async () => {
+    const underReadIsolation = await load();
+    delete process.env.BOTMUX_READ_ISOLATION;
+    expect(underReadIsolation()).toBe(false);
+  });
+
+  it('does NOT infer isolation from SESSION_DATA_DIR + BOTMUX_LARK_APP_ID', async () => {
+    // Rejected v1: the worker injects both of those for EVERY bot it spawns,
+    // sandboxed or not, so this shape is an ordinary CLI. Treating it as isolated
+    // would swallow a real unreadable-bots.json fault on a normal host.
+    const underReadIsolation = await load();
+    delete process.env.BOTMUX_READ_ISOLATION;
+    process.env.SESSION_DATA_DIR = '/h/.botmux/data';
+    process.env.BOTMUX_LARK_APP_ID = 'cli_plain';
+    expect(underReadIsolation()).toBe(false);
+  });
+
+  it('only accepts the exact marker value "1"', async () => {
+    const underReadIsolation = await load();
+    for (const v of ['0', 'true', 'yes', '']) {
+      process.env.BOTMUX_READ_ISOLATION = v;
+      expect(underReadIsolation()).toBe(false);
+    }
   });
 });
