@@ -117,7 +117,7 @@ function piSessionsDirForCwd(cwd: string): string {
   return join(PI_SESSIONS_ROOT, normalized);
 }
 
-export function piSessionIdFromPath(path: string): string | undefined {
+function piSessionIdFromPath(path: string): string | undefined {
   const m = /_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i.exec(path);
   return m ? m[1] : undefined;
 }
@@ -180,20 +180,6 @@ export function findPiTranscriptBySessionId(cliSessionId: string, cwd?: string):
 
 export function findPiTranscriptByPid(pid: number): { path: string; cliSessionId: string } | undefined {
   if (!Number.isInteger(pid) || pid <= 0) return undefined;
-  const hits: Array<{ path: string; cliSessionId: string }> = [];
-  // During `/new` (or `/resume`/fork) Pi can briefly hold descriptors for BOTH
-  // the retired and the new JSONL. Prefer the stream most recently modified so
-  // the rotation follower advances to the new session instead of latching the
-  // retired one by fd-enumeration order (mirrors findGrokSessionByPid).
-  const newestHit = () => {
-    let best: { hit: { path: string; cliSessionId: string }; mtimeMs: number } | undefined;
-    for (const hit of hits) {
-      let mtimeMs = 0;
-      try { mtimeMs = statSync(hit.path).mtimeMs; } catch { /* keep zero */ }
-      if (!best || mtimeMs > best.mtimeMs) best = { hit, mtimeMs };
-    }
-    return best?.hit;
-  };
   if (IS_LINUX) {
     const fdDir = `/proc/${pid}/fd`;
     if (existsSync(fdDir)) {
@@ -203,9 +189,9 @@ export function findPiTranscriptByPid(pid: number): { path: string; cliSessionId
         let target: string;
         try { target = readlinkSync(join(fdDir, fd)); } catch { continue; }
         const hit = matchPiTranscriptPath(target);
-        if (hit && !hits.some((seen) => seen.cliSessionId === hit.cliSessionId)) hits.push(hit);
+        if (hit) return hit;
       }
-      return newestHit();
+      return undefined;
     }
   }
   let out: string;
@@ -221,9 +207,9 @@ export function findPiTranscriptByPid(pid: number): { path: string; cliSessionId
     if (!line.startsWith('n/')) continue;
     const target = line.slice(1);
     const hit = matchPiTranscriptPath(target);
-    if (hit && !hits.some((seen) => seen.cliSessionId === hit.cliSessionId)) hits.push(hit);
+    if (hit) return hit;
   }
-  return newestHit();
+  return undefined;
 }
 
 export function drainPiTranscript(path: string, fromOffset: number): PiDrainResult {

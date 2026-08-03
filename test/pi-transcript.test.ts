@@ -12,15 +12,10 @@
  *     tools → user2 → single assistant_final).
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, writeFileSync, rmSync, openSync, closeSync, utimesSync } from 'node:fs';
+import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import {
-  drainPiTranscript,
-  findPiTranscriptByPid,
-  piSessionIdFromPath,
-  type PiBridgeEvent,
-} from '../src/services/pi-transcript.js';
+import { drainPiTranscript, type PiBridgeEvent } from '../src/services/pi-transcript.js';
 
 const ROOT = join(tmpdir(), `botmux-pi-transcript-test-${process.pid}`);
 const SESSION_ID = 'eef935b5-4201-4e59-8bc7-06f03aa3388c';
@@ -253,56 +248,6 @@ describe('drainPiTranscript: turn terminal contract', () => {
     const result = drainPiTranscript(path, 0);
     expect(result.events.map((e) => e.kind)).toEqual(['user', 'assistant_final']);
     expect(result.pendingTail.startsWith('{"type":"message"')).toBe(true);
-  });
-});
-
-describe('piSessionIdFromPath', () => {
-  it('extracts the session UUID from a Pi transcript filename', () => {
-    const p = `/x/.pi/agent/sessions/--proj--/2026-08-03T05-13-01-270Z_${SESSION_ID}.jsonl`;
-    expect(piSessionIdFromPath(p)).toBe(SESSION_ID);
-  });
-  it('returns undefined for a non-transcript path', () => {
-    expect(piSessionIdFromPath('/x/.pi/agent/sessions/foo.txt')).toBeUndefined();
-  });
-});
-
-// Session rotation (/new, /resume, fork): Pi mints a new UUID/JSONL in the same
-// process and reports no cliSessionId via writeInput, so the worker follows the
-// pid's currently-open transcript. When both the retired and new JSONL are
-// briefly open, the probe must prefer the NEWEST — otherwise the follower
-// latches the retired session and the bridge wedges after `/new`.
-describe.skipIf(process.platform !== 'linux')('findPiTranscriptByPid rotation follow', () => {
-  // Real open fds under /proc/self/fd; path must contain /.pi/agent/sessions/
-  // for matchPiTranscriptPath to recognise it.
-  const PID_ROOT = join(tmpdir(), `botmux-pi-pid-test-${process.pid}`, '.pi', 'agent', 'sessions', '--proj--');
-  beforeEach(() => { rmSync(join(tmpdir(), `botmux-pi-pid-test-${process.pid}`), { recursive: true, force: true }); mkdirSync(PID_ROOT, { recursive: true }); });
-  afterEach(() => { rmSync(join(tmpdir(), `botmux-pi-pid-test-${process.pid}`), { recursive: true, force: true }); });
-
-  function writeSession(sid: string, ts: string): string {
-    const path = join(PID_ROOT, `${ts}_${sid}.jsonl`);
-    writeFileSync(path, JSON.stringify({ type: 'session', id: sid }) + '\n');
-    return path;
-  }
-
-  it('prefers the newest open transcript when /new briefly retains both sessions', () => {
-    const oldSid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
-    const newSid = 'bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee';
-    const oldPath = writeSession(oldSid, '2026-08-03T05-00-00-000Z');
-    const newPath = writeSession(newSid, '2026-08-03T05-05-00-000Z');
-    const oldTime = new Date('2026-01-01T00:00:00Z');
-    const newTime = new Date('2026-01-01T00:00:05Z');
-    utimesSync(oldPath, oldTime, oldTime);
-    utimesSync(newPath, newTime, newTime);
-    const oldFd = openSync(oldPath, 'r');
-    const newFd = openSync(newPath, 'r');
-    try {
-      // The follower compares this against the currently-attached sid; picking
-      // newSid is what lets it detect the rotation and re-attach.
-      expect(findPiTranscriptByPid(process.pid)).toEqual({ path: newPath, cliSessionId: newSid });
-    } finally {
-      closeSync(newFd);
-      closeSync(oldFd);
-    }
   });
 });
 

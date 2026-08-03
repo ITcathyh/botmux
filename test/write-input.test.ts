@@ -585,12 +585,33 @@ describe('reliableTurnTerminal capability', () => {
     expect(createCodexAdapter('/bin/codex').reliableTurnTerminal).toBe(true);
     expect(createTraexAdapter('/bin/traex').reliableTurnTerminal).toBe(true);
     expect(createGrokAdapter('/bin/grok').reliableTurnTerminal).toBe(true);
-    // Pi's per-session JSONL transcript (drainPiTranscript) emits an
-    // assistant_final on every terminal stopReason (stop/length/error/aborted),
-    // giving a session-scoped end-of-turn boundary — the prerequisite for
-    // type-ahead attribution and durable meeting delivery.
-    expect(createPiAdapter('/bin/pi').reliableTurnTerminal).toBe(true);
     expect(createCocoAdapter('/bin/coco').reliableTurnTerminal).toBeUndefined();
+    // Pi supports type-ahead but NOT reliableTurnTerminal: it holds no session
+    // fd (append short open/close) and a custom-terminate turn has no on-disk
+    // boundary, so it cannot make the always-on-disk end-of-turn promise
+    // durable delivery requires. Type-ahead does not need it (see pi.ts).
+    expect(createPiAdapter('/bin/pi').reliableTurnTerminal).toBeUndefined();
+  });
+});
+
+// structuredRateLimitAuthoritative() (worker) suppresses the screen-scan `rate`
+// verdict only for CLIs that actually PUBLISH a structured `limited` state —
+// the Claude family via maybeEmitStructuredRateLimit (bridgeJsonlPath path),
+// marked by `claudeDataDir`. The codexBridgeQueue CLIs (codex/grok/traex/pi)
+// map an error terminal to a receipt but emit NO limited state, so their screen
+// `rate` scan must stay active or a real 429 loses the Dashboard signal. This
+// pins the capability split so a future adapter can't silently re-broaden it by
+// adding reliableTurnTerminal alone.
+describe('rate-limit authority is Claude-family only (claudeDataDir), not all reliableTurnTerminal', () => {
+  it('Claude family carries claudeDataDir (structured rate emit) ⇒ screen-rate suppressed', () => {
+    expect(createClaudeCodeAdapter('/bin/claude').claudeDataDir).toBeTruthy();
+    expect(createGeniusAdapter('/bin/genius').claudeDataDir).toBeTruthy();
+  });
+  it('codexBridgeQueue CLIs have NO claudeDataDir ⇒ keep screen-rate scanning', () => {
+    expect(createCodexAdapter('/bin/codex').claudeDataDir).toBeUndefined();
+    expect(createGrokAdapter('/bin/grok').claudeDataDir).toBeUndefined();
+    expect(createTraexAdapter('/bin/traex').claudeDataDir).toBeUndefined();
+    expect(createPiAdapter('/bin/pi').claudeDataDir).toBeUndefined();
   });
 });
 
