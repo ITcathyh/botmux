@@ -194,8 +194,13 @@ function goalEnvConfigArgs(env: NodeJS.ProcessEnv = process.env): string[] {
  *
  *  · .coco-rollouts-migrated  → gates the "recent SESSIONS" prompt (the wedge)
  *  · .coco-migrated           → gates the config-migration prompt (defence in depth)
- * Both are dirt-cheap read-only single-file binds; missing ones are dropped by
- * the worker's existence filter (keepExisting), so a host without them is fine.
+ * Both are dirt-cheap read-only single-file binds; a marker absent on this host is
+ * dropped by the worker's existence filter (keepExisting) so it can't cause a bind
+ * FAILURE — but note that is not the same as "goal-mode is fine": if the migration
+ * SOURCE (~/.cache/coco) exists while the marker is genuinely missing, the prompt
+ * legitimately fires. In practice the markers are written host-side once migration
+ * has run (the normal fleet state); this bind just makes that host truth visible
+ * through the sandbox instead of hidden behind the ~/.trae/cli-only carve-out.
  */
 export const TRAE_MIGRATION_DONE_MARKERS = [
   '~/.trae/.coco-rollouts-migrated',

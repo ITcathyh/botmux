@@ -201,7 +201,6 @@ describe('isolatedPaneReattachSafe', () => {
   });
 });
 
-<<<<<<< HEAD
 // ─── cold-start migration: START-TIME env contract (bots.json EPERM fix) ──────
 
 /**
@@ -318,6 +317,16 @@ describe('worker capability carve-out ordering', () => {
     expect(source).not.toContain(
       'cfg.skillReadonlyRoots = [...(cfg.skillReadonlyRoots ?? []), ...prepared.readonlyRoots]',
     );
+  });
+
+  it('wires adapter sandboxReadonlyPaths() into the readonlyRoots channel (traex/coco migration markers)', () => {
+    // Guards a call-site blind spot: the adapter test only checks the method's
+    // RETURN value and the fs-policy test hand-feeds readonlyRoots, so if this
+    // spread were deleted the markers would silently stop reaching the sandbox
+    // and BOTH of those tests would stay green (goal-mode traex would wedge again
+    // on the migration prompt). Assert the worker actually threads the method
+    // output into readonlyRoots.
+    expect(source).toContain('...[...(cliAdapter.sandboxReadonlyPaths?.() ?? [])].map(expandTildeLexical),');
   });
 
   it('enforces the mandatory credential gate before adopt and wraps wrapperCli from the outside', () => {
