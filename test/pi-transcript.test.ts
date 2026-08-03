@@ -12,10 +12,15 @@
  *     tools → user2 → single assistant_final).
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdirSync, writeFileSync, rmSync, openSync, closeSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { drainPiTranscript, type PiBridgeEvent } from '../src/services/pi-transcript.js';
+import {
+  drainPiTranscript,
+  findPiTranscriptByPid,
+  piSessionIdFromPath,
+  type PiBridgeEvent,
+} from '../src/services/pi-transcript.js';
 
 const ROOT = join(tmpdir(), `botmux-pi-transcript-test-${process.pid}`);
 const SESSION_ID = 'eef935b5-4201-4e59-8bc7-06f03aa3388c';
@@ -106,7 +111,7 @@ describe('drainPiTranscript: turn terminal contract', () => {
     expect(events.filter((e) => e.kind === 'user')).toHaveLength(1);
   });
 
-  it('emits assistant_final on stopReason:aborted with EMPTY text → failed/pi_turn_aborted (releases the queue head)', () => {
+  it('emits assistant_final on stopReason:aborted with EMPTY text → ambiguous/pi_turn_aborted (releases the queue head)', () => {
     // Real captured shape: user → toolUse → toolResult("Command aborted") →
     // assistant(stopReason:aborted, content:[], errorMessage:"Operation aborted").
     const path = writeTranscript([
@@ -119,7 +124,8 @@ describe('drainPiTranscript: turn terminal contract', () => {
     const finals = drainAll(path).filter((e) => e.kind === 'assistant_final');
     expect(finals).toHaveLength(1);
     expect(finals[0].text).toBe('');
-    expect(finals[0].terminalStatus).toBe('failed');
+    // ambiguous (not failed): Esc may land after a tool side effect ran.
+    expect(finals[0].terminalStatus).toBe('ambiguous');
     expect(finals[0].terminalErrorCode).toBe('pi_turn_aborted');
   });
 
@@ -148,25 +154,42 @@ describe('drainPiTranscript: turn terminal contract', () => {
     expect(finals[0].terminalStatus).toBeUndefined();
   });
 
-  it('does NOT close the turn on a length/stop message that still carries tool calls (Pi loops on it)', () => {
-    // A `length` whose message has tool calls: Pi fails the truncated calls and
-    // KEEPS looping (failToolCallsFromTruncatedMessage → terminate:false). A
-    // `stop` with tool calls is likewise a normal tool step. Neither is a
-    // boundary; only the later tool-call-free terminal record closes the turn.
+  it('does NOT close the turn on a LENGTH message that still carries tool calls (Pi fails truncated calls and loops)', () => {
+    // A `length` whose message has tool calls: Pi runs
+    // failToolCallsFromTruncatedMessage → terminate:false and KEEPS looping.
+    // Not a boundary; only the later terminal record closes the turn.
     const path = writeTranscript([
       sessionHeader(),
       userMsg('do a big multi-step task'),
       assistantTerminalWithTool('length', '2026-08-03T05:13:50.000Z'),
       toolResult('tool failed: truncated args'),
-      assistantTerminalWithTool('stop', '2026-08-03T05:13:55.000Z'),
+      assistantToolUse('2026-08-03T05:13:55.000Z'),
       toolResult('ok'),
       assistantFinal('stop', 'All done'),
     ]);
     const finals = drainAll(path).filter((e) => e.kind === 'assistant_final');
-    // Exactly ONE final — the tool-call-free `stop` at the end. The two
-    // tool-carrying terminal-looking records are mid-turn and skipped.
+    // Exactly ONE final — the tool-call-free `stop` at the end. The mid-turn
+    // `length`+toolCall record is skipped.
     expect(finals).toHaveLength(1);
     expect(finals[0].text).toBe('All done');
+    expect(finals[0].terminalStatus).toBeUndefined();
+  });
+
+  it('DOES close the turn on a STOP message that carries a tool call (custom-tool terminate:true end)', () => {
+    // A custom tool returning terminate:true ends the agent right after the
+    // toolResult; the last assistant record can be `stop`+toolCall. This IS a
+    // genuine turn end (a normal tool step would be `toolUse`, not `stop`), so
+    // it must NOT be skipped or the queue head wedges forever.
+    const path = writeTranscript([
+      sessionHeader(),
+      userMsg('run the finishing tool'),
+      assistantTerminalWithTool('stop', '2026-08-03T05:13:50.000Z'),
+      toolResult('done — terminating'),
+    ]);
+    const finals = drainAll(path).filter((e) => e.kind === 'assistant_final');
+    expect(finals).toHaveLength(1);
+    // Text comes from the stop message's text block; completed default.
+    expect(finals[0].text).toBe('partial');
     expect(finals[0].terminalStatus).toBeUndefined();
   });
 
@@ -232,3 +255,54 @@ describe('drainPiTranscript: turn terminal contract', () => {
     expect(result.pendingTail.startsWith('{"type":"message"')).toBe(true);
   });
 });
+
+describe('piSessionIdFromPath', () => {
+  it('extracts the session UUID from a Pi transcript filename', () => {
+    const p = `/x/.pi/agent/sessions/--proj--/2026-08-03T05-13-01-270Z_${SESSION_ID}.jsonl`;
+    expect(piSessionIdFromPath(p)).toBe(SESSION_ID);
+  });
+  it('returns undefined for a non-transcript path', () => {
+    expect(piSessionIdFromPath('/x/.pi/agent/sessions/foo.txt')).toBeUndefined();
+  });
+});
+
+// Session rotation (/new, /resume, fork): Pi mints a new UUID/JSONL in the same
+// process and reports no cliSessionId via writeInput, so the worker follows the
+// pid's currently-open transcript. When both the retired and new JSONL are
+// briefly open, the probe must prefer the NEWEST — otherwise the follower
+// latches the retired session and the bridge wedges after `/new`.
+describe.skipIf(process.platform !== 'linux')('findPiTranscriptByPid rotation follow', () => {
+  // Real open fds under /proc/self/fd; path must contain /.pi/agent/sessions/
+  // for matchPiTranscriptPath to recognise it.
+  const PID_ROOT = join(tmpdir(), `botmux-pi-pid-test-${process.pid}`, '.pi', 'agent', 'sessions', '--proj--');
+  beforeEach(() => { rmSync(join(tmpdir(), `botmux-pi-pid-test-${process.pid}`), { recursive: true, force: true }); mkdirSync(PID_ROOT, { recursive: true }); });
+  afterEach(() => { rmSync(join(tmpdir(), `botmux-pi-pid-test-${process.pid}`), { recursive: true, force: true }); });
+
+  function writeSession(sid: string, ts: string): string {
+    const path = join(PID_ROOT, `${ts}_${sid}.jsonl`);
+    writeFileSync(path, JSON.stringify({ type: 'session', id: sid }) + '\n');
+    return path;
+  }
+
+  it('prefers the newest open transcript when /new briefly retains both sessions', () => {
+    const oldSid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const newSid = 'bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const oldPath = writeSession(oldSid, '2026-08-03T05-00-00-000Z');
+    const newPath = writeSession(newSid, '2026-08-03T05-05-00-000Z');
+    const oldTime = new Date('2026-01-01T00:00:00Z');
+    const newTime = new Date('2026-01-01T00:00:05Z');
+    utimesSync(oldPath, oldTime, oldTime);
+    utimesSync(newPath, newTime, newTime);
+    const oldFd = openSync(oldPath, 'r');
+    const newFd = openSync(newPath, 'r');
+    try {
+      // The follower compares this against the currently-attached sid; picking
+      // newSid is what lets it detect the rotation and re-attach.
+      expect(findPiTranscriptByPid(process.pid)).toEqual({ path: newPath, cliSessionId: newSid });
+    } finally {
+      closeSync(newFd);
+      closeSync(oldFd);
+    }
+  });
+});
+

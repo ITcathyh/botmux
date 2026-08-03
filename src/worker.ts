@@ -136,7 +136,7 @@ import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from 
 import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath } from './services/hermes-transcript.js';
 import { filterHermesEventsForBotmuxSession } from './services/hermes-session-filter.js';
 import { currentMtrSessionOffset, drainMtrSession, findLatestMtrSessionByDirectory, findMtrSessionById, type MtrTranscriptSource } from './services/mtr-transcript.js';
-import { drainPiTranscript } from './services/pi-transcript.js';
+import { drainPiTranscript, findPiTranscriptByPid, piSessionIdFromPath } from './services/pi-transcript.js';
 import {
   drainGrokUpdates,
   findGrokSessionByPid,
@@ -2039,22 +2039,30 @@ let lastStructuredBridgeActivityAtMs = 0;
 type RuntimeScreenStatus = Exclude<ScreenStatus, 'limited'>;
 
 /**
- * True when this CLI has an authoritative STRUCTURED rate-limit signal in its
- * transcript (Claude family — `error:"rate_limit"`, surfaced by
- * maybeEmitStructuredRateLimit). For those CLIs the screen-text `rate`
- * heuristic is not just redundant but harmful: the model's own output or a dev
- * editing rate-limit code/tests puts phrases like "429 Too Many Requests" /
- * "exceeded retry limit" on screen, which the scraper cannot distinguish from a
- * real limit. So we suppress the screen-scan `rate` verdict and let the
- * structured path be the sole authority. `usage` (quota "hit your limit …")
- * has no structured equivalent yet, so it still comes from the screen.
+ * True when this CLI has an authoritative STRUCTURED rate-limit signal that is
+ * actually PUBLISHED as a `limited` screen_update — i.e. the Claude family,
+ * whose `bridgeIngest → maybeEmitStructuredRateLimit()` reads the transcript's
+ * `error:"rate_limit"` record. For those CLIs the screen-text `rate` heuristic
+ * is not just redundant but harmful: the model's own output or a dev editing
+ * rate-limit code/tests puts phrases like "429 Too Many Requests" / "exceeded
+ * retry limit" on screen, which the scraper cannot distinguish from a real
+ * limit. So we suppress the screen-scan `rate` verdict and let the structured
+ * path be the sole authority. `usage` (quota "hit your limit …") has no
+ * structured equivalent yet, so it still comes from the screen.
  *
- * reliableTurnTerminal is exactly the "transcript-backed" capability flag
- * (claude-code / seed set it); non-transcript CLIs (Codex, gemini, …) keep the
- * screen scanner as their only rate-limit signal.
+ * Gate on `claudeDataDir` (the Claude-family marker: claude-code / seed /
+ * genius), NOT on `reliableTurnTerminal`. Both are "transcript-backed", but the
+ * structured rate-limit EMIT only exists on the Claude bridge (`bridgeJsonlPath`
+ * path). The codexBridgeQueue CLIs (codex / grok / traex / pi) map an `error`
+ * terminal to a failed/ambiguous receipt but publish NO `limited` state — so
+ * suppressing their screen `rate` verdict would silently drop the Dashboard
+ * 「需要你」signal + backoff on a real 429. Pi joining reliableTurnTerminal made
+ * that latent over-suppression concrete; scoping to claudeDataDir fixes it for
+ * every codexBridgeQueue CLI at once. (A future structured rate-limit emit for
+ * those CLIs can widen this predicate.)
  */
 function structuredRateLimitAuthoritative(): boolean {
-  return cliAdapter?.reliableTurnTerminal === true;
+  return !!cliAdapter?.claudeDataDir;
 }
 
 // Per-turn usage-limit state machine. Owns the turn counter plus the
@@ -3613,6 +3621,10 @@ function codexBridgeStartTimer(): void {
       // fd is process-scoped, so following that fd cannot select a sibling
       // TRAE process merely because it shares the working directory.
       maybeFollowTraexSessionRotationViaPid();
+      // Pi rotates its JSONL on `/new` / `/resume` / fork at the same pid and
+      // reports no cliSessionId through writeInput (Lark-driven OR local), so
+      // follow the pid's currently-open transcript on every tick as well.
+      maybeFollowPiSessionRotationViaPid();
       if (!codexBridgeRolloutPath) {
         // Late-attach: cliSessionId (writeInput / daemon probe) then adopt
         // pid. Path lookup is centralized in resolveFileBridgePath so
@@ -3918,6 +3930,41 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
         codexBridgeStartTimer();
       }
     }
+    // Pi keeps one process alive across `/new` (a botmux passthrough that calls
+    // Pi's runtimeHost.newSession()), `/resume` and fork, minting a NEW
+    // UUID/JSONL under the same pid. Pi's writeInput returns no cliSessionId, so
+    // the only follow signal is the pid's currently-open transcript (see
+    // maybeFollowPiSessionRotationViaPid); without a re-attach the bridge stays
+    // wedged on the retired JSONL and every later user/final goes dark — HOL
+    // queue + durable terminal both stuck. Mirror Grok's drain-before-detach.
+    if (structuredBridgeIsPi()) {
+      const currentSid = piSessionIdFromPath(codexBridgeRolloutPath);
+      if (currentSid && currentSid.toLowerCase() === cliSessionId.toLowerCase()) return;
+      const next = resolveFileBridgePath('pi', {
+        sessionId: cliSessionId,
+        cwd: lastInitConfig?.workingDir,
+      });
+      // Close any terminal already committed to the retired JSONL before
+      // switching, so a rotation cannot overtake an unfinished durable delivery.
+      try {
+        codexBridgeIngest();
+        emitReadyCodexTurns();
+      } catch (err: any) {
+        log(`Pi pre-rotation bridge drain failed: ${err.message}`);
+      }
+      if (next && next !== codexBridgeRolloutPath) {
+        log(`Pi session rotated ${currentSid ?? '?'} → ${cliSessionId}; re-attaching bridge to ${next}`);
+        codexBridgeDetachFile();
+        codexBridgePendingSessionId = undefined;
+        codexBridgeAttach(next, 'fresh-empty');
+      } else if (!next) {
+        log(`Pi session rotated ${currentSid ?? '?'} → ${cliSessionId}; waiting for JSONL`);
+        codexBridgeDetachFile();
+        codexBridgePendingSessionId = cliSessionId;
+        codexBridgeStartTimer();
+      }
+      return;
+    }
     return;
   }
   if (structuredBridgeIsMtr()) {
@@ -3990,6 +4037,29 @@ function maybeFollowTraexSessionRotationViaPid(): void {
   const observed = findTraexRolloutByPid(pid);
   if (!observed) return;
   const currentSid = codexSessionIdFromRolloutPath(codexBridgeRolloutPath);
+  if (currentSid?.toLowerCase() === observed.cliSessionId.toLowerCase()) return;
+  persistCliSessionId(observed.cliSessionId);
+  codexBridgeNotifyCliSessionId(observed.cliSessionId);
+}
+
+/** Follow a Pi in-process session rotation. Pi's `/new` / `/resume` / fork mint
+ * a new UUID/JSONL under the same pid and Pi's writeInput reports no
+ * cliSessionId, so — exactly like Grok/TraeX for local/adopt input — the only
+ * follow signal is the pid's currently-open `.pi/.../<ts>_<uuid>.jsonl`.
+ * `codexBridgeNotifyCliSessionId` does the drain-before-detach + reattach and
+ * persists the new id. Throttled to the same interval as Grok's probe. */
+function maybeFollowPiSessionRotationViaPid(): void {
+  if (!structuredBridgeIsPi() || !codexBridgeRolloutPath || !backend) return;
+  const now = Date.now();
+  if (now - grokBridgePidProbeLastMs < GROK_BRIDGE_PID_PROBE_INTERVAL_MS) return;
+  grokBridgePidProbeLastMs = now;
+  const pid = (backend as { cliPid?: number }).cliPid
+    ?? backend.getChildPid?.()
+    ?? codexAdoptPendingPid;
+  if (!pid) return;
+  const observed = findPiTranscriptByPid(pid);
+  if (!observed) return;
+  const currentSid = piSessionIdFromPath(codexBridgeRolloutPath);
   if (currentSid?.toLowerCase() === observed.cliSessionId.toLowerCase()) return;
   persistCliSessionId(observed.cliSessionId);
   codexBridgeNotifyCliSessionId(observed.cliSessionId);

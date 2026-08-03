@@ -10,14 +10,14 @@
  *
  * ## Turn boundary (verified on pi 0.80.6; `@earendil-works/pi-ai` StopReason
  * union = `"stop" | "length" | "toolUse" | "error" | "aborted"`):
- *   - `toolUse`  — mid-turn (the model is calling a tool); never a boundary. A
- *                  turn is a run of `assistant(toolUse) → toolResult` pairs
- *                  closed by one assistant record with a TERMINAL stopReason (or,
- *                  rarely, a `stop`/`length` that still carries tool calls — also
- *                  mid-turn, see below).
- *   - `stop`     — normal completion → `completed`. Terminal only when the
- *                  message has NO tool calls (a `stop` that still carries tool
- *                  calls is a normal tool step; Pi loops again).
+ *   - `toolUse`  — mid-turn (the model is calling a tool); never a boundary. In
+ *                  real transcripts toolCall content always pairs with
+ *                  stopReason:"toolUse" (255/255), so a normal tool step is
+ *                  `toolUse`, not `stop`.
+ *   - `stop`     — normal completion → `completed`. ALWAYS terminal (even with a
+ *                  toolCall: a `stop`+toolCall is the last assistant record of a
+ *                  custom-tool `terminate:true` turn, which the agent-loop ends
+ *                  after the toolResult without writing another assistant).
  *   - `length`   — output hit the model's max-output cap. Terminal only when the
  *                  message has NO tool calls (a truncated but real answer →
  *                  `completed`); a `length` WITH tool calls is mid-turn — Pi
@@ -25,10 +25,12 @@
  *   - `error`    — API/provider error (e.g. "Cancelled by backend") → `failed`
  *                  (`pi_turn_error`). Hard terminal (turn_end→return) regardless
  *                  of content, so it always emits.
- *   - `aborted`  — user interrupt (Esc) → `failed` (`pi_turn_aborted`). Hard
- *                  terminal too. Verified: Pi persists an `assistant` record
- *                  with `stopReason:"aborted"` + `errorMessage:"Operation aborted"`
- *                  and empty content.
+ *   - `aborted`  — user interrupt (Esc) → `ambiguous` (`pi_turn_aborted`). Hard
+ *                  terminal. `ambiguous` (not `failed`) because Esc may land
+ *                  after a tool side effect already ran — same audit semantic as
+ *                  Codex/TraeX `turn_aborted`. Verified: Pi persists an
+ *                  `assistant` record with `stopReason:"aborted"` +
+ *                  `errorMessage:"Operation aborted"` and empty content.
  *
  * The terminal event is emitted even when its visible text is EMPTY: durable
  * delivery completion is keyed to Pi's authoritative stopReason, never to
@@ -77,11 +79,18 @@ export interface PiBridgeEvent {
 type PiTerminalStopReason = 'stop' | 'length' | 'error' | 'aborted';
 
 /** Map Pi's terminal stopReason to the durable terminal contract.
- *  `stop`/`length` are real answers → completed (undefined status keeps the
- *  historical default + empty-final fallback). `error`/`aborted` release the
- *  durable delivery as a retryable failure (grok parity: an explicit
- *  error/cancel is `failed`, reconciled as failed_retryable), never wedging the
- *  queue head as "running" forever. */
+ *  - `stop`/`length` → real answers → completed (undefined status keeps the
+ *    historical default + lets the empty-final fallback fire).
+ *  - `error` → `failed` (`pi_turn_error`): an explicit provider error is a
+ *    retryable failure (reconciled as failed_retryable).
+ *  - `aborted` → `ambiguous` (`pi_turn_aborted`): a user Esc can land AFTER a
+ *    tool's side effect already completed, so we don't know whether the turn's
+ *    external effect happened. `ambiguous` preserves that audit semantic (same
+ *    as Codex/TraeX `turn_aborted`) and still lets a late `completed` from the
+ *    same generation settle the durable delivery, instead of `failed` asserting
+ *    "did not happen". Either way it is `!== 'completed'`, so the pending turn
+ *    is dropped and the type-ahead / durable queue head is released, never
+ *    wedged as "running". */
 function piTerminalOutcome(stopReason: PiTerminalStopReason): Pick<
   PiBridgeEvent,
   'terminalStatus' | 'terminalErrorCode'
@@ -93,7 +102,7 @@ function piTerminalOutcome(stopReason: PiTerminalStopReason): Pick<
     case 'error':
       return { terminalStatus: 'failed', terminalErrorCode: 'pi_turn_error' };
     case 'aborted':
-      return { terminalStatus: 'failed', terminalErrorCode: 'pi_turn_aborted' };
+      return { terminalStatus: 'ambiguous', terminalErrorCode: 'pi_turn_aborted' };
   }
 }
 
@@ -108,7 +117,7 @@ function piSessionsDirForCwd(cwd: string): string {
   return join(PI_SESSIONS_ROOT, normalized);
 }
 
-function piSessionIdFromPath(path: string): string | undefined {
+export function piSessionIdFromPath(path: string): string | undefined {
   const m = /_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i.exec(path);
   return m ? m[1] : undefined;
 }
@@ -171,6 +180,20 @@ export function findPiTranscriptBySessionId(cliSessionId: string, cwd?: string):
 
 export function findPiTranscriptByPid(pid: number): { path: string; cliSessionId: string } | undefined {
   if (!Number.isInteger(pid) || pid <= 0) return undefined;
+  const hits: Array<{ path: string; cliSessionId: string }> = [];
+  // During `/new` (or `/resume`/fork) Pi can briefly hold descriptors for BOTH
+  // the retired and the new JSONL. Prefer the stream most recently modified so
+  // the rotation follower advances to the new session instead of latching the
+  // retired one by fd-enumeration order (mirrors findGrokSessionByPid).
+  const newestHit = () => {
+    let best: { hit: { path: string; cliSessionId: string }; mtimeMs: number } | undefined;
+    for (const hit of hits) {
+      let mtimeMs = 0;
+      try { mtimeMs = statSync(hit.path).mtimeMs; } catch { /* keep zero */ }
+      if (!best || mtimeMs > best.mtimeMs) best = { hit, mtimeMs };
+    }
+    return best?.hit;
+  };
   if (IS_LINUX) {
     const fdDir = `/proc/${pid}/fd`;
     if (existsSync(fdDir)) {
@@ -180,9 +203,9 @@ export function findPiTranscriptByPid(pid: number): { path: string; cliSessionId
         let target: string;
         try { target = readlinkSync(join(fdDir, fd)); } catch { continue; }
         const hit = matchPiTranscriptPath(target);
-        if (hit) return hit;
+        if (hit && !hits.some((seen) => seen.cliSessionId === hit.cliSessionId)) hits.push(hit);
       }
-      return undefined;
+      return newestHit();
     }
   }
   let out: string;
@@ -198,9 +221,9 @@ export function findPiTranscriptByPid(pid: number): { path: string; cliSessionId
     if (!line.startsWith('n/')) continue;
     const target = line.slice(1);
     const hit = matchPiTranscriptPath(target);
-    if (hit) return hit;
+    if (hit && !hits.some((seen) => seen.cliSessionId === hit.cliSessionId)) hits.push(hit);
   }
-  return undefined;
+  return newestHit();
 }
 
 export function drainPiTranscript(path: string, fromOffset: number): PiDrainResult {
@@ -265,16 +288,30 @@ export function drainPiTranscript(path: string, fromOffset: number): PiDrainResu
           : undefined;
 
     // `toolUse` (and any missing/unknown reason) is mid-turn — the model is
-    // still working; wait for the terminal record. `error` / `aborted` are hard
-    // terminals (Pi's agent loop turn_end→agent_end→return regardless of
-    // content) and MUST emit even empty, or type-ahead's collecting head never
-    // closes. `stop` / `length` end the turn ONLY when the message has no tool
-    // calls: Pi keeps looping on a tool-carrying message (a truncated `length`
-    // fails its calls and continues; a `stop` with calls is a normal tool step),
-    // so emitting there would falsely close the turn mid-flight.
+    // still working; wait for the terminal record.
+    //   - `error`/`aborted` are HARD terminals: Pi's agent loop does
+    //     turn_end→agent_end→return regardless of content, so they MUST emit
+    //     even empty, or the collecting head never closes.
+    //   - `stop` is ALWAYS terminal. A normal tool step is `toolUse`, never
+    //     `stop` (verified: in real transcripts toolCall content ⟹
+    //     stopReason:"toolUse", 255/255). So a `stop` that DOES carry a toolCall
+    //     is the last assistant record of a custom-tool `terminate:true` turn
+    //     (agent-loop ends after the toolResult, writing no further assistant) —
+    //     a genuine end we must NOT skip.
+    //   - `length` is terminal ONLY without tool calls. A `length` WITH tool
+    //     calls is mid-turn: Pi runs `failToolCallsFromTruncatedMessage`
+    //     (terminate:false) and keeps looping, so emitting would falsely close
+    //     the turn.
+    // NOTE (reliableTurnTerminal limitation): a custom tool returning
+    // terminate:true ends the agent after a `toolUse`+toolResult with NO
+    // trailing assistant record, and `terminate` is not persisted to the
+    // toolResult — so that specific shape has no on-disk boundary. botmux ships
+    // no such tool; if a user adds one, quiescence idle still marks the session
+    // ready (only this turn's fallback reply / durable receipt would wait for
+    // the next turn's user event to HOL-drop it).
     const isHardTerminal = stopReason === 'error' || stopReason === 'aborted';
-    const isTextTerminal = (stopReason === 'stop' || stopReason === 'length')
-      && !hasToolCall(obj.message.content);
+    const isTextTerminal = stopReason === 'stop'
+      || (stopReason === 'length' && !hasToolCall(obj.message.content));
     if (!isHardTerminal && !isTextTerminal) continue;
 
     events.push({
