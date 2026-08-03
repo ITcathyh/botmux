@@ -163,6 +163,11 @@ function nativeResumeId(ds: DaemonSession): string | undefined {
   return ds.adoptedFrom?.sessionId ?? ds.session.adoptedFrom?.sessionId ?? ds.session.cliSessionId;
 }
 
+function configuredRuntimeExecutable(ds: DaemonSession): string | undefined {
+  const runtime = ds.session.cliRuntime;
+  return runtime?.source === 'configured' ? runtime.executable : undefined;
+}
+
 function adoptedMetadata(ds: DaemonSession): AdoptedMetadata | undefined {
   return ds.adoptedFrom ?? ds.session.adoptedFrom;
 }
@@ -174,6 +179,19 @@ function quoteKnownResumeCommand(cliId: LocalCliId, raw: string): string | null 
   const sid = raw.slice(prefix.length).trim();
   if (!sid) return null;
   return `${RESUME_COMMAND_PREFIXES[cliId]} ${shellQuote(sid)}`;
+}
+
+function replaceConfiguredResumeExecutable(
+  cliId: LocalCliId,
+  command: string,
+  executable: string | undefined,
+): string {
+  // Structured runtimes currently exist only for the Codex adapter. Keep
+  // official and legacy paths on the exact historical command construction.
+  if (cliId !== 'codex' || !executable) return command;
+  const officialPrefix = 'codex ';
+  if (!command.startsWith(officialPrefix)) return command;
+  return `${shellQuote(executable)} ${command.slice(officialPrefix.length)}`;
 }
 
 export function buildItermAppleScript(command: string, tellTarget: string = ITERM_TARGETS[0]): string {
@@ -296,15 +314,17 @@ function buildLocalCliResumeCommand(
   const workingDir = sessionWorkingDir(ds);
   if (!workingDir) return fail('missing_working_dir', 'Session working directory is missing.');
 
-  const adapter = opts.adapterFactory?.(cliId) ?? createCliAdapterSync(cliId);
+  const runtimeExecutable = configuredRuntimeExecutable(ds);
+  const adapter = opts.adapterFactory?.(cliId) ?? createCliAdapterSync(cliId, runtimeExecutable);
   const rawResume = adapter.buildResumeCommand?.({
     sessionId: ds.session.sessionId,
     cliSessionId: nativeResumeId(ds),
   });
   if (!rawResume) return fail('missing_resume_id', `${cliId} does not have a resumable session id yet.`);
 
-  const resumeCommand = quoteKnownResumeCommand(cliId, rawResume);
-  if (!resumeCommand) return fail('missing_resume_id', `${cliId} returned an unsupported resume command.`);
+  const quotedResumeCommand = quoteKnownResumeCommand(cliId, rawResume);
+  if (!quotedResumeCommand) return fail('missing_resume_id', `${cliId} returned an unsupported resume command.`);
+  const resumeCommand = replaceConfiguredResumeExecutable(cliId, quotedResumeCommand, runtimeExecutable);
 
   return { ok: true, command: `cd ${shellQuote(workingDir)} && ${resumeCommand}` };
 }

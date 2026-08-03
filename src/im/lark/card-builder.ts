@@ -270,16 +270,27 @@ export function terminalMultiUrl(url: string): Record<string, string> {
  *
  *  localCliReady 必须由调用方按当前配置模式计算；handler 也会重复校验，防止已发出的
  *  旧卡片绕过开关或模式切换。 */
-function localCliButton(cliId: CliId, actionBase: Record<string, string>, locale: Locale | undefined, localCliReady: boolean): any | undefined {
+function localCliButton(
+  cliId: CliId,
+  actionBase: Record<string, string>,
+  locale: Locale | undefined,
+  localCliReady: boolean,
+  runtimeDisplayName?: string,
+): any | undefined {
   if (!isLocalCliOpenEnabled() || !localCliReady) return undefined;
-  const labelKey = cliId === 'codex'
-    ? 'card.btn.open_local_codex'
-    : cliId === 'traex'
-      ? 'card.btn.open_local_trae'
-      : 'card.btn.open_local_cli';
+  const cliName = runtimeDisplayName?.trim() || getCliDisplayName(cliId);
+  // Keep existing official/legacy labels byte-for-byte. A configured runtime
+  // uses the generic interpolated label so the button names what it launches.
+  const labelKey = runtimeDisplayName?.trim()
+    ? 'card.btn.open_local_cli'
+    : cliId === 'codex'
+      ? 'card.btn.open_local_codex'
+      : cliId === 'traex'
+        ? 'card.btn.open_local_trae'
+        : 'card.btn.open_local_cli';
   return {
     tag: 'button',
-    text: { tag: 'plain_text', content: t(labelKey, { cliName: getCliDisplayName(cliId) }, locale) },
+    text: { tag: 'plain_text', content: t(labelKey, { cliName }, locale) },
     type: 'default',
     value: { action: 'open_local_cli', ...actionBase },
   };
@@ -300,8 +311,9 @@ export function buildSessionCard(
   adoptMode?: boolean,
   locale?: Locale,
   localCliReady = false,
+  runtimeDisplayName?: string,
 ): string {
-  const cliName = getCliDisplayName(cliId ?? 'claude-code');
+  const cliName = runtimeDisplayName?.trim() || getCliDisplayName(cliId ?? 'claude-code');
   const effectiveCliId = cliId ?? 'claude-code';
   const actionBase = { root_id: rootId, session_id: sessionId, cli_id: effectiveCliId };
   const actions: any[] = [];
@@ -314,7 +326,7 @@ export function buildSessionCard(
     });
   }
   if (!showManageButtons) {
-    const localBtn = cliId ? localCliButton(effectiveCliId, actionBase, locale, localCliReady) : undefined;
+    const localBtn = cliId ? localCliButton(effectiveCliId, actionBase, locale, localCliReady, runtimeDisplayName) : undefined;
     if (localBtn) actions.push(localBtn);
     if (terminalUrl) {
       actions.push({
@@ -384,16 +396,17 @@ export function buildSessionClosedCard(
   workingDir?: string,
   cliResumeCommand?: string | null,
   locale?: Locale,
+  runtimeDisplayName?: string,
 ): string {
-  const cliName = getCliDisplayName(cliId ?? 'claude-code');
+  const cliName = runtimeDisplayName?.trim() || getCliDisplayName(cliId ?? 'claude-code');
   const actionBase = { root_id: rootId, session_id: sessionId, cli_id: cliId ?? 'claude-code' };
   const dirLine = workingDir ? `\n${t('card.body.working_dir', undefined, locale)}\`${escapeMd(workingDir)}\`` : '';
   const cmdBlock = cliResumeCommand
     ? `${t('card.body.click_resume_or_run', undefined, locale)}\n\`\`\`\n${cliResumeCommand}\n\`\`\``
-    : `${t('card.body.click_resume_only', undefined, locale)}\n${t('card.body.cli_no_cli_resume', { cliName }, locale)}`;
+    : `${t('card.body.click_resume_only', undefined, locale)}\n${t('card.body.cli_no_cli_resume', { cliName: escapeMd(cliName) }, locale)}`;
   const body =
     `**${escapeMd(title || cliName)}**\n` +
-    `${t('card.body.cli_terminated', { cliName }, locale)}${cmdBlock}` +
+    `${t('card.body.cli_terminated', { cliName: escapeMd(cliName) }, locale)}${cmdBlock}` +
     dirLine;
   const card = {
     config: { wide_screen_mode: true },
@@ -676,8 +689,8 @@ function pushStreamBody(
     elements.push({
       tag: 'markdown',
       content: usageLimit.retryReady
-        ? t('card.usage_limit.retry_ready', { cliName }, locale)
-        : t('card.usage_limit.retry_at', { cliName, retryLabel: usageLimit.retryLabel }, locale),
+        ? t('card.usage_limit.retry_ready', { cliName: escapeMd(cliName) }, locale)
+        : t('card.usage_limit.retry_at', { cliName: escapeMd(cliName), retryLabel: usageLimit.retryLabel }, locale),
     });
     elements.push({ tag: 'hr' });
   }
@@ -731,9 +744,10 @@ export function buildStreamingCard(
   writableTerminalUrl?: string,
   localCliReady = false,
   usage?: CardUsageSnapshot,
+  runtimeDisplayName?: string,
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
-  const cliName = getCliDisplayName(effectiveCliId);
+  const cliName = runtimeDisplayName?.trim() || getCliDisplayName(effectiveCliId);
   const actionBase = { root_id: rootId, session_id: sessionId, cli_id: effectiveCliId, ...(cardNonce ? { card_nonce: cardNonce } : {}) };
   const displayStatus = status === 'limited' && usageLimit?.retryReady ? 'retry_ready' : status;
 
@@ -775,7 +789,7 @@ export function buildStreamingCard(
       multi_url: terminalMultiUrl(terminalUrl),
     });
   }
-  const localBtn = cliId ? localCliButton(effectiveCliId, actionBase, locale, localCliReady) : undefined;
+  const localBtn = cliId ? localCliButton(effectiveCliId, actionBase, locale, localCliReady, runtimeDisplayName) : undefined;
   if (localBtn) headerActions.push(localBtn);
   if (status === 'limited' && usageLimit?.retryReady) {
     headerActions.push({
@@ -901,9 +915,10 @@ export function buildPrivateSnapshotCard(
   rootId: string,
   locale?: Locale,
   usageLimit?: CliUsageLimitState,
+  runtimeDisplayName?: string,
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
-  const cliName = getCliDisplayName(effectiveCliId);
+  const cliName = runtimeDisplayName?.trim() || getCliDisplayName(effectiveCliId);
   const displayStatus = status === 'limited' && usageLimit?.retryReady ? 'retry_ready' : status;
   // `visibility: 'private'` pins this card's privacy intent onto the action
   // itself, so a later callback (notably `close`) keeps sending ephemeral even
@@ -2112,6 +2127,7 @@ export interface AdoptPickerEntry {
   key: string;
   kind: AdoptEntryKind;
   cliId?: CliId;
+  cliDisplayName?: string;
   /** resume: first user prompt; live: project (cwd basename). */
   title: string;
   /** cwd basename, shown compactly. */
@@ -2156,7 +2172,9 @@ export function buildAdoptEntries(
   sessions: Array<AdoptableSession | ZellijAdoptableSession>,
   resumable: ResumableSession[],
   resumeCliId?: CliId,
+  runtimeDisplayName?: string,
 ): AdoptPickerEntry[] {
+  const customName = runtimeDisplayName?.trim();
   const live: AdoptPickerEntry[] = sessions.map((s) => {
     const zellij = 'zellijPaneId' in s;
     const project = s.cwd.split('/').pop() || s.cwd;
@@ -2165,6 +2183,7 @@ export function buildAdoptEntries(
       key: adoptLiveKey(s),
       kind: 'live' as const,
       cliId: s.cliId,
+      ...(customName && s.cliId === resumeCliId ? { cliDisplayName: customName } : {}),
       title: project,
       project,
       cwd: s.cwd,
@@ -2179,6 +2198,7 @@ export function buildAdoptEntries(
       key: `resume:${r.cliSessionId}`,
       kind: 'resume' as const,
       cliId: resumeCliId,
+      ...(customName ? { cliDisplayName: customName } : {}),
       title: r.title || r.cliSessionId.slice(0, 8),
       project,
       cwd: r.cwd,
@@ -2205,7 +2225,7 @@ function adoptPickerFilter(entries: AdoptPickerEntry[], query: string | undefine
   const q = (query ?? '').trim().toLowerCase();
   if (!q) return entries;
   return entries.filter((e) => {
-    const haystack = [e.title, e.project, e.cwd, e.cliId, e.sessionId, e.target]
+    const haystack = [e.title, e.project, e.cwd, e.cliId, e.cliDisplayName, e.sessionId, e.target]
       .filter(Boolean)
       .join(' ')
       .toLowerCase();
@@ -2231,8 +2251,9 @@ export function buildAdoptSelectCard(
   invokerOpenId?: string,
   resumeLimit?: number,
   resumeCliId?: CliId,
+  runtimeDisplayName?: string,
 ): string {
-  const entries = buildAdoptEntries(sessions, resumable ?? [], resumeCliId);
+  const entries = buildAdoptEntries(sessions, resumable ?? [], resumeCliId, runtimeDisplayName);
   const searchQuery = state?.searchQuery ?? '';
   const requestedPage = state?.page ?? 0;
   const selectedKey = state?.selectedKey;
@@ -2315,7 +2336,7 @@ export function buildAdoptSelectCard(
     const kindTag = e.kind === 'live'
       ? t('card.adopt.kind_live', undefined, locale)
       : t('card.adopt.kind_resume', undefined, locale);
-    const cliName = e.cliId ? getCliDisplayName(e.cliId) : '—';
+    const cliName = e.cliDisplayName ?? (e.cliId ? getCliDisplayName(e.cliId) : '—');
     const timeLabel = e.kind === 'live'
       ? t('card.adopt.field_time_live', undefined, locale)
       : t('card.adopt.field_time_resume', undefined, locale);

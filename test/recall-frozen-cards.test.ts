@@ -372,6 +372,8 @@ describe('restoreUsageLimitRuntimeState', () => {
       // 17th arg: streaming-card usage snapshot (no transcript in this test →
       // empty; turnTokens is always present, null when no turn delta is known).
       { context: null, tokens: null, turnTokens: null },
+      // 18th arg: no configured runtime display name for this Claude fixture.
+      undefined,
     );
     expect(updateMessageMock).toHaveBeenCalledWith(APP_ID, 'om_live_limit', '{}');
   });

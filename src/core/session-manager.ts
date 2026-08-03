@@ -5,7 +5,7 @@
  */
 import { existsSync, statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { join, resolve } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import { expandHome } from './working-dir.js';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
@@ -35,7 +35,9 @@ import {
 import type { PersistentBackendTarget } from '../adapters/backend/types.js';
 import { adoptTargetLabel, validateAdoptTargetState } from './session-discovery.js';
 import { getBot, getAllBots, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
+import type { BotConfig } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
+import { sameRuntimeIdentity, type CliRuntimeConfig, type CliRuntimeSnapshot } from '../adapters/cli/runtime.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { composeRowFromActive, composeRowFromPersistedActive } from './dashboard-rows.js';
 import {
@@ -73,6 +75,10 @@ import { readDeferredTopicBinding, removeDeferredTopicBinding } from './deferred
 import { escapeXmlTagLikeTokens } from '../utils/xml.js';
 
 export { getAttachmentsDir } from './attachment-path.js';
+
+type RefreshCliVersion = (
+  botConfig: Pick<BotConfig, 'cliId' | 'cliRuntime' | 'cliPathOverride'>,
+) => boolean;
 
 function sessionCreatedAtMs(session: { createdAt?: string }): number {
   return session.createdAt ? (Date.parse(session.createdAt) || Date.now()) : Date.now();
@@ -119,21 +125,48 @@ function sameUsageLimit(a: DaemonSession['usageLimit'], b: DaemonSession['usageL
 function sessionBotCliMismatch(ds: DaemonSession): { sessionCli: string; botCli: string } | null {
   const sessionCliId = ds.session.cliId;
   if (!sessionCliId) return null;
-  let botCfg: { cliId?: CliId; wrapperCli?: string };
+  let botCfg: { cliId?: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string };
   try { botCfg = getBot(ds.larkAppId).config; } catch { return null; }
   if (!botCfg.cliId) return null;
   const sessionWrapper = ds.session.wrapperCli?.trim() || undefined;
   const botWrapper = botCfg.wrapperCli?.trim() || undefined;
-  const describe = (cliId: CliId, wrapper: string | undefined) => (wrapper ? `${wrapper} (${cliId})` : cliId);
+  const describe = (
+    cliId: CliId,
+    runtime: CliRuntimeConfig | CliRuntimeSnapshot | undefined,
+    legacyPath: string | undefined,
+    wrapper: string | undefined,
+  ) => {
+    const runtimeName = runtime?.displayName ?? runtime?.id ?? (legacyPath ? basename(legacyPath) : cliId);
+    return wrapper ? `${wrapper} (${runtimeName})` : runtimeName;
+  };
   if (sessionCliId !== botCfg.cliId) {
-    return { sessionCli: describe(sessionCliId, sessionWrapper), botCli: describe(botCfg.cliId, botWrapper) };
+    return {
+      sessionCli: describe(sessionCliId, ds.session.cliRuntime, ds.session.cliPathOverride, sessionWrapper),
+      botCli: describe(botCfg.cliId, botCfg.cliRuntime, botCfg.cliPathOverride, botWrapper),
+    };
   }
   // wrapper 轴：'aiden x claude' 与裸 claude-code 共享同一个 cliId，但是两种不同的
   // 启动选择（selectionKeyForBot 以 cliId+wrapperCli 为键），wrapper 间切换同样不能
   // 复活旧会话。仅 agentFrozen 的会话有可靠的 wrapper 快照——legacy 未冻结会话下次
   // fork 会从 live bot 配置回填 wrapper，天然不会在这条轴上失配。
-  if (ds.session.agentFrozen && sessionWrapper !== botWrapper) {
-    return { sessionCli: describe(sessionCliId, sessionWrapper), botCli: describe(botCfg.cliId, botWrapper) };
+  if (ds.session.agentFrozen && !sameRuntimeIdentity(
+    {
+      cliId: sessionCliId,
+      cliRuntime: ds.session.cliRuntime,
+      cliPathOverride: ds.session.cliPathOverride,
+      wrapperCli: sessionWrapper,
+    },
+    {
+      cliId: botCfg.cliId,
+      cliRuntime: botCfg.cliRuntime,
+      cliPathOverride: botCfg.cliPathOverride,
+      wrapperCli: botWrapper,
+    },
+  )) {
+    return {
+      sessionCli: describe(sessionCliId, ds.session.cliRuntime, ds.session.cliPathOverride, sessionWrapper),
+      botCli: describe(botCfg.cliId, botCfg.cliRuntime, botCfg.cliPathOverride, botWrapper),
+    };
   }
   return null;
 }
@@ -1362,80 +1395,89 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
         try { sessionStore.updateSession(session); } catch { /* best-effort */ }
         // fall through: session.adoptedFrom is now unset → normal restore below
       } else {
-      const validation = adopted.zellijPaneId
-        ? (typeof adopted.originalCliPid === 'number' && validateZellijAdoptTarget(adopted.zellijSession ?? '', adopted.zellijPaneId, adopted.originalCliPid, adopted.cliId) ? 'alive' : 'missing')
-        : validateAdoptTargetState(adopted);
-      if (validation === 'missing') {
-        logger.info(`Closing adopt session ${session.sessionId} (adopted target exited: ${adoptTargetLabel(adopted)})`);
-        sessionStore.closeSession(session.sessionId);
+        const frozenRuntimeExecutable = session.cliRuntime?.source === 'configured'
+          ? session.cliRuntime.executable
+          : undefined;
+        const validation = adopted.zellijPaneId
+          ? (typeof adopted.originalCliPid === 'number' && validateZellijAdoptTarget(
+            adopted.zellijSession ?? '',
+            adopted.zellijPaneId,
+            adopted.originalCliPid,
+            adopted.cliId,
+            frozenRuntimeExecutable,
+          ) ? 'alive' : 'missing')
+          : validateAdoptTargetState(adopted, frozenRuntimeExecutable);
+        if (validation === 'missing') {
+          logger.info(`Closing adopt session ${session.sessionId} (adopted target exited: ${adoptTargetLabel(adopted)})`);
+          sessionStore.closeSession(session.sessionId);
+          continue;
+        }
+        if (validation === 'unknown') {
+          logger.warn(`Keeping adopt session ${session.sessionId} active but quarantined until the target can be verified (target validation failed: ${adoptTargetLabel(adopted)})`);
+          quarantineUnregisteredRestoreSession(session, 'adopt_target_validation_unknown');
+          continue;
+        }
+        // Original CLI still alive — re-register and fork adopt worker
+        const larkAppId = session.larkAppId ?? getAllBots()[0]?.config.larkAppId ?? '';
+        const ds: DaemonSession = {
+          session,
+          worker: null,
+          workerPort: null,
+          workerToken: null,
+          larkAppId,
+          chatId: session.chatId,
+          chatType: session.chatType ?? 'group',
+          scope,
+          spawnedAt: sessionCreatedAtMs(session),
+          cliVersion: getCurrentCliVersion(),
+          lastMessageAt: sessionLastMessageAtMs(session),
+          hasHistory: false,
+          workingDir: adopted.cwd,
+          ownerOpenId: session.ownerOpenId,
+          adoptedFrom: adopted,
+          streamCardId: session.streamCardId,
+          streamCardNonce: session.streamCardNonce,
+          displayMode: session.displayMode === 'screenshot' || session.displayMode === 'hidden'
+            ? session.displayMode
+            : (session.streamExpanded ? 'screenshot' : 'hidden'),
+          currentImageKey: session.currentImageKey,
+          currentTurnTitle: session.currentTurnTitle,
+          usageLimit: session.usageLimit,
+          lastUserPrompt: session.lastUserPrompt,
+          lastCliInput: session.lastCliInput,
+          lastCodexAppInput: session.lastCodexAppInput,
+          replyThreadAliases: session.replyThreadAliases,
+          currentReplyTarget: session.currentReplyTarget,
+          // Restart stays silent for adopt sessions too: forkAdoptWorker shares
+          // setupWorkerHandlers, so the recovery ready/screen_update would post a
+          // card without this. Cleared on the first real CLI input.
+          suppressRecoveryCard: true,
+        };
+        const anchor = sessionAnchorId(ds);
+        messageQueue.ensureQueue(anchor);
+        if (ds.usageLimit) restoreUsageLimitRuntimeState(ds);
+        // Same-key collision guard: if a prior iteration already set an entry
+        // at this key (legitimately possible if disk holds two active sessions
+        // resolving to the same chat-scope key — e.g. a leaked scratch +
+        // relayed real session from a prior buggy run), reject and close the
+        // incoming loser rather than silently overwriting the runtime winner.
+        const adoptKey = activeSessionKey(ds);
+        const adoptRegistered = await setActiveSessionSafe(activeSessions, adoptKey, ds);
+        const adoptCurrent = activeSessions.get(adoptKey);
+        if (runtimeWinnerFor(session.sessionId, ds)) {
+          logger.debug(`[${session.sessionId.substring(0, 8)}] Live runtime won adopt restore registration`);
+          continue;
+        }
+        if (!adoptRegistered || session.status !== 'active' || adoptCurrent !== ds) {
+          logger.warn(`[${session.sessionId.substring(0, 8)}] Adopt restore was cancelled while resolving a routing collision`);
+          await closeSession(session.sessionId);
+          continue;
+        }
+        restoredByThisInvocation.push(ds);
+        announceSessionRow(ds);
+        forkAdoptWorker(ds, { restoredFromMetadata: true });
+        logger.info(`[${session.sessionId.substring(0, 8)}] Restored adopt session (target: ${adoptTargetLabel(adopted)}, scope: ${scope})`);
         continue;
-      }
-      if (validation === 'unknown') {
-        logger.warn(`Keeping adopt session ${session.sessionId} active but quarantined until the target can be verified (target validation failed: ${adoptTargetLabel(adopted)})`);
-        quarantineUnregisteredRestoreSession(session, 'adopt_target_validation_unknown');
-        continue;
-      }
-      // Original CLI still alive — re-register and fork adopt worker
-      const larkAppId = session.larkAppId ?? getAllBots()[0]?.config.larkAppId ?? '';
-      const ds: DaemonSession = {
-        session,
-        worker: null,
-        workerPort: null,
-        workerToken: null,
-        larkAppId,
-        chatId: session.chatId,
-        chatType: session.chatType ?? 'group',
-        scope,
-        spawnedAt: sessionCreatedAtMs(session),
-        cliVersion: getCurrentCliVersion(),
-        lastMessageAt: sessionLastMessageAtMs(session),
-        hasHistory: false,
-        workingDir: adopted.cwd,
-        ownerOpenId: session.ownerOpenId,
-        adoptedFrom: adopted,
-        streamCardId: session.streamCardId,
-        streamCardNonce: session.streamCardNonce,
-        displayMode: session.displayMode === 'screenshot' || session.displayMode === 'hidden'
-          ? session.displayMode
-          : (session.streamExpanded ? 'screenshot' : 'hidden'),
-        currentImageKey: session.currentImageKey,
-        currentTurnTitle: session.currentTurnTitle,
-        usageLimit: session.usageLimit,
-        lastUserPrompt: session.lastUserPrompt,
-        lastCliInput: session.lastCliInput,
-        lastCodexAppInput: session.lastCodexAppInput,
-        replyThreadAliases: session.replyThreadAliases,
-        currentReplyTarget: session.currentReplyTarget,
-        // Restart stays silent for adopt sessions too: forkAdoptWorker shares
-        // setupWorkerHandlers, so the recovery ready/screen_update would post a
-        // card without this. Cleared on the first real CLI input.
-        suppressRecoveryCard: true,
-      };
-      const anchor = sessionAnchorId(ds);
-      messageQueue.ensureQueue(anchor);
-      if (ds.usageLimit) restoreUsageLimitRuntimeState(ds);
-      // Same-key collision guard: if a prior iteration already set an entry
-      // at this key (legitimately possible if disk holds two active sessions
-      // resolving to the same chat-scope key — e.g. a leaked scratch +
-      // relayed real session from a prior buggy run), reject and close the
-      // incoming loser rather than silently overwriting the runtime winner.
-      const adoptKey = activeSessionKey(ds);
-      const adoptRegistered = await setActiveSessionSafe(activeSessions, adoptKey, ds);
-      const adoptCurrent = activeSessions.get(adoptKey);
-      if (runtimeWinnerFor(session.sessionId, ds)) {
-        logger.debug(`[${session.sessionId.substring(0, 8)}] Live runtime won adopt restore registration`);
-        continue;
-      }
-      if (!adoptRegistered || session.status !== 'active' || adoptCurrent !== ds) {
-        logger.warn(`[${session.sessionId.substring(0, 8)}] Adopt restore was cancelled while resolving a routing collision`);
-        await closeSession(session.sessionId);
-        continue;
-      }
-      restoredByThisInvocation.push(ds);
-      announceSessionRow(ds);
-      forkAdoptWorker(ds, { restoredFromMetadata: true });
-      logger.info(`[${session.sessionId.substring(0, 8)}] Restored adopt session (target: ${adoptTargetLabel(adopted)}, scope: ${scope})`);
-      continue;
       }
     }
     // Title-only adopt sessions have no target metadata and can only come from
@@ -2074,7 +2116,7 @@ export function resolveScheduledTaskExecutionPosition(
 export async function executeScheduledTask(
   task: ScheduledTask,
   activeSessions: Map<string, DaemonSession>,
-  refreshCliVersion: (...args: any[]) => boolean,
+  refreshCliVersion: RefreshCliVersion,
 ): Promise<void> {
   // Resolve which bot to use — prefer the task's original bot so replies come from
   // the same account the user set up the schedule with.
@@ -2256,7 +2298,7 @@ export async function executeScheduledTask(
     }
   }
 
-  refreshCliVersion(bot.config.cliId, bot.config.cliPathOverride);
+  refreshCliVersion(bot.config);
 
   // Silent fires flip the model's default from "post progress via botmux send"
   // to "say nothing unless the alert condition is met".
@@ -2540,7 +2582,7 @@ export interface SpawnDashboardSessionArgs {
  *  与调度器 new-topic spawn 同构，差别只在「可暂存不起」与角色包装。 */
 export async function spawnDashboardSession(
   activeSessions: Map<string, DaemonSession>,
-  refreshCliVersion: ((...args: any[]) => boolean) | undefined,
+  refreshCliVersion: RefreshCliVersion | undefined,
   args: SpawnDashboardSessionArgs,
 ): Promise<{ ok: true; sessionId: string } | { ok: false; error: string }> {
   const { larkAppId, chatId, content, column, role } = args;
@@ -2565,7 +2607,7 @@ export async function spawnDashboardSession(
     return { ok: false, error: 'session_exists' };
   }
 
-  refreshCliVersion?.(bot.config.cliId, bot.config.cliPathOverride);
+  refreshCliVersion?.(bot.config);
 
   // 可见任务横幅：只由 creator/lead 那次 spawn 发一条，给群成员交代这群是干嘛的。
   // 纯文本、不 @ 任何 bot，不会误触发其它 bot。rootMessageId 存它仅为留痕（chat-scope

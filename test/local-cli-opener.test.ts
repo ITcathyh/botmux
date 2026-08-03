@@ -110,6 +110,47 @@ describe('local-cli-opener', () => {
     });
   });
 
+  it('uses the frozen configured Codex executable for local resume', () => {
+    const result = buildLocalCliOpenCommand(ds({
+      session: {
+        ...ds().session,
+        cliRuntime: {
+          id: 'vendor-codex',
+          displayName: 'Vendor Codex',
+          executable: "/opt/Vendor Codex/vendor'codex",
+          source: 'configured',
+          update: { provider: 'none' },
+        },
+      },
+    }), { mode: 'resume' });
+
+    expect(result).toEqual({
+      ok: true,
+      command: "cd '/tmp/project'\\''s dir' && '/opt/Vendor Codex/vendor'\\''codex' resume 'native'\\''id'",
+    });
+  });
+
+  it('keeps the historical official command for a legacy path snapshot', () => {
+    const result = buildLocalCliOpenCommand(ds({
+      session: {
+        ...ds().session,
+        cliPathOverride: '/opt/legacy/vendor-codex',
+        cliRuntime: {
+          id: 'vendor-codex',
+          displayName: 'vendor-codex',
+          executable: '/opt/legacy/vendor-codex',
+          source: 'legacy-path',
+          update: { provider: 'auto' },
+        },
+      },
+    }), { mode: 'resume' });
+
+    expect(result).toEqual({
+      ok: true,
+      command: "cd '/tmp/project'\\''s dir' && codex resume 'native'\\''id'",
+    });
+  });
+
   it('attach mode opens a managed tmux session with exact target syntax', () => {
     const adapterFactory = vi.fn(() => ({ buildResumeCommand: () => 'codex resume should-not-run' }));
     const result = buildLocalCliOpenCommand(ds({

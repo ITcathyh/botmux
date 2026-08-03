@@ -105,9 +105,11 @@ import { activeSessionKey, sessionKey, sessionAnchorId, storedSessionAnchorId, l
 import { buildTerminalUrl, setTerminalProxyPort, setTerminalExternalPort } from './core/terminal-url.js';
 import { startTerminalProxy, type TerminalProxyHandle } from './core/terminal-proxy.js';
 import type { CliId } from './adapters/cli/types.js';
+import { runtimeInstallationKey } from './adapters/cli/runtime.js';
 import * as scheduler from './core/scheduler.js';
 import { scanProjects, scanMultipleProjects } from './services/project-scanner.js';
 import { buildQuotaExhaustedCard, buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
+import { sessionConfiguredRuntimeDisplayName } from './core/cli-runtime-display.js';
 import { isLocalCliOpenReady } from './services/local-cli-opener.js';
 import { RECEIVED_REACTION_EMOJI_TYPE, SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE } from './core/pending-response.js';
 import { t as tr, botLocale, localeForBot } from './i18n/index.js';
@@ -3492,13 +3494,22 @@ function scheduleAllowedUsersResolveRetry(larkAppId: string, attempt = 1): void 
 
 // ─── Version tracking ────────────────────────────────────────────────────────
 
-function refreshCliVersion(cliId: CliId, cliPathOverride?: string): boolean {
+function cliRuntimeVersionKey(cfg: Pick<BotConfig, 'cliId' | 'cliRuntime' | 'cliPathOverride'>): string {
+  return runtimeInstallationKey({
+    cliId: cfg.cliId,
+    cliRuntime: cfg.cliRuntime,
+    cliPathOverride: cfg.cliPathOverride,
+  });
+}
+
+function refreshCliVersion(botCfg: Pick<BotConfig, 'cliId' | 'cliRuntime' | 'cliPathOverride'>): boolean {
   const now = Date.now();
-  const cached = cliVersionCache.get(cliId);
+  const key = cliRuntimeVersionKey(botCfg);
+  const cached = cliVersionCache.get(key);
   if (cached && now - cached.lastCheckAt < VERSION_CHECK_INTERVAL) return false;
 
   try {
-    const adapter = createCliAdapterSync(cliId, cliPathOverride);
+    const adapter = createCliAdapterSync(botCfg.cliId, botCfg.cliPathOverride);
     // Remote backends (riff) have no local binary to version-check — skip.
     if (!adapter.resolvedBin && !adapter.versionCommand) return false;
     const versionCommand = adapter.versionCommand?.() ?? { bin: adapter.resolvedBin, args: ['--version'] };
@@ -3511,19 +3522,18 @@ function refreshCliVersion(cliId: CliId, cliPathOverride?: string): boolean {
     if (newVersion === 'unknown' || !newVersion) return false;
 
     const oldVersion = cached?.version;
-    cliVersionCache.set(cliId, { version: newVersion, lastCheckAt: now });
-    // Also update the shared version (used by forkWorker for ds.cliVersion)
-    setCurrentCliVersion(newVersion);
+    cliVersionCache.set(key, { version: newVersion, lastCheckAt: now });
+    setCurrentCliVersion(newVersion, key);
 
     if (oldVersion && oldVersion !== newVersion) {
-      logger.info(`CLI version updated: ${oldVersion} → ${newVersion} (${adapter.id})`);
+      logger.info(`CLI version updated: ${oldVersion} → ${newVersion} (${botCfg.cliRuntime?.displayName ?? adapter.id})`);
       return true;
     }
 
-    logger.info(`CLI version: ${newVersion} (${adapter.id})`);
+    logger.info(`CLI version: ${newVersion} (${botCfg.cliRuntime?.displayName ?? adapter.id})`);
     return false;
   } catch (err: any) {
-    logger.warn(`Failed to get CLI version for ${cliId}: ${err.message}`);
+    logger.warn(`Failed to get CLI version for ${botCfg.cliRuntime?.displayName ?? botCfg.cliId}: ${err.message}`);
     return false;
   }
 }
@@ -3962,16 +3972,19 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
   if (ds.streamCardId && workerHasInitialized(ds)) {
     const readUrl = readableTerminalUrlFor(ds);
     const dsBotCfg = getBot(ds.larkAppId).config;
-    const prevTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(dsBotCfg.cliId);
+    const effectiveCliId = ds.session.cliId ?? dsBotCfg.cliId;
+    const runtimeDisplayName = sessionConfiguredRuntimeDisplayName(ds.session, dsBotCfg.cliRuntime);
+    const prevTitle = ds.currentTurnTitle || ds.session.title || runtimeDisplayName || getCliDisplayName(effectiveCliId);
     const prevMode = ds.displayMode ?? 'hidden';
     const frozenCard = buildStreamingCard(
       ds.session.sessionId, sessionAnchorId(ds), readUrl, prevTitle,
-      ds.lastScreenContent ?? '', previousStatus, dsBotCfg.cliId,
+      ds.lastScreenContent ?? '', previousStatus, effectiveCliId,
       prevMode, ds.streamCardNonce, ds.currentImageKey,
       !!ds.adoptedFrom, false, localeForBot(ds.larkAppId), previousUsageLimit,
       writableTerminalLinkFor(ds),
-      isLocalCliOpenReady(ds, { cliId: dsBotCfg.cliId }),
-      getDaemonStreamingCardUsageSnapshot(ds, dsBotCfg.cliId, { fresh: true }),
+      isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+      getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, { fresh: true }),
+      runtimeDisplayName,
     );
     scheduleCardPatch(ds, frozenCard);
 
@@ -15446,7 +15459,7 @@ async function startInitialPassthroughSession(args: {
   }
 
   const botCfg = getBot(larkAppId).config;
-  refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
+  refreshCliVersion(botCfg);
   const directChatSender = chatType === 'p2p'
     ? await resolveSender(larkAppId, senderOpenId, parsed.senderType, { messageId })
     : undefined;
@@ -15491,7 +15504,7 @@ async function startInitialPassthroughSession(args: {
     chatType,
     scope,
     spawnedAt: Date.parse(session.createdAt) || now,
-    cliVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
+    cliVersion: cliVersionCache.get(cliRuntimeVersionKey(botCfg))?.version ?? 'unknown',
     lastMessageAt: now,
     hasHistory: false,
     pendingRepo: !pinnedWorkingDir || autoWt,
@@ -15906,7 +15919,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
         chatType,
         scope,
         spawnedAt: Date.parse(session.createdAt) || now,
-        cliVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
+        cliVersion: cliVersionCache.get(cliRuntimeVersionKey(botCfg))?.version ?? 'unknown',
         lastMessageAt: now,
         hasHistory: false,
         ownerOpenId: senderOpenId,
@@ -15982,7 +15995,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   );
   const newTopicSender = await resolveSender(larkAppId, senderOpenId, parsed.senderType, { messageId });
 
-  refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
+  refreshCliVersion(botCfg);
 
   // Pin the working dir via the layered oncall / inherit / default lookup
   // (auto-binds a defaultOncall chat as a side effect). Shared with the
@@ -16055,7 +16068,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     chatType,
     scope,
     spawnedAt: Date.parse(session.createdAt) || now,
-    cliVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
+    cliVersion: cliVersionCache.get(cliRuntimeVersionKey(botCfg))?.version ?? 'unknown',
     lastMessageAt: now,
     hasHistory: false,
     pendingRepo: !pinnedWorkingDir || autoWt,
@@ -16375,7 +16388,7 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
 
     const { pinnedWorkingDir, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
     const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
-    refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
+    refreshCliVersion(botCfg);
 
     const session = sessionStore.createSession(chatId, anchor, title, chatType);
     const now = Date.now();
@@ -16398,7 +16411,7 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
       chatType,
       scope,
       spawnedAt: Date.parse(session.createdAt) || now,
-      cliVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
+      cliVersion: cliVersionCache.get(cliRuntimeVersionKey(botCfg))?.version ?? 'unknown',
       lastMessageAt: now,
       hasHistory: false,
       pendingRepo: !pinnedWorkingDir || autoWt,
@@ -17001,7 +17014,7 @@ async function handleThreadReply(
           chatType: ctxChatType,
           scope,
           spawnedAt: Date.parse(session.createdAt) || now,
-          cliVersion: cliVersionCache.get(getBot(larkAppId).config.cliId)?.version ?? 'unknown',
+          cliVersion: cliVersionCache.get(cliRuntimeVersionKey(getBot(larkAppId).config))?.version ?? 'unknown',
           lastMessageAt: now,
           hasHistory: false,
           ownerOpenId: threadSenderOpenId,
@@ -17282,7 +17295,7 @@ async function handleThreadReply(
       parsed.mentions,
     );
     logger.info(`No active session for ${scope}-scope ${anchor}, auto-creating new session...`);
-    refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
+    refreshCliVersion(botCfg);
     const senderOId = data.sender?.sender_id?.open_id;
     const senderUId = data.sender?.sender_id?.union_id;
     // For thread-scope: rootMessageId = anchor (real thread root).
@@ -17350,7 +17363,7 @@ async function handleThreadReply(
       chatType: autoCreateChatType,
       scope,
       spawnedAt: Date.parse(session.createdAt) || now,
-      cliVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
+      cliVersion: cliVersionCache.get(cliRuntimeVersionKey(botCfg))?.version ?? 'unknown',
       lastMessageAt: now,
       hasHistory: false,
       pendingRepo: !pinnedWorkingDir || autoWt,
@@ -18837,7 +18850,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     const cfg = bot.config;
 
     // Refresh CLI version per bot's cliId
-    refreshCliVersion(cfg.cliId, cfg.cliPathOverride);
+    refreshCliVersion(cfg);
 
     // Resolve allowed users per bot. Skipped for apiOnly (core-only) bots:
     // their HTTP control-API triggers authenticate via the dashboard token, not

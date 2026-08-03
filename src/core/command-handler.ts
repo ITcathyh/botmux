@@ -19,6 +19,7 @@ import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCar
 import { handleDashboardCommand } from './dashboard-command/index.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId, ResumableSession } from '../adapters/cli/types.js';
+import { resolveCliRuntime, runtimeInstallationKey } from '../adapters/cli/runtime.js';
 import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, uploadFile, UserTokenMissingError } from '../im/lark/client.js';
 import { chatAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
@@ -93,6 +94,10 @@ import { runSkillsImCommand } from './skills/im-command.js';
 import { fetchDaemonIpc } from './daemon-ipc-auth.js';
 import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
+import {
+  configuredRuntimeDisplayName,
+  sessionConfiguredRuntimeDisplayName,
+} from './cli-runtime-display.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
@@ -350,6 +355,13 @@ function botDisplayName(larkAppId: string): string {
   } catch {
     return larkAppId;
   }
+}
+
+function sessionCliDisplayName(ds: DaemonSession): string {
+  const botCfg = getBot(ds.larkAppId).config;
+  const configured = sessionConfiguredRuntimeDisplayName(ds.session, botCfg.cliRuntime);
+  if (configured) return configured;
+  return getCliDisplayName(ds.session.cliId ?? botCfg.cliId);
 }
 
 function formatUptime(ms: number): string {
@@ -1369,7 +1381,7 @@ export async function handleCommand(
             await sessionReply(rootId, t('cmd.session.transfer_in_progress', undefined, loc));
             break;
           }
-          const cliName = getCliDisplayName(getBot(ds.larkAppId).config.cliId);
+          const cliName = sessionCliDisplayName(ds);
           requestSessionRestart(ds, {
             source: 'slash',
             notify: async status => {
@@ -1437,7 +1449,7 @@ export async function handleCommand(
           break;
         }
         const agentSync = requestAgentSessionRename(ds, updated.title);
-        const cliName = getCliDisplayName(agentSync.cliId ?? ds.session.cliId ?? 'claude-code');
+        const cliName = sessionCliDisplayName(ds);
         if (agentSync.status === 'requested') {
           await sessionReply(rootId, t('cmd.rename.updated_requested', { title: updated.title, cliName }, loc));
         } else if (agentSync.status === 'not_running') {
@@ -1934,23 +1946,53 @@ export async function handleCommand(
           const alive = ds.worker && !ds.worker.killed;
           const idle = formatUptime(Date.now() - ds.lastMessageAt);
           const termUrl = ds.workerPort ? buildTerminalUrl(ds) : '-';
+          const botCfg = getBot(ds.larkAppId).config;
+          const migratedFrozenRuntime = ds.session.agentFrozen && !ds.session.cliRuntime
+            ? resolveCliRuntime({
+                cliId: ds.session.cliId ?? botCfg.cliId,
+                cliPathOverride: ds.session.cliPathOverride,
+                context: 'status session cliRuntime',
+              })
+            : undefined;
+          const effectiveRuntime = ds.session.cliRuntime
+            ?? migratedFrozenRuntime
+            ?? (!ds.session.agentFrozen ? botCfg.cliRuntime : undefined);
+          const effectivePath = ds.session.agentFrozen
+            ? ds.session.cliPathOverride
+            : ds.session.cliPathOverride ?? botCfg.cliPathOverride;
+          const runtimeName = configuredRuntimeDisplayName(effectiveRuntime)
+            ?? getCliDisplayName(ds.session.cliId ?? botCfg.cliId);
+          const latestRuntimeVersion = getCurrentCliVersion(runtimeInstallationKey({
+            cliId: ds.session.cliId ?? botCfg.cliId,
+            cliRuntime: effectiveRuntime,
+            cliPathOverride: effectivePath,
+          }));
           const lines = [
             `Session: ${ds.session.sessionId}`,
             `Status: ${alive ? t('cmd.status.running', undefined, loc) : t('cmd.status.waiting', undefined, loc)}`,
             `Terminal: ${termUrl}`,
             `CWD: ${getSessionWorkingDir(ds)}`,
-            `${getCliDisplayName(getBot(ds.larkAppId).config.cliId)}: v${ds.cliVersion}${ds.cliVersion !== getCurrentCliVersion() ? ` (latest: v${getCurrentCliVersion()})` : ''}`,
+            `${runtimeName}: v${ds.cliVersion}${latestRuntimeVersion !== 'unknown' && ds.cliVersion !== latestRuntimeVersion ? ` (latest: v${latestRuntimeVersion})` : ''}`,
             ...(alive ? [`Uptime: ${formatUptime(Date.now() - ds.spawnedAt)}`] : []),
             `Last message: ${idle} ago`,
             `Active sessions: ${getActiveCount()}`,
           ];
           await sessionReply(rootId, lines.join('\n'));
         } else {
-          const fallbackCliName = larkAppId ? getCliDisplayName(getBot(larkAppId).config.cliId) : 'CLI';
+          const fallbackCfg = larkAppId ? getBot(larkAppId).config : undefined;
+          const fallbackCliName = configuredRuntimeDisplayName(fallbackCfg?.cliRuntime)
+            ?? (fallbackCfg ? getCliDisplayName(fallbackCfg.cliId) : 'CLI');
+          const fallbackVersion = fallbackCfg
+            ? getCurrentCliVersion(runtimeInstallationKey({
+                cliId: fallbackCfg.cliId,
+                cliRuntime: fallbackCfg.cliRuntime,
+                cliPathOverride: fallbackCfg.cliPathOverride,
+              }))
+            : getCurrentCliVersion();
           await sessionReply(rootId, t('cmd.status.fallback_no_session', {
             count: getActiveCount(),
             cliName: fallbackCliName,
-            version: getCurrentCliVersion(),
+            version: fallbackVersion,
           }, loc));
         }
         break;
@@ -2406,7 +2448,7 @@ export async function handleCommand(
         }
         if (ds?.adoptedFrom) {
           const adopted = ds.adoptedFrom;
-          const cliName = getCliDisplayName(adopted.cliId ?? 'claude-code');
+          const cliName = sessionCliDisplayName(ds);
           const project = adopted.cwd ? (adopted.cwd.split('/').pop() || adopted.cwd) : '';
           const label = project ? `${cliName} · ${project}` : cliName;
           await sessionReply(rootId, t('cmd.adopt.already_adopted', { label, pane: adoptTargetLabel(adopted) }, loc));
@@ -2439,6 +2481,7 @@ export async function handleCommand(
           activeSessions,
           discoverResumableSessionsForBot,
           ADOPT_RESUME_LIMIT,
+          botCfgForAdopt?.cliRuntime?.executable,
         );
         const sessions = candidates.sessions;
         const resumable = candidates.resumable;
@@ -2498,6 +2541,9 @@ export async function handleCommand(
           message.senderId,
           candidates.resumeLimit,
           botCliId,
+          ds
+            ? sessionConfiguredRuntimeDisplayName(ds.session, getBot(ds.larkAppId).config.cliRuntime)
+            : configuredRuntimeDisplayName(botCfgForAdopt?.cliRuntime),
         );
         await sessionReply(rootId, cardJson, 'interactive');
         break;
@@ -3548,7 +3594,9 @@ export async function handleCommand(
           ? getBot(ds.larkAppId).config
           : (larkAppId ? getBot(larkAppId).config : getAllBots()[0]?.config);
         const cliId = botCfg?.cliId ?? 'claude-code';
-        const cliName = getCliDisplayName(cliId);
+        const cliName = ds
+          ? sessionCliDisplayName(ds)
+          : configuredRuntimeDisplayName(botCfg?.cliRuntime) ?? getCliDisplayName(cliId);
         const workingDir = getSessionWorkingDir(ds);
         const builtin = [...PASSTHROUGH_COMMANDS];
         const adapterDefaults = resolveAdapterDefaultPassthroughCommands(larkAppId);
@@ -3584,7 +3632,10 @@ export async function handleCommand(
       case '/help': {
         const helpAppId = ds?.larkAppId ?? larkAppId;
         const botCfg = ds ? getBot(ds.larkAppId).config : (helpAppId ? getBot(helpAppId).config : getAllBots()[0]?.config);
-        const cliName = getCliDisplayName(botCfg?.cliId ?? 'claude-code');
+        const cliName = ds
+          ? sessionCliDisplayName(ds)
+          : configuredRuntimeDisplayName(botCfg?.cliRuntime)
+            ?? getCliDisplayName(botCfg?.cliId ?? 'claude-code');
         const passthroughCommands = [...resolvePassthroughCommands(helpAppId)];
         const help = [
           t('help.heading_session', undefined, loc),
@@ -3845,7 +3896,11 @@ export async function startAdoptSession(
   // bridge/adopt session. Covers both real host-process adopt entries
   // (`/adopt <pane>` and the adopt_select card, which both route here). Checks
   // the live bot flag AND the session's frozen sandbox decision (union).
-  if (adoptSandboxBlocked(getBot(ds.larkAppId ?? larkAppId).config, ds.session)) {
+  const adoptBotCfg = getBot(ds.larkAppId ?? larkAppId).config;
+  const adoptRuntimeExecutable = ds.session.agentFrozen
+    ? ds.session.cliRuntime?.source === 'configured' ? ds.session.cliRuntime.executable : undefined
+    : adoptBotCfg.cliRuntime?.executable;
+  if (adoptSandboxBlocked(adoptBotCfg, ds.session)) {
     await sessionReply(sessionAnchorId(ds), t('cmd.adopt.sandbox_blocked', undefined, loc));
     return;
   }
@@ -3855,8 +3910,14 @@ export async function startAdoptSession(
   if (await blockTakeoverWhilePendingRepo(ds, sessionReply)) return;
 
   const valid = zellij
-    ? validateZellijAdoptTarget(target.zellijSession, target.zellijPaneId, target.cliPid, target.cliId)
-    : validateAdoptTarget(target);
+    ? validateZellijAdoptTarget(
+      target.zellijSession,
+      target.zellijPaneId,
+      target.cliPid,
+      target.cliId,
+      adoptRuntimeExecutable,
+    )
+    : validateAdoptTarget(target, adoptRuntimeExecutable);
   if (!valid) {
     await sessionReply(sessionAnchorId(ds), t('cmd.adopt.target_exited', undefined, loc));
     return;
@@ -3890,7 +3951,7 @@ export async function startAdoptSession(
 
   forkAdoptWorker(ds);
 
-  const cliName = getCliDisplayName(target.cliId);
+  const cliName = sessionCliDisplayName(ds);
   await sessionReply(sessionAnchorId(ds), t('cmd.adopt.success', { cliName, project, pane }, loc));
 }
 
@@ -3966,6 +4027,6 @@ export async function startResumeImportSession(
 
   forkWorker(ds, '', true);
 
-  const cliName = getCliDisplayName(getBot(ds.larkAppId).config.cliId);
+  const cliName = sessionCliDisplayName(ds);
   await sessionReply(sessionAnchorId(ds), t('cmd.adopt.resume_success', { cliName, project, title: target.title || target.cliSessionId.slice(0, 8) }, loc));
 }

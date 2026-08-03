@@ -97,6 +97,7 @@ import type { ProjectInfo } from '../../services/project-scanner.js';
 import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
 import { withCodexAppContext } from '../../utils/codex-app-context.js';
 import { resolvePairedSpawnBackendType } from '../../core/persistent-backend.js';
+import { sessionConfiguredRuntimeDisplayName } from '../../core/cli-runtime-display.js';
 import { worktreeSlugFromContextAI } from '../../services/worktree-slug-ai.js';
 import { t, localeForBot, isLocale, type Locale } from '../../i18n/index.js';
 import {
@@ -288,6 +289,20 @@ function getSessionByActionValue(
 
 function sessionCliId(ds: DaemonSession) {
   return ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+}
+
+/** A session's configured distribution name is frozen with its launch config.
+ * Never borrow today's bot runtime for an already-frozen legacy/official
+ * session: a hot switch must not relabel old cards or action feedback. */
+function sessionRuntimeDisplayName(ds: DaemonSession): string | undefined {
+  return sessionConfiguredRuntimeDisplayName(
+    ds.session,
+    getBot(ds.larkAppId).config.cliRuntime,
+  );
+}
+
+function sessionCliDisplayName(ds: DaemonSession): string {
+  return sessionRuntimeDisplayName(ds) ?? getCliDisplayName(sessionCliId(ds));
 }
 
 /** Worktree selection always creates or starts a fresh session. Decide whether
@@ -1793,6 +1808,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       candidates = await collectAdoptCandidates(
         botCfg.cliId, botCfg.cliPathOverride, activeSessions,
         discoverResumableSessionsForBot, ADOPT_RESUME_LIMIT,
+        botCfg.cliRuntime?.executable,
       );
       cacheAdoptCandidates(rootId, candidates, Date.now());
     }
@@ -1803,6 +1819,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       invokerOpenId ?? operatorOpenId,
       candidates.resumeLimit,
       botCfg.cliId,
+      sessionRuntimeDisplayName(ds),
     );
     // event-dispatcher wraps this as { card: { type: 'raw', data } } → in-place patch.
     return JSON.parse(cardJson);
@@ -1871,7 +1888,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     async function resolveLive() {
       // Zellij keys carry "live:zellij:" — resolve from the zellij backend.
       if (entryKey!.startsWith('live:zellij:')) {
-        return discoverAdoptableZellijSessions(botCfg.cliId).find(s => adoptLiveKey(s) === entryKey);
+        return discoverAdoptableZellijSessions(botCfg.cliId, botCfg.cliRuntime?.executable)
+          .find(s => adoptLiveKey(s) === entryKey);
       }
       // Fast path: the key IS "live:<adoptTargetKey>" = "live:tmux:<target>:<pid>".
       // Parse the tmux target for a cheap single-pane resolve, staying under
@@ -1880,7 +1898,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const parts = inner.split(':');
       if (parts[0] === 'tmux' && parts.length >= 3) {
         const tmuxTarget = parts.slice(1, -1).join(':'); // drop "tmux" + trailing pid
-        const fast = discoverAdoptableSessionByTarget(tmuxTarget, botCfg.cliId);
+        const fast = discoverAdoptableSessionByTarget(
+          tmuxTarget,
+          botCfg.cliId,
+          botCfg.cliRuntime?.executable,
+        );
         if (fast && adoptLiveKey(fast) === entryKey) return fast;
       }
       const ownedHerdrTargets = [...activeSessions.values()].flatMap(active => {
@@ -1888,7 +1910,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         return active.session.status === 'active' && !active.adoptedFrom && t2?.backendType === 'herdr' && !!t2.agentName
           ? [{ sessionName: t2.sessionName, agentName: t2.agentName }] : [];
       });
-      return excludeOwnedHerdrAdoptTargets(discoverAdoptableSessions(botCfg.cliId), ownedHerdrTargets)
+      return excludeOwnedHerdrAdoptTargets(
+        discoverAdoptableSessions(botCfg.cliId, botCfg.cliRuntime?.executable),
+        ownedHerdrTargets,
+      )
         .find(s => adoptLiveKey(s) === entryKey);
     }
     let target = await resolveLive();
@@ -1932,7 +1957,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           return { toast: { type: 'warning', content: t('card.action.local_cli_not_ready', undefined, locDs) } };
         }
         if (preflight.error === 'unsupported_cli' || preflight.error === 'unsupported_backend' || preflight.error === 'missing_attach_target') {
-          return { toast: { type: 'warning', content: t('card.action.local_terminal_unsupported', { cliName: getCliDisplayName(cliId) }, locDs) } };
+          return { toast: { type: 'warning', content: t('card.action.local_terminal_unsupported', { cliName: sessionCliDisplayName(target) }, locDs) } };
         }
         return { toast: { type: 'error', content: t('card.action.local_cli_failed', { reason: preflight.message }, locDs) } };
       }
@@ -1961,7 +1986,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       return {
         toast: {
           type: 'success',
-          content: t('card.action.local_cli_opened', { cliName: getCliDisplayName(cliId) }, locDs),
+          content: t('card.action.local_cli_opened', { cliName: sessionCliDisplayName(target) }, locDs),
         },
       };
     };
@@ -1976,7 +2001,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         return {
           toast: {
             type: 'warning',
-            content: t('card.action.local_terminal_unsupported', { cliName: getCliDisplayName(sessionCliId(target)) }, locDs),
+            content: t('card.action.local_terminal_unsupported', { cliName: sessionCliDisplayName(target) }, locDs),
           },
         };
       }
@@ -2075,7 +2100,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         };
       }
       const effectiveCliId = sessionCliId(ds);
-      const cliName = getCliDisplayName(effectiveCliId);
+      const cliName = sessionCliDisplayName(ds);
       logger.info(`[${tag(ds)}] Correlated restart via card button`);
       requestSessionRestart(ds, {
         source: 'card',
@@ -2145,7 +2170,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       } else {
         const result = await resumeSession(targetSessionId, activeSessions);
         if (result.ok) {
-          const cliName = getCliDisplayName(result.ds.session.cliId ?? getBot(result.ds.larkAppId).config.cliId);
+          const cliName = sessionCliDisplayName(result.ds);
           const resumeMsg = t('card.action.resume_success', { cliName }, localeForBot(result.ds.larkAppId));
           await deliverEphemeralOrReply(result.ds, operatorOpenId, resumeMsg, 'text', () => sessionReply(rootId, resumeMsg));
           logger.info(`[${targetSessionId.substring(0, 8)}] Resumed via card button`);
@@ -2229,6 +2254,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           writableTerminalLinkFor(ds),
           isLocalCliOpenReady(ds, { cliId: sessionCliId(ds) }),
           getDaemonStreamingCardUsageSnapshot(ds, sessionCliId(ds)),
+          sessionRuntimeDisplayName(ds),
         );
         scheduleCardPatch(ds, cardJson);
       }
@@ -2563,6 +2589,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           !!ds.adoptedFrom, // adoptMode — disconnect, never close-the-CLI
           locDs,
           isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+          sessionRuntimeDisplayName(ds),
         );
         // 普通群发「仅自己可见」私密卡，话题群 / 单聊自动回退私聊 DM（两条通道都私密，
         // 不泄露写入 token）。fire-and-forget，保持卡片回调快速返回。
@@ -2632,6 +2659,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               writableTerminalLinkFor(ds),
               isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
               getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
+              sessionRuntimeDisplayName(ds),
             );
             updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
               logger.debug(`[${tag(ds)}] Failed to migrate unknown frozen card: ${err}`),
@@ -2676,6 +2704,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           writableTerminalLinkFor(ds),
           isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
+          sessionRuntimeDisplayName(ds),
         );
         updateMessage(ds.larkAppId, frozen.messageId, cardJson).catch(err =>
           logger.debug(`[${tag(ds)}] Failed to migrate frozen card: ${err}`),
@@ -2718,6 +2747,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           writableTerminalLinkFor(ds),
           isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
+          sessionRuntimeDisplayName(ds),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -2785,6 +2815,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           writableTerminalLinkFor(ds),
           isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
+          sessionRuntimeDisplayName(ds),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -2835,6 +2866,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           writableTerminalLinkFor(ds),
           isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
+          sessionRuntimeDisplayName(ds),
         );
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }
