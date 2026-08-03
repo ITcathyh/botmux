@@ -12,16 +12,17 @@
  * union = `"stop" | "length" | "toolUse" | "error" | "aborted"`):
  *   - `toolUse`  — mid-turn (the model is calling a tool); never a boundary. In
  *                  real transcripts toolCall content always pairs with
- *                  stopReason:"toolUse" (255/255), so a normal tool step is
- *                  `toolUse`, not `stop`.
- *   - `stop`     — normal completion → `completed`. ALWAYS terminal (even with a
- *                  toolCall: a `stop`+toolCall is the last assistant record of a
- *                  custom-tool `terminate:true` turn, which the agent-loop ends
- *                  after the toolResult without writing another assistant).
- *   - `length`   — output hit the model's max-output cap. Terminal only when the
- *                  message has NO tool calls (a truncated but real answer →
- *                  `completed`); a `length` WITH tool calls is mid-turn — Pi
- *                  fails the truncated calls and keeps looping, so we skip it.
+ *                  stopReason:"toolUse" (255/255).
+ *   - `stop`     — normal completion → `completed`, but terminal ONLY when the
+ *                  message has NO tool calls. A `stop`+toolCall enters the
+ *                  agent-loop's tool branch (`executeToolCalls`) and keeps
+ *                  looping unless the batch returns `terminate:true`, so the
+ *                  real final comes later — emitting here would publish a
+ *                  premature final and orphan the true one.
+ *   - `length`   — output hit the model's max-output cap → `completed`, terminal
+ *                  ONLY without tool calls (a `length`+toolCall is mid-turn: Pi
+ *                  runs failToolCallsFromTruncatedMessage (terminate:false) and
+ *                  keeps looping).
  *   - `error`    — API/provider error (e.g. "Cancelled by backend") → `failed`
  *                  (`pi_turn_error`). Hard terminal (turn_end→return) regardless
  *                  of content, so it always emits.
@@ -32,14 +33,19 @@
  *                  `assistant` record with `stopReason:"aborted"` +
  *                  `errorMessage:"Operation aborted"` and empty content.
  *
- * The terminal event is emitted even when its visible text is EMPTY: durable
- * delivery completion is keyed to Pi's authoritative stopReason, never to
- * whether the model produced a closing paragraph. Without this, an aborted /
- * errored turn (empty final) produced NO event under the old `stopReason ===
- * "stop" && content` rule — which, under type-ahead, would wedge
- * CodexBridgeQueue's head (the collecting turn never closes) forever. This is
- * the exact reason type-ahead was reverted for Pi in 2026-06 (b7dfa0c0), before
- * this transcript bridge existed (#327, 2026-06-30).
+ * A terminal event is emitted even when its visible text is EMPTY (error/aborted
+ * turns): keyed to Pi's stopReason, not to whether the model produced a closing
+ * paragraph — otherwise under type-ahead the collecting turn never closes and
+ * CodexBridgeQueue's head wedges. `terminalStatus`/`terminalErrorCode` are best-
+ * effort attribution metadata: Pi does NOT set `reliableTurnTerminal` (see
+ * pi.ts — it holds no session fd and a custom-terminate turn has no on-disk
+ * boundary), so these are not treated as durable-delivery receipts.
+ *
+ * Accepted gap: a custom tool returning `terminate:true` ends the agent right
+ * after its toolResult with the last assistant record being `toolUse` (and
+ * `terminate` is not persisted), so that turn has NO on-disk boundary. We do not
+ * synthesize one; quiescence idle marks the session ready and the next ordinary
+ * user turn HOL-drops the unclosed collecting head.
  *
  * ## Type-ahead shape
  * Pi's Message Queue is an active-turn STEER (TUI shows "Steering: …" +
@@ -66,31 +72,32 @@ export interface PiBridgeEvent {
   timestampMs: number;
   kind: 'user' | 'assistant_final';
   text: string;
-  /** Durable terminal outcome carried by an `assistant_final`. Undefined on a
-   *  `stop`/`length` completion (keeps the historical completed default and lets
-   *  the empty-final fallback fire); set to `failed` for `error`/`aborted`. */
+  /** Best-effort terminal outcome carried by an `assistant_final` (attribution
+   *  metadata, NOT a durable receipt — Pi has no reliableTurnTerminal). Undefined
+   *  on a `stop`/`length` completion (keeps the historical completed default and
+   *  lets the empty-final fallback fire); `failed` for `error`, `ambiguous` for
+   *  `aborted`. */
   terminalStatus?: 'completed' | 'failed' | 'ambiguous';
   terminalErrorCode?: string;
   sourceSessionId?: string;
 }
 
-/** Assistant stopReason values that CLOSE a turn. `toolUse` is the only
- *  non-terminal reason (the model is mid-turn calling a tool). */
+/** Assistant stopReason values that can CLOSE a turn (subject to the no-tool-call
+ *  gate for stop/length — see drainPiTranscript). `toolUse` is never terminal. */
 type PiTerminalStopReason = 'stop' | 'length' | 'error' | 'aborted';
 
-/** Map Pi's terminal stopReason to the durable terminal contract.
+/** Map Pi's terminal stopReason to best-effort attribution metadata carried on
+ *  the assistant_final. NOT a durable-delivery receipt (Pi has no
+ *  reliableTurnTerminal — see pi.ts); the worker uses these only for
+ *  CodexBridgeQueue emit ordering / dedup.
  *  - `stop`/`length` → real answers → completed (undefined status keeps the
  *    historical default + lets the empty-final fallback fire).
- *  - `error` → `failed` (`pi_turn_error`): an explicit provider error is a
- *    retryable failure (reconciled as failed_retryable).
+ *  - `error` → `failed` (`pi_turn_error`): an explicit provider error.
  *  - `aborted` → `ambiguous` (`pi_turn_aborted`): a user Esc can land AFTER a
- *    tool's side effect already completed, so we don't know whether the turn's
- *    external effect happened. `ambiguous` preserves that audit semantic (same
- *    as Codex/TraeX `turn_aborted`) and still lets a late `completed` from the
- *    same generation settle the durable delivery, instead of `failed` asserting
- *    "did not happen". Either way it is `!== 'completed'`, so the pending turn
- *    is dropped and the type-ahead / durable queue head is released, never
- *    wedged as "running". */
+ *    tool's side effect already completed, so we don't assert it "did not
+ *    happen" — same audit semantic as Codex/TraeX `turn_aborted`.
+ *  All non-`stop`/`length` map to `!== 'completed'`, so the pending turn is
+ *  dropped and the type-ahead queue head is released, never wedged. */
 function piTerminalOutcome(stopReason: PiTerminalStopReason): Pick<
   PiBridgeEvent,
   'terminalStatus' | 'terminalErrorCode'
@@ -278,26 +285,24 @@ export function drainPiTranscript(path: string, fromOffset: number): PiDrainResu
     //   - `error`/`aborted` are HARD terminals: Pi's agent loop does
     //     turn_end→agent_end→return regardless of content, so they MUST emit
     //     even empty, or the collecting head never closes.
-    //   - `stop` is ALWAYS terminal. A normal tool step is `toolUse`, never
-    //     `stop` (verified: in real transcripts toolCall content ⟹
-    //     stopReason:"toolUse", 255/255). So a `stop` that DOES carry a toolCall
-    //     is the last assistant record of a custom-tool `terminate:true` turn
-    //     (agent-loop ends after the toolResult, writing no further assistant) —
-    //     a genuine end we must NOT skip.
-    //   - `length` is terminal ONLY without tool calls. A `length` WITH tool
-    //     calls is mid-turn: Pi runs `failToolCallsFromTruncatedMessage`
-    //     (terminate:false) and keeps looping, so emitting would falsely close
-    //     the turn.
-    // NOTE (reliableTurnTerminal limitation): a custom tool returning
-    // terminate:true ends the agent after a `toolUse`+toolResult with NO
-    // trailing assistant record, and `terminate` is not persisted to the
-    // toolResult — so that specific shape has no on-disk boundary. botmux ships
-    // no such tool; if a user adds one, quiescence idle still marks the session
-    // ready (only this turn's fallback reply / durable receipt would wait for
-    // the next turn's user event to HOL-drop it).
+    //   - `stop`/`length` end the turn ONLY when the message has NO tool calls.
+    //     Both can carry tool calls mid-turn: agent-loop runs the batch and
+    //     keeps looping unless it terminates (`length` → failToolCallsFrom-
+    //     TruncatedMessage → terminate:false always; `stop` → executeToolCalls,
+    //     loops when the batch doesn't set terminate:true). Emitting on a
+    //     tool-carrying stop/length would publish a premature final + fireIdle,
+    //     then the real later final would arrive unmatched — breaking type-ahead
+    //     attribution. So gate both on "no tool call".
+    // Accepted limitation (why we don't claim reliableTurnTerminal): a custom
+    // tool returning terminate:true ends the agent right after its toolResult;
+    // the last assistant record is `toolUse` (not a terminal stopReason) and
+    // `terminate` is NOT persisted, so that turn has no on-disk end marker. We
+    // deliberately do NOT try to synthesize one — quiescence idle still marks
+    // the session ready, and the next ordinary user turn HOL-drops the
+    // unclosed collecting head. (botmux ships no such tool.)
     const isHardTerminal = stopReason === 'error' || stopReason === 'aborted';
-    const isTextTerminal = stopReason === 'stop'
-      || (stopReason === 'length' && !hasToolCall(obj.message.content));
+    const isTextTerminal = (stopReason === 'stop' || stopReason === 'length')
+      && !hasToolCall(obj.message.content);
     if (!isHardTerminal && !isTextTerminal) continue;
 
     events.push({

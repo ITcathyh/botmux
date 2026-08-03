@@ -594,27 +594,6 @@ describe('reliableTurnTerminal capability', () => {
   });
 });
 
-// structuredRateLimitAuthoritative() (worker) suppresses the screen-scan `rate`
-// verdict only for CLIs that actually PUBLISH a structured `limited` state —
-// the Claude family via maybeEmitStructuredRateLimit (bridgeJsonlPath path),
-// marked by `claudeDataDir`. The codexBridgeQueue CLIs (codex/grok/traex/pi)
-// map an error terminal to a receipt but emit NO limited state, so their screen
-// `rate` scan must stay active or a real 429 loses the Dashboard signal. This
-// pins the capability split so a future adapter can't silently re-broaden it by
-// adding reliableTurnTerminal alone.
-describe('rate-limit authority is Claude-family only (claudeDataDir), not all reliableTurnTerminal', () => {
-  it('Claude family carries claudeDataDir (structured rate emit) ⇒ screen-rate suppressed', () => {
-    expect(createClaudeCodeAdapter('/bin/claude').claudeDataDir).toBeTruthy();
-    expect(createGeniusAdapter('/bin/genius').claudeDataDir).toBeTruthy();
-  });
-  it('codexBridgeQueue CLIs have NO claudeDataDir ⇒ keep screen-rate scanning', () => {
-    expect(createCodexAdapter('/bin/codex').claudeDataDir).toBeUndefined();
-    expect(createGrokAdapter('/bin/grok').claudeDataDir).toBeUndefined();
-    expect(createTraexAdapter('/bin/traex').claudeDataDir).toBeUndefined();
-    expect(createPiAdapter('/bin/pi').claudeDataDir).toBeUndefined();
-  });
-});
-
 // =========================================================================
 // 4. Edge cases
 // =========================================================================

@@ -170,21 +170,23 @@ describe('drainPiTranscript: turn terminal contract', () => {
     expect(finals[0].terminalStatus).toBeUndefined();
   });
 
-  it('DOES close the turn on a STOP message that carries a tool call (custom-tool terminate:true end)', () => {
-    // A custom tool returning terminate:true ends the agent right after the
-    // toolResult; the last assistant record can be `stop`+toolCall. This IS a
-    // genuine turn end (a normal tool step would be `toolUse`, not `stop`), so
-    // it must NOT be skipped or the queue head wedges forever.
+  it('does NOT close the turn on a STOP message that carries a tool call (agent-loop keeps looping)', () => {
+    // A `stop`+toolCall enters executeToolCalls; unless the batch returns
+    // terminate:true the agent loops and the REAL final comes later. Emitting on
+    // the stop+toolCall would publish a premature final and orphan the true one,
+    // breaking type-ahead attribution — so it must be skipped (only a
+    // tool-call-free terminal closes the turn).
     const path = writeTranscript([
       sessionHeader(),
-      userMsg('run the finishing tool'),
+      userMsg('run a tool then answer'),
       assistantTerminalWithTool('stop', '2026-08-03T05:13:50.000Z'),
-      toolResult('done — terminating'),
+      toolResult('tool output'),
+      assistantFinal('stop', 'Final answer'),
     ]);
     const finals = drainAll(path).filter((e) => e.kind === 'assistant_final');
+    // Exactly ONE final — the tool-call-free `stop`. The stop+toolCall is skipped.
     expect(finals).toHaveLength(1);
-    // Text comes from the stop message's text block; completed default.
-    expect(finals[0].text).toBe('partial');
+    expect(finals[0].text).toBe('Final answer');
     expect(finals[0].terminalStatus).toBeUndefined();
   });
 
