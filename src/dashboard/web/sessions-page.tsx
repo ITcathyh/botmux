@@ -328,7 +328,12 @@ function sortValue(s: any, key: string): string | number | boolean {
   if (key === 'tokenOut') return tokenCount(s.tokenUsage?.out) ?? -1;
   if (key === 'adopt') return !!s.adopt;
   if (key === 'chat') return sessionLocationText(s).toLowerCase();
+  if (key === 'cliId') return sessionCliDisplayName(s).toLowerCase();
   return String(s[key] ?? '').toLowerCase();
+}
+
+function sessionCliDisplayName(row: any): string {
+  return String(row.runtimeDisplayName ?? row.cliId ?? 'unknown');
 }
 
 function compareRows(a: any, b: any, sortKey: string, sortDir: 'asc' | 'desc'): number {
@@ -906,7 +911,7 @@ function SessionsTable(props: {
       case 'botName':
         return <td data-label={labels.botName}>{botDisplayName(row)}</td>;
       case 'cliId':
-        return <td data-label={labels.cliId}><span className={`badge cli-${cssToken(row.cliId)}`}>{row.cliId ?? 'unknown'}</span></td>;
+        return <td data-label={labels.cliId}><span className={`badge cli-${cssToken(row.cliId)}`} title={row.runtimeId && row.runtimeId !== row.cliId ? `${row.cliId} / ${row.runtimeId}` : undefined}>{sessionCliDisplayName(row)}</span></td>;
       case 'status':
         return <td data-label={labels.status}><StatusBadge status={row.status} /><LockChip row={row} /></td>;
       case 'chat':
@@ -1250,7 +1255,7 @@ function BoardCard(props: {
         <span dangerouslySetInnerHTML={rawHtml(botAvatarHtml({ name: botName, larkAppId: row.larkAppId, size: 'sm' }))} />
         <div className="session-card-title">
           <strong title={String(row.title ?? title)}>{String(title).slice(0, 72)}</strong>
-          <span>{botName} · {chatTitle ?? row.cliId ?? 'unknown'}</span>
+          <span>{botName} · {chatTitle ?? sessionCliDisplayName(row)}</span>
         </div>
         <span className="session-card-status-group">
           <StatusBadge status={row.status} />
@@ -1673,7 +1678,7 @@ function TerminalModal(props: { state: TerminalState | null; onClose: () => void
   const row = props.state ? store.sessions.get(props.state.sessionId) : null;
   const readonlyUrl = row ? terminalHref(row) : null;
   const url = props.state?.url ?? readonlyUrl ?? '';
-  const rowCli = row ? String(row.cliId ?? 'unknown') : '';
+  const rowCli = row ? sessionCliDisplayName(row) : '';
   const rowRepo = row ? repoBasename(row.workingDir) : '';
   return (
     <dialog
@@ -1875,7 +1880,7 @@ function Drawer(props: {
             </span>
             <p><code>{row.sessionId}</code> <CopyButton value={row.sessionId} /></p>
           </header>
-          <p><b>{t('sessions.bot')}:</b> {botDisplayName(row)} · <b>{t('sessions.cli')}:</b> {row.cliId ?? '?'}</p>
+          <p><b>{t('sessions.bot')}:</b> {botDisplayName(row)} · <b>{t('sessions.cli')}:</b> {sessionCliDisplayName(row)}</p>
           <p><b>{t('sessions.location')}:</b> {sessionLocationText(row)}</p>
           <p><b>chatId:</b> <code>{row.chatId ?? ''}</code> <CopyButton value={row.chatId ?? ''} /></p>
           <p><b>rootMessageId:</b> <code>{row.rootMessageId ?? ''}</code> <CopyButton value={row.rootMessageId ?? ''} /></p>

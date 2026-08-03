@@ -161,7 +161,7 @@ let activeHash = location.hash || '#/';
 let ownerAvatar: OwnerAvatar | null = null;
 let updateBehind = false;
 let latestVersion: string | null = null;
-let updateBadgeKind: 'botmux' | 'codex' | null = null;
+let updateBadgeKind: 'botmux' | 'runtime' | null = null;
 let botmuxUpdateStatus: BotmuxUpdateStatus | null = null;
 let routeRoot: HTMLElement | null = null;
 let appRoot: ReturnType<typeof createRoot> | null = null;
@@ -271,7 +271,7 @@ function consumeDesktopShellRouteAction(): boolean {
 
 function updateBadgeTitle(): string {
   const version = latestVersion ? `v${latestVersion}` : '';
-  return updateBadgeKind === 'codex'
+  return updateBadgeKind === 'runtime'
     ? t('update.navRuntimeBadgeTitle', { version })
     : t('update.navBadgeTitle', { version });
 }
@@ -1284,7 +1284,7 @@ async function checkUpdateBadge(force = false): Promise<boolean> {
       latestVersion = String(j.latest);
     } else if (runtime) {
       updateBehind = true;
-      updateBadgeKind = 'codex';
+      updateBadgeKind = 'runtime';
       latestVersion = String(runtime.latest);
     } else {
       updateBehind = false;

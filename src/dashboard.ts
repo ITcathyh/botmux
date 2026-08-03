@@ -99,7 +99,11 @@ import {
   UnsupportedGlobalInstallError,
   type GlobalInstallPlan,
 } from './utils/global-install.js';
-import { listCliRuntimeUpdateEntries } from './core/cli-runtime-update.js';
+import {
+  filterCliRuntimeUpdateEntriesForTargets,
+  listCliRuntimeUpdateEntries,
+  selectCodexRuntimeUpdateTargets,
+} from './core/cli-runtime-update.js';
 import {
   claimRestartLease,
   clearRestartIntent,
@@ -2026,10 +2030,15 @@ function configuredCliIds(): Map<string, string> {
   }
 }
 
-function configuredBotAgentFields(): Map<string, { cliId?: string; wrapperCli?: string; model?: string }> {
+function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string }> {
   try {
     return new Map(loadBotConfigs().map(b => [b.larkAppId, {
       cliId: b.cliId,
+      cliRuntime: b.cliRuntime,
+      // loadBotConfigs mirrors structured runtime.executable into this legacy
+      // field in memory. Only forward a genuine path-only config to the private
+      // Bot Defaults endpoint.
+      cliPathOverride: b.cliRuntime ? undefined : b.cliPathOverride,
       wrapperCli: b.wrapperCli,
       model: b.model,
     }]));
@@ -2038,15 +2047,17 @@ function configuredBotAgentFields(): Map<string, { cliId?: string; wrapperCli?: 
   }
 }
 
-function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; wrapperCli?: string; model?: string }>(
+function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string }>(
   bot: T,
-  ids: Map<string, string> | Map<string, { cliId?: string; wrapperCli?: string; model?: string }>,
-): T & { cliId?: string; wrapperCli?: string; model?: string } {
+  ids: Map<string, string> | Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string }>,
+): T & { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string } {
   const raw = ids.get(bot.larkAppId);
   const fallback = typeof raw === 'string' ? { cliId: raw } : raw;
   return {
     ...bot,
     cliId: bot.cliId || fallback?.cliId,
+    cliRuntime: bot.cliRuntime || fallback?.cliRuntime,
+    cliPathOverride: bot.cliPathOverride || fallback?.cliPathOverride,
     wrapperCli: bot.wrapperCli || fallback?.wrapperCli,
     model: bot.model || fallback?.model,
   };
@@ -3037,9 +3048,26 @@ const server = createServer(async (req, res) => {
       // 2.86.0) is NOT flagged behind — exactly the canary case we want.
       const latestResult = await cachedLatestVersion(url.searchParams.get('refresh') === '1');
       const latest = latestResult.value;
-      const cliUpdates = listCliRuntimeUpdateEntries(config.session.dataDir).map((entry) => ({
+      let configuredUpdateTargets: ReturnType<typeof selectCodexRuntimeUpdateTargets> = [];
+      try {
+        configuredUpdateTargets = selectCodexRuntimeUpdateTargets(
+          loadBotConfigs(),
+          (cliPathOverride) => createCliAdapterSync('codex', cliPathOverride).resolvedBin,
+        );
+      } catch {
+        // Config unreadable or an adapter unavailable: fail closed and hide
+        // persisted badges whose continued relevance cannot be established.
+      }
+      const cliUpdates = filterCliRuntimeUpdateEntriesForTargets(
+        listCliRuntimeUpdateEntries(config.session.dataDir),
+        configuredUpdateTargets,
+      ).map((entry) => ({
         cliId: entry.cliId,
+        runtimeId: entry.runtimeId,
+        displayName: entry.displayName,
         binPath: entry.binPath,
+        provider: entry.provider,
+        managed: entry.managed,
         current: entry.current,
         latest: entry.latest,
         updateAvailable: entry.updateAvailable,
@@ -4458,6 +4486,15 @@ const server = createServer(async (req, res) => {
             ...d,
             botName: d.botName ?? j.botName,
             cliId: j.cliId || d.cliId,
+            // New daemons return explicit null for Official/no legacy path.
+            // Respect that instead of reviving a stale fallback descriptor;
+            // older daemons omit the fields and still use bots.json fallback.
+            cliRuntime: Object.prototype.hasOwnProperty.call(j, 'cliRuntime')
+              ? j.cliRuntime ?? undefined
+              : d.cliRuntime,
+            cliPathOverride: Object.prototype.hasOwnProperty.call(j, 'cliPathOverride')
+              ? j.cliPathOverride ?? undefined
+              : d.cliPathOverride,
             wrapperCli: j.wrapperCli || d.wrapperCli,
             model: j.model || d.model,
           }, j);
