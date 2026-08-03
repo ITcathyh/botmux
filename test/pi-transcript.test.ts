@@ -252,4 +252,3 @@ describe('drainPiTranscript: turn terminal contract', () => {
     expect(result.pendingTail.startsWith('{"type":"message"')).toBe(true);
   });
 });
-
