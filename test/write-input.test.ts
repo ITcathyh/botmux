@@ -552,8 +552,8 @@ describe('supportsTypeAhead flag', () => {
     expect(createGeniusAdapter('/bin/genius').supportsTypeAhead).toBe(true);
   });
 
-  it('pi: undefined (uses busy marker probes instead of type-ahead)', () => {
-    expect(createPiAdapter('/bin/pi').supportsTypeAhead).toBeUndefined();
+  it('pi: true (0.80.6+ Message Queue steers submit-while-busy; JSONL transcript boundary makes attribution correct)', () => {
+    expect(createPiAdapter('/bin/pi').supportsTypeAhead).toBe(true);
   });
 
   it('pi: exposes Working... as the explicit busy marker', () => {
@@ -562,7 +562,7 @@ describe('supportsTypeAhead flag', () => {
     expect(adapter.busyPattern?.test('已完成，等待下一条输入')).toBe(false);
   });
 
-  it('pi: does not squash queued botmux turns', () => {
+  it('pi: does not squash queued botmux turns (one card per Lark turn; steer merge reconciled by the bridge queue)', () => {
     expect(createPiAdapter('/bin/pi').mergeQueuedInput).toBeUndefined();
   });
 
@@ -585,8 +585,12 @@ describe('reliableTurnTerminal capability', () => {
     expect(createCodexAdapter('/bin/codex').reliableTurnTerminal).toBe(true);
     expect(createTraexAdapter('/bin/traex').reliableTurnTerminal).toBe(true);
     expect(createGrokAdapter('/bin/grok').reliableTurnTerminal).toBe(true);
+    // Pi's per-session JSONL transcript (drainPiTranscript) emits an
+    // assistant_final on every terminal stopReason (stop/length/error/aborted),
+    // giving a session-scoped end-of-turn boundary — the prerequisite for
+    // type-ahead attribution and durable meeting delivery.
+    expect(createPiAdapter('/bin/pi').reliableTurnTerminal).toBe(true);
     expect(createCocoAdapter('/bin/coco').reliableTurnTerminal).toBeUndefined();
-    expect(createPiAdapter('/bin/pi').reliableTurnTerminal).toBeUndefined();
   });
 });
 
