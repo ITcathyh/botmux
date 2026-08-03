@@ -184,11 +184,23 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'traex',
-    // Whole ~/.trae/cli kept REAL: traex is codex-based and keeps the same SQLite
-    // state/log DBs there (state_*.sqlite / logs_*.sqlite) — under the deny-by-
-    // default file sandbox a path not in authPaths doesn't exist, so the DBs are
-    // unreachable / lack the fcntl locks SQLite needs (same failure as codex.ts).
-    authPaths: ['~/.trae/cli'],
+    // Whole ~/.trae kept REAL (not just ~/.trae/cli): traex is codex-based and
+    // keeps the same SQLite state/log DBs under cli/ (state_*.sqlite /
+    // logs_*.sqlite) — under the deny-by-default file sandbox a path not in
+    // authPaths doesn't exist, so the DBs are unreachable / lack the fcntl locks
+    // SQLite needs (same failure as codex.ts). It ALSO reads first-run state at
+    // the ~/.trae ROOT: the coco legacy-migration done-markers (`.coco-migrated`,
+    // `.coco-migration-skip-all`), traecli.toml, installation_id. Binding only
+    // cli/ hid those, so a sandboxed goal-mode pane saw the migration SOURCE
+    // (~/.cache/coco, which IS bound) but not the done-marker → the TUI popped an
+    // interactive "Legacy TRAE CLI data detected" migration prompt and WEDGED
+    // (no human at the PTY to answer). Binding the whole dir mirrors codex.ts's
+    // `~/.codex` and matches where TRAE actually reads startup state.
+    // No secret exposure: traecli.toml carries model/hooks/marketplaces/projects,
+    // not API keys (the model_provider credential lives outside ~/.trae); and
+    // ~/.trae is already global-shared across traex bots, so this widens no
+    // cross-bot boundary.
+    authPaths: ['~/.trae'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass, bypassHookTrust, remoteWsUrl, remoteThreadId }) {

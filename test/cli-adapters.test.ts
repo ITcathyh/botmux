@@ -2103,16 +2103,26 @@ describe('kiro-cli buildArgs', () => {
 });
 
 describe('traex/coco sandbox authPaths', () => {
-  it('traex keeps the whole ~/.trae/cli real in the sandbox (codex-based, same SQLite lock hazard)', () => {
+  it('traex keeps the whole ~/.trae real in the sandbox (SQLite state + first-run migration markers)', () => {
     // traex keeps codex-style state_*.sqlite / logs_*.sqlite + rollout sessions
-    // under ~/.trae/cli; the daemon bridge reads them at the REAL path, and the
-    // overlayfs home lacks the fcntl locks SQLite needs (see codex.ts).
+    // under ~/.trae/cli (fresh-tmpfs sandbox lacks the fcntl locks SQLite needs;
+    // see codex.ts), AND reads first-run state at the ~/.trae ROOT: the coco
+    // legacy-migration done-markers (.coco-migrated / .coco-migration-skip-all),
+    // traecli.toml, installation_id. Binding only cli/ hid those, so a sandboxed
+    // goal-mode pane saw the migration SOURCE (~/.cache/coco, bound) but not the
+    // done-marker → the TUI wedged on an interactive "Legacy TRAE CLI data
+    // detected" prompt with no human at the PTY. Whole-dir bind mirrors codex.ts's
+    // ~/.codex. Regression guard: narrowing back to ~/.trae/cli reintroduces the
+    // wedge.
     const adapter = createTraexAdapter('/bin/traex');
-    expect(adapter.authPaths).toEqual(['~/.trae/cli']);
+    expect(adapter.authPaths).toEqual(['~/.trae']);
   });
 
-  it('coco keeps ~/.trae/cli (shared trae state/SQLite) AND ~/.cache/coco (transcripts the bridge reads) real', () => {
+  it('coco keeps the whole ~/.trae (shared trae state/SQLite + migration markers) AND ~/.cache/coco (transcripts the bridge reads) real', () => {
+    // Coco runs the same traecli binary as traex, so it needs the same ~/.trae
+    // ROOT state (migration done-markers etc.) visible or it wedges on the coco
+    // migration prompt; ~/.cache/coco stays bound for the transcript bridge.
     const adapter = createCocoAdapter('/bin/coco');
-    expect(adapter.authPaths).toEqual(['~/.trae/cli', '~/.cache/coco']);
+    expect(adapter.authPaths).toEqual(['~/.trae', '~/.cache/coco']);
   });
 });

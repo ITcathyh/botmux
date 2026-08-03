@@ -119,12 +119,19 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'coco',
-    // ~/.trae/cli kept REAL (shared with traex): login + shared Trae state incl.
-    // the codex-style SQLite DBs (fcntl locks don't work unless the dir is bound
-    // real). ~/.cache/coco kept REAL too: the transcript bridge reads events.jsonl
-    // at the REAL ~/.cache/coco/sessions/<sid>/ path (see coco-transcript.ts) —
-    // without the rw bind the CLI's writes would be invisible to the daemon.
-    authPaths: ['~/.trae/cli', '~/.cache/coco'],
+    // ~/.trae kept REAL (whole dir, shared with traex): login + shared Trae state
+    // incl. the codex-style SQLite DBs under cli/ (fcntl locks don't work unless
+    // the dir is bound real). Coco runs the SAME traecli binary as traex, so it
+    // reads the same first-run state at the ~/.trae ROOT — the coco legacy-
+    // migration done-markers (.coco-migrated / .coco-migration-skip-all),
+    // traecli.toml, installation_id. Binding only cli/ hid those while the
+    // migration SOURCE (~/.cache/coco, bound rw below) stayed visible, so a
+    // sandboxed goal-mode pane wedged on the interactive "Legacy TRAE CLI data
+    // detected" prompt with no human at the PTY (same failure as traex.ts).
+    // ~/.cache/coco kept REAL too: the transcript bridge reads events.jsonl at the
+    // REAL ~/.cache/coco/sessions/<sid>/ path (see coco-transcript.ts) — without
+    // the rw bind the CLI's writes would be invisible to the daemon.
+    authPaths: ['~/.trae', '~/.cache/coco'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, model, disableCliBypass }) {
