@@ -45,7 +45,7 @@ function catalogBody(bot: string, over: Json = {}): Json {
     profiles: [profileDto(`${bot}-profile`)],
     agentOptions: [{
       appId: 'app_agent', label: 'Agent', online: true, workingDirReady: true, reliableTurnTerminal: true,
-      managedSideEffectIsolation: true,
+      managedSideEffectEligible: true, sandboxIsolated: true,
     }],
     templateCatalog: VC_MEETING_CONSUMER_PROFILE_TEMPLATE_CATALOG,
     ...over,
@@ -422,7 +422,7 @@ describe('VcConsumerProfilesSection · 保存', () => {
         profiles: [],
         agentOptions: [{
           appId: 'broken', label: 'Broken', online: true, workingDirReady: false, reliableTurnTerminal: false,
-          managedSideEffectIsolation: false,
+          managedSideEffectEligible: false, sandboxIsolated: false,
         }],
       }),
     });

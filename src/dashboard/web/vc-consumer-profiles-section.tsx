@@ -360,10 +360,24 @@ export function VcConsumerProfilesSection(props: {
         agent.online ? undefined : tr('settings.vcProfiles.agentOffline'),
         agent.workingDirReady ? undefined : tr('settings.vcProfiles.agentNoWorkingDir'),
         agent.reliableTurnTerminal ? undefined : tr('settings.vcProfiles.agentNoReliableTerminal'),
-        agent.managedSideEffectIsolation ? undefined : tr('settings.vcProfiles.agentNoManagedIsolation'),
+        agent.managedSideEffectEligible ? undefined : tr('settings.vcProfiles.agentNoManagedIsolation'),
+        // Plan B: unsandboxed is allowed but the bot credential is exposed to
+        // untrusted meeting input — surface it as an informational note, not a
+        // blocking warning (the agent stays selectable).
+        agent.managedSideEffectEligible && !agent.sandboxIsolated
+          ? tr('settings.vcProfiles.agentUnsandboxedRisk')
+          : undefined,
       ].filter(Boolean);
+      // Hard blockers make the consumer un-spawnable, so disable selection
+      // outright rather than let the user pick a bot that will silently never
+      // reply. Offline is transient (a daemon may come back) and unsandboxed is
+      // an informed opt-out, so neither disables.
+      const blocked = !agent.workingDirReady
+        || !agent.reliableTurnTerminal
+        || !agent.managedSideEffectEligible;
       return {
         value: agent.appId,
+        disabled: blocked,
         label: (
           <span className="vc-agent-option">
             <span className="vc-agent-option-name">
@@ -386,7 +400,8 @@ export function VcConsumerProfilesSection(props: {
     const warn = !agent.online
       || !agent.workingDirReady
       || !agent.reliableTurnTerminal
-      || !agent.managedSideEffectIsolation;
+      || !agent.managedSideEffectEligible
+      || !agent.sandboxIsolated;
     return warn ? `⚠ ${agent.label}` : agent.label;
   };
 
@@ -467,7 +482,7 @@ export function VcConsumerProfilesSection(props: {
   const hasStructurallyEligibleAgent = catalog?.agentOptions.some(
     agent => agent.workingDirReady
       && agent.reliableTurnTerminal
-      && agent.managedSideEffectIsolation,
+      && agent.managedSideEffectEligible,
   ) ?? false;
   const selectedProfileIndex = catalog?.profiles.findIndex(profile => profile.uiKey === selectedProfileKey) ?? -1;
   const selectedProfile = selectedProfileIndex >= 0 ? catalog?.profiles[selectedProfileIndex] ?? null : null;
