@@ -8928,6 +8928,11 @@ async function spawnCli(
       readonlyRoots: keepExisting([
         ...(cfg.skillReadonlyRoots ?? []),
         ...piInitialPromptReadonlyRoots,
+        // Adapter-declared read-only host paths (e.g. traex/coco first-run
+        // migration done-markers at ~/.trae root). Exposed read-only so the CLI
+        // sees them without widening the read-WRITE authPaths surface. `~`-expanded
+        // here; keepExisting drops any absent on this host.
+        ...[...(cliAdapter.sandboxReadonlyPaths?.() ?? [])].map(expandTildeLexical),
       ]),
       botmuxInstallRoot,
       outbox,

@@ -2103,26 +2103,29 @@ describe('kiro-cli buildArgs', () => {
 });
 
 describe('traex/coco sandbox authPaths', () => {
-  it('traex keeps the whole ~/.trae real in the sandbox (SQLite state + first-run migration markers)', () => {
-    // traex keeps codex-style state_*.sqlite / logs_*.sqlite + rollout sessions
-    // under ~/.trae/cli (fresh-tmpfs sandbox lacks the fcntl locks SQLite needs;
-    // see codex.ts), AND reads first-run state at the ~/.trae ROOT: the coco
-    // legacy-migration done-markers (.coco-migrated / .coco-migration-skip-all),
-    // traecli.toml, installation_id. Binding only cli/ hid those, so a sandboxed
-    // goal-mode pane saw the migration SOURCE (~/.cache/coco, bound) but not the
-    // done-marker → the TUI wedged on an interactive "Legacy TRAE CLI data
-    // detected" prompt with no human at the PTY. Whole-dir bind mirrors codex.ts's
-    // ~/.codex. Regression guard: narrowing back to ~/.trae/cli reintroduces the
-    // wedge.
+  it('traex keeps ~/.trae/cli real (RW SQLite state) and exposes migration markers READ-ONLY (not the whole ~/.trae)', () => {
+    // authPaths (readWrite) stays scoped to cli/ — widening to the whole ~/.trae
+    // would give a chat-driven sandbox RW to sibling hooks/plugins/skills/config
+    // that other bots execute. The first-run "Legacy TRAE CLI data detected"
+    // migration prompt (which wedges goal-mode's human-less PTY) is instead
+    // silenced by exposing the done-markers READ-ONLY via sandboxReadonlyPaths.
     const adapter = createTraexAdapter('/bin/traex');
-    expect(adapter.authPaths).toEqual(['~/.trae']);
+    expect(adapter.authPaths).toEqual(['~/.trae/cli']);
+    expect(adapter.sandboxReadonlyPaths?.()).toEqual([
+      '~/.trae/.coco-rollouts-migrated',
+      '~/.trae/.coco-migrated',
+    ]);
   });
 
-  it('coco keeps the whole ~/.trae (shared trae state/SQLite + migration markers) AND ~/.cache/coco (transcripts the bridge reads) real', () => {
-    // Coco runs the same traecli binary as traex, so it needs the same ~/.trae
-    // ROOT state (migration done-markers etc.) visible or it wedges on the coco
-    // migration prompt; ~/.cache/coco stays bound for the transcript bridge.
+  it('coco keeps ~/.trae/cli + ~/.cache/coco real (RW) and exposes the same migration markers READ-ONLY', () => {
+    // Coco runs the same traecli binary as traex → same migration prompt; markers
+    // exposed read-only, authPaths NOT widened past cli/ (+ the coco cache the
+    // transcript bridge reads).
     const adapter = createCocoAdapter('/bin/coco');
-    expect(adapter.authPaths).toEqual(['~/.trae', '~/.cache/coco']);
+    expect(adapter.authPaths).toEqual(['~/.trae/cli', '~/.cache/coco']);
+    expect(adapter.sandboxReadonlyPaths?.()).toEqual([
+      '~/.trae/.coco-rollouts-migrated',
+      '~/.trae/.coco-migrated',
+    ]);
   });
 });

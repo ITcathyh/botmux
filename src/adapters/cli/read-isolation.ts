@@ -307,17 +307,23 @@ export function buildSeatbeltProfile(
 // A marker records which confinement capabilities are attached to the live
 // process. Credential-only panes must cold-spawn when a full sandbox is enabled.
 //
-// BUMP THIS whenever the START-TIME contract of an isolated CLI changes in a way
-// a still-running process cannot satisfy — a warm reattach preserves the live
-// process untouched, so anything the reattach path relies on but the old process
-// lacks makes reattach unsafe.
-//   · 7 → 8 (2026-08-03): isolated CLIs now MUST carry the host-injected
-//     BOTMUX_READ_ISOLATION / BOTMUX_API_ONLY env (bots.json EPERM fix). Panes
-//     spawned by v3.8.0 have a v7 marker but a process with NEITHER key, so
-//     `botmux` inside them still dies on the denied bots.json read. Reattaching
-//     them would leave the regression unfixed after a plain `daemon:restart`;
-//     the bump forces a cold respawn that injects the markers.
-export const ISOLATION_PANE_MARKER_VERSION = 8;
+// BUMP THIS whenever the START-TIME sandbox contract of an isolated CLI changes
+// in a way a still-running process cannot satisfy — warm reattach preserves the
+// live process + its original bwrap mounts/env untouched, so a new mount/env the
+// reattach path relies on but the old process lacks makes reattach unsafe.
+//   · 7 → 8 (#709): isolated CLIs must carry host-injected BOTMUX_READ_ISOLATION
+//     / BOTMUX_API_ONLY env (bots.json EPERM fix). Panes spawned by v3.8.0 have a
+//     v7 marker but a process with NEITHER key, so `botmux` inside them dies on
+//     the denied bots.json read; reattaching leaves the regression unfixed after
+//     a plain `daemon:restart`.
+//   · 8 → 9 (#714): traex/coco now bind ~/.trae migration done-markers read-only
+//     (sandboxReadonlyPaths) so goal-mode stops wedging on the TRAE first-run
+//     migration prompt. That is a new spawn-time mount; a pane predating it warm-
+//     reattaches with the old mount set and still wedges, so it must cold-spawn.
+// #709 (→8) merged first; this PR (#714) rebased on top and takes 9. Numbers stay
+// strictly monotonic — a pane at any intermediate version must be rejected so it
+// cold-spawns under the current contract rather than bypassing a migration.
+export const ISOLATION_PANE_MARKER_VERSION = 9;
 
 export type IsolationCapability = 'credential' | 'read' | 'write';
 

@@ -5,6 +5,7 @@ import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { cocoCacheRoot } from '../../services/coco-paths.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { installCocoAskPlugin } from '../coco-ask-plugin.js';
+import { TRAE_MIGRATION_DONE_MARKERS } from './traex.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
 /** Global submit log — CoCo appends one JSON line here on every successful
@@ -119,19 +120,18 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'coco',
-    // ~/.trae kept REAL (whole dir, shared with traex): login + shared Trae state
-    // incl. the codex-style SQLite DBs under cli/ (fcntl locks don't work unless
-    // the dir is bound real). Coco runs the SAME traecli binary as traex, so it
-    // reads the same first-run state at the ~/.trae ROOT — the coco legacy-
-    // migration done-markers (.coco-migrated / .coco-migration-skip-all),
-    // traecli.toml, installation_id. Binding only cli/ hid those while the
-    // migration SOURCE (~/.cache/coco, bound rw below) stayed visible, so a
-    // sandboxed goal-mode pane wedged on the interactive "Legacy TRAE CLI data
-    // detected" prompt with no human at the PTY (same failure as traex.ts).
-    // ~/.cache/coco kept REAL too: the transcript bridge reads events.jsonl at the
-    // REAL ~/.cache/coco/sessions/<sid>/ path (see coco-transcript.ts) — without
-    // the rw bind the CLI's writes would be invisible to the daemon.
-    authPaths: ['~/.trae', '~/.cache/coco'],
+    // ~/.trae/cli kept REAL (shared with traex): login + shared Trae state incl.
+    // the codex-style SQLite DBs (fcntl locks don't work unless the dir is bound
+    // real). ~/.cache/coco kept REAL too: the transcript bridge reads events.jsonl
+    // at the REAL ~/.cache/coco/sessions/<sid>/ path (see coco-transcript.ts) —
+    // without the rw bind the CLI's writes would be invisible to the daemon.
+    // NOT widened to the whole ~/.trae (that root holds hooks/plugins/skills/
+    // traecli.toml, and authPaths are readWrite → a chat-driven sandbox could
+    // mutate shared hook/plugin code). Coco runs the SAME traecli binary as traex,
+    // so it hits the same first-run migration prompt; the done-markers it needs
+    // are exposed READ-ONLY via sandboxReadonlyPaths() below.
+    authPaths: ['~/.trae/cli', '~/.cache/coco'],
+    sandboxReadonlyPaths: () => [...TRAE_MIGRATION_DONE_MARKERS],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, model, disableCliBypass }) {

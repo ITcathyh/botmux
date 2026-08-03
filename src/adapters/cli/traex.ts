@@ -179,28 +179,46 @@ function goalEnvConfigArgs(env: NodeJS.ProcessEnv = process.env): string[] {
   return args;
 }
 
+/**
+ * First-run "Legacy TRAE CLI data detected → migrate?" done-markers at the
+ * ~/.trae ROOT. traecli treats a marker's mere EXISTENCE (content/mode
+ * irrelevant — verified with a 0-byte `chmod 444` file) as "migration already
+ * done" and skips the interactive prompt. Under the file sandbox the migration
+ * SOURCE ~/.cache/coco is visible (baseline rw bind) but ~/.trae root is not, so
+ * without these the TUI wedges on a prompt no human can answer in goal mode.
+ *
+ * Exposed READ-ONLY (via sandboxReadonlyPaths → fs-policy readonlyRoots), NOT by
+ * widening authPaths to the whole ~/.trae: that root also holds hooks/ plugins/
+ * skills/ traecli.toml and authPaths compile to readWrite, which would let a
+ * chat-driven sandbox mutate shared hook/plugin code other bots execute.
+ *
+ *  · .coco-rollouts-migrated  → gates the "recent SESSIONS" prompt (the wedge)
+ *  · .coco-migrated           → gates the config-migration prompt (defence in depth)
+ * Both are dirt-cheap read-only single-file binds; missing ones are dropped by
+ * the worker's existence filter (keepExisting), so a host without them is fine.
+ */
+export const TRAE_MIGRATION_DONE_MARKERS = [
+  '~/.trae/.coco-rollouts-migrated',
+  '~/.trae/.coco-migrated',
+] as const;
+
 export function createTraexAdapter(pathOverride?: string): CliAdapter {
   const rawBin = pathOverride ?? 'traex';
   let cachedBin: string | undefined;
   return {
     id: 'traex',
-    // Whole ~/.trae kept REAL (not just ~/.trae/cli): traex is codex-based and
-    // keeps the same SQLite state/log DBs under cli/ (state_*.sqlite /
-    // logs_*.sqlite) — under the deny-by-default file sandbox a path not in
-    // authPaths doesn't exist, so the DBs are unreachable / lack the fcntl locks
-    // SQLite needs (same failure as codex.ts). It ALSO reads first-run state at
-    // the ~/.trae ROOT: the coco legacy-migration done-markers (`.coco-migrated`,
-    // `.coco-migration-skip-all`), traecli.toml, installation_id. Binding only
-    // cli/ hid those, so a sandboxed goal-mode pane saw the migration SOURCE
-    // (~/.cache/coco, which IS bound) but not the done-marker → the TUI popped an
-    // interactive "Legacy TRAE CLI data detected" migration prompt and WEDGED
-    // (no human at the PTY to answer). Binding the whole dir mirrors codex.ts's
-    // `~/.codex` and matches where TRAE actually reads startup state.
-    // No secret exposure: traecli.toml carries model/hooks/marketplaces/projects,
-    // not API keys (the model_provider credential lives outside ~/.trae); and
-    // ~/.trae is already global-shared across traex bots, so this widens no
-    // cross-bot boundary.
-    authPaths: ['~/.trae'],
+    // Whole ~/.trae/cli kept REAL: traex is codex-based and keeps the same SQLite
+    // state/log DBs there (state_*.sqlite / logs_*.sqlite) — under the deny-by-
+    // default file sandbox a path not in authPaths doesn't exist, so the DBs are
+    // unreachable / lack the fcntl locks SQLite needs (same failure as codex.ts).
+    // NOTE: we deliberately do NOT widen this to the whole ~/.trae — that root
+    // holds hooks/ plugins/ skills/ traecli.toml, and authPaths compile to
+    // readWrite (fs-policy `push(authPaths,'readWrite')`), so a chat-driven
+    // sandbox could mutate shared hook/plugin CODE that later bots (or the user's
+    // own non-sandboxed traecli) execute. The first-run migration markers that
+    // must be visible are exposed READ-ONLY via sandboxReadonlyPaths() instead.
+    authPaths: ['~/.trae/cli'],
+    sandboxReadonlyPaths: () => [...TRAE_MIGRATION_DONE_MARKERS],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass, bypassHookTrust, remoteWsUrl, remoteThreadId }) {

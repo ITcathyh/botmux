@@ -201,6 +201,7 @@ describe('isolatedPaneReattachSafe', () => {
   });
 });
 
+<<<<<<< HEAD
 // ─── cold-start migration: START-TIME env contract (bots.json EPERM fix) ──────
 
 /**
@@ -237,6 +238,39 @@ describe('isolatedPaneReattachSafe — start-time contract bump forces cold resp
     // lack BOTMUX_READ_ISOLATION. Anything ≥ 8 is fine; reverting to ≤ 7 would
     // silently warm-reattach those broken panes.
     expect(ISOLATION_PANE_MARKER_VERSION).toBeGreaterThan(7);
+  });
+});
+
+// ─── #714: new spawn-time sandbox mount (traex/coco migration markers) ────────
+
+/**
+ * Regression guard. #714 adds a new spawn-time bwrap mount (traex/coco's
+ * read-only migration done-markers via sandboxReadonlyPaths). A warm reattach
+ * keeps the live process + its ORIGINAL mount set, so a pane spawned before this
+ * change would reattach without the marker mount and keep wedging on the TRAE
+ * migration prompt. The marker version is the only lever that turns such a pane
+ * into kill + cold-spawn, so bumping past the pre-#714 versions is load-bearing.
+ *
+ * Ordering note: #709 took 8 (env contract); #714 takes 9. Both prior versions
+ * must be rejected. If the merge order flips, rebase so this stays monotonic.
+ */
+describe('isolatedPaneReattachSafe — #714 mount contract forces cold respawn of pre-9 panes', () => {
+  const full = ['credential', 'read', 'write'] as const;
+  for (const v of [7, 8]) {
+    it(`rejects a v${v} pane even with full capabilities (its bwrap lacks the marker mount)`, () => {
+      const marker = JSON.stringify({ version: v, bootId: `pre-714-v${v}`, capabilities: [...full] });
+      expect(isolatedPaneReattachSafe(marker, ['read', 'write'])).toBe(false);
+    });
+  }
+
+  it('accepts a pane stamped with the current version', () => {
+    expect(isolatedPaneReattachSafe(isolationPaneMarkerContent('fresh', [...full]), ['read', 'write'])).toBe(true);
+  });
+
+  it('has moved the version past 8 (the #709 env-contract version)', () => {
+    // Reverting below 9 would silently warm-reattach panes that predate the
+    // migration-marker mount. ≥ 9 is required.
+    expect(ISOLATION_PANE_MARKER_VERSION).toBeGreaterThan(8);
   });
 });
 
