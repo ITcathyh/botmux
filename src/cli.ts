@@ -1672,10 +1672,11 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
       }
     }
 
-    // A managed Agent sees its caller as BOTMUX_OWNER_OPEN_ID in the source
-    // bot's app scope. Copying that ou_ into a newly created/different app is
-    // guaranteed to lock the caller out. Convert only that exact injected
-    // owner to on_ through the source app before any real app is created.
+    // A managed Agent sees the daemon-frozen session owner as
+    // BOTMUX_OWNER_OPEN_ID in the source bot's app scope; it is not the
+    // current-turn sender. Copying that ou_ into a newly created/different app
+    // locks the owner out. Convert only that exact injected identity to on_
+    // through the source app before any real app is created.
     try {
       cmd.flags.allowedUsers = await normalizeManagedOwnerEntries(
         cmd.flags.allowedUsers,

@@ -757,7 +757,6 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     engineEnv.BOTMUX_LARK_APP_ID = cfg.larkAppId;
     engineEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
     engineEnv.BOTMUX_SESSION_SCOPE = cfg.rootMessageId?.startsWith('om_') ? 'thread' : 'chat';
-    applySessionOwnerEnv(engineEnv, cfg.ownerOpenId);
     // The app-server owns model execution in RPC mode. Its MCP gateway child
     // must inherit the trusted host socket just like a native CLI process does.
     if (sessionMcpGatewayHost) {
@@ -772,6 +771,9 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     // injects into the TUI — else a 3rd-party-provider bot's app-server silently
     // falls back to the default provider. Re-sanitized (crossed IPC).
     Object.assign(engineEnv, sanitizePerBotEnv(cfg.env));
+    // Session identity is host-owned. Pin it after the config-controlled merge,
+    // matching every other backend and preventing stale owner resurrection.
+    applySessionOwnerEnv(engineEnv, cfg.ownerOpenId);
     engine = new CodexRpcEngine({
       cliBin, cwd: cfg.workingDir, env: engineEnv, sessionId: cfg.sessionId,
       model: cfg.model, reasoningEffort: cfg.reasoningEffort, log: (m: string) => log(m),

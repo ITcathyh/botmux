@@ -1,3 +1,18 @@
+/**
+ * Shared owner-identity boundary for every Bot onboarding path.
+ *
+ * An `ou_` open_id is meaningful only to the app that issued/observed it; even
+ * `BOTMUX_OWNER_OPEN_ID` belongs to the source `BOTMUX_LARK_APP_ID`. Never copy
+ * it into another/new app. Normalize an authenticated source owner before app
+ * creation, then validate owner entries through the target app before
+ * persisting them. Reject unknown `ou_` values before app creation; target-app
+ * network/scope failures remain inconclusive unless the identity is definitively
+ * unusable.
+ *
+ * Keep new Dashboard, interactive, scripted, and Agent-driven onboarding paths
+ * on these helpers. A format-only sister path can otherwise reintroduce the
+ * same lockout while every existing onboarding regression test remains green.
+ */
 import { type Brand, sdkDomain } from '../im/lark/lark-hosts.js';
 import { isMobileEntry, normalizeMobileEntry } from './bot-config-editor.js';
 
@@ -148,8 +163,9 @@ export interface ManagedOwnerContext {
 }
 
 /**
- * A managed Agent sees its caller as an app-scoped BOTMUX_OWNER_OPEN_ID. When
- * it creates/configures another bot, copying that ou_ verbatim locks the caller
+ * A managed Agent sees the daemon-frozen session owner as an app-scoped
+ * BOTMUX_OWNER_OPEN_ID. This is not the current-turn sender. When the Agent
+ * creates/configures another bot, copying that ou_ verbatim locks the owner
  * out. Convert only that exact injected identity through the source app; leave
  * explicitly supplied co-owners untouched.
  */

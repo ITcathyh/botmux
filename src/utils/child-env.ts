@@ -122,10 +122,11 @@ export const REDACTED_CHILD_ENV_KEYS = [
 export const SESSION_CLI_HOME_ENV_KEYS = ['CLAUDE_CONFIG_DIR', 'CODEX_HOME'] as const;
 
 /**
- * Keep the session owner available under the public BOTMUX_* contract while
- * preserving the legacy private name used by older wrappers.  Every worker
- * backend must apply this at its final child-env boundary; otherwise a managed
- * CLI can observe an app-scoped owner through one backend but not another.
+ * Pin the daemon-selected session owner under the public BOTMUX_* contract and
+ * the legacy private name used by older wrappers. ownerOpenId is the only
+ * authority: every worker backend must call this after config-controlled env
+ * merges, and an ownerless session must delete both keys. Otherwise a managed
+ * CLI can observe a stale/different app-scoped owner across backends.
  */
 export function applySessionOwnerEnv(
   env: NodeJS.ProcessEnv,
