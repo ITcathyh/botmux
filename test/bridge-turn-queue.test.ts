@@ -928,10 +928,15 @@ describe('BridgeTurnQueue', () => {
   // no adopt) there is no local input, so the next meaningful user event MUST
   // bind the pending durable mark rather than synthesise a local turn that
   // steals the line and leaves the mark to expire with no final_output.
-  describe('managed mode (no local turns): fingerprint-mismatched user binds the pending durable mark', () => {
+  // Truncation-fallback (STRICT no-write apiOnly / core-only / HTTP-virtual):
+  // claude-code TRUNCATES the leading envelope lines when persisting the user
+  // turn, so a head-substring fingerprint can never match. Since local terminal
+  // write is impossible for these sessions, the mismatched user event is
+  // unambiguously the pending durable turn — bind it (not local-synth).
+  describe('truncation-fallback (no-write apiOnly): mismatched user binds the pending durable mark', () => {
     it('binds the pending mark even when the transcript user line does NOT contain the fingerprint', () => {
       const q = new BridgeTurnQueue();
-      // default: setLocalTurns NOT called → managed mode
+      q.setTruncationFallback(true); // strict no-write session
       const fp = makeFingerprint('<user_message>\n<botmux_task trusted="true">\nDo the thing');
       q.mark('t1', fp, 100, undefined, 7); // durable trigger (dispatchAttempt)
       // claude wrote only the truncated tail — no <botmux_task> prefix, so the
@@ -945,8 +950,9 @@ describe('BridgeTurnQueue', () => {
       expect(q.size()).toBe(0);
     });
 
-    it('does NOT synthesise a local turn on a mismatched user event in managed mode', () => {
+    it('does NOT synthesise a local turn on a mismatched user event (no-write session)', () => {
       const q = new BridgeTurnQueue();
+      q.setTruncationFallback(true);
       const fp = makeFingerprint('a prompt whose head claude will drop');
       q.mark('t1', fp);
       q.ingest([user('u1', 'totally different recorded text'), assistant('a1', 'reply')]);
@@ -958,16 +964,57 @@ describe('BridgeTurnQueue', () => {
       expect(ready[0].assistantUuids).toEqual(['a1']);
     });
 
-    it('managed mode: a stray USER event with NO pending mark does not start a local turn', () => {
+    it('no-write session: a stray USER event with NO pending mark does not start a local turn', () => {
       const q = new BridgeTurnQueue();
+      q.setTruncationFallback(true);
       // No mark() — a stray user line (e.g. mark not yet created) must not be
-      // synthesised as a local turn in managed mode. (An orphan assistant
-      // continuation after a restart IS still recovered via the headless path —
-      // that is deliberate and not exercised here.)
+      // synthesised as a local turn. (An orphan assistant continuation after a
+      // restart IS still recovered via the headless path — not exercised here.)
       q.ingest([user('u1', 'orphan user line')]);
       expect(q.peek().some(t => t.isLocal)).toBe(false);
       expect(q.peek()).toHaveLength(0);
       expect(q.drainEmittable()).toEqual([]);
+    });
+  });
+
+  // codex PR #724 P1 regression: adoptMode=false is NOT "no local input". A
+  // NORMAL managed session (truncationFallback OFF — it can mint a Web Terminal
+  // write token) must keep the mismatch→local-synth path: a human-typed local
+  // turn there must NOT steal the API/Lark durable mark.
+  describe('normal managed + writable terminal (truncationFallback OFF): local input does NOT steal the durable mark', () => {
+    it('a Web Terminal local turn does NOT consume the pending API durable mark', () => {
+      const q = new BridgeTurnQueue();
+      // Neither flag set → normal managed. Local write IS possible here.
+      const fp = makeFingerprint('trusted API prompt');
+      q.mark('api-trigger', fp, 100, undefined, 9); // durable API trigger
+      // Human typed in the Web Terminal while the API turn was pending:
+      q.ingest([user('web-u', 'pwd'), assistant('web-a', '/tmp')]);
+      // The local turn is synthesised (not bound to api-trigger); the durable
+      // mark stays pending, unstolen.
+      const apiMark = q.peek().find(t => t.turnId === 'api-trigger');
+      expect(apiMark?.started).toBe(false);
+      const ready = q.drainEmittable();
+      expect(ready).toHaveLength(1);
+      expect(ready[0].isLocal).toBe(true);
+      expect(ready[0].turnId).not.toBe('api-trigger');
+      expect(ready[0].assistantUuids).toEqual(['web-a']);
+      // When the REAL API user line lands, api-trigger binds normally.
+      q.ingest([user('api-u', 'trusted API prompt — full'), assistant('api-a', 'API reply')]);
+      const next = q.drainEmittable();
+      expect(next).toHaveLength(1);
+      expect(next[0].turnId).toBe('api-trigger');
+      expect(next[0].dispatchAttempt).toBe(9);
+      expect(next[0].assistantUuids).toEqual(['api-a']);
+    });
+
+    it('normal managed: a no-pending-mark local turn is emitted (not silently dropped)', () => {
+      const q = new BridgeTurnQueue();
+      // No mark; local human input with no pending Lark/API turn.
+      q.ingest([user('web-u', 'ls'), assistant('web-a', 'file listing')]);
+      const ready = q.drainEmittable();
+      expect(ready).toHaveLength(1);
+      expect(ready[0].isLocal).toBe(true);
+      expect(ready[0].assistantUuids).toEqual(['web-a']);
     });
   });
 });

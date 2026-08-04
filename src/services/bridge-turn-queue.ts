@@ -113,18 +113,41 @@ export class BridgeTurnQueue {
   private collecting: BridgePendingTurn | null = null;
   /** Whether local-terminal turn synthesis is allowed. TRUE only in adopt mode,
    *  where a human types directly in the pane and those turns must surface to
-   *  Lark. In MANAGED mode (normal Lark-driven or core-only/apiOnly triggers)
-   *  there is NO local input: every user event in the transcript belongs to a
-   *  pending durable turn we marked. Synthesising a local turn there is always
-   *  wrong — it steals the transcript line from the pending mark, which then
-   *  expires with no final_output. Default false; the worker flips it on only
-   *  for adopt spawns (mirrors CodexBridgeQueue.setLocalTurns). */
+   *  Lark. Default false; the worker flips it on only for adopt spawns (mirrors
+   *  CodexBridgeQueue.setLocalTurns). NOTE this is NOT "no local input possible"
+   *  — a normal managed session can still receive Web Terminal write input (see
+   *  truncationFallbackEnabled). */
   private localTurnsEnabled = false;
+
+  /** Whether to BIND a fingerprint-mismatched user event to the earliest
+   *  pending durable mark instead of leaving it unmatched. Enabled ONLY for a
+   *  session where local terminal WRITE is impossible — a strict no-transport
+   *  core-only / HTTP-virtual (apiOnly) session. There, claude-code truncates
+   *  the leading envelope lines (`<user_message>` + `<botmux_task …>`) when
+   *  persisting the user turn, so the head-substring fingerprint can never match
+   *  the recorded line — yet the line is unambiguously this turn's user event
+   *  (nothing else can write to that pane).
+   *
+   *  MUST NOT key on adoptMode: a NORMAL managed (non-adopt) session can still
+   *  mint a Web Terminal write token (`/api/sessions/:id/write-link` +
+   *  `writableTerminalLinkInCard`; the worker WS then writes `type:'input'`
+   *  straight to the backend). A human-typed local turn there would STEAL the
+   *  API/Lark durable mark and complete the trigger with the wrong output — the
+   *  regression codex caught in PR #724. So a managed writable session keeps the
+   *  old mismatch→local behavior; only strict no-write apiOnly enables this. */
+  private truncationFallbackEnabled = false;
 
   /** Toggle adopt-mode local-turn synthesis. Called once at spawn: true for an
    *  /adopt of a human's live pane, false (default) for every managed spawn. */
   setLocalTurns(enabled: boolean): void {
     this.localTurnsEnabled = enabled;
+  }
+
+  /** Toggle the truncation-fallback bind. Enable ONLY when local terminal write
+   *  is impossible for this session (strict no-transport apiOnly core-only /
+   *  HTTP-virtual). See the field doc for why adoptMode is the wrong boundary. */
+  setTruncationFallback(enabled: boolean): void {
+    this.truncationFallbackEnabled = enabled;
   }
 
   /** Register events as historical — their uuids are now considered seen
@@ -358,24 +381,29 @@ export class BridgeTurnQueue {
           next.markTimeMs = eventTimeMs;
           this.collecting = next;
           consumedNext = true;
-        } else if (!this.localTurnsEnabled) {
-          // MANAGED mode (no adopt): there is no local-terminal input, so this
-          // user event MUST belong to the earliest pending durable turn even
-          // though the fingerprint (a prefix of what we marked) didn't match.
-          // claude-code is known to TRUNCATE the leading envelope lines
-          // (`<user_message>` + `<botmux_task …>`) when persisting the user turn
-          // to its transcript, so a head-substring fingerprint can never match
-          // the recorded line — yet it is unambiguously this turn's user event
-          // (only one turn is ever in flight per pane in managed mode). Bind it
-          // rather than synthesising a local turn that would steal the line and
-          // leave the durable mark to expire with no final_output.
+        } else if (this.truncationFallbackEnabled) {
+          // STRICT no-write session (apiOnly core-only / HTTP-virtual): local
+          // terminal write is impossible, so this user event MUST belong to the
+          // earliest pending durable turn even though the fingerprint (a prefix
+          // of what we marked) didn't match. claude-code TRUNCATES the leading
+          // envelope lines (`<user_message>` + `<botmux_task …>`) when persisting
+          // the user turn, so a head-substring fingerprint can never match the
+          // recorded line — yet it is unambiguously this turn's user event
+          // (nothing else can write to that pane). Bind it rather than leaving
+          // the durable mark to expire with no final_output.
+          //
+          // Gated on truncationFallbackEnabled, NOT adoptMode: a normal managed
+          // session can mint a Web Terminal write token, so a human-typed local
+          // turn there must NOT steal the durable mark (codex PR #724 P1) — that
+          // case keeps the mismatch→local-synth path below.
           next.started = true;
           if (!next.sourceJsonlPath) next.sourceJsonlPath = sourceJsonlPath;
           next.markTimeMs = eventTimeMs;
           this.collecting = next;
           consumedNext = true;
         }
-        // Adopt-mode mismatch falls through to local-turn synthesis below.
+        // Non-truncation-fallback mismatch falls through to local-turn synthesis
+        // (adopt, or normal managed with a writable terminal).
       } else {
         // Legacy mark() with no fingerprint — start on the next turn-start.
         next.started = true;
@@ -386,18 +414,17 @@ export class BridgeTurnQueue {
       }
     }
     if (!consumedNext) {
-      if (!this.localTurnsEnabled) {
-        // MANAGED mode: no local input exists. A user event with no pending
-        // turn to bind (e.g. the mark hasn't been created yet, or was already
-        // consumed) must NOT become a synthetic local turn — that only applies
-        // to adopt, where a human types directly in the pane. Skip it; a real
-        // pending mark, if any, will bind the next meaningful user event.
+      if (this.truncationFallbackEnabled) {
+        // STRICT no-write session (apiOnly): local input is impossible, so a
+        // user event with no pending mark to bind (mark not yet created, or
+        // already consumed) must NOT be synthesised as a local turn. Skip it;
+        // a real pending mark, if any, binds the next meaningful user event.
         return;
       }
-      // Local-terminal input (or a queued_command whose prompt didn't
-      // match any pending Lark fingerprint). Synthesise a started turn
-      // ahead of any unstarted Lark turn so chronological order matches
-      // transcript order at emit time.
+      // Adopt OR normal managed with a writable Web Terminal: this is (or may
+      // be) real local-terminal input. Synthesise a started turn ahead of any
+      // unstarted Lark turn so chronological order matches transcript order at
+      // emit time — and so it does NOT steal the pending durable mark.
       const localTurn: BridgePendingTurn = {
         turnId: `local-${uuid}`,
         started: true,
