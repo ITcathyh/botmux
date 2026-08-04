@@ -122,6 +122,7 @@ describe('BridgeTurnQueue', () => {
 
   it('local-terminal turn before any Lark message: emitted as isLocal turn (not dropped)', () => {
     const q = new BridgeTurnQueue();
+    q.setLocalTurns(true); // adopt mode: a human types in the pane
     // Local user types in the original pane — no pending turn yet
     q.ingest([user('local-u1'), assistant('local-a1', 'local reply')]);
     // Then a Lark message arrives
@@ -140,6 +141,7 @@ describe('BridgeTurnQueue', () => {
 
   it('local turn between two Lark turns: local emits separately, neither Lark turn is polluted', () => {
     const q = new BridgeTurnQueue();
+    q.setLocalTurns(true); // adopt mode: a human types in the pane
     q.mark('t1');
     q.ingest([user('u1'), assistant('a1', 'lark1')]);
     // After t1 is started+collected but not yet emitted, local user types
@@ -358,6 +360,7 @@ describe('BridgeTurnQueue', () => {
 
   it('fingerprint match: only the matching user event starts the Lark turn; non-match becomes a local turn', () => {
     const q = new BridgeTurnQueue();
+    q.setLocalTurns(true); // adopt mode: local `ls -la` is a real human turn
     const fp = makeFingerprint('please review the new patch');
     q.mark('t1', fp);
     // Local user types something else first — synthesised as a local turn
@@ -378,6 +381,7 @@ describe('BridgeTurnQueue', () => {
 
   it('fingerprint mismatch: local user with different content creates a local turn but does NOT start the Lark turn', () => {
     const q = new BridgeTurnQueue();
+    q.setLocalTurns(true); // adopt mode: distinct local input must not steal the Lark mark
     const fp = makeFingerprint('lark-specific question');
     q.mark('t1', fp);
     // Local user types — content does not match fingerprint
@@ -560,6 +564,7 @@ describe('BridgeTurnQueue', () => {
   describe('local-terminal turn forwarding', () => {
     it('marks the synthesised turn as isLocal and captures userUuid', () => {
       const q = new BridgeTurnQueue();
+      q.setLocalTurns(true);
       q.ingest([user('local-u1', 'pwd'), assistant('local-a1', '/tmp')]);
       const ready = q.drainEmittable();
       expect(ready).toHaveLength(1);
@@ -577,6 +582,7 @@ describe('BridgeTurnQueue', () => {
 
     it('empty local turn (no assistant text yet) is dropped on the next user event', () => {
       const q = new BridgeTurnQueue();
+      q.setLocalTurns(true);
       // First local prompt — Claude crashed / cancelled before responding.
       q.ingest([user('local-u1', 'first')]);
       // Queue now has a started local turn with no assistant uuids.
@@ -594,6 +600,7 @@ describe('BridgeTurnQueue', () => {
 
     it('an empty Lark turn (no fingerprint match yet) is NOT dropped by a local turn arriving', () => {
       const q = new BridgeTurnQueue();
+      q.setLocalTurns(true);
       q.mark('t1', makeFingerprint('lark question'));
       // Local input arrives first — must not consume / drop the unstarted Lark turn.
       q.ingest([user('local-u', 'something else'), assistant('local-a', 'local reply')]);
@@ -613,6 +620,7 @@ describe('BridgeTurnQueue', () => {
 
     it('back-to-back local turns each emit independently with their own uuids', () => {
       const q = new BridgeTurnQueue();
+      q.setLocalTurns(true);
       q.ingest([
         user('local-u1', 'first'),
         assistant('local-a1', 'first reply'),
@@ -636,6 +644,7 @@ describe('BridgeTurnQueue', () => {
       // text. The empty-collecting drop now applies to Lark turns too, so
       // the abandoned turn is removed and the next turn emits cleanly.
       const q = new BridgeTurnQueue();
+      q.setLocalTurns(true);
       q.mark('t1');
       q.ingest([user('u1')]);  // t1 started, model went silent
       q.ingest([user('local-u'), assistant('local-a', 'local reply')]);
@@ -748,6 +757,7 @@ describe('BridgeTurnQueue', () => {
 
     it('queued_command prompt mismatch falls through to local turn synthesised from attachment.prompt', () => {
       const q = new BridgeTurnQueue();
+      q.setLocalTurns(true); // adopt mode: the type-ahead prompt is real human input
       q.mark('t1', makeFingerprint('lark-specific question'));
       // User typed something else directly in the pane while Claude was busy
       // — it landed in the type-ahead queue and now dequeues as a
@@ -908,6 +918,56 @@ describe('BridgeTurnQueue', () => {
           false,
         ),
       ).toBe(true);
+    });
+  });
+
+  // Regression for the core-only / managed-mode completion bug: claude-code
+  // TRUNCATES the leading envelope lines (`<user_message>` + `<botmux_task …>`)
+  // when persisting the user turn to its transcript, so a head-substring
+  // fingerprint can NEVER match the recorded line. In MANAGED mode (default —
+  // no adopt) there is no local input, so the next meaningful user event MUST
+  // bind the pending durable mark rather than synthesise a local turn that
+  // steals the line and leaves the mark to expire with no final_output.
+  describe('managed mode (no local turns): fingerprint-mismatched user binds the pending durable mark', () => {
+    it('binds the pending mark even when the transcript user line does NOT contain the fingerprint', () => {
+      const q = new BridgeTurnQueue();
+      // default: setLocalTurns NOT called → managed mode
+      const fp = makeFingerprint('<user_message>\n<botmux_task trusted="true">\nDo the thing');
+      q.mark('t1', fp, 100, undefined, 7); // durable trigger (dispatchAttempt)
+      // claude wrote only the truncated tail — no <botmux_task> prefix, so the
+      // head fingerprint is absent from the recorded line.
+      q.ingest([user('u1', 'Do the thing\n</botmux_task>\n</user_message>'), assistant('a1', 'CC_DONE')]);
+      const ready = q.drainEmittable();
+      expect(ready).toHaveLength(1);
+      expect(ready[0].turnId).toBe('t1');       // bound to the durable mark, NOT local-*
+      expect(ready[0].isLocal).toBeFalsy();
+      expect(ready[0].assistantUuids).toEqual(['a1']);
+      expect(q.size()).toBe(0);
+    });
+
+    it('does NOT synthesise a local turn on a mismatched user event in managed mode', () => {
+      const q = new BridgeTurnQueue();
+      const fp = makeFingerprint('a prompt whose head claude will drop');
+      q.mark('t1', fp);
+      q.ingest([user('u1', 'totally different recorded text'), assistant('a1', 'reply')]);
+      // No local-* turn is ever created; the mark is bound instead.
+      expect(q.peek().some(t => t.isLocal)).toBe(false);
+      const ready = q.drainEmittable();
+      expect(ready).toHaveLength(1);
+      expect(ready[0].turnId).toBe('t1');
+      expect(ready[0].assistantUuids).toEqual(['a1']);
+    });
+
+    it('managed mode: a stray USER event with NO pending mark does not start a local turn', () => {
+      const q = new BridgeTurnQueue();
+      // No mark() — a stray user line (e.g. mark not yet created) must not be
+      // synthesised as a local turn in managed mode. (An orphan assistant
+      // continuation after a restart IS still recovered via the headless path —
+      // that is deliberate and not exercised here.)
+      q.ingest([user('u1', 'orphan user line')]);
+      expect(q.peek().some(t => t.isLocal)).toBe(false);
+      expect(q.peek()).toHaveLength(0);
+      expect(q.drainEmittable()).toEqual([]);
     });
   });
 });

@@ -111,6 +111,21 @@ export class BridgeTurnQueue {
   private seen = new Set<string>();
   private queue: BridgePendingTurn[] = [];
   private collecting: BridgePendingTurn | null = null;
+  /** Whether local-terminal turn synthesis is allowed. TRUE only in adopt mode,
+   *  where a human types directly in the pane and those turns must surface to
+   *  Lark. In MANAGED mode (normal Lark-driven or core-only/apiOnly triggers)
+   *  there is NO local input: every user event in the transcript belongs to a
+   *  pending durable turn we marked. Synthesising a local turn there is always
+   *  wrong — it steals the transcript line from the pending mark, which then
+   *  expires with no final_output. Default false; the worker flips it on only
+   *  for adopt spawns (mirrors CodexBridgeQueue.setLocalTurns). */
+  private localTurnsEnabled = false;
+
+  /** Toggle adopt-mode local-turn synthesis. Called once at spawn: true for an
+   *  /adopt of a human's live pane, false (default) for every managed spawn. */
+  setLocalTurns(enabled: boolean): void {
+    this.localTurnsEnabled = enabled;
+  }
 
   /** Register events as historical — their uuids are now considered seen
    *  but no attribution happens. Used at attach time to baseline. */
@@ -343,8 +358,24 @@ export class BridgeTurnQueue {
           next.markTimeMs = eventTimeMs;
           this.collecting = next;
           consumedNext = true;
+        } else if (!this.localTurnsEnabled) {
+          // MANAGED mode (no adopt): there is no local-terminal input, so this
+          // user event MUST belong to the earliest pending durable turn even
+          // though the fingerprint (a prefix of what we marked) didn't match.
+          // claude-code is known to TRUNCATE the leading envelope lines
+          // (`<user_message>` + `<botmux_task …>`) when persisting the user turn
+          // to its transcript, so a head-substring fingerprint can never match
+          // the recorded line — yet it is unambiguously this turn's user event
+          // (only one turn is ever in flight per pane in managed mode). Bind it
+          // rather than synthesising a local turn that would steal the line and
+          // leave the durable mark to expire with no final_output.
+          next.started = true;
+          if (!next.sourceJsonlPath) next.sourceJsonlPath = sourceJsonlPath;
+          next.markTimeMs = eventTimeMs;
+          this.collecting = next;
+          consumedNext = true;
         }
-        // Mismatch falls through to local-turn synthesis below.
+        // Adopt-mode mismatch falls through to local-turn synthesis below.
       } else {
         // Legacy mark() with no fingerprint — start on the next turn-start.
         next.started = true;
@@ -355,6 +386,14 @@ export class BridgeTurnQueue {
       }
     }
     if (!consumedNext) {
+      if (!this.localTurnsEnabled) {
+        // MANAGED mode: no local input exists. A user event with no pending
+        // turn to bind (e.g. the mark hasn't been created yet, or was already
+        // consumed) must NOT become a synthetic local turn — that only applies
+        // to adopt, where a human types directly in the pane. Skip it; a real
+        // pending mark, if any, will bind the next meaningful user event.
+        return;
+      }
       // Local-terminal input (or a queued_command whose prompt didn't
       // match any pending Lark fingerprint). Synthesise a started turn
       // ahead of any unstarted Lark turn so chronological order matches

@@ -11477,6 +11477,12 @@ process.on('message', async (raw: unknown) => {
       const initStartedAtMs = Date.now();
       if (lastInitConfig) return;  // already initialized
       lastInitConfig = msg;
+      // Claude bridge local-turn synthesis is adopt-only: a human typing in an
+      // adopted pane produces local turns that must reach Lark. In managed mode
+      // (normal Lark triggers OR core-only/apiOnly) there is no local input, so
+      // every transcript user event belongs to a pending durable mark — see
+      // BridgeTurnQueue.setLocalTurns. Mirrors codexBridgeQueue.setLocalTurns.
+      bridgeQueue.setLocalTurns(msg.adoptMode === true);
       activeRestartAttemptId = msg.restartAttemptId;
       sessionId = msg.sessionId;
       refreshTerminalViewToken();
