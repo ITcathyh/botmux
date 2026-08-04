@@ -1184,6 +1184,7 @@ export const messages: Record<string, string> = {
   'trigger.external_event_clean': 'External event',
 
   // Worker-side submit / notify messages
+  'worker.codex_composer_conflict': 'The adopted Codex terminal already has an unsubmitted local draft. botmux left that draft untouched and did not append the Lark message. Submit or clear the local draft, then resend the Lark message.',
   'worker.submit_impossible': '⚠️ Your last message was not safely written to {cliName}.\nReason: {reason}\nAddress the reason above and verify the terminal state before trying again.\nStart: {preview}',
   'worker.submit_unconfirmed': '⚠️ Your last message was sent to {cliName} but submission couldn’t be confirmed (after retrying Enter and waiting {secs}s, no new entry showed up in {transcriptLabel}). It may be stuck in the input box — check the Web terminal and press Enter manually or resend.\nStart: {preview}',
   'worker.submit_unconfirmed_zmx': '⚠️ Your last message could not be confirmed as written to {cliName} after {secs}s. Do not resend it blindly; run botmux list locally, enter the ZMX session, and inspect its composer.\nStart: {preview}',

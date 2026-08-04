@@ -67,30 +67,31 @@ export function codexSessionIdFromRolloutPath(path: string): string | undefined 
   return m ? m[1] : undefined;
 }
 
-/** Find the rollout file an externally-running Codex process has open. The
- *  Codex process keeps fd open on its current rollout for the entire
- *  lifetime of the session, so this is the authoritative way to bind a
- *  Codex pid to its sessionId — far more reliable than scanning
- *  `~/.codex/sessions` by mtime (which would race with sibling Codex panes
- *  in the same project).
+type CodexRolloutRef = { path: string; cliSessionId: string };
+
+/** Find the rollout file an externally-running Codex process has open. A
+ *  single open rollout is authoritative for that pid. Multiple open rollouts
+ *  are ambiguous: current Codex versions can keep parent and sibling-agent
+ *  transcripts open in the same process, so choosing the first fd can bind
+ *  an adopted pane to the wrong conversation.
  *
  *  Linux: `/proc/<pid>/fd/*` fast path.
  *  macOS / BSD: `lsof -p <pid> -Fn` 兜底（同 session-discovery 里的 readCwd）。
  *  两种平台都用 `codexSessionIdFromRolloutPath` 提取 sid。 */
-export function findCodexRolloutByPid(pid: number): { path: string; cliSessionId: string } | undefined {
+export function findCodexRolloutByPid(pid: number): CodexRolloutRef | undefined {
   if (!Number.isInteger(pid) || pid <= 0) return undefined;
   if (IS_LINUX) {
     const fdDir = `/proc/${pid}/fd`;
     if (existsSync(fdDir)) {
       let entries: string[];
       try { entries = readdirSync(fdDir); } catch { return undefined; }
+      const targets: string[] = [];
       for (const fd of entries) {
         let target: string;
         try { target = readlinkSync(join(fdDir, fd)); } catch { continue; }
-        const hit = matchCodexRolloutPath(target);
-        if (hit) return hit;
+        targets.push(target);
       }
-      return undefined;
+      return findSingleCodexRollout(targets);
     }
     // /proc 不可读时落到下面的 lsof 兜底（极少见，但兜一下）
   }
@@ -105,16 +106,23 @@ export function findCodexRolloutByPid(pid: number): { path: string; cliSessionId
   } catch {
     return undefined;
   }
-  for (const line of out.split('\n')) {
-    if (!line.startsWith('n/')) continue;
-    const target = line.slice(1);
-    const hit = matchCodexRolloutPath(target);
-    if (hit) return hit;
-  }
-  return undefined;
+  return findSingleCodexRollout(out.split('\n').flatMap(line =>
+    line.startsWith('n/') ? [line.slice(1)] : [],
+  ));
 }
 
-function matchCodexRolloutPath(target: string): { path: string; cliSessionId: string } | undefined {
+function findSingleCodexRollout(targets: Iterable<string>): CodexRolloutRef | undefined {
+  let found: CodexRolloutRef | undefined;
+  for (const target of targets) {
+    const hit = matchCodexRolloutPath(target);
+    if (!hit) continue;
+    if (found && found.path !== hit.path) return undefined;
+    found = hit;
+  }
+  return found;
+}
+
+function matchCodexRolloutPath(target: string): CodexRolloutRef | undefined {
   if (!target.endsWith('.jsonl')) return undefined;
   if (!target.includes('/.codex/sessions/')) return undefined;
   const sid = codexSessionIdFromRolloutPath(target);

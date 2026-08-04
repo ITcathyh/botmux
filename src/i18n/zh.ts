@@ -1187,6 +1187,7 @@ export const messages: Record<string, string> = {
   'trigger.external_event_clean': '外部事件触发',
 
   // Worker-side submit / notify messages
+  'worker.codex_composer_conflict': '已 adopt 的 Codex 终端输入框里已有未提交的本地草稿。botmux 保留了草稿，没有把这条飞书消息拼到后面。请先提交或清空本地草稿，再重发飞书消息。',
   'worker.submit_impossible': '⚠️ 刚才那条消息没有安全写入 {cliName}。\n原因：{reason}\n请处理上述原因并确认终端状态后再试。\n开头：{preview}',
   'worker.submit_unconfirmed': '⚠️ 刚才那条消息发给 {cliName} 后没能确认提交（重试 Enter 后等了 {secs}s 仍未在{transcriptLabel}里看到新记录）。可能卡在输入框里——请去 Web 终端看一下，手动按 Enter 或重发。\n开头：{preview}',
   'worker.submit_unconfirmed_zmx': '⚠️ 刚才那条消息没能确认写入 {cliName}（等待 {secs}s 后仍无提交证据）。不要直接重发；请在本机运行 botmux list 进入该 ZMX 会话检查输入框。\n开头：{preview}',

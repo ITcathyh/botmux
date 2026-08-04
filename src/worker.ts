@@ -123,6 +123,7 @@ import {
   type PidFollowResult,
 } from './services/bridge-rotation-policy.js';
 import { CodexBridgeQueue } from './services/codex-bridge-queue.js';
+import { detectCodexComposerState } from './services/codex-composer-state.js';
 import {
   generateCodexAppThreadTitle,
   readCodexAppThreadMetadata,
@@ -3882,6 +3883,30 @@ function codexBridgeDetachFile(): void {
 function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
   if (!codexBridgeFallbackActive()) return;
   if (codexBridgeRolloutPath) {
+    // A Codex process can keep its parent and sibling-agent rollouts open at
+    // the same time. Pre-submit pid discovery therefore may have attached an
+    // adopted pane to an unverified sibling transcript. writeInput returns the
+    // authoritative visible-session id; switch immediately instead of keeping
+    // the first attachment forever. Do not drain the old path because it has
+    // just been proven to belong to a different conversation.
+    if (structuredBridgeIsCodex()) {
+      const currentSid = codexSessionIdFromRolloutPath(codexBridgeRolloutPath);
+      if (currentSid?.toLowerCase() === cliSessionId.toLowerCase()) return;
+      const next = resolveFileBridgePath('codex', { sessionId: cliSessionId });
+      if (next && next !== codexBridgeRolloutPath) {
+        const attachMode = lastInitConfig?.adoptMode ? 'split-live' : 'fresh-empty';
+        log(`Codex session binding corrected ${currentSid ?? '?'} → ${cliSessionId}; re-attaching bridge to ${next}`);
+        codexBridgeDetachFile();
+        codexBridgePendingSessionId = undefined;
+        codexBridgeAttach(next, attachMode);
+      } else if (!next) {
+        log(`Codex session binding corrected ${currentSid ?? '?'} → ${cliSessionId}; waiting for rollout`);
+        codexBridgeDetachFile();
+        codexBridgePendingSessionId = cliSessionId;
+        codexBridgeStartTimer();
+      }
+      return;
+    }
     // Already attached — first-attach-wins for most CLIs. Exceptions: TRAE
     // and Grok can rotate their native session in the same process.
     if (structuredBridgeIsTraex()) {
@@ -5615,6 +5640,13 @@ function adapterInputHandle(target: SessionBackend): PtyHandle {
   return target instanceof ZmxBackend
     ? strictInputHandle(target)
     : target;
+}
+
+function codexAdoptComposerConflict(target: SessionBackend): string | undefined {
+  if (lastInitConfig?.cliId !== 'codex' || !lastInitConfig.adoptMode) return undefined;
+  const state = detectCodexComposerState(target.captureInputState?.());
+  if (state !== 'draft') return undefined;
+  return t('worker.codex_composer_conflict');
 }
 
 let ambiguousSubmissionWriteTail: Promise<void> = Promise.resolve();
@@ -11871,6 +11903,21 @@ process.on('message', async (raw: unknown) => {
             const submissionBackend = backend;
             const submissionAdapter = cliAdapter;
             let recoveryFailureReason: string | undefined;
+            const composerConflict = codexAdoptComposerConflict(submissionBackend);
+            if (composerConflict) {
+              log('Refused Codex adopt input because the local composer contains an unsubmitted draft');
+              scheduleSubmitFailureNotify(
+                content,
+                undefined,
+                'submit history',
+                undefined,
+                composerConflict,
+                turnSeq,
+                msg,
+                'failed',
+              );
+              return;
+            }
             try {
               const transaction = await runAmbiguousSubmissionTransaction(
                 submissionBackend,

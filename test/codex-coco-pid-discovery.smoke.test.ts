@@ -17,12 +17,15 @@ import { findCodexRolloutByPid } from '../src/services/codex-transcript.js';
 import { findCocoSessionByPid } from '../src/services/coco-transcript.js';
 
 const CODEX_SID = '019dd80d-d922-7a11-8339-0208d8c5b4ec';
+const CODEX_SIBLING_SID = '019dd80d-d922-7a11-8339-0208d8c5b4ee';
 const COCO_SID = '8db7d911-96f3-4764-a310-e42ae4cb626f';
 
 let dir: string;
 let codexRollout: string;
+let codexSiblingRollout: string;
 let cocoSessionLog: string;
 let child: ChildProcessWithoutNullStreams;
+let ambiguousChild: ChildProcessWithoutNullStreams;
 
 beforeAll(async () => {
   dir = mkdtempSync(join(tmpdir(), 'bmx-pid-disc-'));
@@ -31,7 +34,9 @@ beforeAll(async () => {
   const codexDir = join(dir, '.codex', 'sessions', '2026', '05', '15');
   mkdirSync(codexDir, { recursive: true });
   codexRollout = join(codexDir, `rollout-2026-05-15T07-04-39-${CODEX_SID}.jsonl`);
+  codexSiblingRollout = join(codexDir, `rollout-2026-05-15T07-04-40-${CODEX_SIBLING_SID}.jsonl`);
   writeFileSync(codexRollout, '');
+  writeFileSync(codexSiblingRollout, '');
   // 伪 CoCo 会话目录：路径里必须含 `/.cache/coco/sessions/<uuid>/`。session.log
   // 模拟 CoCo 长持有的 fd（events.jsonl 是 open-write-close，不靠谱）。
   const cocoDir = join(dir, '.cache', 'coco', 'sessions', COCO_SID);
@@ -63,10 +68,36 @@ beforeAll(async () => {
     });
     child.once('error', reject);
   });
+
+  ambiguousChild = spawn(
+    process.execPath,
+    [
+      '-e',
+      `
+        const fs = require('fs');
+        fs.openSync(${JSON.stringify(codexRollout)}, 'a');
+        fs.openSync(${JSON.stringify(codexSiblingRollout)}, 'a');
+        process.stdout.write('ready\\n');
+        setTimeout(() => {}, 60000);
+      `,
+    ],
+    { stdio: ['ignore', 'pipe', 'pipe'] },
+  ) as ChildProcessWithoutNullStreams;
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('ambiguous child not ready in 5s')), 5000);
+    ambiguousChild.stdout.once('data', (buf: Buffer) => {
+      if (buf.toString().includes('ready')) {
+        clearTimeout(timer);
+        resolve();
+      }
+    });
+    ambiguousChild.once('error', reject);
+  });
 });
 
 afterAll(() => {
   if (child && !child.killed) child.kill('SIGKILL');
+  if (ambiguousChild && !ambiguousChild.killed) ambiguousChild.kill('SIGKILL');
   if (dir) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -78,6 +109,10 @@ describe('findCodexRolloutByPid', () => {
     // macOS lsof 会把 tmp 路径解析成 /private/tmp/... —— 用文件名 anchor
     // 而不是完整路径比较。
     expect(hit!.path.endsWith(`rollout-2026-05-15T07-04-39-${CODEX_SID}.jsonl`)).toBe(true);
+  });
+
+  it('does not guess when one process holds multiple rollout files', () => {
+    expect(findCodexRolloutByPid(ambiguousChild.pid!)).toBeUndefined();
   });
 
   it('returns undefined for a non-existent pid', () => {
