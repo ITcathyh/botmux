@@ -56,6 +56,13 @@ const zhSidebar = [
     ],
   },
   {
+    text: '开发与扩展',
+    collapsed: false,
+    items: [
+      { text: 'Plugin 开发与市场注册', link: '/plugins' },
+    ],
+  },
+  {
     text: '命令参考',
     collapsed: false,
     items: [
@@ -128,6 +135,13 @@ const enSidebar = [
       { text: 'Workflow (Experimental)', link: '/en/workflow' },
       { text: 'Lifecycle Hooks', link: '/en/hooks' },
       { text: 'Skill + CLI Interaction', link: '/en/skill-cli' },
+    ],
+  },
+  {
+    text: 'Development & Extensions',
+    collapsed: false,
+    items: [
+      { text: 'Plugin Development & Market', link: '/en/plugins' },
     ],
   },
   {
