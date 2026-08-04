@@ -11477,24 +11477,6 @@ process.on('message', async (raw: unknown) => {
       const initStartedAtMs = Date.now();
       if (lastInitConfig) return;  // already initialized
       lastInitConfig = msg;
-      // Claude bridge turn-attribution flags, set once per spawn:
-      //  • setLocalTurns(adopt): synthesise local turns for a human typing in
-      //    an ADOPTED pane. Managed spawns leave it off.
-      //  • setTruncationFallback(no-transport): bind a fingerprint-mismatched
-      //    user event to the earliest pending durable mark — ONLY for a strict
-      //    no-write session (apiOnly core-only OR http_async_/http_wait_ virtual
-      //    chat), where local terminal write is impossible so the mismatch can
-      //    only be claude-code's truncated-envelope user line. A NORMAL managed
-      //    session can mint a Web Terminal write token, so it must NOT bind
-      //    (would steal the durable mark — codex PR #724 P1); it keeps
-      //    mismatch→local-synth. Mirrors the no-transport predicate used for the
-      //    credential boundary below.
-      bridgeQueue.setLocalTurns(msg.adoptMode === true);
-      bridgeQueue.setTruncationFallback(
-        msg.apiOnly === true
-        || msg.chatId?.startsWith('http_async_') === true
-        || msg.chatId?.startsWith('http_wait_') === true,
-      );
       activeRestartAttemptId = msg.restartAttemptId;
       sessionId = msg.sessionId;
       refreshTerminalViewToken();

@@ -13,7 +13,7 @@
  *     yet (e.g. Claude is still in tool-use mid-turn)
  */
 import { describe, it, expect } from 'vitest';
-import { BridgeTurnQueue, makeFingerprint } from '../src/services/bridge-turn-queue.js';
+import { BridgeTurnQueue, makeFingerprint, isTruncatedMatch } from '../src/services/bridge-turn-queue.js';
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
 import type { TranscriptEvent } from '../src/services/claude-transcript.js';
 
@@ -122,7 +122,6 @@ describe('BridgeTurnQueue', () => {
 
   it('local-terminal turn before any Lark message: emitted as isLocal turn (not dropped)', () => {
     const q = new BridgeTurnQueue();
-    q.setLocalTurns(true); // adopt mode: a human types in the pane
     // Local user types in the original pane — no pending turn yet
     q.ingest([user('local-u1'), assistant('local-a1', 'local reply')]);
     // Then a Lark message arrives
@@ -141,7 +140,6 @@ describe('BridgeTurnQueue', () => {
 
   it('local turn between two Lark turns: local emits separately, neither Lark turn is polluted', () => {
     const q = new BridgeTurnQueue();
-    q.setLocalTurns(true); // adopt mode: a human types in the pane
     q.mark('t1');
     q.ingest([user('u1'), assistant('a1', 'lark1')]);
     // After t1 is started+collected but not yet emitted, local user types
@@ -360,7 +358,6 @@ describe('BridgeTurnQueue', () => {
 
   it('fingerprint match: only the matching user event starts the Lark turn; non-match becomes a local turn', () => {
     const q = new BridgeTurnQueue();
-    q.setLocalTurns(true); // adopt mode: local `ls -la` is a real human turn
     const fp = makeFingerprint('please review the new patch');
     q.mark('t1', fp);
     // Local user types something else first — synthesised as a local turn
@@ -381,7 +378,6 @@ describe('BridgeTurnQueue', () => {
 
   it('fingerprint mismatch: local user with different content creates a local turn but does NOT start the Lark turn', () => {
     const q = new BridgeTurnQueue();
-    q.setLocalTurns(true); // adopt mode: distinct local input must not steal the Lark mark
     const fp = makeFingerprint('lark-specific question');
     q.mark('t1', fp);
     // Local user types — content does not match fingerprint
@@ -564,7 +560,6 @@ describe('BridgeTurnQueue', () => {
   describe('local-terminal turn forwarding', () => {
     it('marks the synthesised turn as isLocal and captures userUuid', () => {
       const q = new BridgeTurnQueue();
-      q.setLocalTurns(true);
       q.ingest([user('local-u1', 'pwd'), assistant('local-a1', '/tmp')]);
       const ready = q.drainEmittable();
       expect(ready).toHaveLength(1);
@@ -582,7 +577,6 @@ describe('BridgeTurnQueue', () => {
 
     it('empty local turn (no assistant text yet) is dropped on the next user event', () => {
       const q = new BridgeTurnQueue();
-      q.setLocalTurns(true);
       // First local prompt — Claude crashed / cancelled before responding.
       q.ingest([user('local-u1', 'first')]);
       // Queue now has a started local turn with no assistant uuids.
@@ -600,7 +594,6 @@ describe('BridgeTurnQueue', () => {
 
     it('an empty Lark turn (no fingerprint match yet) is NOT dropped by a local turn arriving', () => {
       const q = new BridgeTurnQueue();
-      q.setLocalTurns(true);
       q.mark('t1', makeFingerprint('lark question'));
       // Local input arrives first — must not consume / drop the unstarted Lark turn.
       q.ingest([user('local-u', 'something else'), assistant('local-a', 'local reply')]);
@@ -620,7 +613,6 @@ describe('BridgeTurnQueue', () => {
 
     it('back-to-back local turns each emit independently with their own uuids', () => {
       const q = new BridgeTurnQueue();
-      q.setLocalTurns(true);
       q.ingest([
         user('local-u1', 'first'),
         assistant('local-a1', 'first reply'),
@@ -644,7 +636,6 @@ describe('BridgeTurnQueue', () => {
       // text. The empty-collecting drop now applies to Lark turns too, so
       // the abandoned turn is removed and the next turn emits cleanly.
       const q = new BridgeTurnQueue();
-      q.setLocalTurns(true);
       q.mark('t1');
       q.ingest([user('u1')]);  // t1 started, model went silent
       q.ingest([user('local-u'), assistant('local-a', 'local reply')]);
@@ -757,7 +748,6 @@ describe('BridgeTurnQueue', () => {
 
     it('queued_command prompt mismatch falls through to local turn synthesised from attachment.prompt', () => {
       const q = new BridgeTurnQueue();
-      q.setLocalTurns(true); // adopt mode: the type-ahead prompt is real human input
       q.mark('t1', makeFingerprint('lark-specific question'));
       // User typed something else directly in the pane while Claude was busy
       // — it landed in the type-ahead queue and now dequeues as a
@@ -921,85 +911,71 @@ describe('BridgeTurnQueue', () => {
     });
   });
 
-  // Regression for the core-only / managed-mode completion bug: claude-code
-  // TRUNCATES the leading envelope lines (`<user_message>` + `<botmux_task …>`)
-  // when persisting the user turn to its transcript, so a head-substring
-  // fingerprint can NEVER match the recorded line. In MANAGED mode (default —
-  // no adopt) there is no local input, so the next meaningful user event MUST
-  // bind the pending durable mark rather than synthesise a local turn that
-  // steals the line and leaves the mark to expire with no final_output.
-  // Truncation-fallback (STRICT no-write apiOnly / core-only / HTTP-virtual):
-  // claude-code TRUNCATES the leading envelope lines when persisting the user
-  // turn, so a head-substring fingerprint can never match. Since local terminal
-  // write is impossible for these sessions, the mismatched user event is
-  // unambiguously the pending durable turn — bind it (not local-synth).
-  describe('truncation-fallback (no-write apiOnly): mismatched user binds the pending durable mark', () => {
-    it('binds the pending mark even when the transcript user line does NOT contain the fingerprint', () => {
-      const q = new BridgeTurnQueue();
-      q.setTruncationFallback(true); // strict no-write session
-      const fp = makeFingerprint('<user_message>\n<botmux_task trusted="true">\nDo the thing');
-      q.mark('t1', fp, 100, undefined, 7); // durable trigger (dispatchAttempt)
-      // claude wrote only the truncated tail — no <botmux_task> prefix, so the
-      // head fingerprint is absent from the recorded line.
-      q.ingest([user('u1', 'Do the thing\n</botmux_task>\n</user_message>'), assistant('a1', 'CC_DONE')]);
-      const ready = q.drainEmittable();
-      expect(ready).toHaveLength(1);
-      expect(ready[0].turnId).toBe('t1');       // bound to the durable mark, NOT local-*
-      expect(ready[0].isLocal).toBeFalsy();
-      expect(ready[0].assistantUuids).toEqual(['a1']);
-      expect(q.size()).toBe(0);
+  // Truncation-proof bind (codex PR #724): claude-code TRUNCATES the leading
+  // envelope lines (`<user_message>` + `<botmux_task …>`) when persisting the
+  // user turn, so the head-substring fingerprint never matches. We bind the
+  // pending durable mark ONLY when the recorded line is a PROVABLE truncation
+  // (its normalised text is a contiguous substring of the mark's full
+  // contentNormalized) — capability-agnostic, so an unrelated local terminal
+  // turn cannot steal the mark regardless of write-token access.
+  describe('isTruncatedMatch (content proof)', () => {
+    const full = makeFingerprintFull('<user_message> <botmux_task trusted="true"> Please run the migration and report results </botmux_task> </user_message>');
+    it('accepts the surviving tail of the marked content', () => {
+      expect(isTruncatedMatch('Please run the migration and report results </botmux_task> </user_message>', full)).toBe(true);
     });
-
-    it('does NOT synthesise a local turn on a mismatched user event (no-write session)', () => {
-      const q = new BridgeTurnQueue();
-      q.setTruncationFallback(true);
-      const fp = makeFingerprint('a prompt whose head claude will drop');
-      q.mark('t1', fp);
-      q.ingest([user('u1', 'totally different recorded text'), assistant('a1', 'reply')]);
-      // No local-* turn is ever created; the mark is bound instead.
-      expect(q.peek().some(t => t.isLocal)).toBe(false);
-      const ready = q.drainEmittable();
-      expect(ready).toHaveLength(1);
-      expect(ready[0].turnId).toBe('t1');
-      expect(ready[0].assistantUuids).toEqual(['a1']);
+    it('rejects unrelated short local input (pwd / ls)', () => {
+      expect(isTruncatedMatch('pwd', full)).toBe(false);
+      expect(isTruncatedMatch('ls -la', full)).toBe(false);
     });
-
-    it('no-write session: a stray USER event with NO pending mark does not start a local turn', () => {
-      const q = new BridgeTurnQueue();
-      q.setTruncationFallback(true);
-      // No mark() — a stray user line (e.g. mark not yet created) must not be
-      // synthesised as a local turn. (An orphan assistant continuation after a
-      // restart IS still recovered via the headless path — not exercised here.)
-      q.ingest([user('u1', 'orphan user line')]);
-      expect(q.peek().some(t => t.isLocal)).toBe(false);
-      expect(q.peek()).toHaveLength(0);
-      expect(q.drainEmittable()).toEqual([]);
+    it('rejects when there is no mark content', () => {
+      expect(isTruncatedMatch('anything at all here', undefined)).toBe(false);
+      expect(isTruncatedMatch('anything at all here', '')).toBe(false);
+    });
+    it('rejects a too-short recorded line even if it is a substring', () => {
+      expect(isTruncatedMatch('run', full)).toBe(false); // below TRUNCATION_MATCH_MIN_CHARS
+    });
+    it('rejects text that is NOT a substring of the mark', () => {
+      expect(isTruncatedMatch('a completely different instruction entirely', full)).toBe(false);
     });
   });
 
-  // codex PR #724 P1 regression: adoptMode=false is NOT "no local input". A
-  // NORMAL managed session (truncationFallback OFF — it can mint a Web Terminal
-  // write token) must keep the mismatch→local-synth path: a human-typed local
-  // turn there must NOT steal the API/Lark durable mark.
-  describe('normal managed + writable terminal (truncationFallback OFF): local input does NOT steal the durable mark', () => {
-    it('a Web Terminal local turn does NOT consume the pending API durable mark', () => {
+  describe('truncation-proof bind in the queue (durable mark, mismatched head)', () => {
+    it('binds the durable mark when the recorded line is a provable truncation of the marked content', () => {
       const q = new BridgeTurnQueue();
-      // Neither flag set → normal managed. Local write IS possible here.
-      const fp = makeFingerprint('trusted API prompt');
-      q.mark('api-trigger', fp, 100, undefined, 9); // durable API trigger
-      // Human typed in the Web Terminal while the API turn was pending:
+      const marked = '<user_message>\n<botmux_task trusted="true">\nDo the migration and report</botmux_task>\n</user_message>';
+      const fp = makeFingerprint(marked);
+      const norm = makeFingerprintFull(marked);
+      q.mark('t1', fp, 100, norm, 7); // durable trigger with contentNormalized
+      // claude persisted only the truncated tail (head envelope dropped):
+      q.ingest([user('u1', 'Do the migration and report</botmux_task>\n</user_message>'), assistant('a1', 'CC_DONE')]);
+      const ready = q.drainEmittable();
+      expect(ready).toHaveLength(1);
+      expect(ready[0].turnId).toBe('t1');
+      expect(ready[0].isLocal).toBeFalsy();
+      expect(ready[0].dispatchAttempt).toBe(7);
+      expect(ready[0].assistantUuids).toEqual(['a1']);
+    });
+
+    // codex PR #724 P1: a Web Terminal local turn (capability exists on ANY
+    // session, incl. apiOnly/core-only via write-link) must NOT steal the
+    // durable mark. The content proof makes this hold WITHOUT keying on session
+    // type — `pwd` is not a substring of the marked prompt.
+    it('does NOT let an unrelated Web Terminal local turn steal the durable mark', () => {
+      const q = new BridgeTurnQueue();
+      const marked = 'trusted API prompt: analyse the failing test and propose a fix';
+      const fp = makeFingerprint(marked);
+      const norm = makeFingerprintFull(marked);
+      q.mark('api-trigger', fp, 100, norm, 9);
+      // Human typed `pwd` in the Web Terminal while api-trigger was pending:
       q.ingest([user('web-u', 'pwd'), assistant('web-a', '/tmp')]);
-      // The local turn is synthesised (not bound to api-trigger); the durable
-      // mark stays pending, unstolen.
       const apiMark = q.peek().find(t => t.turnId === 'api-trigger');
-      expect(apiMark?.started).toBe(false);
+      expect(apiMark?.started).toBe(false); // NOT stolen
       const ready = q.drainEmittable();
       expect(ready).toHaveLength(1);
       expect(ready[0].isLocal).toBe(true);
       expect(ready[0].turnId).not.toBe('api-trigger');
-      expect(ready[0].assistantUuids).toEqual(['web-a']);
-      // When the REAL API user line lands, api-trigger binds normally.
-      q.ingest([user('api-u', 'trusted API prompt — full'), assistant('api-a', 'API reply')]);
+      // The real API user line binds it afterwards.
+      q.ingest([user('api-u', 'trusted API prompt: analyse the failing test and propose a fix'), assistant('api-a', 'API reply')]);
       const next = q.drainEmittable();
       expect(next).toHaveLength(1);
       expect(next[0].turnId).toBe('api-trigger');
@@ -1007,14 +983,21 @@ describe('BridgeTurnQueue', () => {
       expect(next[0].assistantUuids).toEqual(['api-a']);
     });
 
-    it('normal managed: a no-pending-mark local turn is emitted (not silently dropped)', () => {
+    it('no truncation proof + no fingerprint match → synth local (not silently dropped)', () => {
       const q = new BridgeTurnQueue();
-      // No mark; local human input with no pending Lark/API turn.
-      q.ingest([user('web-u', 'ls'), assistant('web-a', 'file listing')]);
+      q.mark('t1', makeFingerprint('some API prompt'), 100, makeFingerprintFull('some API prompt'));
+      q.ingest([user('web-u', 'unrelated local command output here'), assistant('web-a', 'result')]);
       const ready = q.drainEmittable();
       expect(ready).toHaveLength(1);
-      expect(ready[0].isLocal).toBe(true);
-      expect(ready[0].assistantUuids).toEqual(['web-a']);
+      expect(ready[0].isLocal).toBe(true); // emitted, not dropped
+      const t1 = q.peek().find(t => t.turnId === 't1');
+      expect(t1?.started).toBe(false); // mark untouched
     });
   });
 });
+
+/** Local helper: full normalised content (what the worker stores as
+ *  contentNormalized), distinct from the 30-char makeFingerprint. */
+function makeFingerprintFull(message: string): string {
+  return message.replace(/\s+/g, ' ').trim();
+}
