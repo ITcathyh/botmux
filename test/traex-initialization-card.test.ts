@@ -32,7 +32,7 @@ describe('TraeX 统一初始化卡', () => {
     { name: 'beta', path: '/repo/beta', type: 'worktree', branch: 'feat/beta' },
   ];
 
-  it('同一张卡包含选仓、worktree、手动目录、提示词和三种启动按钮', () => {
+  it('同一张卡只包含一个路径选择框、运行方式、提示词和启动按钮', () => {
     const card = JSON.parse(buildTraexInitializationCard({
       rootId: 'om_root',
       pending,
@@ -41,23 +41,31 @@ describe('TraeX 统一初始化卡', () => {
     }));
     const nodes = walk(card);
 
-    const target = nodes.find(node => node.tag === 'select_static' && node.name === 'traex_init_target');
-    expect(target).toBeDefined();
-    expect((target?.options as Array<Record<string, unknown>>).map(option => option.value))
+    const targetSelects = nodes.filter(node =>
+      node.tag === 'select_static'
+      && (node.value as Record<string, unknown> | undefined)?.key === 'traex_init_target');
+    expect(targetSelects).toHaveLength(1);
+    expect((targetSelects[0]?.options as Array<Record<string, unknown>>).map(option => option.value))
       .toEqual(['dir:/repo/alpha', 'dir:/repo/beta', 'worktree:/repo/alpha']);
-    expect(nodes.find(node => node.tag === 'input' && node.name === 'traex_init_manual_path')).toBeDefined();
+    const mode = nodes.find(node =>
+      node.tag === 'select_static'
+      && (node.value as Record<string, unknown> | undefined)?.key === 'traex_init_mode');
+    expect(mode).toMatchObject({ initial_option: 'traex' });
+    expect((mode?.options as Array<Record<string, unknown>>).map(option => option.value))
+      .toEqual(['traex', 'forge-pipeline', 'forge-pilot']);
+    expect(nodes.find(node => node.tag === 'input' && node.name === 'traex_init_manual_path')).toBeUndefined();
     expect(nodes.find(node => node.tag === 'input' && node.name === 'initial_prompt')).toMatchObject({
       default_value: pending.originalPrompt,
       input_type: 'multiline_text',
     });
 
-    const modes = nodes
-      .filter(node => node.action_type === 'form_submit')
-      .map(node => (node.value as Record<string, unknown>)?.mode);
-    expect(modes).toEqual(['traex', 'forge-pipeline', 'forge-pilot']);
+    expect(nodes.find(node => node.action_type === 'form_submit')).toMatchObject({
+      name: 'traex_init_start',
+      value: { action: 'traex_init_start' },
+    });
   });
 
-  it('仓库、worktree、目录和提示词都在同一个表单内一次提交', () => {
+  it('下拉在表单外暂存选择，表单只提交提示词和启动动作', () => {
     const card = JSON.parse(buildTraexInitializationCard({
       rootId: 'om_root',
       pending,
@@ -68,8 +76,27 @@ describe('TraeX 统一初始化卡', () => {
     const form = nodes.find(node => node.tag === 'form' && node.name === 'traex_initialization_form')!;
     const formNodes = walk(form);
 
-    expect(formNodes.find(node => node.tag === 'select_static' && node.name === 'traex_init_target')).toBeDefined();
-    expect(formNodes.find(node => node.tag === 'input' && node.name === 'traex_init_manual_path')).toBeDefined();
+    expect(formNodes.find(node => node.tag === 'select_static')).toBeUndefined();
+    expect(formNodes.find(node => node.tag === 'input' && node.name === 'traex_init_manual_path')).toBeUndefined();
     expect(formNodes.find(node => node.tag === 'input' && node.name === 'initial_prompt')).toBeDefined();
+    expect(formNodes.find(node => node.action_type === 'form_submit')).toBeDefined();
+  });
+
+  it('使用稳定的 config/elements 卡片结构，form 内不嵌套布局容器', () => {
+    const card = JSON.parse(buildTraexInitializationCard({
+      rootId: 'om_root',
+      pending,
+      projects,
+      locale: 'zh',
+    }));
+    const nodes = walk(card);
+    const form = nodes.find(node => node.tag === 'form' && node.name === 'traex_initialization_form')!;
+    const formNodes = walk(form);
+
+    expect(card.schema).toBeUndefined();
+    expect(card.body).toBeUndefined();
+    expect(Array.isArray(card.elements)).toBe(true);
+    expect(formNodes.find(node => node.tag === 'column_set')).toBeUndefined();
+    expect(JSON.stringify(card)).not.toContain('primary_filled');
   });
 });

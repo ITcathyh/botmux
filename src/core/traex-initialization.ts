@@ -33,6 +33,7 @@ export interface PendingTraexInitialization {
   ownerOpenId?: string;
   originalPrompt: string;
   promptPrefix: string;
+  mode?: TraexInitializationMode;
   selection: TraexInitializationSelection;
   commitInFlight?: boolean;
 }

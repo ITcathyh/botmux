@@ -111,11 +111,14 @@ import {
   buildTraexInitializationPrompt,
   normalizeTraexInitialPrompt,
   normalizeTraexInitializationMode,
+  type TraexInitializationSelection,
 } from '../../core/traex-initialization.js';
 import {
   buildTraexInitializationCancelledCard,
   TRAEX_INIT_ACTION_CANCEL,
   TRAEX_INIT_ACTION_START,
+  TRAEX_INIT_KEY_MODE,
+  TRAEX_INIT_KEY_TARGET,
 } from './traex-initialization-card.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────
@@ -374,6 +377,43 @@ function duplicateMultiWorktreeChildNames(repoPaths: string[], projects: Project
     else seen.add(childName);
   }
   return [...dupes];
+}
+
+function resolveTraexTargetSelection(
+  selectedTarget: string,
+  projects: ProjectInfo[],
+  locale?: Locale,
+): { ok: true; selection: TraexInitializationSelection } | { ok: false; message: string } {
+  if (selectedTarget.startsWith('worktree:')) {
+    const selectedWorktreePath = selectedTarget.slice('worktree:'.length);
+    const project = projects.find(item => item.path === selectedWorktreePath && item.type === 'repo');
+    if (!project) {
+      return { ok: false, message: t('card.traex_init.repo_not_found', undefined, locale) };
+    }
+    return {
+      ok: true,
+      selection: { kind: 'worktree', repoPaths: [project.path], label: project.name },
+    };
+  }
+
+  if (selectedTarget.startsWith('dir:')) {
+    const selectedRepoPath = selectedTarget.slice('dir:'.length);
+    const project = projects.find(item => item.path === selectedRepoPath);
+    if (!project) {
+      return { ok: false, message: t('card.traex_init.repo_not_found', undefined, locale) };
+    }
+    return {
+      ok: true,
+      selection: {
+        kind: 'directory',
+        path: project.path,
+        label: `${project.name} (${project.branch})`,
+        pinWorkingDir: true,
+      },
+    };
+  }
+
+  return { ok: false, message: t('card.traex_init.repo_not_found', undefined, locale) };
 }
 
 function deferRepoCardWithdraw(larkAppId: string | undefined, messageId: string | undefined): void {
@@ -1757,6 +1797,54 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     };
   }
 
+  if (value?.key === TRAEX_INIT_KEY_TARGET || value?.key === TRAEX_INIT_KEY_MODE) {
+    const rootId = value.root_id;
+    const ds = rootId && larkAppId
+      ? getSessionByActionValue(activeSessions, rootId, larkAppId, value.session_id, undefined)
+      : undefined;
+    const loc = localeForBot(ds?.larkAppId ?? larkAppId);
+    const pending = ds?.pendingTraexInitialization;
+    if (!ds || !pending || pending.nonce !== value.nonce || !ds.pendingRepo) {
+      return { toast: { type: 'warning', content: t('card.traex_init.expired', undefined, loc) } };
+    }
+    if (!operatorOpenId || operatorOpenId !== pending.ownerOpenId || operatorOpenId !== ds.session.ownerOpenId) {
+      return { toast: { type: 'warning', content: t('card.traex_init.owner_only', undefined, loc) } };
+    }
+    if (cardMessageId && !isActiveRepoCard(ds, cardMessageId)) {
+      return { toast: { type: 'warning', content: t('card.traex_init.expired', undefined, loc) } };
+    }
+    if (pending.commitInFlight || ds.pendingRepoCommitInFlight || ds.worktreeCreating) {
+      return { toast: { type: 'info', content: t('card.traex_init.in_progress', undefined, loc) } };
+    }
+
+    const selected = action?.option;
+    if (typeof selected !== 'string') {
+      return { toast: { type: 'error', content: t('card.traex_init.expired', undefined, loc) } };
+    }
+
+    if (value.key === TRAEX_INIT_KEY_MODE) {
+      const mode = normalizeTraexInitializationMode(selected);
+      if (!mode) {
+        return { toast: { type: 'error', content: t('card.traex_init.expired', undefined, loc) } };
+      }
+      pending.mode = mode;
+      return { toast: { type: 'success', content: t('card.traex_init.mode_selected', undefined, loc) } };
+    }
+
+    const resolved = resolveTraexTargetSelection(selected, lastRepoScan.get(ds.chatId) ?? [], loc);
+    if (!resolved.ok) {
+      return { toast: { type: 'error', content: resolved.message } };
+    }
+    pending.selection = resolved.selection;
+    const key = resolved.selection.kind === 'worktree'
+      ? 'card.traex_init.worktree_selected'
+      : 'card.traex_init.repo_selected';
+    const label = resolved.selection.kind === 'worktree'
+      ? resolved.selection.label
+      : resolved.selection.path;
+    return { toast: { type: 'success', content: t(key, { path: label, name: label }, loc) } };
+  }
+
   if (value?.action && (
     value.action === TRAEX_INIT_ACTION_START
     || value.action === TRAEX_INIT_ACTION_CANCEL
@@ -1795,7 +1883,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       return JSON.parse(buildTraexInitializationCancelledCard(loc));
     }
 
-    const mode = normalizeTraexInitializationMode(value.mode);
+    const formValue = action?.form_value ?? {};
+    const mode = normalizeTraexInitializationMode(value.mode ?? formValue.traex_init_mode ?? pending.mode ?? 'traex');
     const normalizedPrompt = normalizeTraexInitialPrompt(action?.form_value?.initial_prompt);
     if (!mode) {
       return { toast: { type: 'error', content: t('card.traex_init.expired', undefined, loc) } };
@@ -1807,7 +1896,6 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       return { toast: { type: 'error', content: t(key, undefined, loc) } };
     }
 
-    const formValue = action?.form_value ?? {};
     const manualPath = typeof formValue.traex_init_manual_path === 'string'
       ? formValue.traex_init_manual_path.trim()
       : '';
@@ -1826,27 +1914,15 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         label: validation.resolvedPath,
         pinWorkingDir: true,
       };
-    } else if (selectedTarget.startsWith('worktree:')) {
-      const selectedWorktreePath = selectedTarget.slice('worktree:'.length);
-      const project = projects.find(item => item.path === selectedWorktreePath && item.type === 'repo');
-      if (!project) {
-        return { toast: { type: 'error', content: t('card.traex_init.repo_not_found', undefined, loc) } };
+    } else if (selectedTarget) {
+      const resolved = resolveTraexTargetSelection(selectedTarget, projects, loc);
+      if (!resolved.ok) {
+        return { toast: { type: 'error', content: resolved.message } };
       }
-      pending.selection = { kind: 'worktree', repoPaths: [project.path], label: project.name };
-    } else if (selectedTarget.startsWith('dir:')) {
-      const selectedRepoPath = selectedTarget.slice('dir:'.length);
-      const project = projects.find(item => item.path === selectedRepoPath);
-      if (!project) {
-        return { toast: { type: 'error', content: t('card.traex_init.repo_not_found', undefined, loc) } };
-      }
-      pending.selection = {
-        kind: 'directory',
-        path: project.path,
-        label: `${project.name} (${project.branch})`,
-        pinWorkingDir: true,
-      };
+      pending.selection = resolved.selection;
     }
 
+    pending.mode = mode;
     ds.pendingPrompt = pending.promptPrefix + buildTraexInitializationPrompt(mode, normalizedPrompt.prompt);
     ds.pendingCodexAppText = buildTraexInitializationPrompt(mode, normalizedPrompt.prompt);
     pending.originalPrompt = normalizedPrompt.prompt;
@@ -1870,6 +1946,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     }
 
     if (selection.kind === 'auto-worktree') {
+      const replyTurnId = fallbackTurnId(ds, undefined);
       void runAutoWorktreeCommit({
         ds,
         anchor: rootId,
@@ -1879,7 +1956,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         prompt: ds.pendingPrompt,
         operatorOpenId,
         activeSessions,
-        notify: message => sessionReply(rootId, message),
+        notify: message => sessionReply(rootId, message, undefined, replyTurnId),
       });
       return { toast: { type: 'info', content: t('card.repo.toast_worktree_creating', undefined, loc) } };
     }
@@ -3281,9 +3358,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       !sessionStillActive() ||
       targetDs.session.sessionId !== startSessionId ||
       !!targetDs.pendingRepo !== wasPending;
+    const worktreeReplyTurnId = fallbackTurnId(targetDs, undefined);
+    const replyWorktreeStatus = (message: string) =>
+      sessionReply(rootId, message, undefined, worktreeReplyTurnId);
     const notSwitched = async (creation: { path: string; branch: string }, when: string) => {
       logger.info(`[${tag(targetDs)}] Worktree ${creation.path} created but session changed ${when} — not switching`);
-      await sessionReply(rootId, t('cmd.repo.worktree_created_not_switched', { path: creation.path, branch: creation.branch }, locTarget));
+      await replyWorktreeStatus(t('cmd.repo.worktree_created_not_switched', { path: creation.path, branch: creation.branch }, locTarget));
     };
     void (async () => {
       try {
@@ -3322,7 +3402,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
             try { await removeRepoWorktree(c.repo, c.result.path); rolledBack++; }
             catch (re) { logger.warn(`[${tag(targetDs)}] rollback of ${c.result.path} failed: ${re instanceof Error ? re.message : re}`); }
           }
-          await sessionReply(rootId, rolledBack > 0
+          await replyWorktreeStatus(rolledBack > 0
             ? t('card.repo.worktree_rolled_back', { repo: pathBasename(failedRepo), error: errMsg, count: rolledBack }, locTarget)
             : t('cmd.repo.worktree_failed', { error: errMsg }, locTarget));
           return;
@@ -3338,11 +3418,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
             } catch (e) {
               const errMsg = e instanceof Error ? e.message : String(e);
               logger.warn(`[${tag(targetDs)}] riff worktree branch push failed (${c.result.branch}): ${errMsg}`);
-              await sessionReply(rootId, t('card.repo.riff_worktree_push_failed', { branch: c.result.branch, error: errMsg }, locTarget));
+              await replyWorktreeStatus(t('card.repo.riff_worktree_push_failed', { branch: c.result.branch, error: errMsg }, locTarget));
             }
           }
         }
-        await sessionReply(rootId, t('cmd.repo.worktree_created', {
+        await replyWorktreeStatus(t('cmd.repo.worktree_created', {
           path: creation.path, branch: creation.branch, base: creation.baseRef,
         }, locTarget));
         // The reply above awaited a Lark round-trip — a plain switch (which is
@@ -3363,7 +3443,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           // Don't report it as a creation failure, or the user retries and
           // trips over "worktree target already exists".
           logger.warn(`[${tag(targetDs)}] Worktree ${creation.path} created but switching failed: ${e instanceof Error ? e.message : e}`);
-          await sessionReply(rootId, t('cmd.repo.worktree_switch_failed', { path: creation.path, error: e instanceof Error ? e.message : String(e) }, locTarget));
+          await replyWorktreeStatus(t('cmd.repo.worktree_switch_failed', { path: creation.path, error: e instanceof Error ? e.message : String(e) }, locTarget));
         }
       } finally {
         targetDs.worktreeCreating = false;
