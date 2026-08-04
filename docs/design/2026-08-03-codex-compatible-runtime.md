@@ -169,7 +169,9 @@ latest；来源未知时不比较、不通知。setup/dashboard 提供显式迁�
 1. 读取 `--version`；
 2. 从 executable 的 realpath 向上查找其真实拥有者 `package.json/bin`；
 3. 只有唯一匹配的 npm package 才查询该 package 的 latest；
-4. 无法确认来源则状态为 `current-only`，绝不回退官方 Codex。
+4. `auto` 只把该归属用于选择版本流，不据此猜测实际安装器，也不合成
+   `npm`/`pnpm`/`yarn` 更新命令；
+5. 无法确认来源则状态为 `current-only`，绝不回退官方 Codex。
 
 `doctor --json` 只用于内置 `internal` 或用户显式选择的 `self` provider，并且 doctor
 报告的 current 必须与 executable 的 `--version` 一致。这样一个沿用上游 Codex doctor
@@ -233,7 +235,8 @@ displayName；official、legacy 与其它 CLI 的既有文案保持原样。
 - `internal`：保留官方 registry fallback；仅内置 runtime 可使用。
 - `self`：只接受 runtime 自身结构化 doctor 结果，无 registry fallback。
 - `npm`：查询显式 package；命令缺省时可不展示，不能伪造包管理器。
-- `auto`：只接受唯一 npm provenance；未知即 current-only。
+- `auto`：只接受唯一 npm provenance；可查询对应 package 的 latest，但不推断安装器或
+  合成更新命令；未知即 current-only。
 - `none`：不进入定时 update audit；运行时 `--version` 状态能力不受影响。
 
 entry key 包含 runtimeId 和 resolved executable；卡片使用 runtime displayName，可选展示
@@ -291,7 +294,7 @@ UI 改动在 PR 中附截图。
 | legacy default `cliPathOverride` | spawn 不变；无官方 fallback；RPC 仍关闭 |
 | 显式 npm custom | 独立 display/key/latest/command；不污染 official |
 | 显式 self custom | 只信同源完整 doctor 结果；异常输出降级 current-only |
-| auto 可定位唯一 npm owner | 查询真实 package，不查询官方 package |
+| auto 可定位唯一 npm owner | 查询真实 package，不查询官方 package，不合成包管理器命令 |
 | auto unknown binary | 有 current、无 latest、无提醒、无假命令 |
 | update none | 不访问 registry、不通知 |
 | official/custom 同时配置 | 两份 cache、dashboard row 和通知水位独立 |

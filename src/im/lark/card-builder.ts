@@ -487,11 +487,12 @@ export function buildSlashListCard(
   elements.push({ tag: 'hr' });
 
   // ④ 自动发现（命令 / skill / 插件）
-  const discHeading = `**${t('slashlist.part_discovered', { cliName }, locale)}**`;
+  const markdownCliName = escapeMd(cliName);
+  const discHeading = `**${t('slashlist.part_discovered', { cliName: markdownCliName }, locale)}**`;
   if (!discoverySupported) {
     elements.push({
       tag: 'markdown',
-      content: `${discHeading}\n${t('slashlist.part_discovered_unsupported', { cliName }, locale)}`,
+      content: `${discHeading}\n${t('slashlist.part_discovered_unsupported', { cliName: markdownCliName }, locale)}`,
     });
   } else if (discovered.length === 0) {
     elements.push({

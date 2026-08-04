@@ -129,6 +129,16 @@ export interface CliRuntimeUpdateMonitorWiring {
 }
 
 const STORE_FILE = 'cli-runtime-updates.json';
+const STORE_NEEDS_REWRITE = Symbol('cli-runtime-update-store-needs-rewrite');
+
+type CliRuntimeUpdateStoreWithMigration = CliRuntimeUpdateStore & {
+  [STORE_NEEDS_REWRITE]?: true;
+};
+
+interface ValidatedStoreEntry {
+  entry: CliRuntimeUpdateEntry;
+  needsRewrite: boolean;
+}
 
 type CliRuntimeUpdatePolicyProvider = CliRuntimeUpdateProvider | 'none';
 
@@ -150,7 +160,7 @@ export function cliRuntimeUpdateStorePathIn(dataDir: string): string {
   return join(dataDir, STORE_FILE);
 }
 
-function validEntry(raw: unknown): CliRuntimeUpdateEntry | null {
+function validEntry(raw: unknown): ValidatedStoreEntry | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
   const v = raw as Record<string, unknown>;
   if (v.cliId !== 'codex' || typeof v.binPath !== 'string' || !v.binPath) return null;
@@ -178,37 +188,46 @@ function validEntry(raw: unknown): CliRuntimeUpdateEntry | null {
   const latest = !autoUnmanaged && typeof v.latest === 'string' && parseVersion(v.latest)
     ? v.latest
     : null;
-  const updateCommand = !autoUnmanaged && typeof v.updateCommand === 'string' && v.updateCommand.trim()
+  // npm bin ownership identifies a release stream, not the package manager
+  // that installed it. Strip commands persisted by older auto probes instead
+  // of continuing to suggest an unproven `npm install -g` action.
+  const persistedUpdateCommand = typeof v.updateCommand === 'string' && v.updateCommand.trim()
     ? v.updateCommand.trim()
     : null;
+  const updateCommand = provider !== 'auto' && !autoUnmanaged
+    ? persistedUpdateCommand
+    : null;
   return {
-    cliId: 'codex',
-    runtimeId,
-    displayName,
-    binPath: v.binPath,
-    provider,
-    ...(packageName ? { packageName } : {}),
-    // Recompute instead of trusting persisted input. Besides hardening corrupted
-    // stores, this migrates v1/v2 entries onto the current fingerprint format.
-    sourceFingerprint: updateSourceFingerprint(provider, packageName),
-    // v1 stores predate this field and represented official Codex, which is
-    // managed.  Preserve that behavior while reading them.
-    managed: autoUnmanaged
-      ? false
-      : typeof v.managed === 'boolean'
-        ? v.managed
-        : provider === 'internal' || provider === 'npm' || (provider === 'auto' && !!packageName),
-    current,
-    latest,
-    updateAvailable: !!current && !!latest && isNewerVersion(latest, current),
-    updateCommand,
-    ...(!autoUnmanaged && typeof v.installTarget === 'string' && v.installTarget
-      ? { installTarget: v.installTarget }
-      : {}),
-    lastCheckedAt: v.lastCheckedAt,
-    ...(!autoUnmanaged && typeof v.lastNotifiedVersion === 'string' && parseVersion(v.lastNotifiedVersion)
-      ? { lastNotifiedVersion: v.lastNotifiedVersion }
-      : {}),
+    needsRewrite: provider === 'auto' && persistedUpdateCommand !== null,
+    entry: {
+      cliId: 'codex',
+      runtimeId,
+      displayName,
+      binPath: v.binPath,
+      provider,
+      ...(packageName ? { packageName } : {}),
+      // Recompute instead of trusting persisted input. Besides hardening corrupted
+      // stores, this migrates v1/v2 entries onto the current fingerprint format.
+      sourceFingerprint: updateSourceFingerprint(provider, packageName),
+      // v1 stores predate this field and represented official Codex, which is
+      // managed.  Preserve that behavior while reading them.
+      managed: autoUnmanaged
+        ? false
+        : typeof v.managed === 'boolean'
+          ? v.managed
+          : provider === 'internal' || provider === 'npm' || (provider === 'auto' && !!packageName),
+      current,
+      latest,
+      updateAvailable: !!current && !!latest && isNewerVersion(latest, current),
+      updateCommand,
+      ...(!autoUnmanaged && typeof v.installTarget === 'string' && v.installTarget
+        ? { installTarget: v.installTarget }
+        : {}),
+      lastCheckedAt: v.lastCheckedAt,
+      ...(!autoUnmanaged && typeof v.lastNotifiedVersion === 'string' && parseVersion(v.lastNotifiedVersion)
+        ? { lastNotifiedVersion: v.lastNotifiedVersion }
+        : {}),
+    },
   };
 }
 
@@ -219,11 +238,18 @@ export function readCliRuntimeUpdateStoreFrom(dataDir: string): CliRuntimeUpdate
     const raw = JSON.parse(readFileSync(path, 'utf8')) as { entries?: unknown };
     if (!raw?.entries || typeof raw.entries !== 'object' || Array.isArray(raw.entries)) return { entries: {} };
     const entries: Record<string, CliRuntimeUpdateEntry> = {};
+    let needsRewrite = false;
     for (const [key, value] of Object.entries(raw.entries as Record<string, unknown>)) {
-      const entry = validEntry(value);
-      if (entry) entries[key] = entry;
+      const validated = validEntry(value);
+      if (!validated) continue;
+      entries[key] = validated.entry;
+      needsRewrite ||= validated.needsRewrite;
     }
-    return { entries };
+    const store: CliRuntimeUpdateStoreWithMigration = { entries };
+    if (needsRewrite) {
+      Object.defineProperty(store, STORE_NEEDS_REWRITE, { value: true });
+    }
+    return store;
   } catch {
     return { entries: {} };
   }
@@ -488,7 +514,12 @@ export async function probeCliRuntimeUpdate(
     // A cached value advertised by doctor may belong to a different stream.
     latest,
     managed: true,
-    updateCommand: `npm install -g ${packageName}@latest`,
+    // Explicit `npm` is a user-selected update policy. Auto provenance proves
+    // only package/bin ownership, so it may select the registry stream but
+    // must not infer npm (rather than pnpm/yarn/etc.) as the installer.
+    updateCommand: target.provider === 'npm'
+      ? `npm install -g ${packageName}@latest`
+      : null,
     ...(target.provider === 'auto' ? { packageName } : {}),
     ...(packageRoot ? { installTarget: packageRoot } : {}),
   };
@@ -598,6 +629,9 @@ export function filterCliRuntimeUpdateEntriesForTargets(
       provider: target.provider,
       ...(target.packageName ? { packageName: target.packageName } : { packageName: undefined }),
       sourceFingerprint: updateSourceFingerprint(target.provider, target.packageName),
+      // Also sanitize callers that supply an in-memory/legacy store without
+      // passing through readCliRuntimeUpdateStoreFrom first.
+      updateCommand: target.provider === 'auto' ? null : entry.updateCommand,
     });
   }
   return visible;
@@ -661,6 +695,15 @@ export async function runCliRuntimeUpdateAudit(deps: CliRuntimeUpdateAuditDeps):
   const log = deps.log ?? (() => {});
   const store = deps.readStore();
   const resolveAutoPackage = deps.resolveAutoPackage ?? resolveNpmPackageForExecutable;
+  // Old stores may contain an auto-generated `npm install -g` suggestion.
+  // Remove it before TTL decisions so upgrading botmux fixes the visible state
+  // immediately without forcing a network probe.
+  let storeChanged = (store as CliRuntimeUpdateStoreWithMigration)[STORE_NEEDS_REWRITE] === true;
+  for (const entry of Object.values(store.entries)) {
+    if (entry.provider !== 'auto' || entry.updateCommand === null) continue;
+    entry.updateCommand = null;
+    storeChanged = true;
+  }
   // Local ownership is intentionally refreshed on every hourly tick, before
   // the 24h network TTL. This makes a symlink/package switch a new update source
   // immediately instead of inheriting stale latest/command/notification state.
@@ -675,7 +718,7 @@ export async function runCliRuntimeUpdateAudit(deps: CliRuntimeUpdateAuditDeps):
     delete store.entries[key];
     pruned = true;
   }
-  if (pruned) deps.writeStore(store);
+  if (pruned || storeChanged) deps.writeStore(store);
 
   for (const target of targets) {
     const key = targetKey(target);
@@ -714,7 +757,7 @@ export async function runCliRuntimeUpdateAudit(deps: CliRuntimeUpdateAuditDeps):
         current: result.current,
         latest: result.latest,
         updateAvailable: !!result.latest && isNewerVersion(result.latest, result.current),
-        updateCommand: result.updateCommand,
+        updateCommand: target.provider === 'auto' ? null : result.updateCommand,
         ...(result.installTarget ? { installTarget: result.installTarget } : {}),
         lastCheckedAt: now,
         ...(reusablePrevious?.lastNotifiedVersion ? { lastNotifiedVersion: reusablePrevious.lastNotifiedVersion } : {}),
@@ -760,13 +803,19 @@ function inlineCode(value: string): string {
   return value.replace(/`/g, "'");
 }
 
+/** Escape runtime-controlled text before interpolating it into Lark Markdown. */
+function escapeLarkMarkdown(value: string): string {
+  return value.replace(/[*_~`\[\]\\<>]/g, (char) => `\\${char}`);
+}
+
 export function buildCliRuntimeUpdateCard(
   entry: CliRuntimeUpdateEntry,
   opts: { dashboardUrl?: string; locale?: Locale } = {},
 ): string {
   const locale = opts.locale;
+  const markdownDisplayName = escapeLarkMarkdown(entry.displayName);
   const lines = [
-    t('cli_update.available', { cli: entry.displayName }, locale),
+    t('cli_update.available', { cli: markdownDisplayName }, locale),
     t('cli_update.version_delta', { current: entry.current ?? '?', latest: entry.latest ?? '?' }, locale),
     t('cli_update.binary', { path: `\`${inlineCode(entry.binPath)}\`` }, locale),
   ];
@@ -778,6 +827,8 @@ export function buildCliRuntimeUpdateCard(
     config: { wide_screen_mode: true },
     header: {
       template: 'orange',
+      // A plain-text field does not parse Markdown; keep the user-facing name
+      // byte-for-byte instead of exposing Markdown escape backslashes.
       title: { tag: 'plain_text', content: t('cli_update.card_title', { cli: entry.displayName }, locale) },
     },
     elements: [{ tag: 'markdown', content: lines.join('\n') }],

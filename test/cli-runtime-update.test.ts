@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -332,6 +332,19 @@ describe('filterCliRuntimeUpdateEntriesForTargets', () => {
       () => ({ packageName: '@vendor/codex-b', packageRoot: '/opt/node_modules/@vendor/codex-b' }),
     )).toEqual([]);
 
+    const known = filterCliRuntimeUpdateEntriesForTargets(
+      [entry],
+      [target],
+      () => ({ packageName: '@vendor/codex-a', packageRoot: '/opt/node_modules/@vendor/codex-a' }),
+    );
+    expect(known).toHaveLength(1);
+    expect(known[0]).toMatchObject({
+      latest: '1.1.0',
+      updateAvailable: true,
+      updateCommand: null,
+      installTarget: '/opt/node_modules/@vendor/codex-a',
+    });
+
     const unknown = filterCliRuntimeUpdateEntriesForTargets([updateEntry({
       ...entry,
       packageName: undefined,
@@ -552,7 +565,7 @@ describe('probeCodexRuntimeUpdate', () => {
       latest: '1.3.0',
       managed: true,
       packageName: '@acme/codex',
-      updateCommand: 'npm install -g @acme/codex@latest',
+      updateCommand: null,
       installTarget: '/opt/node_modules/@acme/codex',
     });
     expect(fetchLatest).not.toHaveBeenCalled();
@@ -730,6 +743,119 @@ describe('runCliRuntimeUpdateAudit', () => {
     expect(notified).toEqual(['0.144.3', '0.145.0']);
   });
 
+  it('persists removal of a legacy auto command inside TTL without probing', async () => {
+    const now = 1_500_000;
+    const key = 'vendor-codex:/opt/vendor-codex';
+    let store: CliRuntimeUpdateStore = {
+      entries: {
+        [key]: updateEntry({
+          runtimeId: 'vendor-codex',
+          displayName: 'Vendor Codex',
+          binPath: '/opt/vendor-codex',
+          provider: 'auto',
+          packageName: '@vendor/codex',
+          current: '1.0.0',
+          latest: '1.1.0',
+          updateCommand: 'npm install -g @vendor/codex@latest',
+          installTarget: '/opt/node_modules/@vendor/codex',
+          lastCheckedAt: now - 1_000,
+        }),
+      },
+    };
+    const probe = vi.fn();
+    const writeStore = vi.fn((next: CliRuntimeUpdateStore) => {
+      store = structuredClone(next);
+    });
+
+    await runCliRuntimeUpdateAudit({
+      now: () => now,
+      targets: () => [runtimeTarget({
+        runtimeId: 'vendor-codex',
+        displayName: 'Vendor Codex',
+        binPath: '/opt/vendor-codex',
+        provider: 'auto',
+      })],
+      readStore: () => store,
+      writeStore,
+      resolveAutoPackage: () => ({
+        packageName: '@vendor/codex',
+        packageRoot: '/opt/node_modules/@vendor/codex',
+      }),
+      probe,
+    });
+
+    expect(probe).not.toHaveBeenCalled();
+    expect(writeStore).toHaveBeenCalledTimes(1);
+    expect(store.entries[key]).toMatchObject({
+      latest: '1.1.0',
+      updateAvailable: true,
+      updateCommand: null,
+      installTarget: '/opt/node_modules/@vendor/codex',
+      lastCheckedAt: now - 1_000,
+    });
+  });
+
+  it('carries a real reader migration through audit and rewrites the old store', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-cli-runtime-auto-migration-'));
+    const now = 1_500_000;
+    const key = 'vendor-codex:/opt/vendor-codex';
+    try {
+      writeCliRuntimeUpdateStoreTo(dir, {
+        entries: {
+          [key]: updateEntry({
+            runtimeId: 'vendor-codex',
+            displayName: 'Vendor Codex',
+            binPath: '/opt/vendor-codex',
+            provider: 'auto',
+            packageName: '@vendor/codex',
+            current: '1.0.0',
+            latest: '1.1.0',
+            updateCommand: 'npm install -g @vendor/codex@latest',
+            installTarget: '/opt/node_modules/@vendor/codex',
+            lastCheckedAt: now - 1_000,
+          }),
+        },
+      });
+      expect(readCliRuntimeUpdateStoreFrom(dir).entries[key]?.updateCommand).toBeNull();
+
+      const probe = vi.fn();
+      const writeStore = vi.fn((store: CliRuntimeUpdateStore) => {
+        writeCliRuntimeUpdateStoreTo(dir, store);
+      });
+      await runCliRuntimeUpdateAudit({
+        now: () => now,
+        targets: () => [runtimeTarget({
+          runtimeId: 'vendor-codex',
+          displayName: 'Vendor Codex',
+          binPath: '/opt/vendor-codex',
+          provider: 'auto',
+        })],
+        readStore: () => readCliRuntimeUpdateStoreFrom(dir),
+        writeStore,
+        resolveAutoPackage: () => ({
+          packageName: '@vendor/codex',
+          packageRoot: '/opt/node_modules/@vendor/codex',
+        }),
+        probe,
+      });
+
+      expect(probe).not.toHaveBeenCalled();
+      expect(writeStore).toHaveBeenCalledTimes(1);
+      const persisted = JSON.parse(readFileSync(cliRuntimeUpdateStorePathIn(dir), 'utf8')) as {
+        entries: Record<string, CliRuntimeUpdateEntry>;
+      };
+      expect(persisted.entries[key]).toMatchObject({
+        latest: '1.1.0',
+        updateAvailable: true,
+        updateCommand: null,
+        installTarget: '/opt/node_modules/@vendor/codex',
+        lastCheckedAt: now - 1_000,
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('clears stale latest data after a successful unmanaged probe', async () => {
     let store: CliRuntimeUpdateStore = {
       entries: {
@@ -865,6 +991,8 @@ describe('runCliRuntimeUpdateAudit', () => {
         latest: '1.1.0',
         managed: true,
         packageName: '@vendor/codex-b',
+        // Audit is a trust boundary too: a custom/injected probe must not make
+        // an auto target regain an inferred package-manager command.
         updateCommand: 'npm install -g @vendor/codex-b@latest',
         installTarget: '/opt/node_modules/@vendor/codex-b',
       };
@@ -897,7 +1025,7 @@ describe('runCliRuntimeUpdateAudit', () => {
       sourceFingerprint: JSON.stringify(['auto', '@vendor/codex-b']),
       current: '1.0.0',
       latest: '1.1.0',
-      updateCommand: 'npm install -g @vendor/codex-b@latest',
+      updateCommand: null,
       installTarget: '/opt/node_modules/@vendor/codex-b',
       lastNotifiedVersion: '1.1.0',
     });
@@ -1076,7 +1204,7 @@ describe('CLI runtime update store and card', () => {
     });
   });
 
-  it('round-trips the discovered package identity for an auto runtime', () => {
+  it('retains auto package identity but strips a legacy inferred update command', () => {
     writeCliRuntimeUpdateStoreTo(dir, {
       entries: {
         'vendor-codex:/opt/vendor-codex': updateEntry({
@@ -1100,6 +1228,7 @@ describe('CLI runtime update store and card', () => {
         managed: true,
         latest: '1.1.0',
         updateAvailable: true,
+        updateCommand: null,
       });
   });
 
@@ -1171,6 +1300,24 @@ describe('CLI runtime update store and card', () => {
     expect(card).toContain('npm install -g @acme/codex@latest');
     expect(card).toContain('不会自动安装');
     expect(card).not.toContain('button');
+  });
+
+  it('escapes a runtime display name only in the Markdown body', () => {
+    const displayName = 'Acme *Codex* <at id=all></at>';
+    const card = JSON.parse(buildCliRuntimeUpdateCard(updateEntry({
+      runtimeId: 'acme-codex',
+      displayName,
+      provider: 'npm',
+    }), { locale: 'en' }));
+
+    expect(card.header.title).toEqual({
+      tag: 'plain_text',
+      content: `New ${displayName} version available`,
+    });
+    expect(card.elements[0].content).toContain(
+      'Acme \\*Codex\\* \\<at id=all\\>\\</at\\>',
+    );
+    expect(card.elements[0].content).not.toContain('<at id=all></at>');
   });
 
   it('does not invent an update command for an unmanaged runtime', () => {

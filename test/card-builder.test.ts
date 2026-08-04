@@ -22,6 +22,7 @@ import {
   buildPrivateSnapshotCard,
   buildConfigCard,
   buildTuiPromptFailedCard,
+  buildSlashListCard,
   getCliDisplayName,
 } from '../src/im/lark/card-builder.js';
 import type { RelayPickerEntry } from '../src/im/lark/card-builder.js';
@@ -334,6 +335,32 @@ describe('getCliDisplayName', () => {
 
   it('should return "Kiro" for kiro-cli', () => {
     expect(getCliDisplayName('kiro-cli')).toBe('Kiro');
+  });
+});
+
+describe('buildSlashListCard', () => {
+  it('escapes a runtime display name only in Markdown fields', () => {
+    const displayName = 'Forge *Codex* <at id=all></at>';
+    const card = parse(buildSlashListCard({
+      cliName: displayName,
+      builtin: [],
+      custom: [],
+      discovered: [],
+      workingDir: '/workspace',
+      mcpServers: [],
+      discoverySupported: false,
+    }, 'en'));
+
+    expect(card.header.title).toEqual({
+      tag: 'plain_text',
+      content: `🧩 Slash commands available now (${displayName})`,
+    });
+    const markdown = card.body.elements
+      .filter((element: any) => element.tag === 'markdown')
+      .map((element: any) => element.content)
+      .join('\n');
+    expect(markdown).toContain('Forge \\*Codex\\* \\<at id=all\\>\\</at\\>');
+    expect(markdown).not.toContain('<at id=all></at>');
   });
 });
 
