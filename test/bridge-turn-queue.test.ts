@@ -937,6 +937,21 @@ describe('BridgeTurnQueue', () => {
     it('rejects text that is NOT a substring of the mark', () => {
       expect(isTruncatedMatch('a completely different instruction entirely', full)).toBe(false);
     });
+    // codex PR #724 review 4851322948 (P1): an INTERIOR ≥16-char substring must
+    // be false. A Web Terminal operator typing a command/phrase that appears in
+    // the MIDDLE of the marked task body is not the surviving truncation tail,
+    // so it must not prove belonging (the old `includes` accepted these and let
+    // the local turn steal the pending durable mark).
+    it('rejects an interior command substring (codex repro: run pnpm test --project unit)', () => {
+      const marked = makeFingerprintFull('<user_message> <botmux_task trusted="true"> Please investigate the failure; run pnpm test --project unit and report results </botmux_task> </user_message>');
+      // Both are ≥16-char substrings that appear INTERIOR to the mark, not as a
+      // suffix. The old `includes` accepted them (letting a local turn steal the
+      // durable mark); the `endsWith` anchor must reject both.
+      expect(isTruncatedMatch('run pnpm test --project unit', marked)).toBe(false);
+      expect(isTruncatedMatch('investigate the failure', marked)).toBe(false);
+      // Sanity: the genuine surviving tail (a real suffix, ≥16) still proves true.
+      expect(isTruncatedMatch('run pnpm test --project unit and report results </botmux_task> </user_message>', marked)).toBe(true);
+    });
   });
 
   describe('truncation-proof bind in the queue (durable mark, mismatched head)', () => {
@@ -980,6 +995,35 @@ describe('BridgeTurnQueue', () => {
       expect(next).toHaveLength(1);
       expect(next[0].turnId).toBe('api-trigger');
       expect(next[0].dispatchAttempt).toBe(9);
+      expect(next[0].assistantUuids).toEqual(['api-a']);
+    });
+
+    // codex PR #724 review 4851322948 (P1): the SHARP repro — an operator types
+    // a command that appears verbatim in the MIDDLE of the marked task body.
+    // Under the old `includes` this ≥16-char interior substring proved true and
+    // stole the pending durable mark. The `endsWith` anchor rejects it (not a
+    // suffix), so it synthesises a local turn and the durable mark survives to
+    // be bound by its real (truncated-tail) user line.
+    it('does NOT let an interior-command local turn steal the durable mark (endsWith anchor)', () => {
+      const q = new BridgeTurnQueue();
+      const marked = '<user_message>\n<botmux_task trusted="true">\nInvestigate the failure; run pnpm test --project unit and report results</botmux_task>\n</user_message>';
+      const fp = makeFingerprint(marked);
+      const norm = makeFingerprintFull(marked);
+      q.mark('api-trigger', fp, 100, norm, 11);
+      // Operator types the exact command that lives INTERIOR to the marked body:
+      q.ingest([user('web-u', 'run pnpm test --project unit'), assistant('web-a', 'FAIL: 2 tests')]);
+      const apiMark = q.peek().find(t => t.turnId === 'api-trigger');
+      expect(apiMark?.started).toBe(false); // interior substring must NOT steal
+      const ready = q.drainEmittable();
+      expect(ready).toHaveLength(1);
+      expect(ready[0].isLocal).toBe(true);
+      expect(ready[0].turnId).not.toBe('api-trigger');
+      // The real durable turn's truncated tail (a genuine suffix) binds it after.
+      q.ingest([user('api-u', 'run pnpm test --project unit and report results</botmux_task>\n</user_message>'), assistant('api-a', 'API reply')]);
+      const next = q.drainEmittable();
+      expect(next).toHaveLength(1);
+      expect(next[0].turnId).toBe('api-trigger');
+      expect(next[0].dispatchAttempt).toBe(11);
       expect(next[0].assistantUuids).toEqual(['api-a']);
     });
 

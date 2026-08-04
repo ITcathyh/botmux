@@ -107,10 +107,10 @@ export function makeFingerprint(message: string, len = 30): string | undefined {
   return collapsed.substring(0, len);
 }
 
-/** Minimum overlap (normalised chars) required for a truncation-proof match.
- *  Long enough that an unrelated short local prompt ("pwd", "ls -la") can't
- *  accidentally be a substring of a marked prompt, short enough that a terse
- *  real instruction still proves. */
+/** Minimum tail length (normalised chars) required for a truncation-proof
+ *  match. A non-trivial length floor so a very short surviving tail can't
+ *  coincide with an unrelated short local prompt. This is a length gate, NOT a
+ *  uniqueness/entropy claim — the actual proof is the SUFFIX anchor below. */
 const TRUNCATION_MATCH_MIN_CHARS = 16;
 
 /** Capability-agnostic proof that a recorded transcript user line is THIS
@@ -118,21 +118,31 @@ const TRUNCATION_MATCH_MIN_CHARS = 16;
  *
  *  claude-code TRUNCATES the leading envelope lines (`<user_message>` +
  *  `<botmux_task …>`) when persisting the user turn, so the head fingerprint is
- *  gone — but the surviving TAIL is a contiguous suffix of what we sent. We
- *  prove belonging by content, NOT by session type (apiOnly/adopt): the
- *  recorded normalised text must be a non-trivial contiguous SUBSTRING of the
- *  mark's full normalised content. Unrelated local terminal input (`pwd`) is
- *  not a substring of the marked API/Lark prompt, so it can never spoof this
- *  and steal the durable mark (the write-terminal race codex flagged, PR #724)
- *  — regardless of whether the session can mint a Web Terminal write token.
+ *  gone — but the surviving text is exactly the TAIL of what we sent, i.e. a
+ *  contiguous SUFFIX of the mark's full normalised content. We anchor the proof
+ *  to that observed invariant with `endsWith`, NOT a loose `includes`: an
+ *  interior substring (a command like `run pnpm test --project unit`, or the
+ *  bare closing tags `</botmux_task> </user_message>`) that happens to appear
+ *  in the middle of the task body is NOT a suffix, so a Web Terminal operator
+ *  typing such a phrase can't spoof this and steal the pending durable mark
+ *  (the interior-substring false-match codex demonstrated on PR #724). Length
+ *  (16) is a floor, not the proof — the suffix anchor is. Proof is by CONTENT
+ *  shape, not session type (apiOnly/adopt), so it holds regardless of whether
+ *  the session can mint a Web Terminal write token.
  *
  *  `recordedNorm` and `markContentNorm` are both already normaliseForFingerprint'd.
- *  Guards: require a real mark content, a recorded line of at least
- *  TRUNCATION_MATCH_MIN_CHARS, and containment. */
+ *  Guards: require a real mark content, a recorded tail of at least
+ *  TRUNCATION_MATCH_MIN_CHARS, and a strict suffix match.
+ *
+ *  NOTE: if a future claude-code build stops truncating at the head (recorded
+ *  line no longer a suffix of what we sent), this correctly returns false and
+ *  the turn falls back to local-synth — never a wrong-mark bind. Re-proving a
+ *  non-suffix truncation would need a truncation-surviving turn nonce/closing
+ *  marker, not a relaxed substring test. */
 export function isTruncatedMatch(recordedNorm: string, markContentNorm?: string): boolean {
   if (!markContentNorm || markContentNorm.length === 0) return false;
   if (recordedNorm.length < TRUNCATION_MATCH_MIN_CHARS) return false;
-  return markContentNorm.includes(recordedNorm);
+  return markContentNorm.endsWith(recordedNorm);
 }
 
 export class BridgeTurnQueue {
