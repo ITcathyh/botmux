@@ -13,6 +13,7 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 | `/status` | View session info (uptime, terminal address, etc.) |
 | `/restart` | Restart the CLI process (preserving the session context) |
 | `/close` | Close the session and send a recoverable card (including the CLI's own resume command) |
+| `/fork --create <group name>` | Clone the current session into a freshly-created group (the source session keeps running untouched); the clone carries full context (Claude family / Codex terminal only) |
 | `/rename <title>` | Rename this Botmux session and sync the running Codex/Claude native session name |
 | `/card` | Manually summon the current session's streaming card (can summon and restore live refresh even when streaming is off; in private-card mode, sends a static snapshot visible only to authorized users instead) |
 | `/term` | Get the operable (write-enabled) terminal link for this session, delivered privately to the owner (visible-to-you in-chat, falling back to DM in topic/p2p — never exposed in the group) |
