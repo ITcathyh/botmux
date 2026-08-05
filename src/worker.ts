@@ -130,7 +130,7 @@ import {
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
-import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, scanCodexThreadSettings, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
+import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, scanCodexThreadSettings, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
 import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid } from './services/traex-transcript.js';
 import { parseTraexUserInputQuestions } from './services/traex-user-input.js';
@@ -3889,9 +3889,6 @@ function codexBridgeDetachFile(): void {
   codexBridgeBaselineDone = false;
 }
 
-/** Called from flushPending after writeInput first returns a cliSessionId.
- *  Tries to locate the rollout file immediately; if it's not on disk yet,
- *  remembers the sid so the 1s poller can keep retrying. */
 /** Resolve the pid of the Codex process this worker observes (spawned child or
  *  adopted pane), mirroring the grok/traex pid-follow resolution order. */
 function currentCodexObservedPid(): number | undefined {
@@ -3909,17 +3906,26 @@ function currentCodexObservedPid(): number | undefined {
  *  collapse the legitimate parent+sibling multi-rollout case to undefined the
  *  way findCodexRolloutByPid does), so membership admits the authoritative id
  *  and rejects a foreign one. FAIL CLOSED: an unavailable fd enumeration
- *  (undefined) or a non-member id returns false → caller must not bind. */
+ *  (undefined) or a non-member id returns false → caller must not bind.
+ *
+ *  The pure decision (sid ∈ owned set) lives in codexHistorySidIsOwned so it can
+ *  be unit-tested without spawning a worker; this wrapper only supplies the live
+ *  pid + fd-set. BOTH production attach entry points (the notify re-attach branch
+ *  AND the initial-attach guard) call this one wrapper — there is no parallel
+ *  decision copy that could drift. */
 function codexHistorySidOwnedByCurrentPid(cliSessionId: string): boolean {
   const pid = currentCodexObservedPid();
   const ownedRollouts = pid ? findCodexRolloutSetByPid(pid) : undefined;
-  if (!ownedRollouts || !ownedRollouts.has(cliSessionId.toLowerCase())) {
+  const owned = codexHistorySidIsOwned(cliSessionId, ownedRollouts);
+  if (!owned) {
     log(`Codex session id ${cliSessionId} not owned by pid ${pid ?? '?'} (open rollouts: ${ownedRollouts ? [...ownedRollouts].join(',') || 'none' : 'unknown'})`);
-    return false;
   }
-  return true;
+  return owned;
 }
 
+/** Called from flushPending after writeInput first returns a cliSessionId.
+ *  Tries to locate the rollout file immediately; if it's not on disk yet,
+ *  remembers the sid so the 1s poller can keep retrying. */
 function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
   if (!codexBridgeFallbackActive()) return;
   if (codexBridgeRolloutPath) {

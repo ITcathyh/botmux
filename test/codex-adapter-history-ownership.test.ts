@@ -30,6 +30,11 @@ let prevCodexHome: string | undefined;
 let prevScale: string | undefined;
 let ownerChild: ChildProcessWithoutNullStreams;
 let rolloutB: string;
+/** Deferred timers scheduled by a test's onEnter. writeInput retries Enter, so
+ *  onEnter can fire several times; track every timer and clear them in afterEach
+ *  so none survives to append to an already-removed home dir (→ uncaught ENOENT
+ *  that poisons later tests / fails CI). */
+let pendingTimers: ReturnType<typeof setTimeout>[] = [];
 
 /** A rollout file under `<CODEX_HOME>/sessions/YYYY/MM/DD/rollout-<ts>-<sid>.jsonl`. */
 function rolloutPath(root: string, sid: string): string {
@@ -82,6 +87,8 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
+  for (const t of pendingTimers) clearTimeout(t);
+  pendingTimers = [];
   if (ownerChild && !ownerChild.killed) ownerChild.kill('SIGKILL');
   if (home) rmSync(home, { recursive: true, force: true });
   if (prevScale === undefined) delete process.env.BOTMUX_TIME_SCALE; else process.env.BOTMUX_TIME_SCALE = prevScale;
@@ -110,9 +117,18 @@ describe('codex writeInput history ownership filter', () => {
     expect((result as any).cliSessionId).toBe(SID_B);
   });
 
-  it('works under a custom CODEX_HOME (no /.codex/ segment in the path)', async () => {
-    // home is already a custom mkdtemp root (not ~/.codex); assert the ownership
-    // probe still recognizes B's rollout by its structural /sessions/ shape.
+  it('recognizes rollouts under a custom CODEX_HOME (env-independent path shape), when worker + Codex share that home', async () => {
+    // SCOPE: this proves the ownership probe recognizes B's rollout by its
+    // structural `/sessions/rollout-…` shape even when the home is a custom
+    // mkdtemp root (no `/.codex/` segment) — home here is BOTH the worker's
+    // CODEX_HOME (via process.env, set in beforeEach) and the child's.
+    //
+    // It does NOT cover an ADOPTED external Codex whose CODEX_HOME differs from
+    // the worker's: the worker scrubs inherited CODEX_HOME and the adapter reads
+    // the worker's own codexHistoryPath()/sessions root, while the adopt init
+    // message carries no external CODEX_HOME (only adoptCwd). That cross-home
+    // adopt was never plumbed (true on master too) — a pre-existing limitation,
+    // out of scope for this fix. See the note in matchCodexRolloutPath.
     const historyPath = join(home, 'history.jsonl');
     const adapter = createCodexAdapter();
     let appended = false;
@@ -131,9 +147,16 @@ describe('codex writeInput history ownership filter', () => {
     const historyPath = join(home, 'history.jsonl');
     const adapter = createCodexAdapter();
     // On submit only A appears; B's line arrives shortly after (separate tick).
+    // writeInput retries Enter, so guard the deferred B-append one-shot and track
+    // the timer so afterEach can clear it (no append into a removed home dir).
+    let scheduledB = false;
     const onEnter = () => {
       appendFileSync(historyPath, historyLine(SID_A, 'ping'));
-      setTimeout(() => appendFileSync(historyPath, historyLine(SID_B, 'ping')), 20);
+      if (scheduledB) return;
+      scheduledB = true;
+      pendingTimers.push(setTimeout(() => {
+        try { appendFileSync(historyPath, historyLine(SID_B, 'ping')); } catch { /* home may be gone if test already resolved */ }
+      }, 20));
     };
 
     const result = await adapter.writeInput!(fakePty(ownerChild.pid!, onEnter), 'ping');

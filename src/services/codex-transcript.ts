@@ -148,6 +148,21 @@ export function findCodexRolloutSetByPid(pid: number): Set<string> | undefined {
   return set;
 }
 
+/** Pure ownership decision: is `cliSessionId` one of the rollouts the observed
+ *  pid holds open? `ownedRollouts` is the lowercased sid set from
+ *  findCodexRolloutSetByPid (undefined when fd enumeration was unavailable).
+ *  FAIL CLOSED — a missing set or a non-member id returns false so the caller
+ *  never binds the bridge to a session it can't prove the pid owns. Extracted so
+ *  the exact predicate the worker's attach entry points use is unit-testable
+ *  without a live pid. */
+export function codexHistorySidIsOwned(
+  cliSessionId: string,
+  ownedRollouts: Set<string> | undefined,
+): boolean {
+  if (!ownedRollouts) return false;
+  return ownedRollouts.has(cliSessionId.toLowerCase());
+}
+
 function findSingleCodexRollout(targets: Iterable<string>): CodexRolloutRef | undefined {
   let found: CodexRolloutRef | undefined;
   for (const target of targets) {

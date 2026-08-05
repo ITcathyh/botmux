@@ -44,12 +44,13 @@ describe('Codex worker structured-bridge wiring', () => {
 
     // The ownership helper must use the fd-SET accessor (not the ambiguity-
     // collapsing single one, which returns undefined for the parent+sibling
-    // case we must ALLOW) and fail closed on an unavailable set.
+    // case we must ALLOW) and delegate the pure membership decision to
+    // codexHistorySidIsOwned (unit-tested in codex-transcript.test.ts).
     const helperStart = workerSource.indexOf('function codexHistorySidOwnedByCurrentPid');
     expect(helperStart).toBeGreaterThan(0);
     const helper = workerSource.slice(helperStart, workerSource.indexOf('\n}', helperStart));
     expect(helper).toContain('findCodexRolloutSetByPid(');
-    expect(helper).toContain('.has(cliSessionId.toLowerCase())');
+    expect(helper).toContain('codexHistorySidIsOwned(');
     expect(helper).not.toContain('findCodexRolloutByPid(');
   });
 
