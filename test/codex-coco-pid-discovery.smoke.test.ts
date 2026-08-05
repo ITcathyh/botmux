@@ -26,6 +26,9 @@ let codexSiblingRollout: string;
 let cocoSessionLog: string;
 let child: ChildProcessWithoutNullStreams;
 let ambiguousChild: ChildProcessWithoutNullStreams;
+let customHomeChild: ChildProcessWithoutNullStreams;
+let customHomeRollout: string;
+const CUSTOM_HOME_SID = '019dd80d-d922-7a11-8339-0208d8c5b4ea';
 
 beforeAll(async () => {
   dir = mkdtempSync(join(tmpdir(), 'bmx-pid-disc-'));
@@ -93,11 +96,37 @@ beforeAll(async () => {
     });
     ambiguousChild.once('error', reject);
   });
+
+  // Custom CODEX_HOME: rollout path has NO `/.codex/` segment. Verifies the
+  // ownership probe recognizes it by the structural `/sessions/rollout-…` shape
+  // (an adopted external Codex may run under a CODEX_HOME the worker never
+  // inherited; the fd already comes from the pid, so the path anchor must be
+  // env-independent). `customhome` deliberately omits `.codex`.
+  const customHomeDir = join(dir, 'customhome', 'sessions', '2026', '05', '15');
+  mkdirSync(customHomeDir, { recursive: true });
+  customHomeRollout = join(customHomeDir, `rollout-2026-05-15T07-04-41-${CUSTOM_HOME_SID}.jsonl`);
+  writeFileSync(customHomeRollout, '');
+  customHomeChild = spawn(
+    process.execPath,
+    ['-e', `require('fs').openSync(${JSON.stringify(customHomeRollout)}, 'a'); process.stdout.write('ready\\n'); setTimeout(() => {}, 60000);`],
+    { stdio: ['ignore', 'pipe', 'pipe'] },
+  ) as ChildProcessWithoutNullStreams;
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('custom-home child not ready in 5s')), 5000);
+    customHomeChild.stdout.once('data', (buf: Buffer) => {
+      if (buf.toString().includes('ready')) {
+        clearTimeout(timer);
+        resolve();
+      }
+    });
+    customHomeChild.once('error', reject);
+  });
 });
 
 afterAll(() => {
   if (child && !child.killed) child.kill('SIGKILL');
   if (ambiguousChild && !ambiguousChild.killed) ambiguousChild.kill('SIGKILL');
+  if (customHomeChild && !customHomeChild.killed) customHomeChild.kill('SIGKILL');
   if (dir) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -162,6 +191,15 @@ describe('findCodexRolloutSetByPid', () => {
     expect(findCodexRolloutSetByPid(0)).toBeUndefined();
     expect(findCodexRolloutSetByPid(-1)).toBeUndefined();
     expect(findCodexRolloutSetByPid(1.5 as any)).toBeUndefined();
+  });
+
+  it('recognizes a rollout under a custom CODEX_HOME with no /.codex/ segment', () => {
+    // Env-independent structural anchor: the path came from the pid's fd, so it
+    // must be recognized by its `/sessions/rollout-<ts>-<uuid>.jsonl` shape even
+    // when CODEX_HOME is a custom/isolated root the worker never inherited.
+    const set = findCodexRolloutSetByPid(customHomeChild.pid!);
+    expect(set).toBeDefined();
+    expect(set!.has(CUSTOM_HOME_SID.toLowerCase())).toBe(true);
   });
 });
 

@@ -161,7 +161,17 @@ function findSingleCodexRollout(targets: Iterable<string>): CodexRolloutRef | un
 
 function matchCodexRolloutPath(target: string): CodexRolloutRef | undefined {
   if (!target.endsWith('.jsonl')) return undefined;
-  if (!target.includes('/.codex/sessions/')) return undefined;
+  // The rollout lives under `<CODEX_HOME>/sessions/<YYYY>/<MM>/<DD>/`. CODEX_HOME
+  // defaults to ~/.codex but can be a custom / per-bot-isolated root, and an
+  // ADOPTED external Codex may have started under a CODEX_HOME the worker never
+  // inherited — so anchoring on the literal `/.codex/sessions/` (or on the
+  // worker's own codexSessionsRoot()) would make that rollout invisible. Once fd
+  // ownership is a hard gate for bridge attach, an invisible rollout means the
+  // legitimate session can never pass the gate. The path already came from the
+  // target PID's open fds (that IS the ownership proof), so anchor only on the
+  // env-independent structural shape: a `sessions/` path segment plus the
+  // distinctive `rollout-<ts>-<uuid>.jsonl` filename (validated below).
+  if (!/(^|\/)sessions\//.test(target)) return undefined;
   const sid = codexSessionIdFromRolloutPath(target);
   if (!sid) return undefined;
   return { path: target, cliSessionId: sid };

@@ -3646,7 +3646,19 @@ function codexBridgeStartTimer(): void {
           cwd: lastInitConfig?.workingDir,
           pid: codexAdoptPendingPid,
         });
-        if (path) {
+        // Codex defense-in-depth: resolveFileBridgePath resolves sessionId-first,
+        // so a pending sid that is actually a shared-CODEX_HOME sibling's would
+        // resolve to that foreign rollout. Only attach when the resolved rollout's
+        // sid is one the observed pid actually holds open. This poller re-runs
+        // every 1s, so a lazily-opened owned fd is picked up on a later tick.
+        // Skip the gate only when we have no pid to prove ownership with (keeps
+        // the sid/pid resolution working for non-adopt / pid-less flows).
+        const attachOk = !(structuredBridgeIsCodex() && lastInitConfig?.adoptMode && path && currentCodexObservedPid())
+          || (() => {
+            const sid = codexSessionIdFromRolloutPath(path!);
+            return !!sid && codexHistorySidOwnedByCurrentPid(sid);
+          })();
+        if (path && attachOk) {
           if (codexAdoptPendingPid && (lastInitConfig?.cliId === 'codex' || lastInitConfig?.cliId === 'traex')) {
             const discoveredSessionId = codexSessionIdFromRolloutPath(path);
             if (discoveredSessionId) persistCliSessionId(discoveredSessionId);
@@ -3880,6 +3892,34 @@ function codexBridgeDetachFile(): void {
 /** Called from flushPending after writeInput first returns a cliSessionId.
  *  Tries to locate the rollout file immediately; if it's not on disk yet,
  *  remembers the sid so the 1s poller can keep retrying. */
+/** Resolve the pid of the Codex process this worker observes (spawned child or
+ *  adopted pane), mirroring the grok/traex pid-follow resolution order. */
+function currentCodexObservedPid(): number | undefined {
+  return (backend as { cliPid?: number } | null)?.cliPid
+    ?? backend?.getChildPid?.()
+    ?? codexAdoptPendingPid;
+}
+
+/** Ownership gate for binding a Codex bridge to a session id that came from the
+ *  GLOBAL history.jsonl. That file is shared by every Codex pane under one
+ *  CODEX_HOME, so a concurrent sibling pane submitting identical text can make
+ *  writeInput's history match return a FOREIGN session id. Before attaching (or
+ *  re-attaching) to such an id we require it to be one THIS pid actually holds
+ *  open. findCodexRolloutSetByPid returns every open rollout (it does NOT
+ *  collapse the legitimate parent+sibling multi-rollout case to undefined the
+ *  way findCodexRolloutByPid does), so membership admits the authoritative id
+ *  and rejects a foreign one. FAIL CLOSED: an unavailable fd enumeration
+ *  (undefined) or a non-member id returns false → caller must not bind. */
+function codexHistorySidOwnedByCurrentPid(cliSessionId: string): boolean {
+  const pid = currentCodexObservedPid();
+  const ownedRollouts = pid ? findCodexRolloutSetByPid(pid) : undefined;
+  if (!ownedRollouts || !ownedRollouts.has(cliSessionId.toLowerCase())) {
+    log(`Codex session id ${cliSessionId} not owned by pid ${pid ?? '?'} (open rollouts: ${ownedRollouts ? [...ownedRollouts].join(',') || 'none' : 'unknown'})`);
+    return false;
+  }
+  return true;
+}
+
 function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
   if (!codexBridgeFallbackActive()) return;
   if (codexBridgeRolloutPath) {
@@ -3904,20 +3944,14 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
       const currentSid = codexSessionIdFromRolloutPath(codexBridgeRolloutPath);
       if (currentSid?.toLowerCase() === cliSessionId.toLowerCase()) return;
       // Ownership gate: only re-attach to a session id THIS pid actually holds
-      // open. This admits the real parent+sibling multi-rollout case (the id is
-      // in the pid's fd set) while rejecting a foreign id contributed by another
-      // pane's identical-text history line. findCodexRolloutByPid can't serve as
-      // the gate — it collapses the multi-rollout case to undefined, which is
-      // exactly the case we must ALLOW. Fail closed: if fd enumeration is
-      // unavailable (undefined) or the id is foreign, keep the current binding.
-      const pid = (backend as { cliPid?: number } | null)?.cliPid
-        ?? backend?.getChildPid?.()
-        ?? codexAdoptPendingPid;
-      const ownedRollouts = pid ? findCodexRolloutSetByPid(pid) : undefined;
-      if (!ownedRollouts || !ownedRollouts.has(cliSessionId.toLowerCase())) {
-        log(`Codex session id ${cliSessionId} not owned by pid ${pid ?? '?'} (open rollouts: ${ownedRollouts ? [...ownedRollouts].join(',') || 'none' : 'unknown'}); keeping current bridge ${currentSid ?? '?'} — refusing history-only re-attach`);
+      // open (admits the real parent+sibling multi-rollout case, rejects a
+      // foreign id from another pane's identical-text history line). Fail
+      // closed: keep the current binding when unowned/unknown.
+      if (!codexHistorySidOwnedByCurrentPid(cliSessionId)) {
+        log(`Keeping current Codex bridge ${currentSid ?? '?'} — refusing history-only re-attach to ${cliSessionId}`);
         return;
       }
+      const pid = currentCodexObservedPid();
       const next = resolveFileBridgePath('codex', { sessionId: cliSessionId });
       if (next && next !== codexBridgeRolloutPath) {
         const attachMode = lastInitConfig?.adoptMode ? 'split-live' : 'fresh-empty';
@@ -4029,6 +4063,25 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
       codexBridgeStartTimer();
     }
     return;
+  }
+  // Codex INITIAL attach (no prior rollout bound). The multi-fd adopt case
+  // reaches here with codexBridgeRolloutPath still unset: findCodexRolloutByPid
+  // returned undefined (ambiguous parent+sibling), so the adopt block armed the
+  // poller instead of attaching. The cliSessionId is normally already
+  // source-filtered by the codex adapter (writeInput only returns an owned sid),
+  // but keep a defense-in-depth ownership gate here too so a sid from any other
+  // path can't first-attach the shared-history foreign session. Fail closed:
+  // when the sid isn't provably owned, DON'T pin it as pending (that would wedge
+  // the bridge — the poller's pid fallback stays ambiguous→undefined forever and
+  // the owned line never re-triggers this callback). Keep the adopt pid pending
+  // so the poller can bind once a uniquely-owned rollout appears.
+  if (structuredBridgeIsCodex() && lastInitConfig?.adoptMode && currentCodexObservedPid()) {
+    if (!codexHistorySidOwnedByCurrentPid(cliSessionId)) {
+      log(`Codex initial-attach refused for unverified session ${cliSessionId}; keeping poller armed on pid ${currentCodexObservedPid()}`);
+      codexBridgePendingSessionId = undefined;
+      codexBridgeStartTimer();
+      return;
+    }
   }
   const path = resolveFileBridgePath(lastInitConfig?.cliId, {
     sessionId: cliSessionId,

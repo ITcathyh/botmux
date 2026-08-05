@@ -31,7 +31,7 @@ describe('Codex worker structured-bridge wiring', () => {
     const end = workerSource.indexOf('// Already attached — first-attach-wins for most CLIs.', start);
     const codex = workerSource.slice(start, end);
 
-    const gate = codex.indexOf('findCodexRolloutSetByPid(');
+    const gate = codex.indexOf('codexHistorySidOwnedByCurrentPid(cliSessionId)');
     const detach = codex.indexOf('codexBridgeDetachFile();');
     const resolveNext = codex.indexOf("resolveFileBridgePath('codex'");
 
@@ -40,11 +40,32 @@ describe('Codex worker structured-bridge wiring', () => {
     expect(gate).toBeGreaterThan(0);
     expect(gate).toBeLessThan(resolveNext);
     expect(gate).toBeLessThan(detach);
-    // Must use the fd-SET accessor, not the ambiguity-collapsing single one
-    // (which returns undefined for the parent+sibling case we must ALLOW).
-    expect(codex).not.toContain('findCodexRolloutByPid(pid)?.cliSessionId === cliSessionId');
-    // Membership test + fail-closed early return when unowned/unknown.
-    expect(codex).toContain('.has(cliSessionId.toLowerCase())');
     expect(codex).toContain('refusing history-only re-attach');
+
+    // The ownership helper must use the fd-SET accessor (not the ambiguity-
+    // collapsing single one, which returns undefined for the parent+sibling
+    // case we must ALLOW) and fail closed on an unavailable set.
+    const helperStart = workerSource.indexOf('function codexHistorySidOwnedByCurrentPid');
+    expect(helperStart).toBeGreaterThan(0);
+    const helper = workerSource.slice(helperStart, workerSource.indexOf('\n}', helperStart));
+    expect(helper).toContain('findCodexRolloutSetByPid(');
+    expect(helper).toContain('.has(cliSessionId.toLowerCase())');
+    expect(helper).not.toContain('findCodexRolloutByPid(');
+  });
+
+  it('also gates the INITIAL attach (unattached multi-fd adopt), not just re-attach', () => {
+    // The multi-fd adopt case starts unattached (findCodexRolloutByPid → undefined),
+    // so a foreign history sid would otherwise reach the generic initial-attach
+    // tail with no ownership check. Assert the codex initial-attach guard exists
+    // and that a rejected sid does NOT get pinned as pending (which would wedge
+    // the bridge — poller pid-fallback stays ambiguous forever).
+    const marker = "Codex INITIAL attach";
+    const guardIdx = workerSource.indexOf(marker);
+    expect(guardIdx).toBeGreaterThan(0);
+    const guard = workerSource.slice(guardIdx, guardIdx + 1400);
+    expect(guard).toContain('codexHistorySidOwnedByCurrentPid(cliSessionId)');
+    // On refusal, clear pending (do not pin the foreign sid) + keep polling.
+    expect(guard).toContain('codexBridgePendingSessionId = undefined;');
+    expect(guard).toContain('codexBridgeStartTimer();');
   });
 });
