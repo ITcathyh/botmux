@@ -1137,6 +1137,18 @@ function seedAndTrustClaudeState(statePath: string, workingDir: string, log: (m:
       } catch { data = {}; }
     }
     if (!data.projects || typeof data.projects !== 'object') data.projects = {};
+    // Onboarding gate: Claude Code holds the FIRST launch on a one-time
+    // theme/onboarding selection until `hasCompletedOnboarding:true` is on the
+    // top level of .claude.json. The seed above copies it from the host's
+    // global ~/.claude.json — but a CLEAN environment (fresh sandbox, e.g.
+    // core-only in riff, or any box that never ran Claude globally) has no
+    // global file to copy it from, so the redirected CLAUDE_CONFIG_DIR session
+    // would stick on that first-frame selection until a human clears it once.
+    // Force it here (idempotent, top-level) so a headless/programmatic first
+    // launch never blocks on interactive onboarding — same intent as the
+    // per-cwd trust-dialog acceptance below. If the seed/global already set it,
+    // this is a no-op.
+    data.hasCompletedOnboarding = true;
     let canonical = workingDir;
     try { canonical = realpathSync(workingDir); } catch { /* cwd may not exist yet */ }
     const entry = data.projects[canonical] && typeof data.projects[canonical] === 'object'
