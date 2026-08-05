@@ -13,7 +13,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { findCodexRolloutByPid } from '../src/services/codex-transcript.js';
+import { findCodexRolloutByPid, findCodexRolloutSetByPid } from '../src/services/codex-transcript.js';
 import { findCocoSessionByPid } from '../src/services/coco-transcript.js';
 
 const CODEX_SID = '019dd80d-d922-7a11-8339-0208d8c5b4ec';
@@ -123,6 +123,45 @@ describe('findCodexRolloutByPid', () => {
     expect(findCodexRolloutByPid(0)).toBeUndefined();
     expect(findCodexRolloutByPid(-1)).toBeUndefined();
     expect(findCodexRolloutByPid(1.5 as any)).toBeUndefined();
+  });
+});
+
+// findCodexRolloutSetByPid is the ownership gate for post-submit rollout
+// re-attach: it must NOT collapse the parent+sibling multi-rollout case to
+// undefined (that's the case the bridge must ALLOW), and it must let a caller
+// prove a history-derived sid is foreign (not in this pid's fd set) so a
+// shared-CODEX_HOME sibling's identical-text history line can't hijack the
+// binding. Same real-subprocess strategy as above so macOS lsof stays covered.
+describe('findCodexRolloutSetByPid', () => {
+  it('returns the single sid a one-rollout process holds', () => {
+    const set = findCodexRolloutSetByPid(child.pid!);
+    expect(set).toBeDefined();
+    expect(set!.has(CODEX_SID.toLowerCase())).toBe(true);
+    expect(set!.size).toBe(1);
+  });
+
+  it('returns BOTH sids for the parent+sibling multi-rollout process (does not collapse to undefined)', () => {
+    const set = findCodexRolloutSetByPid(ambiguousChild.pid!);
+    expect(set).toBeDefined();
+    // The exact case findCodexRolloutByPid refuses to guess — here we must see
+    // every open rollout so `historySid ∈ set` can admit the authoritative one.
+    expect(set!.has(CODEX_SID.toLowerCase())).toBe(true);
+    expect(set!.has(CODEX_SIBLING_SID.toLowerCase())).toBe(true);
+    expect(set!.size).toBe(2);
+  });
+
+  it('does not contain a foreign sid (shared-CODEX_HOME poison is rejectable)', () => {
+    const foreignSid = '019dd80d-d922-7a11-8339-0208d8c5b4ff';
+    const set = findCodexRolloutSetByPid(child.pid!);
+    expect(set).toBeDefined();
+    expect(set!.has(foreignSid.toLowerCase())).toBe(false);
+  });
+
+  it('returns undefined (fail-closed) for a non-existent or invalid pid', () => {
+    expect(findCodexRolloutSetByPid(2_000_000)).toBeUndefined();
+    expect(findCodexRolloutSetByPid(0)).toBeUndefined();
+    expect(findCodexRolloutSetByPid(-1)).toBeUndefined();
+    expect(findCodexRolloutSetByPid(1.5 as any)).toBeUndefined();
   });
 });
 

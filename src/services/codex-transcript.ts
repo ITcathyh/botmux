@@ -69,16 +69,16 @@ export function codexSessionIdFromRolloutPath(path: string): string | undefined 
 
 type CodexRolloutRef = { path: string; cliSessionId: string };
 
-/** Find the rollout file an externally-running Codex process has open. A
- *  single open rollout is authoritative for that pid. Multiple open rollouts
- *  are ambiguous: current Codex versions can keep parent and sibling-agent
- *  transcripts open in the same process, so choosing the first fd can bind
- *  an adopted pane to the wrong conversation.
+/** Enumerate the filesystem paths a process currently has open, normalised to
+ *  a plain string[] regardless of platform. Returns undefined only when the
+ *  enumeration itself is unavailable (unreadable /proc, lsof failed); an empty
+ *  array means "readable, but no matching fds". Both `findCodexRolloutByPid`
+ *  and `findCodexRolloutSetByPid` derive from THIS single source so their
+ *  Linux `/proc` and macOS/BSD `lsof` normalisation can never drift apart.
  *
  *  Linux: `/proc/<pid>/fd/*` fast path.
- *  macOS / BSD: `lsof -p <pid> -Fn` 兜底（同 session-discovery 里的 readCwd）。
- *  两种平台都用 `codexSessionIdFromRolloutPath` 提取 sid。 */
-export function findCodexRolloutByPid(pid: number): CodexRolloutRef | undefined {
+ *  macOS / BSD: `lsof -p <pid> -Fn` 兜底（同 session-discovery 里的 readCwd）。 */
+function codexProcessOpenTargets(pid: number): string[] | undefined {
   if (!Number.isInteger(pid) || pid <= 0) return undefined;
   if (IS_LINUX) {
     const fdDir = `/proc/${pid}/fd`;
@@ -91,7 +91,7 @@ export function findCodexRolloutByPid(pid: number): CodexRolloutRef | undefined 
         try { target = readlinkSync(join(fdDir, fd)); } catch { continue; }
         targets.push(target);
       }
-      return findSingleCodexRollout(targets);
+      return targets;
     }
     // /proc 不可读时落到下面的 lsof 兜底（极少见，但兜一下）
   }
@@ -106,9 +106,46 @@ export function findCodexRolloutByPid(pid: number): CodexRolloutRef | undefined 
   } catch {
     return undefined;
   }
-  return findSingleCodexRollout(out.split('\n').flatMap(line =>
+  return out.split('\n').flatMap(line =>
     line.startsWith('n/') ? [line.slice(1)] : [],
-  ));
+  );
+}
+
+/** Find the rollout file an externally-running Codex process has open. A
+ *  single open rollout is authoritative for that pid. Multiple open rollouts
+ *  are ambiguous: current Codex versions can keep parent and sibling-agent
+ *  transcripts open in the same process, so choosing the first fd can bind
+ *  an adopted pane to the wrong conversation.
+ *
+ *  两种平台都用 `codexSessionIdFromRolloutPath` 提取 sid。 */
+export function findCodexRolloutByPid(pid: number): CodexRolloutRef | undefined {
+  const targets = codexProcessOpenTargets(pid);
+  if (!targets) return undefined;
+  return findSingleCodexRollout(targets);
+}
+
+/** Enumerate ALL rollouts a Codex pid currently has open, keyed by lowercased
+ *  sessionId. Unlike `findCodexRolloutByPid`, this does NOT collapse the
+ *  parent+sibling multi-rollout case to `undefined` — it returns every match so
+ *  a caller can test membership (`historySid ∈ set`).
+ *
+ *  This is the ownership gate for post-submit rollout re-attach: `history.jsonl`
+ *  is a single global file shared by every Codex pane under one CODEX_HOME, so a
+ *  concurrent sibling pane submitting identical text can make writeInput return
+ *  the WRONG session id. Only a sid this exact pid actually holds open is safe to
+ *  re-attach to; a foreign sid (another pane's) is rejected, leaving the current
+ *  binding untouched. Returns an empty Set when the pid holds no rollout, and
+ *  undefined only when the fd enumeration itself is unavailable — callers must
+ *  treat undefined as "cannot prove ownership" (fail closed: do not re-attach). */
+export function findCodexRolloutSetByPid(pid: number): Set<string> | undefined {
+  const targets = codexProcessOpenTargets(pid);
+  if (!targets) return undefined;
+  const set = new Set<string>();
+  for (const target of targets) {
+    const hit = matchCodexRolloutPath(target);
+    if (hit) set.add(hit.cliSessionId.toLowerCase());
+  }
+  return set;
 }
 
 function findSingleCodexRollout(targets: Iterable<string>): CodexRolloutRef | undefined {
