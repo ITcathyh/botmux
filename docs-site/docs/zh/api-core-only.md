@@ -12,7 +12,7 @@
 |---|---|---|
 | 进程模型 | pm2 + dashboard + 每个 bot 一个 daemon | **单进程**，前台运行，进程存活即服务存活 |
 | 飞书凭证 | 需要 `larkAppSecret`，缺则启动失败 | **完全不需要**，也不构造飞书 Client |
-| 配置来源 | `~/.botmux/bots.json` / `BOTS_CONFIG` | **忽略一切外部配置**，合成一个 apiOnly bot |
+| bot 身份/配置来源 | `~/.botmux/bots.json` / `BOTS_CONFIG` | **忽略 bots.json 与 `BOTS_CONFIG`**，合成唯一一个 apiOnly bot（仍会读全局 `~/.botmux/.env` 与全局配置） |
 | 出站通道 | 回复发到飞书话题群 | **无飞书出站**（no-transport），结果只经 HTTP 取回 |
 | 绑定 | dashboard/IPC 端口按需探测 | 固定端口、`127.0.0.1`、bind-or-fail |
 | 状态目录 | `~/.botmux/data` | 专用 `~/.botmux/core-only/<botId>/data`（隔离） |
@@ -42,6 +42,7 @@ BOTMUX_CORE_ONLY=1 BOTMUX_API_PORT=8930 node <pkg>/dist/index-core-only.js
 | `--cli` | `BOTMUX_CORE_CLI` | `codex-app` | 跑哪个 CLI（`codex` / `claude-code` / …） |
 | `--working-dir` | `BOTMUX_CORE_WORKING_DIR` | 当前目录 | CLI 工作目录 |
 | `--state-dir` | `BOTMUX_CORE_STATE_DIR` | `~/.botmux/core-only/<botId>/data` | 专用状态根 |
+| （无 flag） | `BOTMUX_CORE_MODEL` | 未设 | 覆盖合成 bot 的默认模型（仅环境变量，无对应 flag） |
 
 > **可视 TUI vs 结构化返回**：`--cli codex-app` 走 app-server runner，结构化返回、无可视终端；`--cli codex`（或 `claude-code`）在 tmux pane 里跑可视 TUI，可经 Web 终端围观/操作（见 [§6](#6-可写-web-终端)）。
 
@@ -62,22 +63,28 @@ daemon **先 bind 端口、后完成 durable restore**。所以「端口能连�
 
 ---
 
-## 3. 路由分界：公共 vs 需签名
+## 3. 路由分界：三层鉴权
 
-core-only 里 **trusted-host HMAC 始终开着**。只有一个**紧致的 allowlist** 绕过 HMAC，其余每条 IPC 路由都仍需签名。这是刻意的安全设计：早期「全部路由免鉴权」会让一个同机 co-resident 的模型 turn 读写会话/调度/发起变更。
+core-only 的 IPC 路由不是「公共 vs 全部 HMAC」二分，而是**三层**。集成方只需关心第一层；理解另两层能帮你正确判断威胁面。
 
-**公共（免 HMAC）**——就这四条：
+**第一层 · 无凭证的 integrator surface**（core-only 专属，免 HMAC）——集成 botmux 你只用这几条：
 
 | 路由 | 方法 | 用途 |
 |---|---|---|
-| `/healthz` | GET | 就绪探针（无数据、无副作用） |
 | `/api/trigger` | POST | 发起一轮任务 |
 | `/api/sessions/:id/trigger-result` | GET | 轮询最终结果（四态） |
 | `/api/sessions/:id/insight` | GET | 轮询对话/进度 |
+| `/healthz` | GET | 就绪探针（core-only 别名） |
 
-> `/api/asks/answer` **刻意不在** allowlist：它以 askId 为键、无会话绑定，暴露会让任意同机 turn 劫持别的待答 ask。
+（`/__health` 也**永久公开**、任何模式都免鉴权，是 `/healthz` 的底层等价物；无数据无副作用。）
 
-**其余全部路由需要 HMAC**——包括你要的可写终端 `GET /api/sessions/:id/write-link`、`GET /api/sessions/:id`（会话元信息）、`POST /api/sessions/:id/close`（取消）等。下一节讲怎么正确签名。
+这三条控制路由的免签是 core-only 专属的紧致 allowlist——刻意收窄：早期「全部路由免鉴权」会让同机 co-resident 的模型 turn 读写会话/调度/发起变更。`/api/asks/answer` **刻意不在**内（askId 为键、无会话绑定，暴露会让同机 turn 劫持别的待答 ask）。
+
+**第二层 · 内部 capability / 签名路由**（绕外层 trusted-host HMAC，但各由 handler 自证）——这些**不是** public，但也**不要求**本文 §4 那种 trusted-host HMAC；它们由**会话内 rotating per-turn capability**（绑定到 URL 里的 sessionId）或**独立的强签名协议**在 handler 内验证。典型：`POST /api/session-ready`、`POST /api/asks`、`POST /api/sessions/:id/{slash,cd,close,chat-rename}`、`POST /api/hooks/emit`、`POST /api/attention`、`POST /api/vc-meetings/action-request`、workflow v3 变更前缀。合法调用方是**会话内的 CLI 自身**（沙箱/读隔离下读不到 host secret），capability 只证明「我是这个会话当前这轮的 CLI」，选不了别的会话。集成方通常不直接调这层。
+
+**第三层 · host / operator 路由**（需 §4 的 route+port-bound HMAC）——其余全部路由，包括你要的可写终端 `GET /api/sessions/:id/write-link`、`GET /api/sessions/:id`（会话元信息）等。下一节讲怎么正确签名。
+
+> 注意 `POST /api/sessions/:id/close`：既可由外部 host caller 用 §4 的 HMAC 调用，**也**存在第二层的 per-session capability 通道（会话内 CLI 自关）——它不属于「其余全部只认 HMAC」那一类。
 
 ---
 
@@ -161,7 +168,7 @@ curl -s "http://127.0.0.1:8930/api/sessions/<uuid>/trigger-result"
 # → running / completed / failed / not_found（四态见 api-task-trigger）
 ```
 
-> **completion 机制**：trigger-result 翻 `completed` 依赖 botmux 从 CLI transcript 里抽取 final_output。core-only claude-code 曾有一个「首轮 ready-gate 超时回落后落盘 user 行截头 → 完成信号接不上 → 永久 running」的 bug，已在 **v3.9.0-canary.15** 修复（改用后缀锚定的内容证明绑定 durable mark）。用该版本及以上。
+> **completion 机制**：trigger-result 翻 `completed` 依赖 botmux 从 CLI transcript 里抽取 final_output。core-only claude-code 曾有一个「首轮 ready-gate 超时回落后落盘 user 行截头 → 完成信号接不上 → 永久 running」的 bug，已在 **v3.9.0** 修复（改用后缀锚定的内容证明绑定 durable mark）。用 **v3.9.0 及以上**。
 
 ---
 
@@ -180,14 +187,20 @@ curl -s "http://127.0.0.1:8930/api/sessions/<sid>/write-link" \
 - 只读版：`readableTerminalUrlFor` / 卡片里的只读链接带的是 `viewToken`（只能看不能写）。
 - backend 为 `zmx` 时不支持 Web 终端（`409 terminal_unsupported`）；tmux/pty 支持。
 
-### ⚠️ 不要缓存 URL——现签现取
+### core-only 的 `readOnlyUrl` / `viewToken` 也随 trigger-result 下发
 
-**写 token 和端口不是稳定的**：它们由 worker 每一代 `randomBytes(32)` 新铸，worker 一旦换代（suspend 后唤醒 / CLI 崩溃重启 / daemon 重启）旧 token 即失效、端口也可能变。
+core-only 下，只要该 session 有**存活的 worker 终端**（`workerPort` 已绑 + view capability 已铸），公共的 `GET /api/sessions/:id/trigger-result` 响应会附带 `readOnlyUrl` + `viewToken`（只读入口，方便 riff 的 in-sandbox runner 直接打开可视 TUI）。这是 core-only 专属：普通/混合 fleet 的 trigger-result **不发射**这两个字段（那边 trigger-result 是 HMAC 门、也不该把终端读能力塞进轮询响应）；closed / 已恢复无 live worker 的 session 也不发射，所以不会广告出失效 URL。**写 token 永远只经 §4 的 HMAC `write-link` 获取**，绝不进 trigger-result。
 
-- ✅ 正确姿势：前端每次「打开终端」时**现调 write-link 拿当次 URL，用完即弃**，只持久化**稳定的 sessionId**。
-- ❌ 错误姿势：把 write-link URL 存进任务记录/数据库——换代后会**静默失效**（进去连不上，但没有明显报错）。
+### ⚠️ 建议「打开时现取」，而不是缓存 URL
 
-> 单个 core-only 会话**不会被空闲回收**（live-worker cap 默认 30、且**无 idle 超时**，单租户 1 个会话永远 ≤ cap），所以正常情况下 worker 常驻、token 稳定；但崩溃/daemon 重启仍会换代，现签现取能自动拿到新 token。
+**token 本身是稳定的**：production 的 view/write token 是 host dashboard secret + sessionId 的 **domain-separated HMAC**（`deriveTerminalViewToken` / `deriveTerminalWriteToken`，各用不同 domain 前缀），worker init 时 `refreshTerminal*Token()` 重算——**同一 session 跨 worker / daemon restart 得到的是同一个 token**（`randomBytes` 只是 secret 不可用时的 standalone/test fallback）。所以缓存的 token 不会因为 worker 换代就失效。
+
+但仍**建议每次「打开终端」时现调 `write-link` 拿当次 URL**——理由不是 token 会变，而是 **URL 的其它部分会变**：代理端口 / 广告 host / 部署拓扑、以及 worker 当前是否可用（终端页要连上活着的 worker）。现取很轻（loopback + HMAC），能自动拿到与当前拓扑一致、且 worker 确实在线的 URL。
+
+- ✅ 建议：只持久化**稳定的 sessionId**，「打开」时现取 URL。
+- ⚠️ 若要缓存：token 部分可复用，但端口/host/worker 可用性变化会让旧 URL 连不上——现取更省心。
+
+> 单个 core-only 会话**不会被空闲回收**（live-worker cap 默认 30、且**无 idle 超时**，单租户 1 个会话永远 ≤ cap），所以正常情况下 worker 常驻、终端持续可达。
 
 ---
 
@@ -208,13 +221,14 @@ core-only 是「无飞书出站通道 + 单租户 loopback」，围绕这点有�
 
 | 端点 | 方法 | 鉴权 | 用途 |
 |---|---|---|---|
-| `/healthz` | GET | 公共 | 就绪探针（503 starting / 200 ok） |
-| `/api/trigger` | POST | 公共 | 发起一轮任务（须带 HTTP 应答模式） |
-| `/api/sessions/:id/trigger-result` | GET | 公共 | 轮询最终结果（四态） |
-| `/api/sessions/:id/insight` | GET | 公共 | 轮询对话/进度 |
-| `/api/sessions/:id/write-link` | GET | **HMAC + bind** | 取可写终端 URL（现签现取） |
-| `/api/sessions/:id` | GET | **HMAC + bind** | 会话元信息 |
-| `/api/sessions/:id/close` | POST | **HMAC + bind** | 取消/关闭会话 |
+| `/healthz` | GET | 公共（第一层） | 就绪探针（503 starting / 200 ok） |
+| `/api/trigger` | POST | 公共（第一层） | 发起一轮任务（须带 HTTP 应答模式） |
+| `/api/sessions/:id/trigger-result` | GET | 公共（第一层） | 轮询最终结果（四态）；core-only live worker 附 `readOnlyUrl`+`viewToken` |
+| `/api/sessions/:id/insight` | GET | 公共（第一层） | 轮询对话/进度 |
+| `/api/sessions/:id/write-link` | GET | **HMAC + bind**（第三层） | 取可写终端 URL（建议打开时现取） |
+| `/api/sessions/:id` | GET | **HMAC + bind**（第三层） | 会话元信息 |
+| `/api/sessions/:id/close` | POST | HMAC + bind（第三层）**或**会话内 capability（第二层） | 取消/关闭会话 |
 
+- 三层鉴权模型见 §3；集成方只用第一层。
 - 触发请求体结构、`errorCode`、四态语义、重启存活保证：见 [API 编程式触发任务](/api-task-trigger)。
 - 参考签名实现：`src/core/daemon-ipc-auth.ts`（`daemonIpcAuthHeaders`）。

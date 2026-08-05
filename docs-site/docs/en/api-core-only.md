@@ -12,7 +12,7 @@ This doc is for integrators **embedding botmux into their own product** (e.g. an
 |---|---|---|
 | Process model | pm2 + dashboard + one daemon per bot | **single process**, foreground; process lifetime = service lifetime |
 | Feishu creds | requires `larkAppSecret`, fails without | **none needed**; never constructs a Feishu Client |
-| Config source | `~/.botmux/bots.json` / `BOTS_CONFIG` | **ignores all ambient config**; synthesizes one apiOnly bot |
+| Bot identity/config source | `~/.botmux/bots.json` / `BOTS_CONFIG` | **ignores bots.json and `BOTS_CONFIG`**; synthesizes exactly one apiOnly bot (still reads the global `~/.botmux/.env` and global config) |
 | Outbound | replies posted to a Feishu topic | **no Feishu transport**; results retrieved over HTTP only |
 | Bind | dashboard/IPC ports probe as needed | fixed port, `127.0.0.1`, bind-or-fail |
 | State dir | `~/.botmux/data` | dedicated `~/.botmux/core-only/<botId>/data` (isolated) |
@@ -43,6 +43,7 @@ Optional env vars / flags (`--flag` wins over the env var):
 | `--cli` | `BOTMUX_CORE_CLI` | `codex-app` | Which CLI to run (`codex` / `claude-code` / …) |
 | `--working-dir` | `BOTMUX_CORE_WORKING_DIR` | cwd | CLI working directory |
 | `--state-dir` | `BOTMUX_CORE_STATE_DIR` | `~/.botmux/core-only/<botId>/data` | Dedicated state root |
+| (no flag) | `BOTMUX_CORE_MODEL` | unset | Override the synthetic bot's default model (env-only; no matching flag) |
 
 > **Visible TUI vs structured return**: `--cli codex-app` uses the app-server runner — structured return, no visible terminal; `--cli codex` (or `claude-code`) runs a visible TUI in a tmux pane you can watch/operate via the web terminal (see [§6](#6-writable-web-terminal)).
 
@@ -63,22 +64,28 @@ The readiness barrier **also gates the public control routes**: while restore is
 
 ---
 
-## 3. Route boundary: public vs signed
+## 3. Route boundary: three auth layers
 
-In core-only the **trusted-host HMAC stays ON**. Only a **tight allowlist** bypasses it; every other IPC route still requires a signature. This is deliberate: an earlier "auth off for all routes" would let a co-resident model turn read/perturb sessions, the scheduler, and mutations.
+core-only's IPC routes are not a "public vs everything-HMAC" split — there are **three layers**. Integrators only need the first; understanding the other two helps you reason about the threat surface correctly.
 
-**Public (no HMAC)** — exactly these four:
+**Layer 1 · no-credential integrator surface** (core-only-specific, no HMAC) — this is all you need to integrate botmux:
 
 | Route | Method | Purpose |
 |---|---|---|
-| `/healthz` | GET | Readiness probe (no data, no mutation) |
 | `/api/trigger` | POST | Start a turn |
 | `/api/sessions/:id/trigger-result` | GET | Poll the final result (four states) |
 | `/api/sessions/:id/insight` | GET | Poll conversation / progress |
+| `/healthz` | GET | Readiness probe (core-only alias) |
 
-> `/api/asks/answer` is **deliberately excluded**: it is askId-keyed with no session binding, so exposing it would let any co-resident turn hijack another pending ask.
+(`/__health` is also **permanently public** in every mode — the underlying equivalent of `/healthz`; no data, no mutation.)
 
-**Everything else requires HMAC** — including the writable terminal `GET /api/sessions/:id/write-link`, `GET /api/sessions/:id` (metadata), `POST /api/sessions/:id/close` (cancel), etc. The next section shows how to sign correctly.
+The three control routes' no-auth is a tight, core-only-specific allowlist — deliberately narrow: an earlier "auth off for all routes" would let a co-resident model turn read/perturb sessions, the scheduler, and mutations. `/api/asks/answer` is **deliberately excluded** (askId-keyed with no session binding — exposing it would let a co-resident turn hijack another pending ask).
+
+**Layer 2 · internal capability / signature routes** (bypass the outer trusted-host HMAC, but each self-authenticates in its handler) — these are **not** public, yet they do **not** require the §4 trusted-host HMAC either. They are verified by a **per-session rotating per-turn capability** (bound to the sessionId in the URL) or by an **independent strong-signature protocol** inside the handler. Examples: `POST /api/session-ready`, `POST /api/asks`, `POST /api/sessions/:id/{slash,cd,close,chat-rename}`, `POST /api/hooks/emit`, `POST /api/attention`, `POST /api/vc-meetings/action-request`, the workflow-v3 mutation prefix. The legitimate caller is the **in-session CLI itself** (which, under sandbox/read-isolation, cannot read the host secret); the capability only proves "I am this session's current-turn CLI" and cannot select another session. Integrators normally don't call this layer.
+
+**Layer 3 · host / operator routes** (require the §4 route+port-bound HMAC) — everything else, including the writable terminal `GET /api/sessions/:id/write-link` and `GET /api/sessions/:id` (metadata). The next section shows how to sign correctly.
+
+> Note on `POST /api/sessions/:id/close`: it can be called by an external host caller with the §4 HMAC, **and** also has a Layer-2 per-session capability channel (the in-session CLI closing itself) — so it isn't part of a blanket "everything else is HMAC-only".
 
 ---
 
@@ -162,7 +169,7 @@ curl -s "http://127.0.0.1:8930/api/sessions/<uuid>/trigger-result"
 # → running / completed / failed / not_found (four states: see api-task-trigger)
 ```
 
-> **Completion mechanism**: `trigger-result` flips to `completed` when botmux extracts final_output from the CLI transcript. core-only claude-code once had a bug where, after the first-turn ready-gate timed out and fell back, the persisted user line was head-truncated → the completion signal never bound → permanent `running`. Fixed in **v3.9.0-canary.15** (suffix-anchored content proof to bind the durable mark). Use that version or later.
+> **Completion mechanism**: `trigger-result` flips to `completed` when botmux extracts final_output from the CLI transcript. core-only claude-code once had a bug where, after the first-turn ready-gate timed out and fell back, the persisted user line was head-truncated → the completion signal never bound → permanent `running`. Fixed in **v3.9.0** (suffix-anchored content proof to bind the durable mark). Use **v3.9.0 or later**.
 
 ---
 
@@ -181,14 +188,20 @@ curl -s "http://127.0.0.1:8930/api/sessions/<sid>/write-link" \
 - Read-only variant: the read link (`readableTerminalUrlFor` / the card link) carries a `viewToken` (view, no input).
 - Backend `zmx` has no web terminal (`409 terminal_unsupported`); tmux/pty support it.
 
-### ⚠️ Do NOT cache the URL — sign & fetch fresh
+### core-only also ships `readOnlyUrl` / `viewToken` in trigger-result
 
-**The write token and port are not stable**: they are minted fresh per worker generation via `randomBytes(32)`. When the worker cycles (resume-after-suspend / CLI crash-restart / daemon restart), the old token is invalidated and the port may change.
+In core-only, whenever the session has a **live worker terminal** (`workerPort` bound + a view capability minted), the public `GET /api/sessions/:id/trigger-result` response also carries `readOnlyUrl` + `viewToken` (a read-only entry, so riff's in-sandbox runner can open the visible TUI directly). This is core-only-specific: a normal/mixed fleet's trigger-result does **not** emit these fields (there trigger-result is HMAC-gated, and we must not push a terminal read-capability into a poll response); closed / restored sessions with no live worker don't emit them either, so no stale URL is ever advertised. The **write token is only ever obtained via the §4 HMAC `write-link`** — it never appears in trigger-result.
 
-- ✅ Correct: fetch write-link fresh on each "open terminal" click, use the returned URL once, and only persist the **stable sessionId**.
-- ❌ Wrong: store the write-link URL in a task record / DB — it will **silently break** after a worker cycle (the terminal fails to connect, with no obvious error).
+### ⚠️ Prefer "fetch on open" over caching the URL
 
-> A single core-only session is **not idle-reaped** (live-worker cap defaults to 30, with **no idle timeout**; one session is always ≤ cap), so normally the worker stays resident and the token is stable — but a crash / daemon restart still cycles it, and fetching fresh transparently gets the new token.
+**The token itself is stable**: production view/write tokens are a **domain-separated HMAC** of the host dashboard secret + sessionId (`deriveTerminalViewToken` / `deriveTerminalWriteToken`, each with a distinct domain prefix), recomputed by `refreshTerminal*Token()` at worker init — so **the same session derives the same token across worker / daemon restart** (`randomBytes` is only the standalone/test fallback when the secret is unavailable). A cached token does not break just because the worker cycled.
+
+Still, **fetch `write-link` fresh on each "open terminal"** — not because the token changes, but because the **rest of the URL does**: proxy port / advertised host / deployment topology, plus whether the worker is currently available (the terminal page must connect to a live worker). Fetching fresh is cheap (loopback + HMAC) and yields a URL that matches the current topology and a worker that is actually online.
+
+- ✅ Recommended: persist only the **stable sessionId**, fetch the URL on "open".
+- ⚠️ If you must cache: the token part is reusable, but port/host/worker-availability changes will make a stale URL fail to connect — fetching fresh is simpler.
+
+> A single core-only session is **not idle-reaped** (live-worker cap defaults to 30, with **no idle timeout**; one session is always ≤ cap), so normally the worker stays resident and the terminal remains reachable.
 
 ---
 
@@ -209,13 +222,14 @@ core-only is "no Feishu outbound + single-tenant loopback", with a ring of delib
 
 | Route | Method | Auth | Purpose |
 |---|---|---|---|
-| `/healthz` | GET | public | Readiness probe (503 starting / 200 ok) |
-| `/api/trigger` | POST | public | Start a turn (must set an HTTP response mode) |
-| `/api/sessions/:id/trigger-result` | GET | public | Poll the final result (four states) |
-| `/api/sessions/:id/insight` | GET | public | Poll conversation / progress |
-| `/api/sessions/:id/write-link` | GET | **HMAC + bind** | Get the writable terminal URL (fetch fresh) |
-| `/api/sessions/:id` | GET | **HMAC + bind** | Session metadata |
-| `/api/sessions/:id/close` | POST | **HMAC + bind** | Cancel / close the session |
+| `/healthz` | GET | public (layer 1) | Readiness probe (503 starting / 200 ok) |
+| `/api/trigger` | POST | public (layer 1) | Start a turn (must set an HTTP response mode) |
+| `/api/sessions/:id/trigger-result` | GET | public (layer 1) | Poll the final result (four states); core-only live worker also carries `readOnlyUrl`+`viewToken` |
+| `/api/sessions/:id/insight` | GET | public (layer 1) | Poll conversation / progress |
+| `/api/sessions/:id/write-link` | GET | **HMAC + bind** (layer 3) | Get the writable terminal URL (fetch on open) |
+| `/api/sessions/:id` | GET | **HMAC + bind** (layer 3) | Session metadata |
+| `/api/sessions/:id/close` | POST | HMAC + bind (layer 3) **or** in-session capability (layer 2) | Cancel / close the session |
 
+- Three-layer auth model: see §3; integrators only use layer 1.
 - Trigger request shape, `errorCode`s, four-state semantics, restart-survival guarantee: see [Triggering Tasks via API](/en/api-task-trigger).
 - Reference signing implementation: `src/core/daemon-ipc-auth.ts` (`daemonIpcAuthHeaders`).
