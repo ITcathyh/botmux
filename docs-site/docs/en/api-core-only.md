@@ -77,7 +77,7 @@ core-only's IPC routes are not a "public vs everything-HMAC" split — there are
 | `/api/sessions/:id/insight` | GET | Poll conversation / progress |
 | `/healthz` | GET | Readiness probe (core-only alias) |
 
-(`/__health` is also **permanently public** in every mode — the underlying equivalent of `/healthz`; no data, no mutation.)
+(`/__health` is also **permanently public** in every mode, but it is a **legacy liveness probe that always returns 200** — it is **not** equivalent to `/healthz`: `/healthz` returns `503 {status:'starting'}` until restore/attach/scheduler finish, i.e. it is the core-only **readiness barrier**. To decide "may I start triggering", you **must** use `/healthz`; using `/__health` would read as ready-when-not and trigger too early into a racing restore.)
 
 The three control routes' no-auth is a tight, core-only-specific allowlist — deliberately narrow: an earlier "auth off for all routes" would let a co-resident model turn read/perturb sessions, the scheduler, and mutations. `/api/asks/answer` is **deliberately excluded** (askId-keyed with no session binding — exposing it would let a co-resident turn hijack another pending ask).
 
@@ -103,7 +103,7 @@ The secret is the **raw 43-char base64url string** in `~/.botmux/.dashboard-secr
 
 ### ⚠️ Key point: `msg` must include the bind
 
-For **non-public routes**, core-only runs a **bind-carrying** check at the server layer before the route handler. The bind ties the signature to "method + path + port", so a captured signature can't be replayed to a different route/port.
+For **Layer-3 host/operator routes** (the third layer in §3, e.g. write-link), core-only runs a **bind-carrying** check at the server layer before the route handler. (Layer-1 public routes verify no signature; Layer-2 internal routes bypass this check and are verified by their handler's own capability / independent signature — neither uses the bind HMAC described here.) The bind ties the signature to "method + path + port", so a captured signature can't be replayed to a different route/port.
 
 ```
 bind = `${METHOD} ${pathname} ${port}`     // e.g. "GET /api/sessions/<sid>/write-link 8930"
@@ -214,7 +214,7 @@ core-only is "no Feishu outbound + single-tenant loopback", with a ring of delib
 - **State isolation**: the entrypoint **freezes** `SESSION_DATA_DIR` to a dedicated `~/.botmux/core-only/<botId>/data` — a managed turn carrying the host's `SESSION_DATA_DIR` can't point core-only at the real fleet's sessions/pid/descriptor.
 - **Loopback freeze**: `BOTMUX_WORKER_HTTP_HOST` and `WEB_EXTERNAL_HOST` are both frozen to `127.0.0.1` (bind and advertised host agree), so the worker web server is never exposed on all interfaces.
 - **Skips host maintenance**: core-only does not run fleet-level auto-restart / `botmux restart` / shared-HOME breadcrumb writes; it never touches the global botmux install on the same machine.
-- **HMAC is still the hard gate**: loopback is connectivity, not identity — same-machine processes (incl. bwrap sandboxes, which normally share the network namespace) can also dial `127.0.0.1`, so everything outside the four public routes in §3 still requires HMAC.
+- **Auth is still the hard gate**: loopback is connectivity, not identity — same-machine processes (incl. bwrap sandboxes, which normally share the network namespace) can also dial `127.0.0.1`. So beyond §3's Layer-1 three control routes + `/healthz`/`/__health`, every route is authenticated: Layer 2 by a per-session capability / independent strong signature verified in the handler, and Layer-3 host/operator routes by the §4 route+port-bound HMAC. No layer is "bare loopback is enough".
 
 ---
 

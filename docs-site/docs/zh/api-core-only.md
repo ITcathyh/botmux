@@ -76,7 +76,7 @@ core-only 的 IPC 路由不是「公共 vs 全部 HMAC」二分，而是**三层
 | `/api/sessions/:id/insight` | GET | 轮询对话/进度 |
 | `/healthz` | GET | 就绪探针（core-only 别名） |
 
-（`/__health` 也**永久公开**、任何模式都免鉴权，是 `/healthz` 的底层等价物；无数据无副作用。）
+（另有 `/__health` 也**永久公开**、任何模式都免鉴权，但它是 **legacy liveness 探针、始终返 200**——**不是** `/healthz` 的等价物：`/healthz` 在 restore/attach/scheduler 完成前返 `503 {status:'starting'}`，是 core-only 的 **readiness barrier**。判断「能不能开始 trigger」**必须**用 `/healthz`；用 `/__health` 会误判成已就绪、过早 trigger 进正在竞态恢复的路径。）
 
 这三条控制路由的免签是 core-only 专属的紧致 allowlist——刻意收窄：早期「全部路由免鉴权」会让同机 co-resident 的模型 turn 读写会话/调度/发起变更。`/api/asks/answer` **刻意不在**内（askId 为键、无会话绑定，暴露会让同机 turn 劫持别的待答 ask）。
 
@@ -102,7 +102,7 @@ core-only 的 IPC 路由不是「公共 vs 全部 HMAC」二分，而是**三层
 
 ### ⚠️ 关键：`msg` 必须带 bind
 
-core-only 对**非公共路由**在 server 层先走一道**带 bind** 的校验，通过后才进 route 处理器。bind 把签名绑定到「方法 + 路径 + 端口」，防止一个签名被重放到别的路由/端口。
+core-only 对**第三层 host/operator 路由**（§3 分层里的第三层，如 write-link）在 server 层先走一道**带 bind** 的校验，通过后才进 route 处理器。（第一层公共路由不验签；第二层内部路由绕过这道、由 handler 自己的 capability/独立签名验证——都不是这里说的 bind HMAC。）bind 把签名绑定到「方法 + 路径 + 端口」，防止一个签名被重放到别的路由/端口。
 
 ```
 bind = `${METHOD} ${pathname} ${port}`     // 例: "GET /api/sessions/<sid>/write-link 8930"
@@ -213,7 +213,7 @@ core-only 是「无飞书出站通道 + 单租户 loopback」，围绕这点有�
 - **状态隔离**：入口**冻结** `SESSION_DATA_DIR` 到专用 `~/.botmux/core-only/<botId>/data`——一个把 host 的 `SESSION_DATA_DIR` 带进来的 managed turn 无法让 core-only 去读真实 fleet 的会话/pid/descriptor。
 - **loopback 冻结**：`BOTMUX_WORKER_HTTP_HOST` 与 `WEB_EXTERNAL_HOST` 都被冻结成 `127.0.0.1`（bind 与广告 host 一致），worker web server 不会暴露在所有网卡上。
 - **跳过 host 维护**：core-only 不跑 fleet 级的 auto-restart / `botmux restart` / 共享 HOME breadcrumb 写入，绝不触碰同机的全局 botmux 安装。
-- **HMAC 仍是硬门**：loopback 只是连通性不是身份——同机（含 bwrap 沙箱，默认共享网络命名空间）的进程也能拨 `127.0.0.1`，所以除 §3 那四条公共路由外，一切仍需 HMAC。
+- **鉴权仍是硬门**：loopback 只是连通性不是身份——同机（含 bwrap 沙箱，默认共享网络命名空间）的进程也能拨 `127.0.0.1`。所以除 §3 第一层的三条控制路由 + `/healthz`/`/__health` 外，其余路由都要鉴权：第二层由 handler 内的 per-session capability / 独立强签名验证，第三层 host/operator 路由要 §4 的 route+port-bound HMAC。没有任何一层是「裸 loopback 就放行」。
 
 ---
 
