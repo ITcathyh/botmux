@@ -29,7 +29,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { createRequire } from 'node:module';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { validateWorkingDir } from './core/working-dir.js';
 import { resolveSessionContext } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
@@ -9402,20 +9402,24 @@ botmux create-group — 用一组机器人新建飞书群
 
 /**
  * postAsk: 找到 daemon → POST /api/asks → 返回 AskResult。
- * 连接失败 / HTTP 错误时抛出带 exitCode 属性的 Error：
- *   - exitCode=3：daemon 不可达或 HTTP 错误
+ * 连接失败 / HTTP 错误时抛出带 `exitCode` + `retryable` 属性的 Error：
+ *   - exitCode=3：daemon 不可达或 HTTP 错误（保持向后兼容）
+ *   - retryable=true：仅当 daemon 不可达 / 网络失败 / 明确的 transient HTTP
+ *     (502/503/504，含 daemon 启动尚未就绪) 时。这些正是"daemon 重启中"的信号,
+ *     runHook 会重连重试。确定性 4xx（bad body / capability 拒绝 / unsupported)
+ *     与非 JSON 是 retryable=false —— 重试 24h 也不会变,应立即 passthrough。
  */
 async function postAsk(body: Record<string, unknown>): Promise<import('./core/ask-types.js').AskResult> {
   type AskResult = import('./core/ask-types.js').AskResult;
+  type AskError = Error & { exitCode: number; retryable: boolean };
+  const mkErr = (message: string, retryable: boolean): AskError =>
+    Object.assign(new Error(message), { exitCode: 3, retryable });
 
   const larkAppId = body.larkAppId as string;
   const daemon = findDaemon(larkAppId);
   if (!daemon) {
-    const err = new Error(
-      `botmux ask: 找不到 daemon (larkAppId=${larkAppId})。daemon 已停？exit 3.`,
-    ) as Error & { exitCode: number };
-    err.exitCode = 3;
-    throw err;
+    // No daemon record → it's (re)starting or momentarily gone → retryable.
+    throw mkErr(`botmux ask: 找不到 daemon (larkAppId=${larkAppId})。daemon 已停？exit 3.`, true);
   }
 
   let res: Response;
@@ -9447,28 +9451,26 @@ async function postAsk(body: Record<string, unknown>): Promise<import('./core/as
       ? await fetchDaemonIpc(daemon.ipcPort, '/api/asks', init, hostSecret)
       : await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/asks`, init);
   } catch (fetchErr) {
+    // Socket refused / reset / timeout → daemon is down or restarting → retryable.
     const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
-    const err = new Error(
-      `botmux ask: 无法连接 daemon (port=${daemon.ipcPort}): ${msg}`,
-    ) as Error & { exitCode: number };
-    err.exitCode = 3;
-    throw err;
+    throw mkErr(`botmux ask: 无法连接 daemon (port=${daemon.ipcPort}): ${msg}`, true);
   }
 
   if (!res.ok) {
     let errBody = '';
     try { errBody = (await res.text()).slice(0, 200); } catch { /* */ }
-    const err = new Error(`botmux ask: daemon HTTP ${res.status}: ${errBody}`) as Error & { exitCode: number };
-    err.exitCode = 3;
-    throw err;
+    // Only transient server states are retryable. A deterministic 4xx (bad
+    // body, capability denied, unsupported chat) will fail identically forever;
+    // 502/503/504 mean the daemon is up but not ready (startup window) → retry.
+    const retryable = res.status === 502 || res.status === 503 || res.status === 504;
+    throw mkErr(`botmux ask: daemon HTTP ${res.status}: ${errBody}`, retryable);
   }
 
   try {
     return (await res.json()) as AskResult;
   } catch (jsonErr) {
-    const err = new Error(`botmux ask: daemon 返回非 JSON: ${jsonErr}`) as Error & { exitCode: number };
-    err.exitCode = 3;
-    throw err;
+    // A malformed body is not something a retry fixes.
+    throw mkErr(`botmux ask: daemon 返回非 JSON: ${jsonErr}`, false);
   }
 }
 
@@ -9713,6 +9715,12 @@ export async function runHook(
     }
   }
 
+  // Per-invocation identity: generated ONCE here (outside the retry loop) and
+  // reused across every reconnect POST, so a re-POST after a daemon restart
+  // re-attaches to the same restored ask instead of posting a duplicate card.
+  // originKind='hook' namespaces it away from an explicit `botmux ask buttons`.
+  const requestId = randomUUID();
+
   const body: Record<string, unknown> = {
     sessionId: routeSessionId,
     chatId: routeChatId,
@@ -9720,6 +9728,8 @@ export async function runHook(
     rootMessageId: routeRoot,
     questions: parsed.questions,
     timeoutMs,
+    requestId,
+    originKind: 'hook',
   };
 
   // Post the ask, RETRYING across a daemon restart. The daemon holds pending
@@ -9740,11 +9750,14 @@ export async function runHook(
       result = await postAskFn(body);
       break;
     } catch (err) {
-      // exitCode 3 = daemon unreachable / transport error (see postAsk). That is
-      // the restart-in-progress case → retry. Anything else (or a non-coded
-      // throw) is not something a retry fixes → passthrough as before.
-      const code = (err as { exitCode?: number } | undefined)?.exitCode;
-      if (code !== 3 || Date.now() >= deadline) {
+      // Retry ONLY genuinely transient failures (daemon unreachable / network /
+      // 502-503-504 startup-not-ready — see postAsk's `retryable`). That is the
+      // restart-in-progress case. A deterministic error (4xx bad body /
+      // capability / unsupported, non-JSON) has retryable=false → passthrough
+      // immediately rather than spin for 24h. A non-coded throw is also treated
+      // as non-retryable.
+      const retryable = (err as { retryable?: boolean } | undefined)?.retryable === true;
+      if (!retryable || Date.now() >= deadline) {
         return { stdout: adapter.passthrough(payload) };
       }
       attempt++;

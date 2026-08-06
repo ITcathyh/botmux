@@ -1,5 +1,5 @@
 /**
- * ask-persist-store — file-backed pending `botmux ask` state.
+ * ask-persist-store — file-backed pending `botmux ask` state (injectable).
  *
  * Why this exists: the ask broker's pending registry is an in-memory Map, so a
  * daemon restart between "card posted" and "user clicked" loses the ask. The
@@ -9,49 +9,63 @@
  * the answer. (See the AskUserQuestion picker-desync investigation.)
  *
  * This module owns the durable projection of each pending ask under
- * `<dataDir>/asks/<askKey>.json`. The broker persists on create, removes on
- * settle, and on boot re-hydrates them as "dormant" asks (card still live in
- * Feishu, but no waiter yet). When the surviving CLI hook reconnects and
- * re-POSTs the same ask, the broker matches it by `askKey` and re-attaches a
- * fresh waiter Promise + timeout to the dormant entry — so the answer flows back
- * through the normal hook directive, no native picker, no keystroke driving.
+ * `<storeDir>/<askKey>.json`. The broker persists on create, updates on card /
+ * selection / terminal-answer change, and removes once the answer is CLAIMED by
+ * the reconnecting hook. On boot the broker re-hydrates them as "dormant" asks
+ * (card still live in Feishu, no waiter yet).
+ *
+ * DEPENDENCY INJECTION (codex P1-4): the store is created with an explicit
+ * directory rather than reading `config.session.dataDir` at call time. Tests
+ * inject a temp dir and delete only their own sentinel-guarded directory; the
+ * broker never bulk-cleans a shared/global dataDir (a test helper doing that
+ * could delete a LIVE pending ask). Production wires the real dir once at
+ * daemon bootstrap.
  *
  * Design mirrors `workflows/v3/gate-wait-store.ts` (also "survive restart"):
- * atomic writes, fsync durability, a `listPersistedAsks` restore scan. Kept
- * bot-agnostic and pure file IO so it's testable without the daemon.
+ * atomic writes, fsync durability, a `list()` restore scan.
  *
- * `askKey` is a STABLE identity for an ask across restarts: derived by the
- * caller (daemon) from `BOTMUX_SESSION_ID` (unchanged across a daemon restart —
- * it is the CLI process's spawn-time env) + a hash of the questions. The
- * reconnecting hook, being the same CLI process, recomputes the identical key
- * and so re-attaches to its own dormant ask rather than posting a duplicate
- * card.
+ * IDENTITY (codex影响面纠正): `askKey` is supplied by the caller and is derived
+ * from a per-invocation `requestId` (generated once by the hook, reused across
+ * retries) + an `originKind` (hook-ask vs explicit `botmux ask buttons`). This
+ * is a true invocation identity — unlike a questions hash it distinguishes two
+ * concurrent same-question asks and two same-question invocations 24h apart, and
+ * prevents an explicit ask from re-claiming a hook ask's card.
  */
 
-import { createHash } from 'node:crypto';
 import {
   existsSync,
   mkdirSync,
   readFileSync,
   readdirSync,
   unlinkSync,
+  writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
 
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
-import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
-import type { AskQuestion } from './ask-types.js';
+import type { AskQuestion, AskResult } from './ask-types.js';
 
-/** Persisted shape — everything needed to re-hydrate a dormant ask + re-render
- *  its card. Deliberately excludes runtime-only fields (resolve fn, timers). */
+/** Sentinel file marking a directory as a botmux ask store. teardown/reset only
+ *  ever touches a directory that contains this file — a guard against a missing
+ *  temp override accidentally reaping a real data dir. */
+export const ASK_STORE_SENTINEL = '.botmux-ask-store';
+
+/** Persisted shape — everything needed to re-hydrate a dormant ask, re-render or
+ *  re-send its card, and hand off an answer that arrived before the hook
+ *  reconnected. Excludes runtime-only fields (resolve fn, timers). */
 export interface PersistedAsk {
   /** Schema version so a future field change can migrate/skip cleanly. */
-  v: 1;
-  /** Stable cross-restart identity (see module doc). */
+  v: 2;
+  /** Stable cross-restart identity = `${originKind}.${requestId}` (see module doc). */
   askKey: string;
-  /** The random per-process askId assigned when first registered. Retained so a
-   *  restored ask keeps a stable id for logging/snapshots; a re-attach keeps it. */
+  /** Per-invocation id the hook generates once and reuses across retries. */
+  requestId: string;
+  /** Distinguishes a hook AskUserQuestion from an explicit `botmux ask buttons`
+   *  so they can never re-claim each other's card. */
+  originKind: string;
+  /** Random per-process askId assigned at first register; kept stable across
+   *  restore/re-attach for logging + card action values. */
   askId: string;
   nonce: string;
   larkAppId: string;
@@ -62,111 +76,120 @@ export interface PersistedAsk {
   questions: ReadonlyArray<AskQuestion>;
   createdAt: number;
   deadlineAt: number;
-  /** Feishu message id of the posted card, once dispatch landed. Undefined until
-   *  the card send resolves; a restored ask without it can still be re-sent. */
+  /** Feishu message id of the posted card, once dispatch landed. Undefined means
+   *  the card has NOT been confirmed sent — restore/re-attach must (idempotently,
+   *  keyed by requestId) send it so the user always has exactly one live card. */
   cardMessageId?: string;
   /** Accumulated per-question selections (checkbox state), so a restart mid-
    *  multi-select keeps the boxes the user already ticked. */
   selections: ReadonlyArray<ReadonlyArray<string>>;
+  /** Durable handoff (codex P1-1): a terminal answer that arrived while the ask
+   *  was dormant (user clicked before the hook reconnected). The record is NOT
+   *  deleted on settle in that case — it is retained here until the reconnecting
+   *  hook CLAIMS it, then removed. Absent while still awaiting a click. */
+  answeredResult?: AskResult;
 }
 
-/** Compute the stable cross-restart key for an ask. Same session + same
- *  questions → same key, so a reconnecting hook re-attaches deterministically.
- *  The questions hash guards against two concurrent asks from one session
- *  colliding (rare, but possible if a CLI fires two AskUserQuestion in flight).
- */
-export function computeAskKey(sessionId: string, questions: ReadonlyArray<AskQuestion>): string {
-  const shape = JSON.stringify(
-    questions.map((q) => ({
-      p: q.prompt,
-      m: !!q.multiSelect,
-      o: q.options.map((o) => o.key),
-    })),
-  );
-  const h = createHash('sha256').update(shape).digest('hex').slice(0, 16);
-  // sessionId is already filesystem-safe (uuid-ish); keep it readable in the
-  // filename, append the questions hash for collision resistance.
-  return `${sanitizeKeySegment(sessionId)}.${h}`;
+/** Build the stable identity key from the invocation id + origin. */
+export function askKeyFor(originKind: string, requestId: string): string {
+  return `${sanitizeKeySegment(originKind)}.${sanitizeKeySegment(requestId)}`;
 }
 
 /** Keep a key segment safe as a path component (no separators / traversal). */
 function sanitizeKeySegment(s: string): string {
-  return s.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 80);
+  return String(s).replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 80);
 }
 
-function asksDir(): string {
-  return join(config.session.dataDir, 'asks');
+export interface AskPersistStore {
+  /** Absolute directory this store owns. */
+  readonly dir: string;
+  /** Create-or-update a record. Best-effort durable (atomic rename + fsync). */
+  put(ask: PersistedAsk): void;
+  /** Remove a record by key. Idempotent (missing file is not an error). */
+  remove(askKey: string): void;
+  /** Load all valid, unexpired records (reaps corrupt / wrong-version / expired). */
+  list(now?: number): PersistedAsk[];
 }
 
-function askFilePath(askKey: string): string {
-  return join(asksDir(), `${sanitizeKeySegment(askKey)}.json`);
-}
+/**
+ * Create a store bound to an explicit directory. The directory is created (with
+ * a sentinel) lazily on first write. Nothing here reads global config — the
+ * caller decides the path, which is what makes the broker testable without
+ * touching live data.
+ */
+export function createAskPersistStore(dir: string): AskPersistStore {
+  const filePath = (askKey: string): string => join(dir, `${sanitizeKeySegment(askKey)}.json`);
 
-/** Persist (create or update) a pending ask. Called on register and whenever
- *  cardMessageId / selections change so a restart mid-interaction is faithful.
- *  Best-effort durable: atomic rename + fsync via atomicWriteFileSync. */
-export function persistAsk(ask: PersistedAsk): void {
-  try {
-    mkdirSync(asksDir(), { recursive: true });
-    atomicWriteFileSync(askFilePath(ask.askKey), JSON.stringify(ask), { mode: 0o600, durable: true });
-  } catch (e) {
-    // Persistence is a resilience enhancement, never a correctness gate for the
-    // live path: a failed write just means this ask won't survive a restart.
-    logger.warn?.(
-      `ask-persist: failed to persist ${ask.askKey}: ${e instanceof Error ? e.message : String(e)}`,
-    );
-  }
-}
-
-/** Remove a persisted ask (on settle: answered / timed out / invalidated).
- *  Idempotent — a missing file is not an error. */
-export function removePersistedAsk(askKey: string): void {
-  try {
-    unlinkSync(askFilePath(askKey));
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return;
-    logger.warn?.(
-      `ask-persist: failed to remove ${askKey}: ${e instanceof Error ? e.message : String(e)}`,
-    );
-  }
-}
-
-/** Load all persisted asks for restart recovery. Skips corrupt / wrong-version
- *  / already-expired entries (and reaps the expired files). Never throws — a
- *  bad store must not block daemon boot. */
-export function listPersistedAsks(now: number = Date.now()): PersistedAsk[] {
-  const dir = asksDir();
-  if (!existsSync(dir)) return [];
-  let names: string[];
-  try {
-    names = readdirSync(dir).filter((n) => n.endsWith('.json'));
-  } catch (e) {
-    logger.warn?.(
-      `ask-persist: cannot read ${dir}: ${e instanceof Error ? e.message : String(e)}`,
-    );
-    return [];
-  }
-  const out: PersistedAsk[] = [];
-  for (const name of names) {
-    const fp = join(dir, name);
-    let parsed: PersistedAsk | undefined;
-    try {
-      parsed = JSON.parse(readFileSync(fp, 'utf-8')) as PersistedAsk;
-    } catch {
-      // Corrupt/racing write — drop it so it can't wedge recovery.
-      try { unlinkSync(fp); } catch { /* ignore */ }
-      continue;
+  function ensureDir(): void {
+    mkdirSync(dir, { recursive: true });
+    const sentinel = join(dir, ASK_STORE_SENTINEL);
+    if (!existsSync(sentinel)) {
+      try { writeFileSync(sentinel, 'botmux ask persist store\n', { mode: 0o600 }); } catch { /* best effort */ }
     }
-    if (!parsed || parsed.v !== 1 || !parsed.askKey || !Array.isArray(parsed.questions)) {
-      try { unlinkSync(fp); } catch { /* ignore */ }
-      continue;
-    }
-    if (typeof parsed.deadlineAt === 'number' && parsed.deadlineAt <= now) {
-      // Already past its deadline while the daemon was down — nothing to resume.
-      try { unlinkSync(fp); } catch { /* ignore */ }
-      continue;
-    }
-    out.push(parsed);
   }
-  return out;
+
+  return {
+    dir,
+    put(ask: PersistedAsk): void {
+      try {
+        ensureDir();
+        atomicWriteFileSync(filePath(ask.askKey), JSON.stringify(ask), { mode: 0o600, durable: true });
+      } catch (e) {
+        // Persistence is a resilience enhancement, never a correctness gate for
+        // the live path: a failed write just means this ask won't survive a
+        // restart.
+        logger.warn?.(
+          `ask-persist: failed to persist ${ask.askKey}: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    },
+    remove(askKey: string): void {
+      try {
+        unlinkSync(filePath(askKey));
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === 'ENOENT') return;
+        logger.warn?.(
+          `ask-persist: failed to remove ${askKey}: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    },
+    list(now: number = Date.now()): PersistedAsk[] {
+      if (!existsSync(dir)) return [];
+      let names: string[];
+      try {
+        names = readdirSync(dir).filter((n) => n.endsWith('.json'));
+      } catch (e) {
+        logger.warn?.(`ask-persist: cannot read ${dir}: ${e instanceof Error ? e.message : String(e)}`);
+        return [];
+      }
+      const out: PersistedAsk[] = [];
+      for (const name of names) {
+        const fp = join(dir, name);
+        let parsed: PersistedAsk | undefined;
+        try {
+          parsed = JSON.parse(readFileSync(fp, 'utf-8')) as PersistedAsk;
+        } catch {
+          try { unlinkSync(fp); } catch { /* ignore */ }
+          continue;
+        }
+        if (!parsed || parsed.v !== 2 || !parsed.askKey || !parsed.requestId || !Array.isArray(parsed.questions)) {
+          try { unlinkSync(fp); } catch { /* ignore */ }
+          continue;
+        }
+        // A record carrying an unclaimed answer is kept even past its deadline —
+        // the answer still needs delivering to the reconnecting hook. Only drop
+        // deadline-expired records that were never answered.
+        if (
+          parsed.answeredResult === undefined &&
+          typeof parsed.deadlineAt === 'number' &&
+          parsed.deadlineAt <= now
+        ) {
+          try { unlinkSync(fp); } catch { /* ignore */ }
+          continue;
+        }
+        out.push(parsed);
+      }
+      return out;
+    },
+  };
 }

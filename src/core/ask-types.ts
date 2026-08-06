@@ -93,6 +93,16 @@ export interface CreateAskInput {
   rootMessageId: string | null;
   /** Session that issued the ask — used for audit + future replay scoping. */
   sessionId: string;
+  /** Per-invocation identity: the hook generates this once and reuses it across
+   *  reconnect retries, so a re-POST after a daemon restart re-attaches to the
+   *  same ask instead of creating a duplicate. Unlike a questions hash it
+   *  distinguishes concurrent same-question asks. Optional for legacy/explicit
+   *  callers that don't need restart-resume; the broker synthesizes one. */
+  requestId?: string;
+  /** What kind of caller issued this ask ('hook' = AskUserQuestion PreToolUse,
+   *  'explicit' = `botmux ask buttons`, etc.). Namespaces the identity so an
+   *  explicit ask can never re-claim a hook ask's card. Defaults to 'hook'. */
+  originKind?: string;
   /** 问题列表，调用方保证每问 `options.length ≥ 2` 且 key 唯一。 */
   questions: ReadonlyArray<AskQuestion>;
   /** Absolute deadline; computed by caller from `--timeout`. Broker won't

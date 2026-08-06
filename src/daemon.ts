@@ -360,11 +360,13 @@ import { botAutoWorktreeEnabled } from './services/default-worktree.js';
 import {
   setCardDispatcher as setAskCardDispatcher,
   setCanTalkChecker as setAskCanTalkChecker,
+  setAskPersistStore as setAskPersistStoreBroker,
   registerAsk as registerAskBroker,
   restorePersistedAsks as restorePersistedAsksBroker,
   findPendingAskByAnchor,
   submitCustomReply,
 } from './core/ask-broker.js';
+import { createAskPersistStore } from './core/ask-persist-store.js';
 import { parseAskBody } from './core/ask-api.js';
 import { computeCocoPickerKeys } from './core/coco-picker-keys.js';
 import { createLarkAskCardDispatcher } from './im/lark/ask-card.js';
@@ -5200,6 +5202,9 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     questions: boundAsk.questions,
     timeoutMs: boundAsk.timeoutMs,
     chatType: askChatType,
+    // Invocation identity (from the hook; enables cross-restart re-attach).
+    requestId: boundAsk.requestId,
+    originKind: boundAsk.originKind,
   });
 
   // CoCo 专属：它的 hook 不能用 directive 代答（hook 客户端永远 passthrough，CoCo 会
@@ -18736,6 +18741,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // waiter, so the answer flows back through the normal hook directive instead
   // of the CLI falling into a stuck native picker. Scoped to this daemon's bot.
   try {
+    // Bind the durable store to the real data dir (dependency-injected so unit
+    // tests use a temp dir and never touch live data — codex P1-4).
+    setAskPersistStoreBroker(createAskPersistStore(join(config.session.dataDir, 'asks')));
     restorePersistedAsksBroker(Date.now(), cfg.larkAppId);
   } catch (e) {
     logger.warn(`[ask] restorePersistedAsks failed: ${e instanceof Error ? e.message : String(e)}`);
