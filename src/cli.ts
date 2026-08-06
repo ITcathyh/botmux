@@ -3766,16 +3766,34 @@ function sessionBackingInfo(s: SessionData, snapshot?: BackingProbeSnapshot): {
   if (s.backendType === 'pty') {
     return { backendType: 'pty', probe: 'missing', label: 'pty' };
   }
-  // Legacy rows predate backend stamping. Only tmux was externally attachable.
-  const target = sessionPersistentTarget(s)!;
-  const probe = backingProbe(snapshot, target);
-  return {
-    backendType: 'tmux',
-    target,
-    probe,
-    label: probe === 'exists' ? `tmux: ${target.sessionName}` : '-',
-    attachBackend: 'tmux',
-  };
+  if (s.backendType === 'riff') {
+    // Riff runs the CLI on a remote sandbox, not a local multiplexer pane: there
+    // is nothing to probe, attach to, or name as a PersistentBackendTarget
+    // (sessionPersistentTarget returns undefined for it, by design). Surface a
+    // stable label and report the nonexistent local backing as missing — exactly
+    // like pty — so it never slips into the legacy tmux branch and dereferences an
+    // undefined target.
+    return { backendType: 'riff', probe: 'missing', label: 'riff' };
+  }
+  if (s.backendType === undefined) {
+    // Legacy rows predate backend stamping. Only tmux was externally attachable,
+    // so its deterministic target remains the compatibility path.
+    const target = sessionPersistentTarget(s)!;
+    const probe = backingProbe(snapshot, target);
+    return {
+      backendType: 'tmux',
+      target,
+      probe,
+      label: probe === 'exists' ? `tmux: ${target.sessionName}` : '-',
+      attachBackend: 'tmux',
+    };
+  }
+  // Exhaustiveness guard: every BackendType must be classified above. A future
+  // non-suspendable backend added to BackendType will fail to compile here rather
+  // than silently inheriting the legacy tmux target (the Riff crash's root cause).
+  const _exhaustive: never = s.backendType;
+  void _exhaustive;
+  return { probe: 'missing', label: '-' };
 }
 
 function sessionTargetLabel(s: SessionData, snapshot?: BackingProbeSnapshot): string {
