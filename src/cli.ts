@@ -84,6 +84,7 @@ import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
 import { isColdResumeDormant, isRealManagedSession, sessionListDisposition } from './cli/session-list-liveness.js';
+import { computeSessionPickerScrollWindow } from './cli/session-picker-viewport.js';
 import {
   attachFrozenManagedZmxSession,
   freezeManagedZmxAttachTarget,
@@ -3912,27 +3913,62 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
   const separator = '─'.repeat(displayWidth(header));
 
   let cursor = 0;
+  let scrollTop = 0;              // index of the first visible row (vertical scroll)
   let confirmDelete = false;  // true when waiting for y/n confirmation
   let flashMsg = '';
+
+  // Fixed chrome around the scrolling row window: title(2) + header block(3) +
+  // bottom separator(1) + target hint(2) + flash/confirm(2) + hints(2) + a
+  // one-line safety margin so the final newline never scrolls the pinned title
+  // off the alt-screen. Everything else is the row viewport.
+  const CHROME_ROWS = 13;
+  const sepWidth = displayWidth(separator);
+  // Overlay a "N 更多" marker onto a separator line without changing its display
+  // width, so the up/down hidden-row counters cost no extra vertical lines.
+  const sepWithMarker = (marker: string): string => {
+    const label = ` ${marker} `;
+    const lw = displayWidth(label);
+    if (lw + 4 > sepWidth) return separator;
+    return `──${label}${'─'.repeat(sepWidth - 2 - lw)}`;
+  };
 
   function render(): void {
     process.stdout.write('\x1b[H\x1b[J');
 
-    process.stdout.write(`\x1b[1m botmux sessions\x1b[0m  \x1b[2m(${rows.length})\x1b[0m\n\n`);
-
-    // Header + separator — use same 4-char prefix as rows
-    process.stdout.write(`    ${separator}\n`);
-    process.stdout.write(`    \x1b[2m${header}\x1b[0m\n`);
-    process.stdout.write(`    ${separator}\n`);
+    const posLabel = rows.length > 0 ? `${cursor + 1}/${rows.length}` : '0';
+    process.stdout.write(`\x1b[1m botmux sessions\x1b[0m  \x1b[2m(${posLabel})\x1b[0m\n\n`);
 
     if (rows.length === 0) {
+      process.stdout.write(`    ${separator}\n`);
+      process.stdout.write(`    \x1b[2m${header}\x1b[0m\n`);
+      process.stdout.write(`    ${separator}\n`);
       process.stdout.write(`\n    \x1b[2m没有活跃会话\x1b[0m\n`);
       process.stdout.write(`    ${separator}\n`);
       process.stdout.write(`\n  \x1b[2mq 退出\x1b[0m\n`);
       return;
     }
 
-    for (let i = 0; i < rows.length; i++) {
+    // Vertical viewport: render only the window of rows that fits the terminal
+    // height, scrolling to keep the cursor visible. Without this a long session
+    // list overflows the alt-screen and pushes the title/header/top rows off it.
+    const win = computeSessionPickerScrollWindow({
+      cursor,
+      scrollTop,
+      rowCount: rows.length,
+      termRows: process.stdout.rows || 24,
+      chromeRows: CHROME_ROWS,
+    });
+    scrollTop = win.scrollTop;
+    const { viewEnd, hiddenAbove, hiddenBelow } = win;
+
+    // Header + separator — use same 4-char prefix as rows
+    process.stdout.write(`    ${separator}\n`);
+    process.stdout.write(`    \x1b[2m${header}\x1b[0m\n`);
+    process.stdout.write(hiddenAbove > 0
+      ? `    \x1b[36m${sepWithMarker(`↑ ${hiddenAbove} 更多`)}\x1b[0m\n`
+      : `    ${separator}\n`);
+
+    for (let i = scrollTop; i < viewEnd; i++) {
       const r = rows[i];
       const pointer = i === cursor ? '\x1b[36m❯\x1b[0m' : ' ';
       if (i === cursor) {
@@ -3942,7 +3978,9 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
       }
     }
 
-    process.stdout.write(`    ${separator}\n`);
+    process.stdout.write(hiddenBelow > 0
+      ? `    \x1b[36m${sepWithMarker(`↓ ${hiddenBelow} 更多`)}\x1b[0m\n`
+      : `    ${separator}\n`);
 
     // Footer info
     const selected = rows[cursor];
@@ -3977,7 +4015,13 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
 
     render();
 
+    // Recompute the scrolling viewport when the terminal is resized so the
+    // pinned header/footer and visible row window always fit the new height.
+    const onResize = (): void => render();
+    process.stdout.on('resize', onResize);
+
     function cleanup(): void {
+      process.stdout.off('resize', onResize);
       process.stdin.setRawMode(false);
       process.stdin.pause();
       process.stdout.write('\x1b[?25h');   // show cursor
