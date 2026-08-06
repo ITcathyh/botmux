@@ -188,6 +188,7 @@ export function registerAsk(input: CreateAskInput): Promise<AskResult> {
     // Persist immediately so a restart before the card even lands still leaves a
     // resumable record (its cardMessageId fills in once dispatch resolves).
     persistFromInternal(ask);
+    logger.info?.(`ask-broker: registered + persisted ask ${askId} (key=${askKey}, session=${input.sessionId})`);
 
     // Card dispatch is async — store the messageId once it lands.
     void dispatcher!
@@ -557,10 +558,17 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
     };
     pending.set(p.askId, ask);
     restored++;
+    logger.info?.(
+      `ask-broker: restored pending ask ${p.askId} (key=${p.askKey}, session=${p.sessionId}, ` +
+      `dormant, ${Math.round((p.deadlineAt - now) / 1000)}s left) — awaiting hook re-attach`,
+    );
   }
-  if (restored > 0) {
-    logger.info?.(`ask-broker: restored ${restored} pending ask(s) from disk (dormant, awaiting hook re-attach)`);
-  }
+  // Always log the boot sweep outcome (even 0) so a live restart test can
+  // confirm the restore path ran, not just infer it from behaviour.
+  logger.info?.(
+    `ask-broker: restore sweep complete — ${restored} pending ask(s) restored` +
+    (larkAppId ? ` for ${larkAppId}` : ''),
+  );
   return restored;
 }
 
