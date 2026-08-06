@@ -229,6 +229,13 @@ export const messages: Record<string, string> = {
   'card.relay.toast_not_started_yet': '⚠️ 会话还没选仓库、CLI 没起来，无法接力。请先回原会话把仓库选了。',
   'card.relay.toast_same_chat': '该会话已在目标位置（同一话题/群），无需接力。',
   'card.relay.toast_failed': '接力失败：{error}',
+  // 接力确认失败后走可见消息（而非 toast）时用的文案：确认处理要等 detach 死线
+  // （最长 8s），必然超过卡片 ACK 窗口（2.5s），此时 toast 已无法补发、会被丢弃，
+  // 只能靠消息把失败告诉用户。transferSession 在任何 !ok 路径都不提交路由改写，
+  // 会话必然仍在原处，因此文案统一强调「未丢失、可重试」。
+  'card.relay.fail_timeout': '⚠️ 接力超时未完成。会话仍在原处、未丢失——飞书消息历史和 AI 记忆都还在源会话里。请稍等片刻，再点一次「确认接力」重试。',
+  'card.relay.fail_worker_busy': '⚠️ 接力未完成：会话正在处理中（mid-turn）。会话仍在原处、未丢失，请等它空闲后再点一次「确认接力」重试。',
+  'card.relay.fail_generic': '⚠️ 接力未完成（{error}）。会话仍在原处、未丢失——飞书消息历史和 AI 记忆都还在源会话里。请稍后再点一次「确认接力」重试。',
   'card.relay.toast_target_has_session': '本群已有该机器人的活跃会话，请先 /close 它再接力',
   'cmd.relay.target_has_session_msg': '⚠️ 本群已有该机器人的活跃会话「{title}」。请先用 /close 关掉那个会话，再接力新的过来。',
   'card.relay.toast_success': '✅ 已接力到本群',

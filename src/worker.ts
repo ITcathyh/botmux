@@ -12905,6 +12905,13 @@ process.on('message', async (raw: unknown) => {
       killCli({ preserveSandbox: true });
       cleanup();
       await flushTransferDetachAck(msg.requestId);
+      // NOTE: process.exit(0) can wedge in node-pty's native teardown when a
+      // web-terminal client PTY was attached (the reader-thread join blocks and
+      // the JS event loop is already stopped, so this process cannot self-kill
+      // via a timer). killCli() above already detached the observer and the ACK
+      // just flushed, so the daemon force-kills this now-disposable process
+      // shortly after the ACK (see detachWorkerForTransfer's post-ACK kill).
+      // We still request a clean exit; the daemon SIGKILL is the hard backstop.
       process.exit(0);
     }
 

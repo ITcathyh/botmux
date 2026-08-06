@@ -1593,34 +1593,52 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     } catch (err: any) {
       return { toast: { type: 'error', content: t('card.relay.toast_failed', { error: err?.message ?? 'send_m1_failed' }, loc) } };
     }
-    const { transferSession } = await import('../../core/worker-pool.js');
+    const { transferSession, TRANSFER_DETACH_FENCE_PICKER_MS } = await import('../../core/worker-pool.js');
     // chat-scope → anchor on the M1 id (audit-only); thread-scope → anchor on
     // the 话题 root (targetAnchor) so future replies in the 话题 route here.
+    // In-process picker relay has no HTTP abort above it (unlike the cross-daemon
+    // /relay --create peer path), so give the observer-detach fence generous
+    // headroom — a clean-but-slightly-slow worker teardown (~3.5s observed) must
+    // not be misclassified as worker_detach_timeout.
     const r = targetScope === 'thread'
-      ? await transferSession(sourceDs.session.sessionId, targetChatId, targetAnchor, targetChatType, 'thread')
-      : await transferSession(sourceDs.session.sessionId, targetChatId, m1MessageId, targetChatType, 'chat');
+      ? await transferSession(sourceDs.session.sessionId, targetChatId, targetAnchor, targetChatType, 'thread', { detachTimeoutMs: TRANSFER_DETACH_FENCE_PICKER_MS })
+      : await transferSession(sourceDs.session.sessionId, targetChatId, m1MessageId, targetChatType, 'chat', { detachTimeoutMs: TRANSFER_DETACH_FENCE_PICKER_MS });
     if (!r.ok) {
       // Best-effort: orphan M1 cleanup so a failed transfer doesn't leave a
       // misleading "已接力" message in the target chat (王皓's "明明失败了
       // 却返回成功了" complaint). Race-condition fallback only — the
       // pre-flight checks above should catch the common cases first.
       deleteMessage(larkAppId, m1MessageId).catch(() => { /* leave it */ });
-      if (r.error === 'target_chat_has_session') {
-        // Lost the race vs the pre-flight check — still surface as a message.
-        const errText = t('cmd.relay.target_has_session_msg', { title: '' }, loc);
-        sendMessage(larkAppId, targetChatId, errText, 'text').catch(() => undefined);
-        return;
+      // Deliver the failure as a VISIBLE message, never a toast. The confirm
+      // handler awaits the detach fence (up to TRANSFER_DETACH_FENCE_PICKER_MS
+      // = 8s), which always exceeds the 2.5s card-ACK window — once the generic
+      // "后台处理中" ACK has gone out, a toast can no longer be surfaced and is
+      // silently dropped (only a `not shown to user` log line remained; this is
+      // exactly the failure 申晗 hit — a false-timeout relay whose error the
+      // user never saw). transferSession never commits the routing rewrite on
+      // ANY !ok path, so the source session is always still intact; the copy
+      // reassures the user it was not lost and points at a concrete retry (the
+      // picker card + its 确认 button survive — we only delete them on success
+      // below). Land the notice where the user is looking, mirroring the M1
+      // delivery target: thread-scope → reply_in_thread into the 话题;
+      // chat-scope → a top-level message in the target chat.
+      const failText =
+        r.error === 'worker_detach_timeout' ? t('card.relay.fail_timeout', undefined, loc)
+        : r.error === 'worker_busy' ? t('card.relay.fail_worker_busy', undefined, loc)
+        : r.error === 'target_chat_has_session' ? t('cmd.relay.target_has_session_msg', { title: '' }, loc)
+        : r.error === 'adopt_not_relayable' ? t('card.relay.toast_adopt_not_relayable', undefined, loc)
+        : r.error === 'not_started_yet' ? t('card.relay.toast_not_started_yet', undefined, loc)
+        : t('card.relay.fail_generic', { error: r.error }, loc);
+      try {
+        if (targetScope === 'thread') {
+          await replyMessage(larkAppId, targetAnchor, failText, 'text', /*replyInThread*/ true);
+        } else {
+          await sendMessage(larkAppId, targetChatId, failText, 'text');
+        }
+      } catch (e) {
+        logger.warn(`[card-action] relay failure notice send failed (${e instanceof Error ? e.message : e}); relay error was: ${r.error}`);
       }
-      if (r.error === 'adopt_not_relayable') {
-        return { toast: { type: 'error', content: t('card.relay.toast_adopt_not_relayable', undefined, loc) } };
-      }
-      if (r.error === 'worker_busy') {
-        return { toast: { type: 'error', content: t('card.relay.toast_worker_busy', undefined, loc) } };
-      }
-      if (r.error === 'not_started_yet') {
-        return { toast: { type: 'error', content: t('card.relay.toast_not_started_yet', undefined, loc) } };
-      }
-      return { toast: { type: 'error', content: t('card.relay.toast_failed', { error: r.error }, loc) } };
+      return;
     }
     // Best-effort: remove the picker card now that the selection resolved.
     // Ephemeral (private) pickers need the ephemeral-delete endpoint —

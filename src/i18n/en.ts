@@ -226,6 +226,15 @@ export const messages: Record<string, string> = {
   'card.relay.toast_not_started_yet': '⚠️ The session has not picked a repo yet, so the CLI never started. Pick a repo in the source chat first.',
   'card.relay.toast_same_chat': 'That session is already at the target location (same topic/chat) — nothing to relay.',
   'card.relay.toast_failed': 'Relay failed: {error}',
+  // Copy used when a relay-confirm failure is delivered as a visible message
+  // (not a toast): confirm processing waits on the detach fence (up to 8s),
+  // which necessarily exceeds the card ACK window (2.5s), after which a toast
+  // can no longer be surfaced and is dropped — only a message reaches the user.
+  // transferSession never commits the routing rewrite on any !ok path, so the
+  // session always stays put; the copy therefore stresses "not lost, retry".
+  'card.relay.fail_timeout': '⚠️ Relay timed out before completing. The session is still where it was — nothing was lost; its Lark history and AI memory remain in the source. Wait a moment, then click "Confirm relay" again to retry.',
+  'card.relay.fail_worker_busy': '⚠️ Relay did not complete: the session is mid-turn. It is still where it was and was not lost — wait for it to go idle, then click "Confirm relay" again.',
+  'card.relay.fail_generic': '⚠️ Relay did not complete ({error}). The session is still where it was — nothing was lost; its Lark history and AI memory remain in the source. Please click "Confirm relay" again to retry.',
   'card.relay.toast_target_has_session': 'This chat already has an active session for the bot. Please /close it first, then relay.',
   'cmd.relay.target_has_session_msg': '⚠️ This bot already has an active session "{title}" in this chat. Please /close it first, then relay a new one in.',
   'card.relay.toast_success': '✅ Relayed into this chat',

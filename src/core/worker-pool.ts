@@ -286,7 +286,31 @@ const WORKER_SIGKILL_BACKSTOP_MS = 7_000;
 const CLOSE_FENCE_WARN_MS = 8_000;
 // Peer relay waits 5s for the whole transfer request. Tmux observer detach has
 // its own 3s command timeout, so this fence leaves headroom for routing/fork.
+// This tight default is load-bearing ONLY for the cross-daemon `/relay --create`
+// peer path (dashboard-ipc-server migrate-to-chat), whose transfer must finish
+// inside the leader's 5s HTTP abort — otherwise the peer commits the move after
+// the leader already reported failure (split-brain; see the busy-refuse comment
+// in transferSession). In-process callers have no such ceiling.
 const TRANSFER_DETACH_FENCE_MS = 3_500;
+// In-process picker relay (card-handler relay_confirm) runs with no HTTP abort
+// above it — its card ACK already degrades to a background "处理中" toast at 2.5s
+// and the real result is delivered as a visible message. So it can afford a
+// larger fence as a last-resort safety net. The COMMON hang, however, is not a
+// slow teardown — it's the worker ACKing the detach in ~9ms but then wedging in
+// node-pty's native process-exit teardown (a still-open web-terminal client PTY
+// blocks `process.exit()` in the reader-thread join; the JS event loop is
+// already stopped so the worker cannot self-rescue). We handle that below by
+// force-killing the worker once its ACK proves the observer already detached, so
+// this fence only bounds the pathological "no ACK at all" case.
+export const TRANSFER_DETACH_FENCE_PICKER_MS = 8_000;
+// Grace after the worker's transfer_detached ACK before the daemon force-kills
+// it. The ACK proves killCli({preserveSandbox:true}) already ran — backend
+// detached, CLI/tmux/sandbox left intact for the replacement — so the ACKed
+// worker process is disposable. Give it a brief window to exit cleanly on its
+// own; if node-pty's exit teardown wedges it (the real bug), SIGKILL it rather
+// than stranding the transfer behind the full fence. Short because a healthy
+// worker exits within a few ms of the ACK.
+const TRANSFER_DETACH_POST_ACK_KILL_MS = 300;
 const TRANSFER_FORCE_EXIT_MS = 500;
 const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN'] as const;
 
@@ -1920,14 +1944,32 @@ export async function detachWorkerForTransfer(
   const maybeFinish = (): void => {
     if (acked && exited) finish(true);
   };
+  // Once the worker ACKs, its observer is already detached (killCli ran); the
+  // process itself is disposable. A healthy worker exits within a few ms, but a
+  // web-terminal client PTY makes node-pty's process.exit() teardown wedge the
+  // process for the whole fence (JS loop already stopped → it can't self-kill).
+  // So on ACK, arm a short grace timer, then SIGKILL — turning an 8s stall into
+  // a ~300ms one. Cleared if the worker exits on its own first.
+  let postAckKillTimer: ReturnType<typeof setTimeout> | undefined;
+  const armPostAckKill = (): void => {
+    if (postAckKillTimer || exited) return;
+    postAckKillTimer = setTimeout(() => {
+      if (exited) return;
+      logger.info(`[${tag(ds)}] Detach ACK received but worker still alive after ${TRANSFER_DETACH_POST_ACK_KILL_MS}ms (node-pty exit wedge); SIGKILL`);
+      try { w.kill('SIGKILL'); } catch { /* already gone */ }
+    }, TRANSFER_DETACH_POST_ACK_KILL_MS);
+    postAckKillTimer.unref?.();
+  };
   const onMessage = (raw: unknown): void => {
     const msg = raw as Partial<WorkerToDaemon>;
     if (msg.type !== 'transfer_detached' || msg.requestId !== requestId) return;
     acked = true;
+    armPostAckKill();
     maybeFinish();
   };
   const onExit = (): void => {
     exited = true;
+    if (postAckKillTimer) { clearTimeout(postAckKillTimer); postAckKillTimer = undefined; }
     maybeFinish();
   };
   w.on('message', onMessage);
@@ -1940,6 +1982,7 @@ export async function detachWorkerForTransfer(
   void sendWorkerIpc(w, { type: 'detach_for_transfer', requestId })
     .catch(() => finish(false));
   const completed = await completion;
+  if (postAckKillTimer) { clearTimeout(postAckKillTimer); postAckKillTimer = undefined; }
 
   // A timed-out detach request may still be queued in Node's IPC channel and
   // arrive later. Never hand new input back to that uncertain worker. SIGKILL
@@ -3376,6 +3419,14 @@ export async function transferSession(
     detachWorkerImpl?: (
       ds: DaemonSession,
     ) => boolean | void | Promise<boolean | void>;
+    /** Detach-fence budget (ms) for the observer teardown handshake. Defaults
+     *  to the tight TRANSFER_DETACH_FENCE_MS, which the cross-daemon peer path
+     *  needs to stay inside the leader's 5s HTTP abort. In-process callers with
+     *  no HTTP ceiling (the picker relay_confirm) pass a larger value
+     *  (TRANSFER_DETACH_FENCE_PICKER_MS) so a slightly-slow-but-clean teardown
+     *  is not misclassified as a failure. Ignored when detachWorkerImpl is set
+     *  (test doubles don't observe a real fence). */
+    detachTimeoutMs?: number;
   },
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   // Depth defense — unreachable per TS narrowing above, but guards against
@@ -3489,7 +3540,13 @@ export async function transferSession(
   }
 
   const fkw = opts?.forkWorkerImpl ?? forkWorker;
-  const detach = opts?.detachWorkerImpl ?? detachWorkerForTransfer;
+  // The default detach observes a real fence and takes a per-call timeout; a
+  // test double only takes `ds`. Bind the requested fence onto the real impl
+  // only — a test double never observes a fence, so the budget is irrelevant
+  // (and its narrower signature wouldn't accept it).
+  const detachTimeoutMs = opts?.detachTimeoutMs ?? TRANSFER_DETACH_FENCE_MS;
+  const detach = opts?.detachWorkerImpl
+    ?? ((d: DaemonSession) => detachWorkerForTransfer(d, { timeoutMs: detachTimeoutMs }));
   const transferGate = beginTransferInputGate(ds);
   if (!transferGate) return { ok: false, error: 'worker_busy' };
   let uncertainRetiringWorker: ChildProcess | undefined;
