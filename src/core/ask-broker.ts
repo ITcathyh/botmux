@@ -11,6 +11,13 @@
 import { randomUUID } from 'node:crypto';
 
 import { logger } from '../utils/logger.js';
+import {
+  computeAskKey,
+  listPersistedAsks,
+  persistAsk,
+  removePersistedAsk,
+  type PersistedAsk,
+} from './ask-persist-store.js';
 import type {
   AskCardDispatcher,
   AskClickOutcome,
@@ -20,10 +27,26 @@ import type {
 } from './ask-types.js';
 
 interface InternalPending extends Omit<PendingAsk, 'selections'> {
-  resolve: (result: AskResult) => void;
+  /** Stable cross-restart identity (sessionId + questions hash). Used to
+   *  re-attach a reconnecting hook to its own restored ask, and as the
+   *  persistence filename key. */
+  askKey: string;
+  /** Waiter Promise resolver. Absent on a dormant (restored, unclaimed) ask —
+   *  a click can still settle its card, but there is no CLI turn to resolve
+   *  until a reconnecting hook re-attaches one. */
+  resolve?: (result: AskResult) => void;
   timeoutHandle: NodeJS.Timeout;
   /** epoch ms when settle ran; undefined while still pending. */
   settledAt?: number;
+  /**
+   * Restored from disk after a daemon restart but not yet re-claimed by a
+   * reconnecting hook: the card is still live in Feishu, but there is no waiter
+   * Promise to resolve. A click on a dormant ask records selections/settles the
+   * card, and the answer is delivered when the hook re-registers (which flips
+   * dormant → active by attaching a fresh resolve). No timeout runs while
+   * dormant except the absolute-deadline sweep.
+   */
+  dormant?: boolean;
   /**
    * 按问题序号（questionIndex）累积的勾选 key 集合。
    * 单选问题（multiSelect:false）Set 内最多保留 1 个 key。
@@ -108,6 +131,18 @@ export function registerAsk(input: CreateAskInput): Promise<AskResult> {
     throw new Error('ask-broker: cardDispatcher not wired — daemon bootstrap bug');
   }
 
+  const askKey = computeAskKey(input.sessionId, input.questions);
+
+  // Re-attach path: a hook reconnecting after a daemon restart re-POSTs the
+  // same ask. If we restored a dormant entry with this key (card still live in
+  // Feishu), attach a fresh waiter + timeout to it instead of posting a second
+  // card. The user's click — whenever it lands — resolves this new Promise, so
+  // the answer flows back through the normal hook directive.
+  const existing = findDormantByKey(askKey);
+  if (existing) {
+    return reattachDormantAsk(existing, input);
+  }
+
   const askId = randomUUID();
   const nonce = randomUUID().slice(0, 8);
   const createdAt = Date.now();
@@ -134,6 +169,7 @@ export function registerAsk(input: CreateAskInput): Promise<AskResult> {
 
     const ask: InternalPending = {
       askId,
+      askKey,
       nonce,
       larkAppId: input.larkAppId,
       chatId: input.chatId,
@@ -149,13 +185,21 @@ export function registerAsk(input: CreateAskInput): Promise<AskResult> {
       selections,
     };
     pending.set(askId, ask);
+    // Persist immediately so a restart before the card even lands still leaves a
+    // resumable record (its cardMessageId fills in once dispatch resolves).
+    persistFromInternal(ask);
 
     // Card dispatch is async — store the messageId once it lands.
     void dispatcher!
       .send(snapshot(ask))
       .then(({ messageId }) => {
         const cur = pending.get(askId);
-        if (cur && !cur.settled) cur.cardMessageId = messageId;
+        if (cur && !cur.settled) {
+          cur.cardMessageId = messageId;
+          // Re-persist so a restart after the card lands can patch the exact
+          // card on settle and knows it was already delivered.
+          persistFromInternal(cur);
+        }
       })
       .catch((err) => {
         const msg = err instanceof Error ? err.message : String(err);
@@ -170,6 +214,67 @@ export function registerAsk(input: CreateAskInput): Promise<AskResult> {
         });
       });
   });
+}
+
+/** Find a dormant (restored-but-unclaimed) ask by its stable key. Only dormant
+ *  entries are re-attachable — an active ask with a live waiter must never be
+ *  hijacked by a second registration. */
+function findDormantByKey(askKey: string): InternalPending | undefined {
+  for (const ask of pending.values()) {
+    if (ask.askKey === askKey && ask.dormant && !ask.settled) return ask;
+  }
+  return undefined;
+}
+
+/** Re-attach a reconnecting hook to a restored dormant ask: keep its card,
+ *  nonce, and accumulated selections, but install a fresh waiter Promise and
+ *  a timeout re-armed to the ORIGINAL absolute deadline. Flips dormant → active. */
+function reattachDormantAsk(ask: InternalPending, input: CreateAskInput): Promise<AskResult> {
+  return new Promise<AskResult>((resolve) => {
+    ask.dormant = false;
+    ask.resolve = resolve;
+    // Replace the dormant-phase deadline timer (armed by restorePersistedAsks)
+    // rather than leaking it — settle is idempotent, but two live timers is
+    // sloppy. Re-arm to the surviving absolute deadline (not a fresh full
+    // timeout — the clock kept running while the daemon was down).
+    clearTimeout(ask.timeoutHandle);
+    const remaining = Math.max(0, ask.deadlineAt - Date.now());
+    ask.timeoutHandle = setTimeout(() => {
+      settle(ask.askId, {
+        kind: 'timedOut', selected: null, by: null, comment: null, timedOut: true,
+      });
+    }, remaining);
+    ask.timeoutHandle.unref?.();
+    logger.info?.(
+      `ask-broker: re-attached hook to restored ask ${ask.askId} (key=${ask.askKey}, ` +
+      `${Math.round(remaining / 1000)}s left)`,
+    );
+    // sessionId/chatId are identity-stable across the reconnect; input is only
+    // used for the key match, which already succeeded. Nothing else to copy.
+    void input;
+  });
+}
+
+/** Build the persisted projection from a live internal ask and write it. */
+function persistFromInternal(ask: InternalPending): void {
+  if (ask.settled) return;
+  const persisted: PersistedAsk = {
+    v: 1,
+    askKey: ask.askKey,
+    askId: ask.askId,
+    nonce: ask.nonce,
+    larkAppId: ask.larkAppId,
+    chatId: ask.chatId,
+    rootMessageId: ask.rootMessageId,
+    sessionId: ask.sessionId,
+    chatType: ask.chatType,
+    questions: ask.questions,
+    createdAt: ask.createdAt,
+    deadlineAt: ask.deadlineAt,
+    cardMessageId: ask.cardMessageId,
+    selections: ask.questions.map((_, i) => [...(ask.selections.get(i) ?? new Set<string>())]),
+  };
+  persistAsk(persisted);
 }
 
 /**
@@ -215,6 +320,10 @@ export function toggleAsk(args: {
     sel.clear();
     sel.add(args.key);
   }
+
+  // Persist the updated checkbox state so a restart mid-multi-select keeps the
+  // boxes the user already ticked (best-effort; never blocks the toggle).
+  persistFromInternal(ask);
 
   return 'toggled';
 }
@@ -393,6 +502,68 @@ export function invalidateAll(reason: string): number {
   return ids.length;
 }
 
+/**
+ * Restore pending asks from disk after a daemon restart. Each becomes a DORMANT
+ * entry: its card is still live in Feishu (we do NOT re-post — cardMessageId is
+ * preserved), so a click can settle it, but there is no waiter Promise until the
+ * surviving CLI hook reconnects and re-registers (findDormantByKey →
+ * reattachDormantAsk installs a fresh resolve). Each dormant ask arms a timer to
+ * its ORIGINAL absolute deadline so it can't linger forever if the CLI never
+ * comes back. Called once during daemon bootstrap. Returns the count restored.
+ *
+ * Idempotent-ish: an askKey already present (e.g. re-invoked) is skipped.
+ */
+export function restorePersistedAsks(now: number = Date.now(), larkAppId?: string): number {
+  let restored = 0;
+  for (const p of listPersistedAsks(now)) {
+    // One bot per daemon process: only restore asks this daemon can actually
+    // serve (its own bot's sessions). Another bot's daemon owns the rest.
+    if (larkAppId && p.larkAppId !== larkAppId) continue;
+    // Skip if this key is already live (defensive — boot runs once).
+    let dup = false;
+    for (const a of pending.values()) if (a.askKey === p.askKey && !a.settled) { dup = true; break; }
+    if (dup) continue;
+
+    const selections = new Map<number, Set<string>>();
+    for (let i = 0; i < p.questions.length; i++) {
+      selections.set(i, new Set<string>(p.selections?.[i] ?? []));
+    }
+    const remaining = Math.max(0, p.deadlineAt - now);
+    const timeoutHandle = setTimeout(() => {
+      settle(p.askId, {
+        kind: 'timedOut', selected: null, by: null, comment: null, timedOut: true,
+      });
+    }, remaining);
+    timeoutHandle.unref?.();
+
+    const ask: InternalPending = {
+      askId: p.askId,
+      askKey: p.askKey,
+      nonce: p.nonce,
+      larkAppId: p.larkAppId,
+      chatId: p.chatId,
+      rootMessageId: p.rootMessageId,
+      sessionId: p.sessionId,
+      chatType: p.chatType,
+      questions: p.questions,
+      createdAt: p.createdAt,
+      deadlineAt: p.deadlineAt,
+      cardMessageId: p.cardMessageId,
+      settled: false,
+      dormant: true,
+      // No resolve yet — attached when the reconnecting hook re-registers.
+      timeoutHandle,
+      selections,
+    };
+    pending.set(p.askId, ask);
+    restored++;
+  }
+  if (restored > 0) {
+    logger.info?.(`ask-broker: restored ${restored} pending ask(s) from disk (dormant, awaiting hook re-attach)`);
+  }
+  return restored;
+}
+
 /** Internal — settle an ask exactly once and notify the dispatcher's onSettle
  *  hook (best-effort, never blocks broker state transitions). The settled
  *  entry stays in the map for `SETTLED_RETENTION_MS` so late race-losers get
@@ -403,12 +574,17 @@ function settle(askId: string, result: AskResult): void {
   ask.settled = true;
   ask.settledAt = Date.now();
   clearTimeout(ask.timeoutHandle);
+  // The durable record's job is done the moment the ask leaves the pending
+  // state — drop it so a later restart doesn't resurrect a settled ask.
+  removePersistedAsk(ask.askKey);
   // Reap older settled entries opportunistically — keeps the map bounded
   // without paying for a dedicated GC timer.
   gcSettled();
 
+  // A dormant (restored, not-yet-reclaimed) ask has no waiter Promise — a click
+  // can still settle its card, but there is nothing to resolve. Guard the call.
   try {
-    ask.resolve(result);
+    ask.resolve?.(result);
   } catch (err) {
     logger.warn?.(
       `ask-broker: ${askId} resolve threw: ${err instanceof Error ? err.message : String(err)}`,

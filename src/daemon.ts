@@ -361,6 +361,7 @@ import {
   setCardDispatcher as setAskCardDispatcher,
   setCanTalkChecker as setAskCanTalkChecker,
   registerAsk as registerAskBroker,
+  restorePersistedAsks as restorePersistedAsksBroker,
   findPendingAskByAnchor,
   submitCustomReply,
 } from './core/ask-broker.js';
@@ -18727,6 +18728,18 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   setAskCanTalkChecker((appId, chatId, openId, chatType, actor) =>
     evaluateAskAnswerTalk(appId, chatId, openId, chatType, actor),
   );
+
+  // Resume pending `botmux ask` cards that outlived a daemon restart. Each is
+  // restored as a DORMANT ask (card still live in Feishu, no waiter yet). The
+  // surviving CLI hook — whose /api/asks connection dropped on restart and is
+  // retrying — re-registers the same ask by its stable key and re-attaches a
+  // waiter, so the answer flows back through the normal hook directive instead
+  // of the CLI falling into a stuck native picker. Scoped to this daemon's bot.
+  try {
+    restorePersistedAsksBroker(Date.now(), cfg.larkAppId);
+  } catch (e) {
+    logger.warn(`[ask] restorePersistedAsks failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
 
   writePidFile();
   const memoryDiagnostics = startMemoryDiagnostics();

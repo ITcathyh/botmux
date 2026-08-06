@@ -9696,8 +9696,14 @@ export async function runHook(
     routeRoot = adopt.rootMessageId;
   }
 
-  // 解析 timeoutMs：默认 1 小时，可由 BOTMUX_ASK_TIMEOUT_MS 覆盖
-  const DEFAULT_TIMEOUT_MS = 3_600_000;
+  // 解析 timeoutMs：默认 ~24h，可由 BOTMUX_ASK_TIMEOUT_MS 覆盖。
+  // 为什么这么长：ask 超时不是良性兜底——broker settle 成 `timedOut` 会让 hook
+  // 落到 passthrough，Claude 转而渲染原生 picker，而此后飞书回调已无通道把答案
+  // 送回（picker 挂死、答案不生效）。所以默认值对齐 hook 安装侧的进程超时上限
+  // （settings.json 里的 86400s），让 broker 不会 *早于* hook 进程本身超时；
+  // 既避免"人回复慢→picker 卡死"，又保留一个有限的进程级兜底（永不超时会让一次
+  // CLI turn 无限阻塞，是更糟的失败）。
+  const DEFAULT_TIMEOUT_MS = 86_400_000; // 24h — 对齐 hook 安装侧 timeout:86400s
   let timeoutMs = DEFAULT_TIMEOUT_MS;
   const timeoutEnv = env.BOTMUX_ASK_TIMEOUT_MS;
   if (timeoutEnv) {
@@ -9716,12 +9722,39 @@ export async function runHook(
     timeoutMs,
   };
 
-  let result: import('./core/ask-types.js').AskResult;
-  try {
-    result = await postAskFn(body);
-  } catch {
-    // 任何失败（daemon 不可达、HTTP 错误等）→ passthrough 放行
-    return { stdout: adapter.passthrough(payload) };
+  // Post the ask, RETRYING across a daemon restart. The daemon holds pending
+  // asks in memory only, so a restart between "card posted" and "user clicked"
+  // drops the ask; historically postAskFn then threw (daemon unreachable) and
+  // we fell straight to passthrough → the CLI rendered its native picker with no
+  // way to receive the answer. Instead: while the daemon is unreachable (and
+  // only then — an answered/timedOut/invalidated result returns normally), keep
+  // reconnecting until the ask's own deadline. The daemon restores the pending
+  // ask from disk on boot and re-attaches this reconnecting request to it by a
+  // stable key, so the SAME card resolves through the normal hook directive.
+  // Blocking here keeps Claude spinning; the native picker never renders.
+  const deadline = Date.now() + timeoutMs;
+  let result: import('./core/ask-types.js').AskResult | undefined;
+  let attempt = 0;
+  while (true) {
+    try {
+      result = await postAskFn(body);
+      break;
+    } catch (err) {
+      // exitCode 3 = daemon unreachable / transport error (see postAsk). That is
+      // the restart-in-progress case → retry. Anything else (or a non-coded
+      // throw) is not something a retry fixes → passthrough as before.
+      const code = (err as { exitCode?: number } | undefined)?.exitCode;
+      if (code !== 3 || Date.now() >= deadline) {
+        return { stdout: adapter.passthrough(payload) };
+      }
+      attempt++;
+      // Backoff: quick first reconnects (daemon usually returns in a few
+      // seconds), capped at 5s. Never sleep past the deadline.
+      const backoff = Math.min(5_000, 500 * attempt);
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return { stdout: adapter.passthrough(payload) };
+      await new Promise((r) => setTimeout(r, Math.min(backoff, remaining)));
+    }
   }
 
   if (result.kind === 'answered') {
