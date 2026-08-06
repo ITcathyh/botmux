@@ -15474,14 +15474,25 @@ async function startInitialPassthroughSession(args: {
   creatorOpenId: string | undefined;
   /** 发起方是飞书盖章的 bot → talk 复查走 evaluateBotTalk（与 dispatcher 外层同源）。 */
   botSender?: boolean;
+  /** 本轮触发者是否 bot，用于 reply attribution（--mention-back 不对称门禁）。
+   *  与 quota 用的 platform-stamped botSender 分开传：这里用 caller 已算好的
+   *  cross-ref 兜底身份（thread 的 isForeignBot / new-topic 的 isForeignBotSender），
+   *  这样飞书 sender_type 缺失/变值但已识别 peer 时冷启动 passthrough 也归属为 bot，
+   *  不扩大 quota 的信任边界。 */
+  senderIsBot?: boolean;
 }): Promise<void> {
   const {
     larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId,
-    parsed, cmd, commandContent, senderOpenId, substitute, senderUnionId, memberUnionId, ownerOpenId, ownerUnionId, creatorOpenId, botSender,
+    parsed, cmd, commandContent, senderOpenId, substitute, senderUnionId, memberUnionId, ownerOpenId, ownerUnionId, creatorOpenId, botSender, senderIsBot,
   } = args;
   if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId, memberUnionId, chatType, botSender)) {
     return;
   }
+  // Reply attribution's is-bot: prefer the caller's cross-ref-resolved identity
+  // (passed as senderIsBot); fall back to the platform sender_type only when a
+  // caller didn't supply it. Used for --mention-back's asymmetric gate, quote
+  // target, and pendingSender — NOT for quota (that stays on botSender above).
+  const resolvedSenderIsBot = senderIsBot ?? (parsed.senderType === 'app' || parsed.senderType === 'bot');
 
   const botCfg = getBot(larkAppId).config;
   refreshCliVersion(botCfg);
@@ -15494,7 +15505,7 @@ async function startInitialPassthroughSession(args: {
   const initialPassthroughSender = directChatSender ?? (senderOpenId
     ? {
       openId: senderOpenId,
-      type: parsed.senderType === 'app' || parsed.senderType === 'bot' ? 'bot' as const : 'user' as const,
+      type: resolvedSenderIsBot ? 'bot' as const : 'user' as const,
     }
     : undefined);
   const rootIdForStore = scope === 'thread' ? anchor : messageId;
@@ -15508,7 +15519,7 @@ async function startInitialPassthroughSession(args: {
   session.lastCallerOpenId = senderOpenId;
   session.quoteTargetId = parsed.messageId;
   session.quoteTargetSenderOpenId = senderOpenId;
-  session.quoteTargetSenderIsBot = parsed.senderType === 'app' || parsed.senderType === 'bot';
+  session.quoteTargetSenderIsBot = resolvedSenderIsBot;
   session.lastMessageAt = new Date(now).toISOString();
   session.scope = scope;
   sessionStore.updateSession(session);
@@ -15545,7 +15556,7 @@ async function startInitialPassthroughSession(args: {
     ds.session.workingDir = pinnedWorkingDir;
     sessionStore.updateSession(ds.session);
   }
-  beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { senderOpenId, senderIsBot: parsed.senderType === 'app' || parsed.senderType === 'bot' });
+  beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { senderOpenId, senderIsBot: resolvedSenderIsBot });
   sessionStore.updateSession(ds.session);
   const creationKey = sessionKey(anchor, larkAppId);
   if (!setActiveSessionIfActive(activeSessions, creationKey, ds)) {
@@ -15559,7 +15570,7 @@ async function startInitialPassthroughSession(args: {
         messageId,
         replyRootId,
         senderOpenId,
-        senderIsBot: parsed.senderType === 'app' || parsed.senderType === 'bot',
+        senderIsBot: resolvedSenderIsBot,
         substitute,
       });
     } else {
@@ -15867,6 +15878,10 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
           senderUnionId: teamTrustUnionId,
           memberUnionId: senderUnionId, // 原始 union（人腿），不锁 bot
           botSender: isBotSenderType,
+          // Reply attribution uses the cross-ref-resolved is-bot (foreign peer
+          // bots included), matching the twin new-topic spawn path so冷启动
+          // passthrough 也能让 bot→bot 的 --mention-back 直通不对称门禁。
+          senderIsBot: isForeignBotSender,
           // New-topic senders are humans here (mirrors the normal new-topic
           // spawn path, which assigns ownership unconditionally too).
           ownerOpenId: senderOpenId,
@@ -16992,6 +17007,10 @@ async function handleThreadReply(
           senderUnionId: threadTeamTrustUnionId,
           memberUnionId: threadSenderUnionId, // 原始 union（人腿），不锁 bot
           botSender: isBotSenderType || isForeignBot,
+          // Reply attribution: platform-stamped OR cross-ref-resolved bot →
+          // treat as bot for --mention-back (never mis-attribute a peer bot as
+          // human when飞书 sender_type 缺失/变值但已识别 peer).
+          senderIsBot: isBotSenderType || isForeignBot,
           // Bot-started cold starts get no human owner (mirrors the auto-create
           // path) — see the ownership note on startInitialPassthroughSession.
           ownerOpenId: isForeignBot ? undefined : threadSenderOpenId,
