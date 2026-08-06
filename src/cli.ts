@@ -84,6 +84,11 @@ import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
 import { isColdResumeDormant, isRealManagedSession, sessionListDisposition } from './cli/session-list-liveness.js';
+import {
+  computeSessionPickerLayout,
+  type SessionPickerColumnKey,
+  type SessionPickerLayout,
+} from './cli/session-picker-layout.js';
 import { computeSessionPickerScrollWindow } from './cli/session-picker-viewport.js';
 import {
   attachFrozenManagedZmxSession,
@@ -3817,28 +3822,7 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
     botLabels.set(b.larkAppId, `bot${i + 1} (${b.cliId ?? 'claude-code'})`);
   }
 
-  // Responsive column widths based on terminal width
-  const termWidth = process.stdout.columns || 100;
-  const PREFIX = 4;    // "  ❯ " or "    "
-  const SEP_W = 3;     // " │ "
-  const fixedCols = { id: 10, pid: 8, uptime: 7, status: 7, target: 26 };
-  const botW = multiBot ? 18 : 0;
-  const numSeps = (multiBot ? 8 : 7) - 1;  // separators between columns
-  const fixedTotal = PREFIX + fixedCols.id + botW + fixedCols.pid + fixedCols.uptime + fixedCols.status + fixedCols.target + numSeps * SEP_W;
-  const flexTotal = Math.max(20, termWidth - fixedTotal);
-  const titleW = Math.floor(flexTotal * 0.4);
-  const dirW = flexTotal - titleW;
-
-  const cols = {
-    id: fixedCols.id,
-    ...(multiBot ? { bot: botW } : {}),
-    title: titleW,
-    dir: dirW,
-    pid: fixedCols.pid,
-    uptime: fixedCols.uptime,
-    status: fixedCols.status,
-    target: fixedCols.target,
-  };
+  let layout: SessionPickerLayout = computeSessionPickerLayout(process.stdout.columns || 100, multiBot);
 
   // Build row data — use shortened paths for TUI
   function buildRows(): Array<{
@@ -3858,26 +3842,29 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
         ? { probe: 'missing' as const, label: adoptTargetLabel(s) }
         : sessionBackingInfo(s, probeSnapshot);
       const targetLabel = backing.label;
-      // Build row text with shortened dir
-      const id = padEndDisplay(s.sessionId.substring(0, 8), cols.id);
-      const parts = [id];
-      if (multiBot) {
-        const label = s.larkAppId ? (botLabels.get(s.larkAppId) ?? s.larkAppId.substring(0, 16)) : '-';
-        parts.push(padEndDisplay(truncate(label, cols.bot!), cols.bot!));
-      }
-      const title = padEndDisplay(truncate((s.title || '(untitled)').replace(/[\r\n]+/g, ' '), cols.title), cols.title);
-      const dir = padEndDisplay(truncate(shortenPath(s.workingDir || '-'), cols.dir), cols.dir);
       const displayPid = sessionDisplayPid(s);
-      const pid = displayPid ? String(displayPid).padEnd(cols.pid) : '-'.padEnd(cols.pid);
-      const uptime = formatDuration(Date.now() - new Date(s.createdAt).getTime()).padEnd(cols.uptime);
       const alive = isSessionAliveForList(s);
-      const status = padEndDisplay(sessionStatusLabel(s), cols.status);
-      const target = padEndDisplay(truncate(targetLabel, cols.target), cols.target);
-      parts.push(title, dir, pid, uptime, status, target);
+      const botLabel = s.larkAppId ? (botLabels.get(s.larkAppId) ?? s.larkAppId.substring(0, 16)) : '-';
+      const cells: Record<SessionPickerColumnKey, string> = {
+        id: s.sessionId.substring(0, 8),
+        bot: botLabel,
+        title: (s.title || '(untitled)').replace(/[\r\n]+/g, ' '),
+        dir: shortenPath(s.workingDir || '-'),
+        pid: displayPid ? String(displayPid) : '-',
+        uptime: formatDuration(Date.now() - new Date(s.createdAt).getTime()),
+        status: sessionStatusLabel(s),
+        target: targetLabel,
+      };
+      const text = layout.columns
+        .map(column => {
+          const value = cells[column.key].replace(/[\r\n]+/g, ' ');
+          return padEndDisplay(truncate(value, column.width), column.width);
+        })
+        .join(' │ ');
 
       return {
         session: s,
-        text: parts.join(' │ '),
+        text,
         alive,
         backendTarget: 'target' in backing ? backing.target : undefined,
         backingProbe: backing.probe,
@@ -3896,21 +3883,23 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
 
   // Build header (same column layout as rows, no extra prefix in join)
   function buildHeader(): string {
-    const hParts = ['id'.padEnd(cols.id)];
-    if (multiBot) hParts.push('bot'.padEnd(cols.bot!));
-    hParts.push(
-      'title'.padEnd(cols.title),
-      'working dir'.padEnd(cols.dir),
-      'pid'.padEnd(cols.pid),
-      'uptime'.padEnd(cols.uptime),
-      'status'.padEnd(cols.status),
-      'target'.padEnd(cols.target),
-    );
-    return hParts.join(' │ ');
+    const labels: Record<SessionPickerColumnKey, string> = {
+      id: 'id',
+      bot: 'bot',
+      title: 'title',
+      dir: 'working dir',
+      pid: 'pid',
+      uptime: 'uptime',
+      status: 'status',
+      target: 'target',
+    };
+    return layout.columns
+      .map(column => padEndDisplay(truncate(labels[column.key], column.width), column.width))
+      .join(' │ ');
   }
 
-  const header = buildHeader();
-  const separator = '─'.repeat(displayWidth(header));
+  let header = buildHeader();
+  let separator = '─'.repeat(displayWidth(header));
 
   let cursor = 0;
   let scrollTop = 0;              // index of the first visible row (vertical scroll)
@@ -3922,7 +3911,15 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
   // one-line safety margin so the final newline never scrolls the pinned title
   // off the alt-screen. Everything else is the row viewport.
   const CHROME_ROWS = 13;
-  const sepWidth = displayWidth(separator);
+  let sepWidth = displayWidth(separator);
+
+  function rebuildLayout(): void {
+    layout = computeSessionPickerLayout(process.stdout.columns || 100, multiBot);
+    rows = buildRows();
+    header = buildHeader();
+    separator = '─'.repeat(displayWidth(header));
+    sepWidth = displayWidth(separator);
+  }
   // Overlay a "N 更多" marker onto a separator line without changing its display
   // width, so the up/down hidden-row counters cost no extra vertical lines.
   const sepWithMarker = (marker: string): string => {
@@ -3932,19 +3929,49 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
     return `──${label}${'─'.repeat(sepWidth - 2 - lw)}`;
   };
 
+  const fitLine = (text: string, width: number): string => {
+    if (width <= 0) return '';
+    const singleLine = text.replace(/[\r\n]+/g, ' ');
+    return displayWidth(singleLine) <= width ? singleLine : truncate(singleLine, width);
+  };
+  const fitAnsiLine = (text: string, width: number): string => {
+    const plain = text
+      .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+      .replace(/[\r\n]+/g, ' ');
+    if (!/[\r\n]/.test(text) && displayWidth(plain) <= width) return text;
+    return `\x1b[2m${fitLine(plain, width)}\x1b[0m`;
+  };
+  const blankRowPrefix = (): string => ' '.repeat(layout.prefixWidth);
+  const rowPrefix = (selected: boolean): string => {
+    if (!selected) return blankRowPrefix();
+    const pointer = '\x1b[36m❯\x1b[0m';
+    if (layout.prefixWidth >= 4) return `  ${pointer} `;
+    if (layout.prefixWidth === 3) return ` ${pointer} `;
+    if (layout.prefixWidth === 2) return `${pointer} `;
+    return layout.prefixWidth === 1 ? pointer : '';
+  };
+  const footerPrefixWidth = (): number => Math.min(2, layout.termWidth);
+  const footerContentWidth = (): number => Math.max(0, layout.termWidth - footerPrefixWidth());
+  const footerPrefix = (): string => ' '.repeat(footerPrefixWidth());
+
   function render(): void {
     process.stdout.write('\x1b[H\x1b[J');
 
     const posLabel = rows.length > 0 ? `${cursor + 1}/${rows.length}` : '0';
-    process.stdout.write(`\x1b[1m botmux sessions\x1b[0m  \x1b[2m(${posLabel})\x1b[0m\n\n`);
+    const titleText = ` botmux sessions  (${posLabel})`;
+    if (displayWidth(titleText) <= layout.termWidth) {
+      process.stdout.write(`\x1b[1m botmux sessions\x1b[0m  \x1b[2m(${posLabel})\x1b[0m\n\n`);
+    } else {
+      process.stdout.write(`\x1b[1m${fitLine(titleText, layout.termWidth)}\x1b[0m\n\n`);
+    }
 
     if (rows.length === 0) {
-      process.stdout.write(`    ${separator}\n`);
-      process.stdout.write(`    \x1b[2m${header}\x1b[0m\n`);
-      process.stdout.write(`    ${separator}\n`);
-      process.stdout.write(`\n    \x1b[2m没有活跃会话\x1b[0m\n`);
-      process.stdout.write(`    ${separator}\n`);
-      process.stdout.write(`\n  \x1b[2mq 退出\x1b[0m\n`);
+      process.stdout.write(`${blankRowPrefix()}${separator}\n`);
+      process.stdout.write(`${blankRowPrefix()}\x1b[2m${header}\x1b[0m\n`);
+      process.stdout.write(`${blankRowPrefix()}${separator}\n`);
+      process.stdout.write(`\n${blankRowPrefix()}\x1b[2m${fitLine('没有活跃会话', Math.max(0, layout.termWidth - layout.prefixWidth))}\x1b[0m\n`);
+      process.stdout.write(`${blankRowPrefix()}${separator}\n`);
+      process.stdout.write(`\n${footerPrefix()}\x1b[2m${fitLine('q 退出', footerContentWidth())}\x1b[0m\n`);
       return;
     }
 
@@ -3961,48 +3988,59 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
     scrollTop = win.scrollTop;
     const { viewEnd, hiddenAbove, hiddenBelow } = win;
 
-    // Header + separator — use same 4-char prefix as rows
-    process.stdout.write(`    ${separator}\n`);
-    process.stdout.write(`    \x1b[2m${header}\x1b[0m\n`);
+    // Header + separator — use the same responsive prefix as rows.
+    process.stdout.write(`${blankRowPrefix()}${separator}\n`);
+    process.stdout.write(`${blankRowPrefix()}\x1b[2m${header}\x1b[0m\n`);
     process.stdout.write(hiddenAbove > 0
-      ? `    \x1b[36m${sepWithMarker(`↑ ${hiddenAbove} 更多`)}\x1b[0m\n`
-      : `    ${separator}\n`);
+      ? `${blankRowPrefix()}\x1b[36m${sepWithMarker(`↑ ${hiddenAbove} 更多`)}\x1b[0m\n`
+      : `${blankRowPrefix()}${separator}\n`);
 
     for (let i = scrollTop; i < viewEnd; i++) {
       const r = rows[i];
-      const pointer = i === cursor ? '\x1b[36m❯\x1b[0m' : ' ';
       if (i === cursor) {
-        process.stdout.write(`  ${pointer} \x1b[7m${r.text}\x1b[0m\n`);
+        process.stdout.write(`${rowPrefix(true)}\x1b[7m${r.text}\x1b[0m\n`);
       } else {
-        process.stdout.write(`  ${pointer} ${r.text}\n`);
+        process.stdout.write(`${rowPrefix(false)}${r.text}\n`);
       }
     }
 
     process.stdout.write(hiddenBelow > 0
-      ? `    \x1b[36m${sepWithMarker(`↓ ${hiddenBelow} 更多`)}\x1b[0m\n`
-      : `    ${separator}\n`);
+      ? `${blankRowPrefix()}\x1b[36m${sepWithMarker(`↓ ${hiddenBelow} 更多`)}\x1b[0m\n`
+      : `${blankRowPrefix()}${separator}\n`);
 
     // Footer info
     const selected = rows[cursor];
+    const targetHintText = selected.isAdopt
+      ? `${selected.targetLabel}  Enter 已禁用；请直接使用原 tmux/zellij/herdr 客户端。`
+      : selected.canAttach
+        ? `${selected.attachBackend}: ${selected.backendTarget?.sessionName}`
+        : `${selected.targetLabel}（不可连接）`;
     const targetHint = selected.isAdopt
       ? `\x1b[33m${selected.targetLabel}\x1b[0m  \x1b[2mEnter 已禁用；请直接使用原 tmux/zellij/herdr 客户端。\x1b[0m`
       : selected.canAttach
-        ? `\x1b[32m${selected.attachBackend}: ${selected.backendTarget?.sessionName}\x1b[0m`
-        : `\x1b[2m${selected.targetLabel}（不可连接）\x1b[0m`;
-    process.stdout.write(`\n  ${targetHint}\n`);
+        ? `\x1b[32m${targetHintText}\x1b[0m`
+        : `\x1b[2m${targetHintText}\x1b[0m`;
+    const fittedTargetHint = displayWidth(targetHintText) <= footerContentWidth()
+      ? targetHint
+      : `\x1b[2m${fitLine(targetHintText, footerContentWidth())}\x1b[0m`;
+    process.stdout.write(`\n${footerPrefix()}${fittedTargetHint}\n`);
 
     // Flash message or confirmation prompt
     if (confirmDelete) {
       const s = selected.session;
-      process.stdout.write(`\n  \x1b[33m确认删除 ${s.sessionId.substring(0, 8)} "${truncate(s.title || '', 20)}"? (y/n)\x1b[0m\n`);
+      const confirmation = `确认删除 ${s.sessionId.substring(0, 8)} "${truncate(s.title || '', 20)}"? (y/n)`;
+      process.stdout.write(`\n${footerPrefix()}\x1b[33m${fitLine(confirmation, footerContentWidth())}\x1b[0m\n`);
     } else if (flashMsg) {
-      process.stdout.write(`\n  ${flashMsg}\n`);
+      process.stdout.write(`\n${footerPrefix()}${fitAnsiLine(flashMsg, footerContentWidth())}\n`);
     } else {
       process.stdout.write('\n');
     }
 
     // Keybinding hints
-    process.stdout.write(`\n  \x1b[2m↑/↓ 选择  ⏎ ${selected?.canAttach ? '连接' : '不可连接'}  d 删除  q 退出\x1b[0m\n`);
+    const fullHints = `↑/↓ 选择  ⏎ ${selected?.canAttach ? '连接' : '不可连接'}  d 删除  q 退出`;
+    const compactHints = '↑/↓ 选择  ⏎  d  q';
+    const hints = displayWidth(fullHints) <= footerContentWidth() ? fullHints : compactHints;
+    process.stdout.write(`\n${footerPrefix()}\x1b[2m${fitLine(hints, footerContentWidth())}\x1b[0m\n`);
   }
 
   return new Promise<void>((resolve) => {
@@ -4015,9 +4053,12 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
 
     render();
 
-    // Recompute the scrolling viewport when the terminal is resized so the
-    // pinned header/footer and visible row window always fit the new height.
-    const onResize = (): void => render();
+    // Rebuild both axes on resize: rows/header must use the current columns or
+    // stale wide lines wrap and invalidate the vertical one-row-per-session math.
+    const onResize = (): void => {
+      rebuildLayout();
+      render();
+    };
     process.stdout.on('resize', onResize);
 
     function cleanup(): void {
