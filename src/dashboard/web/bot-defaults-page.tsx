@@ -34,7 +34,7 @@ import {
   RefreshIconButton,
   dropdownLabel,
 } from './dashboard-components.js';
-import { botAvatarHtml, loadNameMaps, overrideBotAvatar, ui } from './ui.js';
+import { botAvatarHtml, larkConsoleUrl, loadNameMaps, overrideBotAvatar, ui } from './ui.js';
 
 type StatusMessage = { text: string; ok?: boolean } | null;
 type PatchBot = (appId: string, patch: Partial<BotDefaultsRow> | ((bot: BotDefaultsRow) => BotDefaultsRow)) => void;
@@ -1121,7 +1121,22 @@ function BotProfileIdentity(props: { bot: BotDefaultsRow; cli: string; patchBot:
           <button type="button" data-action="cancel-bot-name" disabled={busy} onClick={() => setEditMode(false)}>{tr('botDefaults.renameCancel')}</button>
         </span>
       )}
-      <code>{bot.larkAppId}</code>
+      <div className="bd-profile-appid-row">
+        <code>{bot.larkAppId}</code>
+        {larkConsoleUrl(bot.larkAppId) ? (
+          <a
+            className="bd-console-link"
+            href={larkConsoleUrl(bot.larkAppId)!}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            {tr('botDefaults.openConsole')}
+            <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M7 17 17 7M9 7h8v8" />
+            </svg>
+          </a>
+        ) : null}
+      </div>
       <small className={statusClass(status, 'bd-name-status')} data-name-status>{status?.text ?? ''}</small>
       <button type="button" className="bd-feishu-login" data-action="feishu-login" hidden={!loginVisible} onClick={() => setLoginOpen(true)}>{tr('feishuLogin.entry')}</button>
       {loginOpen ? (

@@ -9902,6 +9902,7 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   border: 1px solid var(--border-soft);
   background: var(--surface);
   box-shadow: var(--shadow);
+  position: relative;
 }
 :root[data-theme="dark"] .mate {
   background: rgba(255, 255, 255, 0.045);
@@ -9914,8 +9915,33 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
 }
 .mate-off { opacity: 0.55; }
 .mate-top { display: flex; align-items: center; gap: 11px; }
+.mate-console {
+  position: absolute;
+  top: 11px;
+  right: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  color: var(--faint);
+  background: var(--surface-muted);
+  border: 1px solid var(--border-soft);
+  text-decoration: none;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.mate-console:hover {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 42%, transparent);
+}
+:root[data-theme="dark"] .mate-console { background: rgba(255, 255, 255, 0.07); border-color: rgba(255, 255, 255, 0.1); }
 .mate-id { min-width: 0; }
 .mate-id b { display: block; font-size: 14px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+/* 只给名字这一行右侧留出 ↗ 按钮宽度：长名字（如「哆啦A(dev)-claude」）提前省略号，
+ * 不会滑到绝对定位的按钮底下；cliId 标签在下一行、按钮只占顶部，均不受影响。 */
+.mate-console ~ .mate-top .mate-id b { padding-right: 24px; }
 .mate-role {
   display: inline-block;
   margin-top: 3px;
@@ -9946,6 +9972,15 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   gap: 8px;
   font-size: 11px;
   color: var(--faint);
+}
+/* 右侧活跃时间不换行、不被长状态 tag（如「执行中 · N 会话」）挤成两行；
+ * 窄卡 + 双长文本时由状态 tag 收缩省略来吸收溢出（时间短、优先保住）。 */
+.mate-foot > span { white-space: nowrap; flex: 0 0 auto; }
+.mate-foot .tag {
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .tag {
   padding: 3px 10px;
@@ -10515,6 +10550,22 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   color: var(--faint);
   font-size: 10.5px;
 }
+.bd-profile-appid-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.bd-console-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+  text-decoration: none;
+}
+.bd-console-link:hover { color: var(--accent-strong); text-decoration: underline; }
 /* 机器人改名（档案头 ✎ → 行内编辑器） */
 .bd-name-edit {
   position: absolute;

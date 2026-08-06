@@ -189,6 +189,16 @@ export function botAvatarUrlFor(name?: string, larkAppId?: string): string | und
   return name ? botAvatarByName.get(String(name)) : undefined;
 }
 
+/** 该 bot 在飞书开放平台的应用后台深链。larkAppId 即开放平台 AppID（cli_xxx），
+ *  console 走 open.feishu.cn/app/{appId}（Lark 国际版租户访问时自动重定向到
+ *  open.larkoffice.com，同一份链接通用）。非 cli_ 前缀（首屏聚合未回来时的占位
+ *  键、按名聚合的历史卡）返回 null，避免拼出无效地址。 */
+export function larkConsoleUrl(larkAppId?: string): string | null {
+  return larkAppId && larkAppId.startsWith('cli_')
+    ? `https://open.feishu.cn/app/${encodeURIComponent(larkAppId)}`
+    : null;
+}
+
 export interface BotAvatarOpts {
   /** 展示名 —— 决定回退渐变球的色相，也用于按名查头像。 */
   name?: string;
