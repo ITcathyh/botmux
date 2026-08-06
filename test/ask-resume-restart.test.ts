@@ -12,7 +12,7 @@ import {
   setAskPersistStore,
   _resetForTest,
 } from '../src/core/ask-broker.js';
-import { createAskPersistStore, askKeyFor, ASK_STORE_SENTINEL, type PersistedAsk } from '../src/core/ask-persist-store.js';
+import { createAskPersistStore, askKeyFor, dispatchUuidFor, ASK_STORE_SENTINEL, type PersistedAsk } from '../src/core/ask-persist-store.js';
 import type { AskCardDispatcher, AskResult, CreateAskInput, PendingAsk } from '../src/core/ask-types.js';
 
 /**
@@ -231,11 +231,41 @@ describe('card re-send when restart precedes cardMessageId (codex P1-2)', () => 
   });
 });
 
-describe('identity + isolation', () => {
-  it('askKeyFor namespaces by originKind so hook vs explicit asks never collide', () => {
-    expect(askKeyFor('hook', 'req-1')).toBe(askKeyFor('hook', 'req-1'));
-    expect(askKeyFor('hook', 'req-1')).not.toBe(askKeyFor('explicit', 'req-1'));
-    expect(askKeyFor('hook', 'req-1')).not.toBe(askKeyFor('hook', 'req-2'));
+describe('identity + isolation (codex P1-3)', () => {
+  it('askKeyFor scopes by larkAppId+session+originKind+requestId (not a bearer secret)', () => {
+    const k = askKeyFor('cli_app', 'sess-1', 'hook', 'req-1');
+    expect(k).toBe(askKeyFor('cli_app', 'sess-1', 'hook', 'req-1'));
+    expect(k).not.toBe(askKeyFor('cli_app', 'sess-2', 'hook', 'req-1')); // diff session
+    expect(k).not.toBe(askKeyFor('cli_b', 'sess-1', 'hook', 'req-1'));   // diff bot
+    expect(k).not.toBe(askKeyFor('cli_app', 'sess-1', 'explicit', 'req-1')); // diff origin
+    expect(k).not.toBe(askKeyFor('cli_app', 'sess-1', 'hook', 'req-2')); // diff request
+  });
+
+  it('session B CANNOT reclaim session A dormant ask by reusing the same requestId', async () => {
+    setCardDispatcher(mockDispatcher());
+    registerAsk(makeInput({ sessionId: 'sess-A', requestId: 'shared-req' }));
+    await new Promise((r) => setTimeout(r, 5));
+    const a = onlyPersisted();
+
+    // Restart → restore A's dormant ask.
+    _resetForTest(); bindStore();
+    const d2 = mockDispatcher();
+    setCardDispatcher(d2);
+    setCanTalkChecker((_x, _y, openId) => openId === 'ou_owner');
+    restorePersistedAsks(Date.now(), 'cli_app');
+
+    // Session B re-registers with the SAME requestId but its own session id.
+    // Different scoped key → must NOT re-attach to A; posts B's own new card.
+    const bPromise = registerAsk(makeInput({ sessionId: 'sess-B', requestId: 'shared-req' }));
+    await new Promise((r) => setTimeout(r, 5));
+    expect(d2.sendCalls).toHaveLength(1); // B got its OWN card, did not steal A's
+
+    // Answering A's original card must resolve nobody's B promise.
+    tryResolveAsk({ askId: a.askId, nonce: a.nonce, selected: 'yes', by: 'ou_owner' });
+    let bResolved = false;
+    void bPromise.then(() => { bResolved = true; });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(bResolved).toBe(false); // B never received A's answer
   });
 
   it('two concurrent same-question asks from one session get distinct records (distinct requestId)', async () => {
@@ -246,11 +276,53 @@ describe('identity + isolation', () => {
     expect(persistedFiles()).toHaveLength(2); // NOT collapsed by a questions hash
   });
 
-  it('restore skips a different bot; drops answered-never records past deadline', async () => {
+  it('restore skips a different bot', async () => {
     setCardDispatcher(mockDispatcher());
-    registerAsk(makeInput({ larkAppId: 'cli_other', requestId: 'req-other' }));
+    registerAsk(makeInput({ larkAppId: 'cli_other', sessionId: 'sess-o', requestId: 'req-other' }));
     await new Promise((r) => setTimeout(r, 5));
     _resetForTest(); bindStore(); setCardDispatcher(mockDispatcher());
-    expect(restorePersistedAsks(Date.now(), 'cli_app')).toBe(0);      // different bot
+    expect(restorePersistedAsks(Date.now(), 'cli_app')).toBe(0);
+  });
+});
+
+describe('active same-requestId replay joins one ask (codex P1-1)', () => {
+  it('a second live register with the same identity shares the ONE ask/card and both get the answer', async () => {
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    const p1 = registerAsk(makeInput());
+    await new Promise((r) => setTimeout(r, 5));
+    // Client reset → re-POST same requestId while still active: joins, no 2nd card.
+    const p2 = registerAsk(makeInput());
+    await new Promise((r) => setTimeout(r, 5));
+    expect(d.sendCalls).toHaveLength(1);        // ONE card
+    expect(persistedFiles()).toHaveLength(1);   // ONE record
+
+    const rec = onlyPersisted();
+    tryResolveAsk({ askId: rec.askId, nonce: rec.nonce, selected: 'yes', by: 'ou_owner' });
+    const [r1, r2] = await Promise.all([p1, p2]);
+    expect(r1.kind).toBe('answered');
+    expect(r2).toEqual(r1);                     // both waiters got the SAME result
+  });
+});
+
+describe('dispatch uuid + non-resumable origins (codex P1-1/P1-4)', () => {
+  it('resumable (hook) card send carries a stable dispatchUuid derived from requestId', async () => {
+    let seenUuid: string | undefined = 'UNSET';
+    const d = mockDispatcher((ask) => { seenUuid = ask.dispatchUuid; return Promise.resolve({ messageId: 'om_x' }); });
+    setCardDispatcher(d);
+    registerAsk(makeInput({ requestId: 'req-uuid-1' }));
+    await new Promise((r) => setTimeout(r, 5));
+    expect(seenUuid).toBe(dispatchUuidFor('req-uuid-1'));
+  });
+
+  it('explicit origin is NOT persisted and its card carries no dispatchUuid', async () => {
+    let seenUuid: string | undefined = 'UNSET';
+    const d = mockDispatcher((ask) => { seenUuid = ask.dispatchUuid; return Promise.resolve({ messageId: 'om_x' }); });
+    setCardDispatcher(d);
+    // Explicit ask: originKind='explicit', no requestId → not resumable.
+    registerAsk(makeInput({ originKind: 'explicit', requestId: undefined }));
+    await new Promise((r) => setTimeout(r, 5));
+    expect(persistedFiles()).toHaveLength(0);   // never persisted → no orphan handoff
+    expect(seenUuid).toBeUndefined();           // no dedupe uuid (never re-sends)
   });
 });

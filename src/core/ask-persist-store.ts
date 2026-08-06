@@ -40,6 +40,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
@@ -88,11 +89,40 @@ export interface PersistedAsk {
    *  deleted on settle in that case — it is retained here until the reconnecting
    *  hook CLAIMS it, then removed. Absent while still awaiting a click. */
   answeredResult?: AskResult;
+  /** epoch ms the answer was stashed. Bounds handoff retention so an answer that
+   *  is never claimed (e.g. the CLI is gone for good) is eventually reaped
+   *  instead of accumulating forever (codex P1-4). */
+  answeredAt?: number;
 }
 
-/** Build the stable identity key from the invocation id + origin. */
-export function askKeyFor(originKind: string, requestId: string): string {
-  return `${sanitizeKeySegment(originKind)}.${sanitizeKeySegment(requestId)}`;
+/** How long an unclaimed answered-handoff record is kept before `list()` reaps
+ *  it. Generous (a reconnecting hook claims within seconds of a restart) but
+ *  bounded so a dead CLI's stash can't live forever. */
+export const HANDOFF_RETENTION_MS = 24 * 60 * 60 * 1000; // 24h
+
+/**
+ * Build the stable identity key. Scoped to `larkAppId + sessionId + originKind +
+ * requestId` so the key is NOT a bearer secret: a different bot/session reusing
+ * the same requestId lands on a DIFFERENT key and can never reclaim another
+ * session's ask (codex P1-3). The reattach path additionally verifies the full
+ * immutable identity (chat/root/questions) before delivering.
+ */
+export function askKeyFor(
+  larkAppId: string,
+  sessionId: string,
+  originKind: string,
+  requestId: string,
+): string {
+  return [larkAppId, sessionId, originKind, requestId].map(sanitizeKeySegment).join('.');
+}
+
+/** Feishu IM `uuid` dedupe token: ≤50 chars. A requestId is normally a uuid
+ *  (36 chars) so it passes through, but an over-long / unusual caller-supplied
+ *  requestId is hashed to a stable ≤50 token so the card send is still
+ *  idempotent (codex P1-1). */
+export function dispatchUuidFor(requestId: string): string {
+  if (requestId.length <= 50 && /^[A-Za-z0-9_-]+$/.test(requestId)) return requestId;
+  return `ask-${createHash('sha256').update(requestId).digest('hex').slice(0, 40)}`;
 }
 
 /** Keep a key segment safe as a path component (no separators / traversal). */
@@ -176,14 +206,18 @@ export function createAskPersistStore(dir: string): AskPersistStore {
           try { unlinkSync(fp); } catch { /* ignore */ }
           continue;
         }
-        // A record carrying an unclaimed answer is kept even past its deadline —
-        // the answer still needs delivering to the reconnecting hook. Only drop
-        // deadline-expired records that were never answered.
-        if (
-          parsed.answeredResult === undefined &&
-          typeof parsed.deadlineAt === 'number' &&
-          parsed.deadlineAt <= now
-        ) {
+        // Reap rules:
+        //  - answered-handoff records are kept until CLAIMED, but bounded by
+        //    HANDOFF_RETENTION_MS from answeredAt so an unclaimed stash (dead
+        //    CLI) can't accumulate forever (codex P1-4).
+        //  - never-answered records are dropped once past their deadline.
+        if (parsed.answeredResult !== undefined) {
+          const stashedAt = typeof parsed.answeredAt === 'number' ? parsed.answeredAt : parsed.createdAt;
+          if (now - stashedAt > HANDOFF_RETENTION_MS) {
+            try { unlinkSync(fp); } catch { /* ignore */ }
+            continue;
+          }
+        } else if (typeof parsed.deadlineAt === 'number' && parsed.deadlineAt <= now) {
           try { unlinkSync(fp); } catch { /* ignore */ }
           continue;
         }

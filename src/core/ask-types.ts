@@ -140,6 +140,11 @@ export interface PendingAsk {
   cardMessageId?: string;
   /** Once true, subsequent click attempts return `already_settled`. */
   settled: boolean;
+  /** Stable Feishu IM dedupe token for the card send (≤50 chars, derived from
+   *  the ask's requestId). The dispatcher passes it as the message `uuid` so a
+   *  re-send after a daemon restart returns the ORIGINAL message_id instead of
+   *  posting a duplicate card. Absent for non-resumable asks. */
+  dispatchUuid?: string;
 }
 
 /** Outcome of a click-resolution attempt. Card click handler maps these to

@@ -9558,6 +9558,10 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     options,
     prompt,
     timeoutMs,
+    // Explicit `botmux ask buttons` has no reconnecting claimant (the CLI exits
+    // on daemon restart), so mark it non-hook: the broker won't persist/handoff
+    // it and can never confuse it with a hook ask's card (codex P1-4/P1-3).
+    originKind: 'explicit',
     ...(liveAskOrigin?.turnId ? { originTurnId: liveAskOrigin.turnId } : {}),
     ...(liveAskOrigin?.dispatchAttempt !== undefined
       ? { originDispatchAttempt: liveAskOrigin.dispatchAttempt }

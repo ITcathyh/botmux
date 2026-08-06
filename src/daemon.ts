@@ -528,6 +528,13 @@ import {
 // ─── State ───────────────────────────────────────────────────────────────────
 
 const activeSessions = new Map<string, DaemonSession>();
+/** False until restoreActiveSessions() finishes. During the startup window the
+ *  IPC server is already listening but activeSessions is empty, so a reconnecting
+ *  ask hook would fail session lookup and get a 403 origin_unproven — which the
+ *  CLI would treat as permanent and passthrough into a stuck native picker
+ *  (codex P1-2). While false, /api/asks returns a retryable 503 for unknown
+ *  sessions instead, so the reconnecting hook keeps waiting through the restore. */
+let sessionsRestored = false;
 const VC_MEETING_DELIVERY_LEASE_MS = 15 * 60_000;
 const VC_MEETING_DELIVERY_LEASE_SCAN_MS = 60_000;
 const VC_MEETING_RUNTIME_EXPIRY_ACK_TIMEOUT_MS = 3_000;
@@ -5118,6 +5125,13 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
   if ('error' in parsed) return jsonRes(res, 400, { ok: false, error: parsed.error });
 
   const askSession = findActiveBySessionId(parsed.sessionId);
+  // Startup window (codex P1-2): IPC is listening but sessions aren't restored
+  // yet, so a reconnecting ask hook's session lookup misses and would otherwise
+  // get a permanent 403. Return a RETRYABLE 503 so the hook keeps waiting
+  // (blocking Claude, no native picker) until restore finishes and it can bind.
+  if (!askSession && !sessionsRestored && !isTrustedHostIpcRequest(req)) {
+    return jsonRes(res, 503, { ok: false, error: 'startup_not_ready' });
+  }
   let boundAsk = parsed;
   if (!isTrustedHostIpcRequest(req)) {
     const body = raw && typeof raw === 'object' && !Array.isArray(raw)
@@ -19281,6 +19295,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
   // Restore active sessions from previous run
   await restoreActiveSessions(activeSessions);
+  // Restore complete → /api/asks may now safely 403 unknown sessions again; a
+  // reconnecting ask hook that raced the restore got retryable 503s until here.
+  sessionsRestored = true;
 
   // Now that activeSessions is populated, release the forward-followup flush
   // barrier. Persisted seeds were loaded into the buffer at dispatcher startup

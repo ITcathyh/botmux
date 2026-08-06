@@ -50,9 +50,13 @@ export function createLarkAskCardDispatcher(
       // 所以这里要按前缀判断是否真的能 reply.
       const canReplyToRoot =
         typeof ask.rootMessageId === 'string' && ask.rootMessageId.startsWith('om_');
+      // Pass the ask's stable dispatchUuid as the Feishu message uuid so a
+      // re-send after a daemon restart (restart-resume) dedupes server-side and
+      // returns the ORIGINAL message_id instead of posting a second card.
+      const uuid = ask.dispatchUuid;
       const messageId = canReplyToRoot
-        ? await reply(ask.larkAppId, ask.rootMessageId!, cardJson, 'interactive', true)
-        : await send(ask.larkAppId, ask.chatId, cardJson, 'interactive');
+        ? await reply(ask.larkAppId, ask.rootMessageId!, cardJson, 'interactive', true, uuid)
+        : await send(ask.larkAppId, ask.chatId, cardJson, 'interactive', uuid);
       return { messageId };
     },
     async onSettle(ask, result) {
