@@ -20,23 +20,37 @@ export interface TurnReplyTarget extends Omit<ReplyTargetEntry, 'updatedAt'> {
  * persisted sessions may fall back to the single slots only when those slots
  * explicitly identify the requested turn. */
 export function pickTurnReplyTarget(
-  s: Pick<Session, 'replyTargets' | 'currentReplyTarget' | 'quoteTargetId' | 'quoteTargetSenderOpenId'>,
+  s: Pick<Session, 'replyTargets' | 'currentReplyTarget' | 'quoteTargetId' | 'quoteTargetSenderOpenId' | 'quoteTargetSenderIsBot'>,
   currentTurnId: string | undefined,
 ): TurnReplyTarget | undefined {
   if (currentTurnId) {
     const entry = s.replyTargets?.[currentTurnId];
-    const legacySender = s.quoteTargetId === currentTurnId
-      ? s.quoteTargetSenderOpenId
-      : undefined;
+    // Legacy single-slot sender is trusted only when it explicitly names THIS
+    // turn (quoteTargetId === currentTurnId); the is-bot flag rides the same
+    // gate so it never borrows a later turn's attribution.
+    const legacyMatches = s.quoteTargetId === currentTurnId;
+    const legacySender = legacyMatches ? s.quoteTargetSenderOpenId : undefined;
+    const legacyIsBot = legacyMatches ? s.quoteTargetSenderIsBot : undefined;
     if (entry) {
       const senderOpenId = entry.senderOpenId ?? legacySender;
-      return { ...entry, turnId: currentTurnId, ...(senderOpenId ? { senderOpenId } : {}) };
+      const senderIsBot = entry.senderIsBot ?? (entry.senderOpenId ? undefined : legacyIsBot);
+      return {
+        ...entry,
+        turnId: currentTurnId,
+        ...(senderOpenId ? { senderOpenId } : {}),
+        ...(senderIsBot !== undefined ? { senderIsBot } : {}),
+      };
     }
     const slot = s.currentReplyTarget?.turnId === currentTurnId
       ? s.currentReplyTarget
       : undefined;
     if (slot || legacySender) {
-      return { ...slot, turnId: currentTurnId, ...(legacySender ? { senderOpenId: legacySender } : {}) };
+      return {
+        ...slot,
+        turnId: currentTurnId,
+        ...(legacySender ? { senderOpenId: legacySender } : {}),
+        ...(legacySender && legacyIsBot !== undefined ? { senderIsBot: legacyIsBot } : {}),
+      };
     }
     return undefined;
   }
@@ -52,6 +66,10 @@ export function isSubstituteTurn(
   ds: Pick<DaemonSession, 'scope' | 'session' | 'currentReplyTarget'>,
   turnId?: string,
 ): boolean {
+  // Substitute (avatar-style) turns are a chat-scope-only concept: topic-group
+  // substitute sessions are thread-scope and keep their normal streaming card.
+  // Defense-in-depth alongside beginReplyTargetTurn NOT persisting the flag for
+  // thread scope — a thread-scope session is never card-off via this path.
   if (ds.scope !== 'chat') return false;
   const slot = ds.currentReplyTarget ?? ds.session.currentReplyTarget;
   if (turnId) {
@@ -118,18 +136,27 @@ export function beginReplyTargetTurn(
   replyRootId: string | undefined,
   turnId: string,
   nowIso = new Date().toISOString(),
-  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string },
+  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; senderIsBot?: boolean },
 ): void {
   // Routing and sender are one atomic per-turn record. Thread-scope and
   // rootless chat turns may have no rootMessageId, but still require their
-  // exact sender for --mention-back.
+  // exact sender for --mention-back. Sender attribution (senderOpenId +
+  // senderIsBot) is written in ANY scope — bot→bot handoff happens in threads
+  // too. Everything else is chat-scope-only: quoteOnly/substitute are
+  // chat-scope semantics (topic-group substitute keeps its normal card; footer
+  // substitute addressing only applies to the shared chat-scope session), and a
+  // thread-scope turn routes off session.rootMessageId, never a per-turn root.
+  // So a thread entry carries ONLY sender attribution + updatedAt — no chat
+  // routing metadata can leak in, or readers (isSubstituteTurn, footer
+  // isSubstitute) would misread it.
+  const isChatScope = ds.scope === 'chat';
   const targets = { ...(ds.session.replyTargets ?? {}) };
   targets[turnId] = {
-    ...(replyRootId ? { rootMessageId: replyRootId } : {}),
+    ...(isChatScope && replyRootId ? { rootMessageId: replyRootId } : {}),
     updatedAt: nowIso,
-    quoteOnly: opts?.quoteOnly,
-    substitute: opts?.substitute,
+    ...(isChatScope ? { quoteOnly: opts?.quoteOnly, substitute: opts?.substitute } : {}),
     ...(opts?.senderOpenId ? { senderOpenId: opts.senderOpenId } : {}),
+    ...(opts?.senderIsBot !== undefined ? { senderIsBot: opts.senderIsBot } : {}),
   };
   const keys = Object.keys(targets);
   if (keys.length > REPLY_TARGETS_MAX) {

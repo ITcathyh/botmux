@@ -117,13 +117,19 @@ export type StreamStatus = ScreenStatus | 'starting';
 
 /** Reply context bound to one exact inbound turn. `rootMessageId` is absent
  * for thread-scope and rootless chat turns, which still need an immutable
- * sender for `--mention-back`. */
+ * sender for `--mention-back`. `senderOpenId`/`senderIsBot` are per-turn sender
+ * attribution (written in any scope); `rootMessageId`/`quoteOnly`/`substitute`
+ * are chat-scope-only routing metadata. */
 export interface ReplyTargetEntry {
   rootMessageId?: string;
   updatedAt: string;
   quoteOnly?: boolean;
   substitute?: boolean;
   senderOpenId?: string;
+  /** Whether this turn's sender is a bot — drives the asymmetric --mention-back
+   *  gate (bot→bot handoff is a deterministic @-back; a human triggerer in a
+   *  multi-party chat must instead pick an explicit --mention). */
+  senderIsBot?: boolean;
 }
 
 export interface Session {

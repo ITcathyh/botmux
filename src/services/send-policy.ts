@@ -177,6 +177,52 @@ export function validateMentionDecision(args: MentionDecisionArgs): MentionDecis
   };
 }
 
+export interface MentionBackParticipantArgs {
+  /** Session chat type — 'p2p' is inherently 1v1 (no fetch needed). */
+  chatType?: 'group' | 'p2p';
+  /** Whether THIS turn's triggerer is a bot (from the per-turn reply record's
+   *  senderIsBot). A bot triggerer short-circuits to allow — see below. */
+  senderIsBot?: boolean;
+  /** Real (human) member count from getGroupStats — excludes bots. */
+  userCount: number;
+  /** Bot member count from getGroupStats. */
+  botCount: number;
+}
+
+/**
+ * Should `--mention-back` be blocked because a HUMAN triggered this turn in a
+ * conversation with more than two participants?
+ *
+ * The gate is ASYMMETRIC on who triggered this turn:
+ *
+ * - Triggerer is a BOT (bot→bot handoff) → NEVER block. "@ back the bot that
+ *   triggered this turn" is deterministic and correct: the platform inbound
+ *   event hands us that bot's exact open_id (turn-bound in the reply record),
+ *   so --mention-back fills it without the model guessing. Blocking here is the
+ *   documented footgun — it forces the model to rebuild the same open_id from
+ *   context, and in a many-bot group (same display name, different per-app
+ *   open_id) it easily grabs the wrong id, or falls back to @-ing the lone
+ *   human. The caller short-circuits BEFORE any getGroupStats fetch.
+ *
+ * - Triggerer is a HUMAN in a >2-party chat → block, force explicit --mention.
+ *   Here "whoever triggered this turn" is genuinely not reliably "who should be
+ *   addressed" (a bystander's message can trigger the bot while the substantive
+ *   reply belongs to someone else), and the model choosing among humans is the
+ *   right call.
+ *
+ * - True 1v1 (userCount + botCount <= 2, incl. p2p DM) → allow: the triggerer
+ *   is the only counterpart.
+ *
+ * p2p short-circuits to `false` (no API round-trip). The caller passes
+ * getGroupStats' worst-case `{999,999}` soft-failure fallback for the human
+ * path, which yields `true` here → fail-closed to "make an explicit decision".
+ */
+export function shouldBlockMentionBackByParticipants(args: MentionBackParticipantArgs): boolean {
+  if (args.senderIsBot) return false;
+  if (args.chatType === 'p2p') return false;
+  return args.userCount + args.botCount > 2;
+}
+
 /**
  * Agent "raise-hand" attention flag for `botmux send --attention[=kind]`.
  *

@@ -15413,6 +15413,7 @@ function deliverPassthroughToExistingSession(
       quoteOnly: substituteReplyMode === 'quote',
       substitute: turn.substitute,
       senderOpenId: turn.senderOpenId,
+      senderIsBot: turn.senderIsBot,
     });
     if (turn.senderOpenId && ds.session.lastCallerOpenId !== turn.senderOpenId) {
       ds.session.lastCallerOpenId = turn.senderOpenId;
@@ -15544,7 +15545,7 @@ async function startInitialPassthroughSession(args: {
     ds.session.workingDir = pinnedWorkingDir;
     sessionStore.updateSession(ds.session);
   }
-  beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { senderOpenId });
+  beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { senderOpenId, senderIsBot: parsed.senderType === 'app' || parsed.senderType === 'bot' });
   sessionStore.updateSession(ds.session);
   const creationKey = sessionKey(anchor, larkAppId);
   if (!setActiveSessionIfActive(activeSessions, creationKey, ds)) {
@@ -16136,7 +16137,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const substituteReplyMode = substituteTrigger
     ? (botCfg.substituteMode?.replyMode ?? 'thread')
     : 'thread';
-  beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId });
+  beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId, senderIsBot: isForeignBotSender || parsed.senderType === 'app' || parsed.senderType === 'bot' });
   sessionStore.updateSession(ds.session);
   const creationKey = sessionKey(anchor, larkAppId);
   if (!setActiveSessionIfActive(activeSessions, creationKey, ds)) {
@@ -17239,7 +17240,7 @@ async function handleThreadReply(
     const substituteReplyMode = substituteTrigger
       ? (getBot(larkAppId).config.substituteMode?.replyMode ?? 'thread')
       : 'thread';
-    beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: callerOpenId });
+    beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: callerOpenId, senderIsBot: isForeignBot });
     if (callerOpenId && ds.session.lastCallerOpenId !== callerOpenId) {
       ds.session.lastCallerOpenId = callerOpenId;
     }
@@ -17464,7 +17465,7 @@ async function handleThreadReply(
     const substituteReplyMode = substituteTrigger
       ? (botCfg.substituteMode?.replyMode ?? 'thread')
       : 'thread';
-    beginReplyTargetTurn(newDs, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: senderOId });
+    beginReplyTargetTurn(newDs, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: senderOId, senderIsBot: isForeignBot });
     sessionStore.updateSession(newDs.session);
     const creationKey = sessionKey(anchor, larkAppId);
     if (!setActiveSessionIfActive(activeSessions, creationKey, newDs)) {

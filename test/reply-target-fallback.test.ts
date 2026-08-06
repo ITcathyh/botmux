@@ -160,19 +160,68 @@ describe('per-turn replyTargets — queued/concurrent turns keep their own ancho
     expect(resolveSessionReplyTarget(ds, 'turn-a')).toEqual({ mode: 'thread', rootMessageId: 'om_thread_root' });
   });
 
-  it('thread-scope substitute turns keep their streaming card', () => {
+  it('a thread-scope substitute turn keeps its card (substitute flag NOT persisted, sender still bound)', () => {
+    // Topic-group substitute sessions (#475) are thread-scope and MUST keep
+    // their normal streaming card + owner-addressed footer. The per-turn record
+    // still needs the sender for --mention-back, but must NOT carry the
+    // chat-scope-only substitute/quoteOnly flags — otherwise isSubstituteTurn
+    // (card suppression) and the cli.ts footer isSubstitute both flip to true
+    // and the topic-group substitute turn loses its card / gets re-addressed.
     const ds = makeDs({ scope: 'thread' }) as DaemonSession;
-    beginReplyTargetTurn(ds, undefined, 'turn-sub', NOW, {
-      substitute: true,
-      senderOpenId: 'ou_sender',
-    });
+    ds.session.rootMessageId = 'om_thread_root';
+    beginReplyTargetTurn(ds, 'om_thread_root', 'turn-sub', NOW, { substitute: true, quoteOnly: true, senderOpenId: 'ou_bot_a' });
 
-    expect(ds.session.replyTargets?.['turn-sub']).toMatchObject({
-      substitute: true,
-      senderOpenId: 'ou_sender',
-    });
+    const entry = ds.session.replyTargets?.['turn-sub'];
+    expect(entry?.senderOpenId).toBe('ou_bot_a');       // sender bound for --mention-back
+    expect(entry?.substitute).toBeUndefined();          // chat-scope-only flag not persisted
+    expect(entry?.quoteOnly).toBeUndefined();
+    expect(entry?.rootMessageId).toBeUndefined();        // thread routes off session.rootMessageId, no per-turn root
+    // Card-suppression read-point: never card-off in thread scope.
     expect(isSubstituteTurn(ds, 'turn-sub')).toBe(false);
-    expect(isSubstituteTurn(ds)).toBe(false);
+    // Footer read-point (cli.ts:7897 reads pickTurnReplyTarget().substitute):
+    // stays falsy so footer addressing is unchanged.
+    expect(pickTurnReplyTarget(ds.session, 'turn-sub')?.substitute).toBeUndefined();
+    // Thread routing still resolves off the session root, unaffected.
+    expect(resolveSessionReplyTarget(ds, 'turn-sub')).toEqual({ mode: 'thread', rootMessageId: 'om_thread_root' });
+  });
+
+  it('isSubstituteTurn is scope-gated: a non-chat scope is never a substitute turn (defense-in-depth)', () => {
+    // Even if a stray entry somehow carried substitute:true in a thread-scope
+    // session (e.g. a future writer bug), isSubstituteTurn fails safe to false
+    // so a thread-scope session is never wrongly card-off.
+    const ds = makeDs({ scope: 'thread' }) as DaemonSession;
+    ds.session.replyTargets = { 'turn-x': { updatedAt: NOW, substitute: true } };
+    expect(isSubstituteTurn(ds, 'turn-x')).toBe(false);
+  });
+
+  it('binds per-turn senderIsBot (chat + thread) for the asymmetric mention-back gate', () => {
+    const ds = makeDs() as DaemonSession;
+    beginReplyTargetTurn(ds, 'om_a', 'turn-bot', NOW, { senderOpenId: 'ou_bot', senderIsBot: true });
+    beginReplyTargetTurn(ds, 'om_b', 'turn-human', NOW, { senderOpenId: 'ou_human', senderIsBot: false });
+    expect(pickTurnReplyTarget(ds.session, 'turn-bot')).toMatchObject({ turnId: 'turn-bot', senderIsBot: true });
+    expect(pickTurnReplyTarget(ds.session, 'turn-human')).toMatchObject({ turnId: 'turn-human', senderIsBot: false });
+
+    // thread scope also carries senderIsBot (bot→bot handoff happens in threads)
+    const td = makeDs({ scope: 'thread' }) as DaemonSession;
+    td.session.rootMessageId = 'om_root';
+    beginReplyTargetTurn(td, undefined, 'turn-t', NOW, { senderOpenId: 'ou_bot', senderIsBot: true });
+    expect(pickTurnReplyTarget(td.session, 'turn-t')).toMatchObject({ turnId: 'turn-t', senderIsBot: true });
+  });
+
+  it('legacy senderIsBot falls back from quoteTargetSenderIsBot only on an exact turnId match', () => {
+    const exact = {
+      quoteTargetId: 'turn-a',
+      quoteTargetSenderOpenId: 'ou_a',
+      quoteTargetSenderIsBot: true,
+    };
+    expect(pickTurnReplyTarget(exact, 'turn-a')).toMatchObject({ turnId: 'turn-a', senderOpenId: 'ou_a', senderIsBot: true });
+    // Mismatched turn → no borrow of a later turn's is-bot attribution.
+    const mismatched = {
+      quoteTargetId: 'turn-b',
+      quoteTargetSenderOpenId: 'ou_b',
+      quoteTargetSenderIsBot: true,
+    };
+    expect(pickTurnReplyTarget(mismatched, 'turn-a')).toBeUndefined();
   });
 
   it('keeps rootless chat sender A separate from topic sender/root B', () => {

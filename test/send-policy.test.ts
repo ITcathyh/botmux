@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   resolveQuoteTarget,
   validateMentionDecision,
+  shouldBlockMentionBackByParticipants,
   parseAttentionFlag,
   attentionUsageError,
   managedVcQuoteError,
@@ -245,6 +246,44 @@ describe('validateMentionDecision', () => {
 
   it('--top-level exempt from gate', () => {
     expect(validateMentionDecision({ ...base, sendTopLevel: true }).ok).toBe(true);
+  });
+});
+
+describe('shouldBlockMentionBackByParticipants (asymmetric on triggerer)', () => {
+  it('bot triggerer NEVER blocks, regardless of participant counts (bot→bot handoff is deterministic)', () => {
+    // Even a large multi-party group: a bot triggerer resolves to a known
+    // open_id, so --mention-back @-back is exact. Caller also short-circuits
+    // the getGroupStats fetch on this branch.
+    expect(shouldBlockMentionBackByParticipants({ senderIsBot: true, chatType: 'group', userCount: 5, botCount: 5 })).toBe(false);
+    expect(shouldBlockMentionBackByParticipants({ senderIsBot: true, userCount: 999, botCount: 999 })).toBe(false);
+  });
+
+  it('p2p DM never blocks (inherently 1v1), regardless of reported counts', () => {
+    expect(shouldBlockMentionBackByParticipants({ chatType: 'p2p', userCount: 999, botCount: 999 })).toBe(false);
+  });
+
+  it('human triggerer, 1 human + 1 bot (true 1v1 group, sum = 2) → allow', () => {
+    expect(shouldBlockMentionBackByParticipants({ senderIsBot: false, chatType: 'group', userCount: 1, botCount: 1 })).toBe(false);
+  });
+
+  it('human triggerer, 2 humans + 1 bot (sum = 3 > 2) → block, force explicit --mention', () => {
+    expect(shouldBlockMentionBackByParticipants({ senderIsBot: false, chatType: 'group', userCount: 2, botCount: 1 })).toBe(true);
+  });
+
+  it('human triggerer, 1 human + 2 bots (the reported footgun: lone human + multi-bot) → block', () => {
+    // This is exactly the user-reported mis-@: with the gate blocking, a human
+    // triggerer in 1-human+multi-bot must pick explicitly (a bot triggerer here
+    // would instead have short-circuited to allow above).
+    expect(shouldBlockMentionBackByParticipants({ senderIsBot: false, chatType: 'group', userCount: 1, botCount: 2 })).toBe(true);
+  });
+
+  it('getGroupStats soft-failure fallback {999,999} on the human path fails closed to blocked', () => {
+    expect(shouldBlockMentionBackByParticipants({ senderIsBot: false, chatType: 'group', userCount: 999, botCount: 999 })).toBe(true);
+  });
+
+  it('undefined senderIsBot is treated as human (conservative): sum > 2 blocks', () => {
+    expect(shouldBlockMentionBackByParticipants({ userCount: 3, botCount: 0 })).toBe(true);
+    expect(shouldBlockMentionBackByParticipants({ userCount: 1, botCount: 1 })).toBe(false);
   });
 });
 

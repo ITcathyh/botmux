@@ -6398,6 +6398,7 @@ import { getSessionUsageSnapshot } from './core/cost-calculator.js';
 import {
   resolveQuoteTarget,
   validateMentionDecision,
+  shouldBlockMentionBackByParticipants,
   parseAttentionFlag,
   attentionUsageError,
   managedVcQuoteError,
@@ -7454,6 +7455,38 @@ async function cmdSend(rest: string[]): Promise<void> {
   try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
   if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
 
+  // Asymmetric participant gate for --mention-back. A BOT-triggered turn always
+  // passes: "@ back the bot that triggered this turn" is deterministic — the
+  // platform hands us that bot's exact open_id, turn-bound in the reply record,
+  // so we short-circuit before any getGroupStats fetch (bot→bot handoff must not
+  // be forced onto a guess-the-open_id path). A HUMAN-triggered turn in a
+  // >2-party group is blocked → force an explicit --mention, because "who
+  // triggered" is not reliably "who to address" among multiple people. 1v1 /
+  // p2p pass. Symmetric with the inbound un-@ gate (event-dispatcher).
+  const replyTargetSenderIsBot = explicitVcMeetingImOrigin
+    ? undefined
+    : turnReplyTarget?.senderIsBot;
+  if (mentionBack && !replyTargetSenderIsBot && s.chatType !== 'p2p' && s.larkAppId && s.chatId && !sendTopLevel) {
+    try {
+      const { getGroupStats } = await import('./im/lark/event-dispatcher.js');
+      const { userCount, botCount } = await getGroupStats(s.larkAppId, s.chatId);
+      if (shouldBlockMentionBackByParticipants({ chatType: s.chatType, senderIsBot: replyTargetSenderIsBot, userCount, botCount })) {
+        console.error(
+          `--mention-back 在多人会话（当前 ${userCount} 人 + ${botCount} bot）里、且本轮由人触发时不可用：`
+          + '"回复触发这轮的人" 在多方场景可能 @ 错对象。请改用 --mention <ou:Name> 显式点名，'
+          + '或 --no-mention 不 @。（bot→bot 接力不受此限，会自动 @ 回触发的 bot。）',
+        );
+        process.exit(2);
+      }
+    } catch (err: any) {
+      // getGroupStats already soft-fails to {999,999} (→ block) internally, so
+      // reaching here means the dynamic import itself failed. Fail-closed to a
+      // clear error rather than silently letting a possibly-wrong @ through.
+      console.error(`无法确认会话人数以校验 --mention-back：${err?.message ?? err}。请改用 --mention <ou:Name> 或 --no-mention。`);
+      process.exit(2);
+    }
+  }
+
   // --mention-back: @ the sender of the message this turn is replying to
   // (open_id from the session — model needn't know it). Bare-name form so it
   // renders as a trailing <at>.
@@ -7916,7 +7949,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         ? { ...s, lastCallerOpenId: explicitVcMeetingImOrigin.replyTargetSenderOpenId }
         : s, {
           isOncall: !!oncallEntry,
-          isSubstitute: turnReplyTarget?.turnId === currentTurnId && turnReplyTarget?.substitute === true,
+          isSubstitute: isChatScope && turnReplyTarget?.turnId === currentTurnId && turnReplyTarget?.substitute === true,
           hasExplicitBotMention: explicitKnownBotMention,
           knownBotOpenIds,
         });

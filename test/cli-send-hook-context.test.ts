@@ -29,10 +29,18 @@ describe('cmdSend hook context wiring', () => {
       'const replyTargetSenderOpenId = explicitVcMeetingImOrigin?.replyTargetSenderOpenId',
     );
     expect(cliSource).toContain('?? turnReplyTarget?.senderOpenId');
-    expect(cliSource).not.toContain('shouldBlockMentionBackByParticipants');
-    expect(cliSource).not.toMatch(/mentionBack[\s\S]{0,500}getGroupStats/);
     expect(cliSource).toContain('hasQuoteTargetSender: !!replyTargetSenderOpenId');
     expect(cliSource).toMatch(/mentions\.push\(\{ open_id: replyTargetSenderOpenId, name: '' \}\)/);
+  });
+
+  it('gates --mention-back asymmetrically: bot triggerer skips the participant fetch, human triggerer is gated', () => {
+    // A bot-triggered turn resolves is-bot from the per-turn record and
+    // short-circuits before getGroupStats; only a human triggerer in a
+    // multi-party chat hits the count gate.
+    expect(cliSource).toContain('const replyTargetSenderIsBot = explicitVcMeetingImOrigin');
+    expect(cliSource).toContain('turnReplyTarget?.senderIsBot');
+    expect(cliSource).toMatch(/if \(mentionBack && !replyTargetSenderIsBot &&[\s\S]{0,200}getGroupStats/);
+    expect(cliSource).toMatch(/shouldBlockMentionBackByParticipants\(\{[\s\S]{0,120}senderIsBot: replyTargetSenderIsBot/);
   });
 
   it('freezes VC listener replay content and indexes only the successful primary output', () => {
