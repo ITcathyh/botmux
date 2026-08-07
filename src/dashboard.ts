@@ -2329,7 +2329,10 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
       return (a.name ?? a.chatId).localeCompare(b.name ?? b.chatId);
     })
     .map(({ _firstSeenAt, ...rest }) => rest);
-  const bots = onlineBots.map(botSummaryPayload);
+  // brand 是 bots.json 的 per-bot 字段（DaemonRegistry 的心跳态不带它），
+  // 从 loadBotConfigs 按 appId 补进 summary，供前端派生飞书后台深链 host。
+  const brandByAppId = new Map(loadBotConfigs().map(b => [b.larkAppId, b.brand]));
+  const bots = onlineBots.map(d => botSummaryPayload({ ...d, brand: brandByAppId.get(d.larkAppId) }));
   return { chats, bots };
 }
 
@@ -4519,7 +4522,13 @@ const server = createServer(async (req, res) => {
 
     if (req.method === 'GET' && url.pathname === '/api/bots') {
       const agentFields = configuredBotAgentFields();
-      const onlineBots = [...registry.list()].map(b => withConfiguredCliId(b, agentFields)).sort((a, b) => a.botIndex - b.botIndex);
+      // brand 是 bots.json 的 per-bot 字段（DaemonRegistry 心跳态不带它），
+      // 从 loadBotConfigs 按 appId 补进每个 descriptor，供前端派生飞书后台深链 host。
+      const brandByAppId = new Map(loadBotConfigs().map(b => [b.larkAppId, b.brand]));
+      const onlineBots = [...registry.list()]
+        .map(b => withConfiguredCliId(b, agentFields))
+        .map(b => ({ ...b, brand: brandByAppId.get(b.larkAppId) }))
+        .sort((a, b) => a.botIndex - b.botIndex);
       const out = await Promise.all(onlineBots.map(async d => {
         try {
           const r = await fetchDaemonIpc(d.ipcPort, '/api/bot-default-oncall');

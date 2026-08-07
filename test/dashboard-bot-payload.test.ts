@@ -315,4 +315,22 @@ describe('dashboard bot payload helpers', () => {
       },
     });
   });
+
+  it('emits brand in the group roster summary only when set (so the console link picks the right host)', () => {
+    // 国际版 lark bot：brand 带出,前端据此拼 open.larksuite.com/app/...。
+    expect(botSummaryPayload({ larkAppId: 'cli_lark', botName: 'LarkBot', cliId: 'codex', brand: 'lark' }))
+      .toMatchObject({ larkAppId: 'cli_lark', brand: 'lark' });
+    // feishu bot(缺省)：不下发 brand,前端 normalizeBrand 兜底 feishu.cn。
+    expect(botSummaryPayload({ larkAppId: 'cli_feishu', botName: 'FeishuBot', cliId: 'codex' }))
+      .not.toHaveProperty('brand');
+  });
+
+  it('emits brand in Bot Defaults rows (success + degraded) so the config-page link picks the right host', () => {
+    const lark = { larkAppId: 'cli_lark', botName: 'LarkBot', cliId: 'codex', brand: 'lark' };
+    expect(botDefaultsPayload(lark, {})).toMatchObject({ brand: 'lark' });
+    expect(botDefaultsPayload(lark, undefined, 'http_503')).toMatchObject({ brand: 'lark', error: 'http_503' });
+    // feishu(缺省)：不带 brand,前端兜底 feishu。
+    expect(botDefaultsPayload({ larkAppId: 'cli_feishu', botName: 'FeishuBot', cliId: 'codex' }, {}))
+      .not.toHaveProperty('brand');
+  });
 });

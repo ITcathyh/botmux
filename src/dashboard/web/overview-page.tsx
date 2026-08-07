@@ -115,7 +115,7 @@ function alignPanelToSidebarBottom(panel: HTMLElement | null, propertyName: stri
 
 function MateCard({ card }: { card: BotCard }) {
   const tr = useT();
-  const consoleUrl = larkConsoleUrl(card.larkAppId);
+  const consoleUrl = larkConsoleUrl(card.larkAppId, card.brand);
   const offline = !card.online && card.active.length === 0;
   const needsYou = card.attention.length > 0;
   const busy = card.busy.length > 0;

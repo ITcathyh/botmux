@@ -8,6 +8,9 @@ export interface DashboardBotDescriptor {
   botName?: string | null;
   botAvatarUrl?: string;
   cliId?: string;
+  /** 租户品牌（bots.json 的 BotConfig.brand）。决定飞书后台深链 host。
+   *  缺省 → 前端 normalizeBrand 兜底 feishu，向后兼容旧 payload。 */
+  brand?: string;
   cliRuntime?: CliRuntimeConfig;
   /** Legacy executable override. Private Bot Defaults payload only. */
   cliPathOverride?: string;
@@ -21,6 +24,7 @@ export function botSummaryPayload(bot: DashboardBotDescriptor) {
     botName: bot.botName,
     ...(bot.botAvatarUrl ? { botAvatarUrl: bot.botAvatarUrl } : {}),
     ...(bot.cliId ? { cliId: bot.cliId } : {}),
+    ...(bot.brand ? { brand: bot.brand } : {}),
   };
 }
 
@@ -29,6 +33,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     larkAppId: bot.larkAppId,
     botName: bot.botName,
     ...(bot.cliId ? { cliId: bot.cliId } : {}),
+    ...(bot.brand ? { brand: bot.brand } : {}),
     ...(bot.cliRuntime ? { cliRuntime: bot.cliRuntime } : {}),
     ...(bot.cliPathOverride ? { cliPathOverride: bot.cliPathOverride } : {}),
     ...(bot.wrapperCli ? { wrapperCli: bot.wrapperCli } : {}),

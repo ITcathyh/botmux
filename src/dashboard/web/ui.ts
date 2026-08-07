@@ -19,6 +19,7 @@ import {
   type SkinId,
 } from './preferences.js';
 import { applyCyberFx } from './cyber-fx.js';
+import { larkHosts, normalizeBrand } from '../../im/lark/lark-hosts.js';
 
 type UiListener = () => void;
 
@@ -189,13 +190,16 @@ export function botAvatarUrlFor(name?: string, larkAppId?: string): string | und
   return name ? botAvatarByName.get(String(name)) : undefined;
 }
 
-/** 该 bot 在飞书开放平台的应用后台深链。larkAppId 即开放平台 AppID（cli_xxx），
- *  console 走 open.feishu.cn/app/{appId}（Lark 国际版租户访问时自动重定向到
- *  open.larkoffice.com，同一份链接通用）。非 cli_ 前缀（首屏聚合未回来时的占位
- *  键、按名聚合的历史卡）返回 null，避免拼出无效地址。 */
-export function larkConsoleUrl(larkAppId?: string): string | null {
+/** 该 bot 在飞书/Lark 开放平台的应用后台深链。larkAppId 即开放平台 AppID
+ *  （cli_xxx），host 必须按 bot 的 brand 派生:feishu 租户走 open.feishu.cn、
+ *  国际版 lark 租户走 open.larksuite.com——两者是**独立平台上的独立应用**
+ *  （AppID 各自独立、登录域不同），拿 feishu host 打开 lark 应用后台不通，
+ *  反之亦然。brand 缺省 / 非法值经 normalizeBrand 归一为 feishu，向后兼容
+ *  旧 payload。非 cli_ 前缀（首屏聚合未回来时的占位键、按名聚合的历史卡、
+ *  headless 的 local_ 身份）返回 null，避免拼出无效地址。 */
+export function larkConsoleUrl(larkAppId?: string, brand?: string): string | null {
   return larkAppId && larkAppId.startsWith('cli_')
-    ? `https://open.feishu.cn/app/${encodeURIComponent(larkAppId)}`
+    ? `${larkHosts(normalizeBrand(brand)).openApi}/app/${encodeURIComponent(larkAppId)}`
     : null;
 }
 

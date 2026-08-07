@@ -1123,10 +1123,10 @@ function BotProfileIdentity(props: { bot: BotDefaultsRow; cli: string; patchBot:
       )}
       <div className="bd-profile-appid-row">
         <code>{bot.larkAppId}</code>
-        {larkConsoleUrl(bot.larkAppId) ? (
+        {larkConsoleUrl(bot.larkAppId, bot.brand) ? (
           <a
             className="bd-console-link"
-            href={larkConsoleUrl(bot.larkAppId)!}
+            href={larkConsoleUrl(bot.larkAppId, bot.brand)!}
             target="_blank"
             rel="noopener noreferrer"
           >
