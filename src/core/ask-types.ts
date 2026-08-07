@@ -250,17 +250,22 @@ export function isRetryableAskHttpStatus(status: number): boolean {
  * decision seam). PURE + exported so daemon.ts and its unit test share the SAME
  * predicate rather than asserting against source regex.
  *
- * True iff a NON-trusted caller's session lookup missed AND session restore
- * hasn't finished — the reconnecting hook is racing `restoreActiveSessions`, so
- * a permanent 403 here would drop it to passthrough (stuck native picker). A 503
- * (which `isRetryableAskHttpStatus` marks retryable) keeps the hook blocking
- * until restore binds its session. A trusted-host IPC caller bypasses this (it
- * isn't a session-scoped hook).
+ * True iff an unknown session hits the route while restore is still in flight —
+ * regardless of how the caller authenticated. The earlier `trustedHost` escape
+ * was WRONG (codex P1-2): a normal unsandbox hook IS the trusted-host path
+ * (`postAsk` loads the host secret and calls the HMAC `fetchDaemonIpc` when
+ * there's no relay), so exempting trusted callers let exactly the reconnecting
+ * hook we must protect slip through during the descriptor-published-but-sessions-
+ * not-yet-restored window — it would then register a NEW ask computed as
+ * `backendSurvivesRestart:false` (session unknown) and be lost on the next
+ * restart. Every `POST /api/asks` caller is a session-scoped ask registration
+ * (the desktop/dashboard ANSWER path is a different route), so gating all
+ * unknown sessions here is safe: once `sessionsRestored` flips true the gate
+ * lifts and unknown sessions fall through to normal authorization.
  */
 export function shouldReturnAskStartupNotReady(args: {
   hasSession: boolean;
   sessionsRestored: boolean;
-  trustedHost: boolean;
 }): boolean {
-  return !args.hasSession && !args.sessionsRestored && !args.trustedHost;
+  return !args.hasSession && !args.sessionsRestored;
 }

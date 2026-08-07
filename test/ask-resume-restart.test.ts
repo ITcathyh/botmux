@@ -316,7 +316,7 @@ describe('dispatch uuid + non-resumable origins (codex P1-1/P1-4)', () => {
     expect(seenUuid).toBe(dispatchUuidForKey(askKeyFor('cli_app', 'sess-1', 'hook', 'req-uuid-1')));
   });
 
-  it('explicit origin is NOT persisted and its card carries no dispatchUuid', async () => {
+  it('explicit origin is NOT persisted but DOES carry a dispatchUuid (codex P1-1)', async () => {
     let seenUuid: string | undefined = 'UNSET';
     const d = mockDispatcher((ask) => { seenUuid = ask.dispatchUuid; return Promise.resolve({ messageId: 'om_x' }); });
     setCardDispatcher(d);
@@ -324,6 +324,9 @@ describe('dispatch uuid + non-resumable origins (codex P1-1/P1-4)', () => {
     registerAsk(makeInput({ originKind: 'explicit', requestId: undefined }));
     await new Promise((r) => setTimeout(r, 5));
     expect(persistedFiles()).toHaveLength(0);   // never persisted → no orphan handoff
-    expect(seenUuid).toBeUndefined();           // no dedupe uuid (never re-sends)
+    // But it STILL carries a dedupe uuid: the bounded retry re-sends even a
+    // non-resumable card, so it needs server-side dedupe. uuid gates dispatch
+    // idempotency (intra-process); resumable gates persistence (cross-restart).
+    expect(seenUuid).toBeTruthy();
   });
 });

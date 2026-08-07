@@ -5131,10 +5131,13 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
   // get a permanent 403. Return a RETRYABLE 503 so the hook keeps waiting
   // (blocking Claude, no native picker) until restore finishes and it can bind.
   // Predicate is a shared pure function (unit-tested directly — codex P1-2 seam).
+  // NOTE: this gate does NOT exempt trusted-host callers — a normal unsandbox
+  // hook IS the trusted-host path (HMAC fetchDaemonIpc), so exempting it would
+  // let the very reconnecting hook we must protect register a lost
+  // non-resumable ask during the restore window.
   if (shouldReturnAskStartupNotReady({
     hasSession: !!askSession,
     sessionsRestored,
-    trustedHost: isTrustedHostIpcRequest(req),
   })) {
     return jsonRes(res, 503, { ok: false, error: 'startup_not_ready' });
   }

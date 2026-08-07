@@ -45,27 +45,33 @@ describe('postAsk retry classifier (codex P1-3 seam)', () => {
 });
 
 describe('daemon /api/asks startup readiness guard (codex P1-2 seam)', () => {
-  it('unknown session + restore not finished + untrusted → 503 startup_not_ready', () => {
+  it('unknown session + restore not finished → 503 startup_not_ready', () => {
     expect(shouldReturnAskStartupNotReady({
-      hasSession: false, sessionsRestored: false, trustedHost: false,
+      hasSession: false, sessionsRestored: false,
     })).toBe(true);
   });
 
   it('once restore has finished, a still-unknown session does NOT get 503 (falls through to 403/proceed)', () => {
     expect(shouldReturnAskStartupNotReady({
-      hasSession: false, sessionsRestored: true, trustedHost: false,
+      hasSession: false, sessionsRestored: true,
     })).toBe(false);
   });
 
   it('a session that already resolved never hits the startup guard', () => {
     expect(shouldReturnAskStartupNotReady({
-      hasSession: true, sessionsRestored: false, trustedHost: false,
+      hasSession: true, sessionsRestored: false,
     })).toBe(false);
   });
 
-  it('a trusted-host IPC caller bypasses the startup guard (not a session-scoped hook)', () => {
+  it('a reconnecting unsandbox hook (trusted-host transport) is NOT exempted during restore — it is exactly who must 503 (codex P1-2)', () => {
+    // A normal unsandbox tmux hook reaches /api/asks via the HMAC fetchDaemonIpc
+    // (trusted-host) path. The earlier gate exempted trusted callers, letting
+    // this hook slip past 503 during the descriptor-published-but-not-restored
+    // window and register a lost non-resumable ask. The predicate no longer
+    // takes trustedHost at all: an unknown session mid-restore ALWAYS 503s,
+    // regardless of how it authenticated.
     expect(shouldReturnAskStartupNotReady({
-      hasSession: false, sessionsRestored: false, trustedHost: true,
-    })).toBe(false);
+      hasSession: false, sessionsRestored: false,
+    })).toBe(true);
   });
 });

@@ -870,11 +870,13 @@ function snapshot(ask: InternalPending): PendingAsk {
   return {
     ...rest,
     selections: ask.questions.map((_, i) => [...(ask.selections.get(i) ?? new Set<string>())]),
-    // Resumable asks carry a stable dedupe token so a re-send (after restart)
-    // is idempotent on the Feishu side. Derived from the SCOPED key (not the
-    // bare requestId) so a second session reusing the same requestId can't alias
-    // this card's uuid (codex P1-1). Non-resumable asks don't re-send.
-    ...(ask.resumable ? { dispatchUuid: dispatchUuidForKey(ask.askKey) } : {}),
+    // EVERY ask carries a scoped dedupe token (codex P1-1): the broker's bounded
+    // retry re-sends the card, and a re-send without a uuid posts a DUPLICATE on
+    // the Feishu side. The uuid is the card's dedupe identity for THIS broker
+    // lifetime — derived from the scoped askKey, independent of persistence.
+    // `resumable` gates only cross-restart persistence, NOT intra-process
+    // dispatch idempotency, so explicit / PTY asks (which also retry) dedupe too.
+    dispatchUuid: dispatchUuidForKey(ask.askKey),
   };
 }
 

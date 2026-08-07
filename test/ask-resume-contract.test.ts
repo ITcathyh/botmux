@@ -314,6 +314,38 @@ describe('clause 5 — dispatch partial-success converges (codex P1-3)', () => {
     expect(result.kind).toBe('invalidated');
     expect(attempts).toBe(1);                    // fail closed — no retry when idempotency unproven
   });
+
+  // codex P1-1 (regression the retry-all change introduced): a NON-resumable ask
+  // (explicit `botmux ask buttons`, or a PTY-backed hook) ALSO retries — so it
+  // MUST carry a dedupe uuid, or the retry after a landed-but-reset send posts a
+  // second real card. dispatchUuid is now decoupled from resumability.
+  for (const variant of [
+    { name: 'explicit ask', over: { originKind: 'explicit' as const, requestId: undefined, backendSurvivesRestart: false } },
+    { name: 'PTY-backed hook', over: { backendSurvivesRestart: false } },
+  ]) {
+    it(`${variant.name}: transient retry reuses the SAME uuid → one logical card (not double-send)`, async () => {
+      let attempts = 0;
+      const uuids: (string | undefined)[] = [];
+      const d: AskCardDispatcher & { sendCalls: PendingAsk[] } = {
+        sendCalls: [],
+        async send(ask) {
+          this.sendCalls.push(ask);
+          uuids.push(ask.dispatchUuid);
+          attempts++;
+          if (attempts === 1) throw new AskDispatchError('socket hang up', true);
+          return { messageId: 'om_original' };
+        },
+        onSettle() {},
+      };
+      setCardDispatcher(d);
+      registerAsk(brokerInput(variant.over));
+      await new Promise((r) => setTimeout(r, 900));
+      expect(attempts).toBe(2);
+      expect(uuids[0]).toBeTruthy();      // non-resumable STILL gets a uuid now
+      expect(uuids[1]).toBe(uuids[0]);    // same uuid on retry → server dedupes
+      expect(brokerFiles()).toHaveLength(0); // and it is still NOT persisted (backend gate intact)
+    });
+  }
 });
 
 describe('clause 5 — classifier decision table (executable seam, codex P1-3)', () => {
@@ -335,6 +367,18 @@ describe('clause 5 — classifier decision table (executable seam, codex P1-3)',
     expect(classifyAskDispatchError('nope').retryable).toBe(false);
     expect(classifyAskDispatchError(undefined).retryable).toBe(false);
   });
+  it('transient Lark business codes are retryable EVEN on HTTP 400 / 2xx-body (codex P1-3)', () => {
+    // 230049 "message is being sent" — official retry-later; can appear as the
+    // second same-uuid partial-success request while the first is still landing.
+    expect(classifyAskDispatchError({ isAxiosError: true, response: { status: 400, data: { code: 230049, msg: 'The message is being sent.' } } }).retryable).toBe(true);
+    // 230020 per-chat rate limit; 99991400 generic OpenAPI freq-control (legacy 400).
+    expect(classifyAskDispatchError({ isAxiosError: true, response: { status: 400, data: { code: 230020 } } }).retryable).toBe(true);
+    expect(classifyAskDispatchError({ isAxiosError: true, response: { status: 400, data: { code: 99991400 } } }).retryable).toBe(true);
+    // Same code surfacing via a 2xx-body plain Error (code only in the message).
+    expect(classifyAskDispatchError(new Error('Failed to reply message: being sent (code: 230049)')).retryable).toBe(true);
+    // A NON-whitelisted business code on 400 stays deterministic.
+    expect(classifyAskDispatchError({ isAxiosError: true, response: { status: 400, data: { code: 230011 } } }).retryable).toBe(false);
+  });
 });
 
 describe('clause 4 — only a restart-surviving backend is resumable (codex P1-4)', () => {
@@ -354,19 +398,22 @@ describe('clause 4 — only a restart-surviving backend is resumable (codex P1-4
     registerAsk(brokerInput({ backendSurvivesRestart: false }));
     await new Promise((r) => setTimeout(r, 5));
     expect(brokerFiles()).toHaveLength(0);        // never persisted
-    // And its card carries no dedupe uuid (it never re-sends across a restart).
-    expect(d.sendCalls[0]!.dispatchUuid).toBeUndefined();
+    // But its card STILL carries a dedupe uuid (codex P1-1): the bounded retry
+    // re-sends even a non-resumable card, so it needs server-side dedupe. uuid
+    // gates dispatch idempotency; persistence is gated separately (backend).
+    expect(d.sendCalls[0]!.dispatchUuid).toBeTruthy();
   });
 
-  it('an undefined backend signal fails closed (not persisted)', async () => {
+  it('an undefined backend signal fails closed (not persisted) but still carries a uuid', async () => {
     const d = mockDispatcher();
     setCardDispatcher(d);
     registerAsk(brokerInput({ backendSurvivesRestart: undefined }));
     await new Promise((r) => setTimeout(r, 5));
     expect(brokerFiles()).toHaveLength(0);
+    expect(d.sendCalls[0]!.dispatchUuid).toBeTruthy(); // dedupe uuid decoupled from persistence
   });
 
-  it('a hook on a persistent (tmux) backend IS persisted', async () => {
+  it('a hook on a persistent (tmux) backend IS persisted and carries a uuid', async () => {
     const d = mockDispatcher();
     setCardDispatcher(d);
     registerAsk(brokerInput({ backendSurvivesRestart: true }));
