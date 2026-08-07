@@ -13,7 +13,7 @@
  * Run:  pnpm vitest run test/reply-target-fallback.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { beginReplyTargetTurn, fallbackTurnId, isSubstituteTurn, pickTurnReplyTarget, resolveSessionReplyTarget } from '../src/core/reply-target.js';
+import { beginReplyTargetTurn, collectTurnWindowParticipants, fallbackTurnId, isSubstituteTurn, pickTurnReplyTarget, resolveSessionReplyTarget } from '../src/core/reply-target.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 const NOW = new Date().toISOString();
@@ -194,34 +194,43 @@ describe('per-turn replyTargets — queued/concurrent turns keep their own ancho
     expect(isSubstituteTurn(ds, 'turn-x')).toBe(false);
   });
 
-  it('binds per-turn senderIsBot (chat + thread) for the asymmetric mention-back gate', () => {
+  it('binds per-turn participants (chat + thread) and dedupes/keeps richest label', () => {
     const ds = makeDs() as DaemonSession;
-    beginReplyTargetTurn(ds, 'om_a', 'turn-bot', NOW, { senderOpenId: 'ou_bot', senderIsBot: true });
-    beginReplyTargetTurn(ds, 'om_b', 'turn-human', NOW, { senderOpenId: 'ou_human', senderIsBot: false });
-    expect(pickTurnReplyTarget(ds.session, 'turn-bot')).toMatchObject({ turnId: 'turn-bot', senderIsBot: true });
-    expect(pickTurnReplyTarget(ds.session, 'turn-human')).toMatchObject({ turnId: 'turn-human', senderIsBot: false });
+    beginReplyTargetTurn(ds, 'om_a', 'turn-1', NOW, {
+      senderOpenId: 'ou_bot',
+      participants: [{ openId: 'ou_bot', isBot: true }, { openId: 'ou_bot', name: 'Codex' }],
+    });
+    expect(pickTurnReplyTarget(ds.session, 'turn-1')?.participants)
+      .toEqual([{ openId: 'ou_bot', name: 'Codex', isBot: true }]); // merged: name + isBot
 
-    // thread scope also carries senderIsBot (bot→bot handoff happens in threads)
+    // thread scope also carries participants (bot→bot handoff happens in threads)
     const td = makeDs({ scope: 'thread' }) as DaemonSession;
     td.session.rootMessageId = 'om_root';
-    beginReplyTargetTurn(td, undefined, 'turn-t', NOW, { senderOpenId: 'ou_bot', senderIsBot: true });
-    expect(pickTurnReplyTarget(td.session, 'turn-t')).toMatchObject({ turnId: 'turn-t', senderIsBot: true });
+    beginReplyTargetTurn(td, undefined, 'turn-t', NOW, { senderOpenId: 'ou_bot', participants: [{ openId: 'ou_bot', isBot: true }] });
+    expect(pickTurnReplyTarget(td.session, 'turn-t')?.participants).toEqual([{ openId: 'ou_bot', isBot: true }]);
   });
 
-  it('legacy senderIsBot falls back from quoteTargetSenderIsBot only on an exact turnId match', () => {
-    const exact = {
-      quoteTargetId: 'turn-a',
-      quoteTargetSenderOpenId: 'ou_a',
-      quoteTargetSenderIsBot: true,
-    };
-    expect(pickTurnReplyTarget(exact, 'turn-a')).toMatchObject({ turnId: 'turn-a', senderOpenId: 'ou_a', senderIsBot: true });
-    // Mismatched turn → no borrow of a later turn's is-bot attribution.
-    const mismatched = {
-      quoteTargetId: 'turn-b',
-      quoteTargetSenderOpenId: 'ou_b',
-      quoteTargetSenderIsBot: true,
-    };
-    expect(pickTurnReplyTarget(mismatched, 'turn-a')).toBeUndefined();
+  it('collectTurnWindowParticipants unions sibling turns within the window (type-ahead), deduped', () => {
+    const ds = makeDs() as DaemonSession;
+    // Two messages folded into one model turn (type-ahead) land as sibling
+    // records with close timestamps; the model resolves BOTMUX_TURN_ID to the
+    // later one, but the window must surface BOTH counterparts.
+    beginReplyTargetTurn(ds, 'om_1', 'turn-1', NOW, { senderOpenId: 'ou_zhang', participants: [{ openId: 'ou_zhang', name: '张三' }] });
+    const soon = new Date(Date.parse(NOW) + 3000).toISOString();
+    beginReplyTargetTurn(ds, 'om_2', 'turn-2', soon, { senderOpenId: 'ou_li', participants: [{ openId: 'ou_li', name: '李四' }] });
+
+    const w = collectTurnWindowParticipants(ds.session, 'turn-2');
+    expect(w.map(p => p.openId).sort()).toEqual(['ou_li', 'ou_zhang']);
+  });
+
+  it('collectTurnWindowParticipants excludes records outside the time window', () => {
+    const ds = makeDs() as DaemonSession;
+    beginReplyTargetTurn(ds, 'om_old', 'turn-old', NOW, { senderOpenId: 'ou_old', participants: [{ openId: 'ou_old' }] });
+    const wayLater = new Date(Date.parse(NOW) + 10 * 60_000).toISOString(); // 10 min later
+    beginReplyTargetTurn(ds, 'om_new', 'turn-new', wayLater, { senderOpenId: 'ou_new', participants: [{ openId: 'ou_new' }] });
+
+    const w = collectTurnWindowParticipants(ds.session, 'turn-new');
+    expect(w.map(p => p.openId)).toEqual(['ou_new']); // old turn is out of window
   });
 
   it('keeps rootless chat sender A separate from topic sender/root B', () => {

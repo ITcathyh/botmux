@@ -9,6 +9,7 @@
  *   - validateMentionDecision: the @ hard-gate — every model-initiated reply
  *     must explicitly choose --mention / --mention-back / --no-mention.
  */
+import type { TurnParticipant } from '../types.js';
 
 export interface QuoteTargetArgs {
   /** session.scope === 'chat' */
@@ -177,50 +178,61 @@ export function validateMentionDecision(args: MentionDecisionArgs): MentionDecis
   };
 }
 
-export interface MentionBackParticipantArgs {
-  /** Session chat type — 'p2p' is inherently 1v1 (no fetch needed). */
+export interface MentionBackAmbiguityArgs {
+  /** Session chat type — a p2p DM is inherently 1v1, never ambiguous. */
   chatType?: 'group' | 'p2p';
-  /** Whether THIS turn's triggerer is a bot (from the per-turn reply record's
-   *  senderIsBot). A bot triggerer short-circuits to allow — see below. */
-  senderIsBot?: boolean;
-  /** Real (human) member count from getGroupStats — excludes bots. */
-  userCount: number;
-  /** Bot member count from getGroupStats. */
-  botCount: number;
+  /** Turn-window counterparts (sender + @-mentions across folded/type-ahead
+   *  messages, self bot already excluded, deduped by open_id). */
+  participants: TurnParticipant[];
+}
+
+export interface MentionBackAmbiguityResult {
+  /** True when --mention-back is ambiguous and must be replaced by an explicit
+   *  --mention (2+ distinct counterparts took part in this turn's window). */
+  ambiguous: boolean;
+  /** The distinct counterparts to offer as explicit --mention candidates
+   *  (present only when ambiguous). */
+  candidates: TurnParticipant[];
 }
 
 /**
- * Should `--mention-back` be blocked because a HUMAN triggered this turn in a
- * conversation with more than two participants?
+ * Is `--mention-back` ambiguous for THIS turn? --mention-back means "@ back the
+ * one counterpart who triggered this turn". That is unambiguous only when the
+ * turn's window had a single counterpart. Once two or more distinct people/bots
+ * took part (a human + a peer bot, two humans, the triggerer plus someone they
+ * @-ed, a type-ahead follow-up from a third party, …), "@ back the triggerer"
+ * is no longer reliably "who to address" — so we ask the model to pick an
+ * explicit `--mention <open_id>` from the candidates instead of auto-@-ing.
  *
- * The gate is ASYMMETRIC on who triggered this turn:
+ * NOT symmetric on human-vs-bot: bot→bot handoff in a 1v1 window stays
+ * unambiguous (allowed); a lone human likewise. The signal is purely "how many
+ * distinct counterparts", which the caller derives from the persisted per-turn
+ * participant window (type-ahead included). p2p short-circuits to not-ambiguous.
  *
- * - Triggerer is a BOT (bot→bot handoff) → NEVER block. "@ back the bot that
- *   triggered this turn" is deterministic and correct: the platform inbound
- *   event hands us that bot's exact open_id (turn-bound in the reply record),
- *   so --mention-back fills it without the model guessing. Blocking here is the
- *   documented footgun — it forces the model to rebuild the same open_id from
- *   context, and in a many-bot group (same display name, different per-app
- *   open_id) it easily grabs the wrong id, or falls back to @-ing the lone
- *   human. The caller short-circuits BEFORE any getGroupStats fetch.
- *
- * - Triggerer is a HUMAN in a >2-party chat → block, force explicit --mention.
- *   Here "whoever triggered this turn" is genuinely not reliably "who should be
- *   addressed" (a bystander's message can trigger the bot while the substantive
- *   reply belongs to someone else), and the model choosing among humans is the
- *   right call.
- *
- * - True 1v1 (userCount + botCount <= 2, incl. p2p DM) → allow: the triggerer
- *   is the only counterpart.
- *
- * p2p short-circuits to `false` (no API round-trip). The caller passes
- * getGroupStats' worst-case `{999,999}` soft-failure fallback for the human
- * path, which yields `true` here → fail-closed to "make an explicit decision".
+ * Fail-safe direction: when unsure the caller passes MORE participants, which
+ * can only over-suggest an explicit --mention — it never wrongly auto-@s.
  */
-export function shouldBlockMentionBackByParticipants(args: MentionBackParticipantArgs): boolean {
-  if (args.senderIsBot) return false;
-  if (args.chatType === 'p2p') return false;
-  return args.userCount + args.botCount > 2;
+export function mentionBackAmbiguity(args: MentionBackAmbiguityArgs): MentionBackAmbiguityResult {
+  if (args.chatType === 'p2p') return { ambiguous: false, candidates: [] };
+  const distinct = args.participants.filter(p => !!p.openId);
+  if (distinct.length <= 1) return { ambiguous: false, candidates: [] };
+  return { ambiguous: true, candidates: distinct };
+}
+
+/** Render the blocked-`--mention-back` error: explains the ambiguity and lists
+ *  every candidate's open_id + name + person/bot so the model can immediately
+ *  `--mention <open_id>` the right one instead of guessing. */
+export function mentionBackAmbiguityError(candidates: TurnParticipant[]): string {
+  const lines = candidates.map((p) => {
+    const kind = p.isBot ? 'bot' : '人';
+    const name = p.name ? ` ${p.name}` : '';
+    return `  • ${p.openId}（${kind}${name}）`;
+  });
+  return (
+    '--mention-back 在本轮有多个参与者时不可用："回复触发这轮的人" 在多方场景可能 @ 错对象。\n'
+    + '请改用 --mention <open_id> 显式点名下列本轮参与者之一（可重复 --mention 点多个），或 --no-mention 不 @：\n'
+    + lines.join('\n')
+  );
 }
 
 /**

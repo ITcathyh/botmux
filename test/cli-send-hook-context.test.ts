@@ -33,14 +33,17 @@ describe('cmdSend hook context wiring', () => {
     expect(cliSource).toMatch(/mentions\.push\(\{ open_id: replyTargetSenderOpenId, name: '' \}\)/);
   });
 
-  it('gates --mention-back asymmetrically: bot triggerer skips the participant fetch, human triggerer is gated', () => {
-    // A bot-triggered turn resolves is-bot from the per-turn record and
-    // short-circuits before getGroupStats; only a human triggerer in a
-    // multi-party chat hits the count gate.
-    expect(cliSource).toContain('const replyTargetSenderIsBot = explicitVcMeetingImOrigin');
-    expect(cliSource).toContain('turnReplyTarget?.senderIsBot');
-    expect(cliSource).toMatch(/if \(mentionBack && !replyTargetSenderIsBot &&[\s\S]{0,200}getGroupStats/);
-    expect(cliSource).toMatch(/shouldBlockMentionBackByParticipants\(\{[\s\S]{0,120}senderIsBot: replyTargetSenderIsBot/);
+  it('gates --mention-back by turn-window participant ambiguity (no group-stats round-trip)', () => {
+    // 2+ distinct counterparts in the turn window → block --mention-back and
+    // hand the model explicit --mention candidates. Reads the persisted
+    // participant window; no getGroupStats fetch. Explicit VC turns skip it.
+    expect(cliSource).toContain('collectTurnWindowParticipants(s, currentTurnId)');
+    expect(cliSource).toContain('mentionBackAmbiguity({ chatType: s.chatType, participants: windowParticipants })');
+    expect(cliSource).toMatch(/if \(mentionBack && !explicitVcMeetingImOrigin && !sendTopLevel\)/);
+    expect(cliSource).toContain('console.error(mentionBackAmbiguityError(ambiguity.candidates))');
+    // The old asymmetric/group-stats gate is fully gone.
+    expect(cliSource).not.toContain('shouldBlockMentionBackByParticipants');
+    expect(cliSource).not.toMatch(/mentionBack[\s\S]{0,300}getGroupStats/);
   });
 
   it('freezes VC listener replay content and indexes only the successful primary output', () => {

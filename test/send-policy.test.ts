@@ -2,7 +2,8 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   resolveQuoteTarget,
   validateMentionDecision,
-  shouldBlockMentionBackByParticipants,
+  mentionBackAmbiguity,
+  mentionBackAmbiguityError,
   parseAttentionFlag,
   attentionUsageError,
   managedVcQuoteError,
@@ -249,41 +250,50 @@ describe('validateMentionDecision', () => {
   });
 });
 
-describe('shouldBlockMentionBackByParticipants (asymmetric on triggerer)', () => {
-  it('bot triggerer NEVER blocks, regardless of participant counts (bot→bot handoff is deterministic)', () => {
-    // Even a large multi-party group: a bot triggerer resolves to a known
-    // open_id, so --mention-back @-back is exact. Caller also short-circuits
-    // the getGroupStats fetch on this branch.
-    expect(shouldBlockMentionBackByParticipants({ senderIsBot: true, chatType: 'group', userCount: 5, botCount: 5 })).toBe(false);
-    expect(shouldBlockMentionBackByParticipants({ senderIsBot: true, userCount: 999, botCount: 999 })).toBe(false);
+describe('mentionBackAmbiguity (turn-window participant count)', () => {
+  it('zero or one counterpart → unambiguous, allow --mention-back', () => {
+    expect(mentionBackAmbiguity({ chatType: 'group', participants: [] })).toEqual({ ambiguous: false, candidates: [] });
+    expect(mentionBackAmbiguity({ chatType: 'group', participants: [{ openId: 'ou_a' }] })).toEqual({ ambiguous: false, candidates: [] });
   });
 
-  it('p2p DM never blocks (inherently 1v1), regardless of reported counts', () => {
-    expect(shouldBlockMentionBackByParticipants({ chatType: 'p2p', userCount: 999, botCount: 999 })).toBe(false);
+  it('a bot-only 1v1 window stays unambiguous (bot→bot handoff @-back is exact)', () => {
+    // The reported footgun path: 1 human + N idle bots, a bot triggers — the
+    // turn window has just that one bot, so --mention-back is allowed and @s it.
+    expect(mentionBackAmbiguity({ chatType: 'group', participants: [{ openId: 'ou_bot_a', isBot: true }] }).ambiguous).toBe(false);
   });
 
-  it('human triggerer, 1 human + 1 bot (true 1v1 group, sum = 2) → allow', () => {
-    expect(shouldBlockMentionBackByParticipants({ senderIsBot: false, chatType: 'group', userCount: 1, botCount: 1 })).toBe(false);
+  it('2+ distinct counterparts → ambiguous, list them as --mention candidates', () => {
+    const r = mentionBackAmbiguity({
+      chatType: 'group',
+      participants: [{ openId: 'ou_human', name: '张三' }, { openId: 'ou_bot', name: 'Codex', isBot: true }],
+    });
+    expect(r.ambiguous).toBe(true);
+    expect(r.candidates.map(c => c.openId)).toEqual(['ou_human', 'ou_bot']);
   });
 
-  it('human triggerer, 2 humans + 1 bot (sum = 3 > 2) → block, force explicit --mention', () => {
-    expect(shouldBlockMentionBackByParticipants({ senderIsBot: false, chatType: 'group', userCount: 2, botCount: 1 })).toBe(true);
+  it('two humans (triggerer @-ed someone) → ambiguous', () => {
+    expect(mentionBackAmbiguity({ chatType: 'group', participants: [{ openId: 'ou_a' }, { openId: 'ou_b' }] }).ambiguous).toBe(true);
   });
 
-  it('human triggerer, 1 human + 2 bots (the reported footgun: lone human + multi-bot) → block', () => {
-    // This is exactly the user-reported mis-@: with the gate blocking, a human
-    // triggerer in 1-human+multi-bot must pick explicitly (a bot triggerer here
-    // would instead have short-circuited to allow above).
-    expect(shouldBlockMentionBackByParticipants({ senderIsBot: false, chatType: 'group', userCount: 1, botCount: 2 })).toBe(true);
+  it('p2p DM is never ambiguous regardless of participants', () => {
+    expect(mentionBackAmbiguity({ chatType: 'p2p', participants: [{ openId: 'ou_a' }, { openId: 'ou_b' }] })).toEqual({ ambiguous: false, candidates: [] });
   });
 
-  it('getGroupStats soft-failure fallback {999,999} on the human path fails closed to blocked', () => {
-    expect(shouldBlockMentionBackByParticipants({ senderIsBot: false, chatType: 'group', userCount: 999, botCount: 999 })).toBe(true);
+  it('ignores participant entries without an open_id', () => {
+    expect(mentionBackAmbiguity({ chatType: 'group', participants: [{ openId: 'ou_a' }, { openId: '' }] }).ambiguous).toBe(false);
   });
+});
 
-  it('undefined senderIsBot is treated as human (conservative): sum > 2 blocks', () => {
-    expect(shouldBlockMentionBackByParticipants({ userCount: 3, botCount: 0 })).toBe(true);
-    expect(shouldBlockMentionBackByParticipants({ userCount: 1, botCount: 1 })).toBe(false);
+describe('mentionBackAmbiguityError', () => {
+  it('lists each candidate open_id with person/bot label and name', () => {
+    const msg = mentionBackAmbiguityError([
+      { openId: 'ou_human', name: '张三' },
+      { openId: 'ou_bot', name: 'Codex', isBot: true },
+    ]);
+    expect(msg).toContain('--mention <open_id>');
+    expect(msg).toContain('ou_human（人 张三）');
+    expect(msg).toContain('ou_bot（bot Codex）');
+    expect(msg).toContain('--no-mention');
   });
 });
 

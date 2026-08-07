@@ -93,7 +93,7 @@ import { withFileLock, withFileLockSync } from './utils/file-lock.js';
 import { delay } from './utils/timing.js';
 import { BoundedMap } from './utils/bounded-map.js';
 import { checkAllowedChatGroupsConfig } from './services/allowed-chat-groups.js';
-import type { Session, VcMeetingImTurnOrigin } from './types.js';
+import type { Session, VcMeetingImTurnOrigin, TurnParticipant, LarkMention } from './types.js';
 import { ensureCjkFontsInstalled } from './utils/font-installer.js';
 import { scrubTmuxServerGlobalEnv } from './setup/ensure-tmux.js';
 import { entryNeedsContactResolve } from './setup/bot-config-editor.js';
@@ -15383,6 +15383,33 @@ function fastToggleUnsupportedBackend(ds: DaemonSession | undefined): boolean {
   return ds.initConfig?.codexRpcInput === true;
 }
 
+/** Build the turn-window counterparts contributed by ONE inbound message: its
+ *  sender plus everyone it @-mentioned, excluding the answering bot itself,
+ *  each labelled person/bot (mentions use isKnownPeerBot as the is-bot signal,
+ *  defaulting to person). `botmux send` unions these across every message folded
+ *  into a turn to decide whether --mention-back is unambiguous. */
+function buildTurnParticipants(
+  larkAppId: string,
+  senderOpenId: string | undefined,
+  senderIsBot: boolean | undefined,
+  mentions: LarkMention[] | undefined,
+): TurnParticipant[] {
+  const selfOpenId = getBot(larkAppId).botOpenId;
+  const out: TurnParticipant[] = [];
+  if (senderOpenId && senderOpenId !== selfOpenId) {
+    out.push({ openId: senderOpenId, ...(senderIsBot !== undefined ? { isBot: senderIsBot } : {}) });
+  }
+  for (const m of mentions ?? []) {
+    if (!m.openId || m.openId === selfOpenId) continue;
+    out.push({
+      openId: m.openId,
+      ...(m.name ? { name: m.name } : {}),
+      isBot: isKnownPeerBot(config.session.dataDir, larkAppId, m.openId),
+    });
+  }
+  return out;
+}
+
 /** Preserve the established mid-session passthrough semantics when a cold-start
  * scratch loses its registration race to a concurrently-created real session. */
 function deliverPassthroughToExistingSession(
@@ -15413,7 +15440,8 @@ function deliverPassthroughToExistingSession(
       quoteOnly: substituteReplyMode === 'quote',
       substitute: turn.substitute,
       senderOpenId: turn.senderOpenId,
-      senderIsBot: turn.senderIsBot,
+      // Passthrough is a raw CLI command (no @-mentions) — window is the sender only.
+      participants: buildTurnParticipants(larkAppId, turn.senderOpenId, turn.senderIsBot, undefined),
     });
     if (turn.senderOpenId && ds.session.lastCallerOpenId !== turn.senderOpenId) {
       ds.session.lastCallerOpenId = turn.senderOpenId;
@@ -15556,7 +15584,7 @@ async function startInitialPassthroughSession(args: {
     ds.session.workingDir = pinnedWorkingDir;
     sessionStore.updateSession(ds.session);
   }
-  beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { senderOpenId, senderIsBot: resolvedSenderIsBot });
+  beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { senderOpenId, participants: buildTurnParticipants(larkAppId, senderOpenId, resolvedSenderIsBot, undefined) });
   sessionStore.updateSession(ds.session);
   const creationKey = sessionKey(anchor, larkAppId);
   if (!setActiveSessionIfActive(activeSessions, creationKey, ds)) {
@@ -16152,7 +16180,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const substituteReplyMode = substituteTrigger
     ? (botCfg.substituteMode?.replyMode ?? 'thread')
     : 'thread';
-  beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId, senderIsBot: isForeignBotSender || parsed.senderType === 'app' || parsed.senderType === 'bot' });
+  beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId, participants: buildTurnParticipants(larkAppId, senderOpenId, isForeignBotSender || parsed.senderType === 'app' || parsed.senderType === 'bot', parsed.mentions) });
   sessionStore.updateSession(ds.session);
   const creationKey = sessionKey(anchor, larkAppId);
   if (!setActiveSessionIfActive(activeSessions, creationKey, ds)) {
@@ -17259,7 +17287,7 @@ async function handleThreadReply(
     const substituteReplyMode = substituteTrigger
       ? (getBot(larkAppId).config.substituteMode?.replyMode ?? 'thread')
       : 'thread';
-    beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: callerOpenId, senderIsBot: isForeignBot });
+    beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: callerOpenId, participants: buildTurnParticipants(larkAppId, callerOpenId, isForeignBot, parsed.mentions) });
     if (callerOpenId && ds.session.lastCallerOpenId !== callerOpenId) {
       ds.session.lastCallerOpenId = callerOpenId;
     }
@@ -17484,7 +17512,7 @@ async function handleThreadReply(
     const substituteReplyMode = substituteTrigger
       ? (botCfg.substituteMode?.replyMode ?? 'thread')
       : 'thread';
-    beginReplyTargetTurn(newDs, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: senderOId, senderIsBot: isForeignBot });
+    beginReplyTargetTurn(newDs, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: senderOId, participants: buildTurnParticipants(larkAppId, senderOId, isForeignBot, parsed.mentions) });
     sessionStore.updateSession(newDs.session);
     const creationKey = sessionKey(anchor, larkAppId);
     if (!setActiveSessionIfActive(activeSessions, creationKey, newDs)) {

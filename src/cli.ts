@@ -35,7 +35,7 @@ import { resolveSessionContext } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, appendDispatchReportProtocol, appendLegacyDispatchReportProtocol, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, findDispatchRegistryEntry, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportPlacement, resolveReportRecipient, resolveReportTarget, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
-import { pickTurnReplyTarget } from './core/reply-target.js';
+import { pickTurnReplyTarget, collectTurnWindowParticipants } from './core/reply-target.js';
 import { recordDispatchRegistryEntry } from './core/dispatch-registry.js';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
@@ -6398,7 +6398,8 @@ import { getSessionUsageSnapshot } from './core/cost-calculator.js';
 import {
   resolveQuoteTarget,
   validateMentionDecision,
-  shouldBlockMentionBackByParticipants,
+  mentionBackAmbiguity,
+  mentionBackAmbiguityError,
   parseAttentionFlag,
   attentionUsageError,
   managedVcQuoteError,
@@ -7455,34 +7456,20 @@ async function cmdSend(rest: string[]): Promise<void> {
   try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
   if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
 
-  // Asymmetric participant gate for --mention-back. A BOT-triggered turn always
-  // passes: "@ back the bot that triggered this turn" is deterministic — the
-  // platform hands us that bot's exact open_id, turn-bound in the reply record,
-  // so we short-circuit before any getGroupStats fetch (bot→bot handoff must not
-  // be forced onto a guess-the-open_id path). A HUMAN-triggered turn in a
-  // >2-party group is blocked → force an explicit --mention, because "who
-  // triggered" is not reliably "who to address" among multiple people. 1v1 /
-  // p2p pass. Symmetric with the inbound un-@ gate (event-dispatcher).
-  const replyTargetSenderIsBot = explicitVcMeetingImOrigin
-    ? undefined
-    : turnReplyTarget?.senderIsBot;
-  if (mentionBack && !replyTargetSenderIsBot && s.chatType !== 'p2p' && s.larkAppId && s.chatId && !sendTopLevel) {
-    try {
-      const { getGroupStats } = await import('./im/lark/event-dispatcher.js');
-      const { userCount, botCount } = await getGroupStats(s.larkAppId, s.chatId);
-      if (shouldBlockMentionBackByParticipants({ chatType: s.chatType, senderIsBot: replyTargetSenderIsBot, userCount, botCount })) {
-        console.error(
-          `--mention-back 在多人会话（当前 ${userCount} 人 + ${botCount} bot）里、且本轮由人触发时不可用：`
-          + '"回复触发这轮的人" 在多方场景可能 @ 错对象。请改用 --mention <ou:Name> 显式点名，'
-          + '或 --no-mention 不 @。（bot→bot 接力不受此限，会自动 @ 回触发的 bot。）',
-        );
-        process.exit(2);
-      }
-    } catch (err: any) {
-      // getGroupStats already soft-fails to {999,999} (→ block) internally, so
-      // reaching here means the dynamic import itself failed. Fail-closed to a
-      // clear error rather than silently letting a possibly-wrong @ through.
-      console.error(`无法确认会话人数以校验 --mention-back：${err?.message ?? err}。请改用 --mention <ou:Name> 或 --no-mention。`);
+  // Ambiguity gate for --mention-back. --mention-back means "@ back the one
+  // counterpart who triggered this turn"; that is only unambiguous when this
+  // turn's window had a single counterpart. Once 2+ distinct people/bots took
+  // part (a human + a peer bot, two humans, the triggerer plus someone they
+  // @-ed, a type-ahead follow-up from a third party, …), block --mention-back
+  // and hand the model the exact candidates so it can --mention <open_id> the
+  // right one instead of guessing (or mis-@-ing the lone human). Reads the
+  // persisted per-turn participant window — no group-stats round-trip. Explicit
+  // VC turns carry their own single-target origin, so they skip this gate.
+  if (mentionBack && !explicitVcMeetingImOrigin && !sendTopLevel) {
+    const windowParticipants = collectTurnWindowParticipants(s, currentTurnId);
+    const ambiguity = mentionBackAmbiguity({ chatType: s.chatType, participants: windowParticipants });
+    if (ambiguity.ambiguous) {
+      console.error(mentionBackAmbiguityError(ambiguity.candidates));
       process.exit(2);
     }
   }

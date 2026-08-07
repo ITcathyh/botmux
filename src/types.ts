@@ -115,21 +115,36 @@ export type ScreenStatus = 'working' | 'idle' | 'analyzing' | 'limited';
 /** Status shown on a streaming card — adds the pre-spawn 'starting' phase. */
 export type StreamStatus = ScreenStatus | 'starting';
 
+/** One human/bot who took part in a turn's window — the union of every folded
+ *  message's sender and @-mentions (type-ahead follow-ups included), excluding
+ *  the answering bot itself. Drives `botmux send --mention-back`'s ambiguity
+ *  gate: 2+ distinct counterparts → block --mention-back and list these as
+ *  explicit --mention candidates. `isBot` labels each candidate person/bot. */
+export interface TurnParticipant {
+  openId: string;
+  name?: string;
+  isBot?: boolean;
+}
+
 /** Reply context bound to one exact inbound turn. `rootMessageId` is absent
  * for thread-scope and rootless chat turns, which still need an immutable
- * sender for `--mention-back`. `senderOpenId`/`senderIsBot` are per-turn sender
- * attribution (written in any scope); `rootMessageId`/`quoteOnly`/`substitute`
- * are chat-scope-only routing metadata. */
+ * sender for `--mention-back`. `senderOpenId` is per-turn sender attribution
+ * (written in any scope); `participants` is the turn-window counterpart set
+ * (sender + mentions across folded/type-ahead messages) for the --mention-back
+ * ambiguity gate; `rootMessageId`/`quoteOnly`/`substitute` are chat-scope-only
+ * routing metadata. */
 export interface ReplyTargetEntry {
   rootMessageId?: string;
   updatedAt: string;
   quoteOnly?: boolean;
   substitute?: boolean;
   senderOpenId?: string;
-  /** Whether this turn's sender is a bot — drives the asymmetric --mention-back
-   *  gate (bot→bot handoff is a deterministic @-back; a human triggerer in a
-   *  multi-party chat must instead pick an explicit --mention). */
-  senderIsBot?: boolean;
+  /** Turn-window counterparts (sender + @-mentions, self bot excluded, deduped
+   *  by open_id) accumulated across every message folded into this turn,
+   *  type-ahead follow-ups included. `botmux send` reads it to decide whether
+   *  --mention-back is unambiguous (≤1 counterpart → allow) or must be replaced
+   *  by an explicit --mention (≥2 → block + offer these as candidates). */
+  participants?: TurnParticipant[];
 }
 
 export interface Session {
