@@ -15,8 +15,9 @@
  * same here — matching what the terminal actually paints, not the grapheme count.
  *
  * Flat sorted [start,end,start,end,...] inclusive ranges; everything not listed
- * is width 1. Do not hand-edit — regenerate from the addon if xterm bumps its
- * Unicode tables.
+ * is width 1. DO NOT hand-edit — regenerate with
+ * `node scripts/generate-terminal-width.mjs` when xterm bumps its Unicode
+ * tables (test/terminal-width-generated.test.ts guards against drift).
  */
 
 const WIDE_RANGES: readonly number[] = [
