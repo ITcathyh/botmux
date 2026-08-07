@@ -81,7 +81,7 @@ import { migrateOverloadAlertAtStartup } from './services/overload-alert-migrati
 import * as messageQueue from './services/message-queue.js';
 import { emitHookEvent, emitHookEventLocal, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
-import { createImgNumberer, parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
+import { createImgNumberer, extractPostAtParticipants, parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
 import { expandMergeForward } from './im/lark/merge-forward.js';
 import { bindResourcesToMessage, composeForwardFollowupContent, mergeMessageMentions } from './im/lark/forward-followup-content.js';
 import { buildQuoteHint } from './im/lark/quote-hint.js';
@@ -15408,11 +15408,18 @@ function buildTurnParticipants(
   senderIsBot: boolean | undefined,
   mentions: LarkMention[] | undefined,
   senderName?: string,
+  /** Raw inbound message(s) folded into this turn, so post rich-text inline
+   *  `at` @s (which live outside `message.mentions[]`) also count toward the
+   *  window. Pass the current message and, when a forward seed folds into the
+   *  same turn, the seed message too. Concatenated (NOT key/name-merged) with
+   *  `mentions`; the core dedupes by open_id, so duplicates are harmless. */
+  ...postMessages: Array<{ content?: string } | null | undefined>
 ): { participants: TurnParticipant[]; incomplete: boolean } {
   const selfBot = getBot(larkAppId);
+  const postAt = postMessages.flatMap(m => extractPostAtParticipants(m));
   return buildTurnParticipantsFrom(
     { openId: senderOpenId, isBot: senderIsBot, name: senderName },
-    mentions,
+    [...(mentions ?? []), ...postAt],
     selfBot.botOpenId,
     (openId) => isKnownPeerBot(config.session.dataDir, larkAppId, openId),
     selfBot.config.larkAppId,
@@ -16196,7 +16203,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const substituteReplyMode = substituteTrigger
     ? (botCfg.substituteMode?.replyMode ?? 'thread')
     : 'thread';
-  const newTopicWindow = buildTurnParticipants(larkAppId, senderOpenId, senderIsBotTriState(parsed.senderType, isForeignBotSender), parsed.mentions, newTopicSender?.name);
+  const newTopicWindow = buildTurnParticipants(larkAppId, senderOpenId, senderIsBotTriState(parsed.senderType, isForeignBotSender), parsed.mentions, newTopicSender?.name, data?.message, ctx.forwardSeedData?.message);
   beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId, participants: newTopicWindow.participants, participantsIncomplete: newTopicWindow.incomplete });
   sessionStore.updateSession(ds.session);
   const creationKey = sessionKey(anchor, larkAppId);
@@ -17308,7 +17315,7 @@ async function handleThreadReply(
     // hot path avoids an await before the buffering barrier), so the candidate
     // list may show open_id without a name — the ambiguity decision itself is
     // unaffected.
-    const existingWindow = buildTurnParticipants(larkAppId, callerOpenId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions);
+    const existingWindow = buildTurnParticipants(larkAppId, callerOpenId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, undefined, data?.message);
     beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: callerOpenId, participants: existingWindow.participants, participantsIncomplete: existingWindow.incomplete });
     if (callerOpenId && ds.session.lastCallerOpenId !== callerOpenId) {
       ds.session.lastCallerOpenId = callerOpenId;
@@ -17534,7 +17541,7 @@ async function handleThreadReply(
     const substituteReplyMode = substituteTrigger
       ? (botCfg.substituteMode?.replyMode ?? 'thread')
       : 'thread';
-    const autoCreateWindow = buildTurnParticipants(larkAppId, senderOId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, autoCreateSender?.name);
+    const autoCreateWindow = buildTurnParticipants(larkAppId, senderOId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, autoCreateSender?.name, data?.message);
     beginReplyTargetTurn(newDs, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: senderOId, participants: autoCreateWindow.participants, participantsIncomplete: autoCreateWindow.incomplete });
     sessionStore.updateSession(newDs.session);
     const creationKey = sessionKey(anchor, larkAppId);

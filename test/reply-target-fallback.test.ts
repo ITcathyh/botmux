@@ -442,6 +442,25 @@ describe('buildTurnParticipantsFrom (pure per-message contribution)', () => {
     expect(r.participants).toEqual([]);
     expect(r.incomplete).toBe(true);
   });
+
+  it('structured @all ({open_id:"all"}) is NOT an executable candidate → incomplete', () => {
+    // `all` reaches the parser as a structured mention with open_id "all"; it must
+    // never be listed (would suggest an illegal `--mention all`) and must fail safe.
+    const r = buildTurnParticipantsFrom(
+      { openId: 'ou_human', isBot: false },
+      [{ key: '@_1', name: '所有人', openId: 'all' }],
+      'ou_self',
+      noPeer,
+    );
+    expect(r.participants.map(p => p.openId)).toEqual(['ou_human']); // 'all' not a candidate
+    expect(r.incomplete).toBe(true);
+  });
+
+  it('a non-ou_ pseudo sender open_id is treated as unaccountable → incomplete, not a candidate', () => {
+    const r = buildTurnParticipantsFrom({ openId: 'all' }, undefined, 'ou_self', noPeer);
+    expect(r.participants).toEqual([]);
+    expect(r.incomplete).toBe(true);
+  });
 });
 
 describe('collectTurnWindowParticipants — legacy pre-participants anchor', () => {

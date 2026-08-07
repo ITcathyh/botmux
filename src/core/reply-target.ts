@@ -40,7 +40,13 @@ export function buildTurnParticipantsFrom(
 ): { participants: TurnParticipant[]; incomplete: boolean } {
   const out: TurnParticipant[] = [];
   let incomplete = false;
-  if (sender.openId) {
+  // A candidate open_id must be a real receiver-scoped user/bot id (`ou_`).
+  // Pseudo-ids like `all` (structured `{open_id:'all'}` OR post inline
+  // `user_id:'all'`) and any non-`ou_` shape are NOT executable `--mention`
+  // targets — never list them; mark the window incomplete instead. One check
+  // here covers BOTH the text (structured mentions) and post-at lanes.
+  const isExecutableOpenId = (id: string | undefined): id is string => !!id && id.startsWith('ou_');
+  if (isExecutableOpenId(sender.openId)) {
     if (sender.openId !== selfOpenId) {
       out.push({
         openId: sender.openId,
@@ -49,20 +55,20 @@ export function buildTurnParticipantsFrom(
       });
     }
   } else {
-    // A real inbound message with no resolvable sender open_id (e.g. an app_id-
-    // only bot sender routed via realtime/message-listener). The sender is never
-    // the answering bot, so this is an unaccountable counterpart → incomplete.
+    // A real inbound message whose sender has no executable open_id (e.g. an
+    // app_id-only bot sender routed via realtime/message-listener). The sender
+    // is never the answering bot, so it is an unaccountable counterpart.
     incomplete = true;
   }
   for (const m of mentions ?? []) {
     // The answering bot itself — matched by open_id OR app_id (a self @ frequently
     // arrives as an app_id-form mention with no open_id).
     if (m.openId && m.openId === selfOpenId) continue;
-    if (!m.openId && selfAppId && m.appId === selfAppId) continue;
-    if (!m.openId) {
-      // A NON-self @ in app_id / user_id / union_id form (parser leaves openId
-      // undefined): a real counterpart we can't reduce to a --mention <open_id>
-      // candidate. Don't fake an id into the candidate list; mark the window
+    if (selfAppId && m.appId === selfAppId) continue;
+    if (!isExecutableOpenId(m.openId)) {
+      // A NON-self @ we can't reduce to a `--mention <open_id>` candidate: an
+      // app_id / user_id / union_id-form @ (openId undefined), `all`, or any
+      // other pseudo-id. Don't fake it into the candidate list; mark the window
       // incomplete so the gate fails toward an explicit decision.
       incomplete = true;
       continue;
