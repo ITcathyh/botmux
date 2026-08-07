@@ -63,14 +63,18 @@ function makeTerminal(cols: number, modern = false): InstanceType<typeof Termina
     terminal.unicode.register({
       version: 'modern-test',
       wcwidth(cp: number): number {
+        if (cp === 0xfe0f) return 2; // VS16: emoji-presentation selector, painted wide
         const w = base.wcwidth(cp);
         return w === 1 && rendersTwoWide(cp) ? 2 : w;
       },
       charProperties(cp: number, preceding: number): number {
         const raw = base.charProperties(cp, preceding);
-        // Force the width bits to 2 for modern emoji so the parser lays them out
-        // two cells wide (width lives in bits 1-2: clear with ~6, set 2 with |4).
-        return rendersTwoWide(cp) ? (raw & ~6) | 4 : raw;
+        // Force the width bits to 2 (clear with ~6, set 2 with |4) so the parser
+        // lays these two cells wide. VS16 is included: it promotes the preceding
+        // glyph to emoji presentation, and forcing its width to 2 makes the joined
+        // grapheme (e.g. ❤+VS16 = ❤️) occupy two buffer cells, as a grapheme-aware
+        // terminal renders it.
+        return rendersTwoWide(cp) || cp === 0xfe0f ? (raw & ~6) | 4 : raw;
       },
     });
     terminal.unicode.activeVersion = 'modern-test';
@@ -276,6 +280,25 @@ describe('session picker real terminal responsiveness', () => {
       99,
       false,
       i => Array.from({ length: 24 }, (_, k) => trigrams[(i + k) % trigrams.length]).join(''),
+      true,
+    );
+    const screen = inspectScreen(picker.terminal);
+    expect(screen.lines[0]).toContain('botmux sessions  (1/48)');
+    expect(screen.lines.some(line => line.includes('❯'))).toBe(true);
+    expect(screen.wrappedRows).toEqual([]);
+    await closePicker(picker.child, picker.terminal);
+  });
+
+  it('does not wrap on emoji formed by a base char + VS16 (emoji variation selector)', async () => {
+    // ❤️ is ❤ (U+2764, default-text width 1) + VS16 (U+FE0F). A grapheme-aware
+    // terminal paints the joined grapheme two cells wide. Per-code-point summing
+    // that treats VS16 as zero-width under-counts (1+0=1) → an all-❤️ title
+    // overflows the row, wraps, and pushes the title off screen. The width table
+    // budgets 1 for VS16 so base(1)+VS16(1)=2, matching the terminal.
+    const picker = await spawnPicker(
+      99,
+      false,
+      i => Array.from({ length: 20 }, () => '❤️').join('') + ` ${i + 1}`,
       true,
     );
     const screen = inspectScreen(picker.terminal);

@@ -70,12 +70,25 @@ describe('terminal-width generated table', () => {
     }
   });
 
-  it('keeps combining marks / ZWJ / variation selectors zero width (per-code-point sum)', () => {
+  it('keeps combining marks / ZWJ / text variation selector zero width (per-code-point sum)', () => {
     expect(codePointCellWidth(0x200d)).toBe(0); // ZWJ
-    expect(codePointCellWidth(0xfe0f)).toBe(0); // VS16
     expect(codePointCellWidth(0x0301)).toBe(0); // combining acute
+    expect(codePointCellWidth(0xfe0e)).toBe(0); // VS15 (text presentation, stays narrow)
     // No grapheme clustering: a ZWJ family emoji sums its parts (2+0+2+0+2 = 6),
     // which over-counts vs a single glyph — safe for the no-wrap invariant.
     expect(terminalCellWidth('👨‍👩‍👧')).toBe(6);
+  });
+
+  it('budgets one cell for VS16 so emoji + variation selector is never under-counted', () => {
+    // VS16 (U+FE0F) itself is zero-width, but it promotes a preceding default-text
+    // glyph to emoji presentation — a grapheme-aware terminal paints ❤+VS16 (❤️) two
+    // cells wide. The per-code-point model can't look back, so VS16 carries a 1-cell
+    // budget: text-base(1) + VS16(1) = 2, matching what the terminal draws.
+    expect(codePointCellWidth(0xfe0f)).toBe(1);
+    for (const e of ['❤️', '☂️', '⚠️', '✍️', '✌️']) {
+      expect(terminalCellWidth(e)).toBe(2);
+    }
+    // An already-wide emoji + VS16 over-counts (2+1=3) — harmless upper bound.
+    expect(terminalCellWidth('🤖️')).toBe(3);
   });
 });

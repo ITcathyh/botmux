@@ -11,9 +11,10 @@
 //       emoji-data.txt)——覆盖 Unicode 14/15/16/17 新增 emoji(🫠🩷🛘🪊…),这些在
 //       xterm-11 表里还是 1,但现代本地/SSH 终端按 2 画,只锁旧 oracle 会欠计。用固定集
 //       (而非运行时 \p{Emoji_Presentation})保证生成结果不随 Node 的 ICU 版本漂移,也不落后标准。
-// 宽度=0 沿用 xterm-11 的零宽集(控制符、组合记号、ZWJ、VS 选择符…);这些即使个别
-// 终端画成别的宽度,过计方向也安全。逐码点求和、不做 grapheme 聚合(与 xterm 一致:
-// ZWJ 家庭 = 2+0+2+0+2 = 6;过计对不折行无害)。
+// 宽度=0 沿用 xterm-11 的零宽集(控制符、组合记号、ZWJ、VS15 等);这些即使个别
+// 终端画成别的宽度,过计方向也安全。**例外**:VS16(U+FE0F)记 1 格(见下 widthOf),
+// 因为它把前字符提升为 emoji 呈现、grapheme-aware 终端据此画 2 格。逐码点求和、不做
+// grapheme 聚合(与 xterm 一致:ZWJ 家庭 = 2+0+2+0+2 = 6;过计对不折行无害)。
 //
 // 注意:Tab/ESC/C0/C1 等会移动光标的控制符不在宽度表职责内——它们在渲染前由
 // cli.ts 的 sanitize 统一清理(不能靠"宽度"表达一个跳到 tab stop 的动作)。
@@ -70,9 +71,14 @@ function extractRanges() {
   if (!svc || typeof svc.wcwidth !== 'function') {
     throw new Error('无法从 @xterm/headless 取到 unicodeService.wcwidth;xterm 内部结构可能已变，需更新本脚本');
   }
-  // 每个码点归一到 0/1/2:先看 xterm-11(权威零宽优先,组合记号/ZWJ 恒 0),
-  // 再对 width-1 的码点用固定 U17 数据提为 2(现代 emoji 或 East_Asian_Width=W/F)。
+  // 每个码点归一到 0/1/2。
+  // 特例:VS16(U+FE0F,emoji 变体选择符)本身零宽,但它会把前一个默认文本呈现的
+  // 字符「提升为 emoji 呈现」——grapheme-aware 终端据此把 ❤+FE0F(❤️)画成 2 格。
+  // 逐码点模型无法看前一个字符,故给 FE0F 记 1 格预算:默认文本 base(1)+FE0F(1)=2(正确);
+  // 本已宽 2 的 emoji + FE0F 会过计成 3(安全侧,保守上界只多截不折行)。VS15(U+FE0E,
+  // 强制文本/窄呈现)仍归 0。
   const widthOf = cp => {
+    if (cp === 0xFE0F) return 1;
     const w = svc.wcwidth(cp);
     if (w === 0 || w === 2) return w;
     // w === 1(含 xterm 对未知/负值的兜底):现代 emoji 或 U17 EAW 宽字符提为 2。
@@ -129,6 +135,12 @@ function render({ wide, zero }) {
  *   bundles, and does not lag the current Unicode standard.
  * Width 0 = xterm-11 zero-width set (controls, combining marks, ZWJ, variation
  * selectors) — checked first, so a combining mark that is also EAW-wide stays 0.
+ * EXCEPTION: the emoji variation selector VS16 (U+FE0F) is given width 1, not 0.
+ * VS16 promotes a preceding default-text glyph to emoji presentation, which a
+ * grapheme-aware terminal paints two wide (❤ + VS16 = ❤️ = 2). The per-code-point
+ * model can't look back, so budgeting 1 for VS16 makes text-base(1)+VS16(1) = 2
+ * (correct); an already-wide emoji + VS16 over-counts to 3 (safe upper bound).
+ * The text variation selector VS15 (U+FE0E, forces narrow) stays 0.
  * Per-code-point sum, NO grapheme clustering (a ZWJ family emoji is
  * 2+0+2+0+2 = 6) — over-counting there is harmless for the no-wrap invariant.
  *
