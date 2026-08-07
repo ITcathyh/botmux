@@ -953,15 +953,22 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
           )}
               </div>
               <footer className="connector-modal-actions">
-                <button type="button" disabled={creating} onClick={closeCreateModal}>
-                  {tr('connectors.cancel')}
-                </button>
                 {created ? (
+                  // The one-time credential panel commits server-side before it
+                  // shows. A "cancel" here would not roll anything back — it would
+                  // only dismiss the shown-once token and lose it. Offer just
+                  // "close" so the credential can't be discarded by a misleading
+                  // button. This footer is shared by create + edit success paths.
                   <button type="button" className="primary" onClick={closeCreateModal}>{tr('connectors.close')}</button>
                 ) : (
-                  <button id="cn-create" type="button" className="primary" disabled={creating} onClick={() => void submitConnector()}>
-                    {tr(editingConnector ? 'connectors.btnSave' : 'connectors.btnCreate')}
-                  </button>
+                  <>
+                    <button type="button" disabled={creating} onClick={closeCreateModal}>
+                      {tr('connectors.cancel')}
+                    </button>
+                    <button id="cn-create" type="button" className="primary" disabled={creating} onClick={() => void submitConnector()}>
+                      {tr(editingConnector ? 'connectors.btnSave' : 'connectors.btnCreate')}
+                    </button>
+                  </>
                 )}
               </footer>
             </article>
