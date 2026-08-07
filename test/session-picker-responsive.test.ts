@@ -31,13 +31,40 @@ afterEach(() => {
 // (src/worker.ts loads Unicode11Addon + activeVersion='11'). A bare xterm scores
 // emoji as one cell and would NOT reproduce emoji wrapping — this addon makes the
 // headless terminal count 🤖/🎉/你 as two cells, exactly as a real terminal paints.
-// (Unicode 14+ emoji width is asserted at the unit level in
-// test/terminal-width-generated.test.ts — headless xterm's parser does not lay
-// those out two-wide, so a PTY test cannot observe them faithfully.)
-function makeTerminal(cols: number): InstanceType<typeof Terminal> {
+//
+// `modern: true` also registers a provider that widens every
+// \p{Emoji_Presentation} code point to two cells, modelling a current local/SSH
+// terminal (Unicode 14/15/16) where 🫠/🩷/🫨 render two wide — code points that
+// xterm-11 still scores as one. The parser lays cells out from charProperties'
+// width BITS (not wcwidth), so we patch those directly: `(raw & ~6) | 4` forces
+// width 2. That makes such emoji genuinely occupy two buffer cells, so the PTY
+// test can observe wrapping if the picker under-counts them.
+const EMOJI_PRESENTATION = /\p{Emoji_Presentation}/u;
+function makeTerminal(cols: number, modern = false): InstanceType<typeof Terminal> {
   const terminal = new Terminal({ cols, rows: 24, allowProposedApi: true });
   terminal.loadAddon(new Unicode11Addon());
   terminal.unicode.activeVersion = '11';
+  if (modern) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const svc: any = (terminal as any)._core?._inputHandler?._unicodeService
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ?? (terminal as any)._core?.unicodeService;
+    const base = svc._providers['11'];
+    terminal.unicode.register({
+      version: 'modern-test',
+      wcwidth(cp: number): number {
+        const w = base.wcwidth(cp);
+        return w === 1 && EMOJI_PRESENTATION.test(String.fromCodePoint(cp)) ? 2 : w;
+      },
+      charProperties(cp: number, preceding: number): number {
+        const raw = base.charProperties(cp, preceding);
+        // Force the width bits to 2 for modern emoji so the parser lays them out
+        // two cells wide (width lives in bits 1-2: clear with ~6, set 2 with |4).
+        return EMOJI_PRESENTATION.test(String.fromCodePoint(cp)) ? (raw & ~6) | 4 : raw;
+      },
+    });
+    terminal.unicode.activeVersion = 'modern-test';
+  }
   return terminal;
 }
 
@@ -77,7 +104,7 @@ function makeFixture(multiBot: boolean, titleFor?: (index: number) => string): {
   return { root, dataDir };
 }
 
-async function spawnPicker(cols: number, multiBot: boolean, titleFor?: (index: number) => string): Promise<{
+async function spawnPicker(cols: number, multiBot: boolean, titleFor?: (index: number) => string, modern = false): Promise<{
   child: pty.IPty;
   terminal: InstanceType<typeof Terminal>;
   renderCount: () => number;
@@ -105,7 +132,7 @@ async function spawnPicker(cols: number, multiBot: boolean, titleFor?: (index: n
     name: 'xterm-256color',
   });
   children.push(child);
-  const terminal = makeTerminal(cols);
+  const terminal = makeTerminal(cols, modern);
   let raw = '';
   let writes = Promise.resolve();
   child.onData(data => {
@@ -186,13 +213,29 @@ describe('session picker real terminal responsiveness', () => {
     // Regression for the Unicode-width gap: Lark topic titles routinely carry
     // emoji, and the project's Unicode11 web terminal (and real terminals) paint
     // each two cells wide. With an xterm-11-only width table that scored them as
-    // one, the row overflowed, wrapped, and the pinned title scrolled off. These
-    // 🤖/🎉/🚀/✅ are wide under xterm-11 itself, so this reproduces in headless
-    // xterm; modern Unicode 14+ emoji (🫠 etc.) are covered at the unit level in
-    // test/terminal-width-generated.test.ts, where the table's per-code-point
-    // upper bound can be asserted directly (headless xterm's parser does not lay
-    // those out two-wide, so a PTY test could not observe them faithfully).
+    // one, the row overflowed, wrapped, and the pinned title scrolled off.
     const picker = await spawnPicker(99, false, i => `🤖🎉🚀 session ${i + 1} 部署✅ 🔥🔥🔥`);
+    const screen = inspectScreen(picker.terminal);
+    expect(screen.lines[0]).toContain('botmux sessions  (1/48)');
+    expect(screen.lines.some(line => line.includes('❯'))).toBe(true);
+    expect(screen.wrappedRows).toEqual([]);
+    await closePicker(picker.child, picker.terminal);
+  });
+
+  it('does not wrap on modern (Unicode 14+) emoji a current terminal paints two wide', async () => {
+    // 🫠🩷🫨🪿🫎🪼 are width 1 under xterm-11 but two cells on modern local/SSH
+    // terminals — exactly what an xterm-11-only width table under-counted. The
+    // `modern` terminal forces these two wide in the buffer (see makeTerminal),
+    // and the titles are built ENTIRELY from them so they fill the truncated
+    // title cell: an under-count truncates at ~1x while the terminal paints ~2x,
+    // overflowing the row, wrapping it, and pushing the title off screen.
+    const modern = ['🫠', '🩷', '🫨', '🪿', '🫎', '🪼'];
+    const picker = await spawnPicker(
+      99,
+      false,
+      i => Array.from({ length: 24 }, (_, k) => modern[(i + k) % modern.length]).join(''),
+      true,
+    );
     const screen = inspectScreen(picker.terminal);
     expect(screen.lines[0]).toContain('botmux sessions  (1/48)');
     expect(screen.lines.some(line => line.includes('❯'))).toBe(true);
