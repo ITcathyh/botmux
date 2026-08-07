@@ -103,6 +103,14 @@ export interface CreateAskInput {
    *  'explicit' = `botmux ask buttons`, etc.). Namespaces the identity so an
    *  explicit ask can never re-claim a hook ask's card. Defaults to 'hook'. */
   originKind?: string;
+  /** DAEMON-COMPUTED authoritative persistence gate (codex P1-4): does the
+   *  authenticated issuing session's FROZEN backend survive a daemon restart
+   *  (tmux/herdr/zellij/zmx = yes; pty = no)? The broker persists + resumes ONLY
+   *  when this is true — it must NOT trust the client-supplied `originKind`
+   *  string, since a PTY-session hook could POST `originKind:'hook'` and orphan a
+   *  record that can never be re-claimed. Undefined → treated as false (fail
+   *  closed: don't persist when the backend is unknown). */
+  backendSurvivesRestart?: boolean;
   /** 问题列表，调用方保证每问 `options.length ≥ 2` 且 key 唯一。 */
   questions: ReadonlyArray<AskQuestion>;
   /** Absolute deadline; computed by caller from `--timeout`. Broker won't
@@ -192,4 +200,67 @@ export interface AskCardDispatcher {
     ask: PendingAsk,
     result: AskResult,
   ): void | Promise<void>;
+}
+
+/**
+ * Typed dispatch failure the card dispatcher throws from `send`, so the broker
+ * can decide whether re-sending could help WITHOUT importing IM/HTTP types
+ * (codex P1-3). The IM side owns classification (it alone sees the AxiosError /
+ * Feishu code); the broker owns the bounded retry policy.
+ *
+ *   - `retryable: true`  → transient (5xx / 429 / network / no-response). The
+ *     broker re-sends with the SAME dispatchUuid, so a send that actually landed
+ *     server-side before the socket broke returns the original message_id (one
+ *     logical card) instead of duplicating.
+ *   - `retryable: false` → deterministic (4xx bad request / permission /
+ *     withdrawn / malformed). Retrying can't help; the broker invalidates now.
+ *
+ * A plain (untyped) error thrown from `send` is treated as NOT retryable — fail
+ * closed, since we can't prove a re-send is safe/idempotent.
+ */
+export class AskDispatchError extends Error {
+  readonly retryable: boolean;
+  constructor(message: string, retryable: boolean) {
+    super(message);
+    this.name = 'AskDispatchError';
+    this.retryable = retryable;
+  }
+}
+
+/**
+ * Whether a daemon `/api/asks` HTTP status is worth the hook retrying (codex
+ * P1-3, executable decision seam). PURE + exported so cli.ts's `postAsk` AND its
+ * unit test call the SAME function — the retry contract is exercised by real
+ * calls, not asserted against source text.
+ *
+ * Retryable = the daemon is up but transiently unready: 502/503/504 (e.g. the
+ * startup readiness window returns 503 `startup_not_ready`). Everything else is
+ * deterministic — a 4xx (bad body / capability denied / unsupported chat) fails
+ * identically forever, so the hook should stop retrying and passthrough. The
+ * no-daemon and network-failure legs are classified retryable separately at
+ * their throw sites (there is no HTTP status there).
+ */
+export function isRetryableAskHttpStatus(status: number): boolean {
+  return status === 502 || status === 503 || status === 504;
+}
+
+/**
+ * Whether the daemon's `/api/asks` handler must answer a RETRYABLE 503
+ * `startup_not_ready` instead of proceeding (codex P1-2/P1-4, executable
+ * decision seam). PURE + exported so daemon.ts and its unit test share the SAME
+ * predicate rather than asserting against source regex.
+ *
+ * True iff a NON-trusted caller's session lookup missed AND session restore
+ * hasn't finished — the reconnecting hook is racing `restoreActiveSessions`, so
+ * a permanent 403 here would drop it to passthrough (stuck native picker). A 503
+ * (which `isRetryableAskHttpStatus` marks retryable) keeps the hook blocking
+ * until restore binds its session. A trusted-host IPC caller bypasses this (it
+ * isn't a session-scoped hook).
+ */
+export function shouldReturnAskStartupNotReady(args: {
+  hasSession: boolean;
+  sessionsRestored: boolean;
+  trustedHost: boolean;
+}): boolean {
+  return !args.hasSession && !args.sessionsRestored && !args.trustedHost;
 }

@@ -106,6 +106,15 @@ export const HANDOFF_RETENTION_MS = 24 * 60 * 60 * 1000; // 24h
  * the same requestId lands on a DIFFERENT key and can never reclaim another
  * session's ask (codex P1-3). The reattach path additionally verifies the full
  * immutable identity (chat/root/questions) before delivering.
+ *
+ * Canonical + INJECTIVE (codex P1-1): each segment is length-prefixed
+ * (`<len>:<raw>`) and joined with `|`. Length-prefixing means no separator can
+ * be forged from segment content and no two distinct tuples can alias — unlike
+ * the previous delimiter-join-then-truncate, which collapsed production-length
+ * keys (a 36-char app id + uuid session pushed the requestId past the 80-char
+ * cut, so two different requestIds sharing an 80-char prefix produced ONE key).
+ * The full string is retained (never truncated); the filesystem-length problem
+ * is solved separately by hashing for the filename, not by cutting the key.
  */
 export function askKeyFor(
   larkAppId: string,
@@ -113,21 +122,22 @@ export function askKeyFor(
   originKind: string,
   requestId: string,
 ): string {
-  return [larkAppId, sessionId, originKind, requestId].map(sanitizeKeySegment).join('.');
+  return [larkAppId, sessionId, originKind, requestId]
+    .map((seg) => {
+      const raw = String(seg);
+      return `${raw.length}:${raw}`;
+    })
+    .join('|');
 }
 
-/** Feishu IM `uuid` dedupe token: ≤50 chars. A requestId is normally a uuid
- *  (36 chars) so it passes through, but an over-long / unusual caller-supplied
- *  requestId is hashed to a stable ≤50 token so the card send is still
- *  idempotent (codex P1-1). */
-export function dispatchUuidFor(requestId: string): string {
-  if (requestId.length <= 50 && /^[A-Za-z0-9_-]+$/.test(requestId)) return requestId;
-  return `ask-${createHash('sha256').update(requestId).digest('hex').slice(0, 40)}`;
-}
-
-/** Keep a key segment safe as a path component (no separators / traversal). */
-function sanitizeKeySegment(s: string): string {
-  return String(s).replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 80);
+/** Feishu IM `uuid` dedupe token (≤50 chars) derived from the FULL scoped ask
+ *  key — NOT the bare requestId (codex P1-1). Deriving from the scoped key means
+ *  a re-send within the same invocation dedupes server-side (same key → same
+ *  uuid → Feishu returns the original message_id), while a different session
+ *  reusing the same requestId gets a DIFFERENT uuid and so cannot alias the
+ *  first session's card. `ask-` + 40 hex = 44 chars, safely under the cap. */
+export function dispatchUuidForKey(askKey: string): string {
+  return `ask-${createHash('sha256').update(`uuid|${askKey}`).digest('hex').slice(0, 40)}`;
 }
 
 export interface AskPersistStore {
@@ -148,7 +158,14 @@ export interface AskPersistStore {
  * touching live data.
  */
 export function createAskPersistStore(dir: string): AskPersistStore {
-  const filePath = (askKey: string): string => join(dir, `${sanitizeKeySegment(askKey)}.json`);
+  // Filename = SHA-256 of the FULL canonical key (codex P1-1). Hashing (not
+  // truncating) means two production-length keys that share a long prefix but
+  // differ in the requestId tail land on DISTINCT files — the previous
+  // `sanitize(key).slice(0,80)` collapsed them because a 36-char app id + uuid
+  // session pushed the requestId past char 80. Fixed-length hex is also always a
+  // valid path component, so no separate sanitize step is needed.
+  const filePath = (askKey: string): string =>
+    join(dir, `${createHash('sha256').update(askKey).digest('hex')}.json`);
 
   function ensureDir(): void {
     mkdirSync(dir, { recursive: true });

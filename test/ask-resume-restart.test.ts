@@ -12,7 +12,7 @@ import {
   setAskPersistStore,
   _resetForTest,
 } from '../src/core/ask-broker.js';
-import { createAskPersistStore, askKeyFor, dispatchUuidFor, ASK_STORE_SENTINEL, type PersistedAsk } from '../src/core/ask-persist-store.js';
+import { createAskPersistStore, askKeyFor, dispatchUuidForKey, ASK_STORE_SENTINEL, type PersistedAsk } from '../src/core/ask-persist-store.js';
 import type { AskCardDispatcher, AskResult, CreateAskInput, PendingAsk } from '../src/core/ask-types.js';
 
 /**
@@ -37,6 +37,7 @@ function makeInput(over: Partial<CreateAskInput> = {}): CreateAskInput {
     sessionId: 'sess-1',
     requestId: 'req-1',
     originKind: 'hook',
+    backendSurvivesRestart: true, // tmux-backed hook: resumable (daemon-computed)
     questions: [{ prompt: '继续发版吗？', options: OPTIONS, multiSelect: false }],
     timeoutMs: 60_000,
     ...over,
@@ -306,13 +307,13 @@ describe('active same-requestId replay joins one ask (codex P1-1)', () => {
 });
 
 describe('dispatch uuid + non-resumable origins (codex P1-1/P1-4)', () => {
-  it('resumable (hook) card send carries a stable dispatchUuid derived from requestId', async () => {
+  it('resumable (hook) card send carries a stable dispatchUuid derived from the scoped key', async () => {
     let seenUuid: string | undefined = 'UNSET';
     const d = mockDispatcher((ask) => { seenUuid = ask.dispatchUuid; return Promise.resolve({ messageId: 'om_x' }); });
     setCardDispatcher(d);
     registerAsk(makeInput({ requestId: 'req-uuid-1' }));
     await new Promise((r) => setTimeout(r, 5));
-    expect(seenUuid).toBe(dispatchUuidFor('req-uuid-1'));
+    expect(seenUuid).toBe(dispatchUuidForKey(askKeyFor('cli_app', 'sess-1', 'hook', 'req-uuid-1')));
   });
 
   it('explicit origin is NOT persisted and its card carries no dispatchUuid', async () => {

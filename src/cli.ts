@@ -120,6 +120,7 @@ import {
   readWorkflowSessionRelayContext,
 } from './workflows/v3/session-relay-client.js';
 import { fetchDaemonIpc, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
+import { isRetryableAskHttpStatus } from './core/ask-types.js';
 import { readManagedOriginCapability } from './core/managed-origin-capability.js';
 import { rejectLikelyWindowsStdinMojibake, decodeStdinBytes } from './cli/stdin-encoding.js';
 import {
@@ -9462,7 +9463,8 @@ async function postAsk(body: Record<string, unknown>): Promise<import('./core/as
     // Only transient server states are retryable. A deterministic 4xx (bad
     // body, capability denied, unsupported chat) will fail identically forever;
     // 502/503/504 mean the daemon is up but not ready (startup window) → retry.
-    const retryable = res.status === 502 || res.status === 503 || res.status === 504;
+    // Shared pure classifier (unit-tested directly — codex P1-3 seam).
+    const retryable = isRetryableAskHttpStatus(res.status);
     throw mkErr(`botmux ask: daemon HTTP ${res.status}: ${errBody}`, retryable);
   }
 

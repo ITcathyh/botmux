@@ -1,58 +1,71 @@
 import { describe, expect, it } from 'vitest';
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+
+import {
+  isRetryableAskHttpStatus,
+  shouldReturnAskStartupNotReady,
+} from '../src/core/ask-types.js';
 
 /**
- * Source-guard tests for two ask-resume behaviours that live inside large
- * closures (daemon.ts's `/api/asks` handler; cli.ts's `postAsk`) and can't be
- * unit-tested without booting the whole daemon / doing real daemon discovery.
- * The runtime contract they enforce IS unit-tested elsewhere:
- *   - the retry gate honouring `retryable`     → test/cmd-hook.test.ts
- *   - requestId/originKind parsing             → test/ask-api.test.ts
- *   - persistence / handoff / re-attach        → test/ask-resume-restart.test.ts
- * These assertions pin the two remaining seams so they can't be silently
- * removed (codex P1-2/P1-3 startup-503 + typed classifier).
+ * Executable decision seams for two ask-resume behaviours that used to be
+ * asserted only against source text (codex round-3: source regex can't be the
+ * contract). Both predicates are now PURE functions that the daemon `/api/asks`
+ * handler (shouldReturnAskStartupNotReady) and cli.ts `postAsk`
+ * (isRetryableAskHttpStatus) import and call at runtime — so these tests
+ * exercise the SAME code the production path runs, not a copy.
+ *
+ * The runtime WIRING (that daemon.ts actually calls the guard before the 403,
+ * and postAsk actually gates its retry on the classifier) is covered by
+ * behavioural tests: test/cmd-hook.test.ts drives postAsk's retry loop end to
+ * end against a stub daemon returning 503 vs 4xx.
  */
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const read = (rel: string) => readFileSync(join(__dirname, '..', rel), 'utf-8');
-
-describe('daemon /api/asks startup readiness (codex P1-2)', () => {
-  const daemon = read('src/daemon.ts');
-
-  it('returns a RETRYABLE 503 startup_not_ready for an unknown session before restore completes', () => {
-    // The guard must sit before the 403 origin_unproven authorization so a
-    // reconnecting hook that races restoreActiveSessions gets 503 (retryable),
-    // not a permanent 403 → passthrough → stuck native picker.
-    expect(daemon).toMatch(/!askSession\s*&&\s*!sessionsRestored[\s\S]*?503[\s\S]*?startup_not_ready/);
+describe('postAsk retry classifier (codex P1-3 seam)', () => {
+  it('502/503/504 are retryable (daemon up but transiently unready)', () => {
+    expect(isRetryableAskHttpStatus(502)).toBe(true);
+    expect(isRetryableAskHttpStatus(503)).toBe(true);
+    expect(isRetryableAskHttpStatus(504)).toBe(true);
   });
 
-  it('flips sessionsRestored=true only AFTER restoreActiveSessions()', () => {
-    const restoreIdx = daemon.indexOf('await restoreActiveSessions(activeSessions)');
-    const flipIdx = daemon.indexOf('sessionsRestored = true');
-    expect(restoreIdx).toBeGreaterThan(0);
-    expect(flipIdx).toBeGreaterThan(restoreIdx); // set after, not before
+  it('deterministic 4xx are NOT retryable (fail identically forever → passthrough)', () => {
+    for (const s of [400, 401, 403, 404, 409, 422]) {
+      expect(isRetryableAskHttpStatus(s)).toBe(false);
+    }
+  });
+
+  it('other 5xx that are not the startup/ready band are NOT retryable', () => {
+    // 500/501 are treated as deterministic here: the daemon answered decisively,
+    // not "restarting". Only the 502/503/504 unready band is retried.
+    expect(isRetryableAskHttpStatus(500)).toBe(false);
+    expect(isRetryableAskHttpStatus(501)).toBe(false);
+  });
+
+  it('2xx is never classified retryable (success is not an error to retry)', () => {
+    expect(isRetryableAskHttpStatus(200)).toBe(false);
   });
 });
 
-describe('postAsk error classification (codex P1-3)', () => {
-  const cli = read('src/cli.ts');
-  // Isolate the postAsk function body.
-  const start = cli.indexOf('async function postAsk(');
-  const body = cli.slice(start, start + 3000);
-
-  it('only 502/503/504 HTTP responses are marked retryable (deterministic 4xx are not)', () => {
-    expect(body).toMatch(/res\.status === 502 \|\| res\.status === 503 \|\| res\.status === 504/);
+describe('daemon /api/asks startup readiness guard (codex P1-2 seam)', () => {
+  it('unknown session + restore not finished + untrusted → 503 startup_not_ready', () => {
+    expect(shouldReturnAskStartupNotReady({
+      hasSession: false, sessionsRestored: false, trustedHost: false,
+    })).toBe(true);
   });
 
-  it('non-JSON daemon response is NOT retryable (retry cannot fix a malformed body)', () => {
-    expect(body).toMatch(/返回非 JSON[\s\S]*?false/);
+  it('once restore has finished, a still-unknown session does NOT get 503 (falls through to 403/proceed)', () => {
+    expect(shouldReturnAskStartupNotReady({
+      hasSession: false, sessionsRestored: true, trustedHost: false,
+    })).toBe(false);
   });
 
-  it('no-daemon and transport failures ARE retryable (restart-in-progress)', () => {
-    // Both the "找不到 daemon" and "无法连接 daemon" throws pass retryable=true.
-    expect(body).toMatch(/找不到 daemon[\s\S]*?true/);
-    expect(body).toMatch(/无法连接 daemon[\s\S]*?true/);
+  it('a session that already resolved never hits the startup guard', () => {
+    expect(shouldReturnAskStartupNotReady({
+      hasSession: true, sessionsRestored: false, trustedHost: false,
+    })).toBe(false);
+  });
+
+  it('a trusted-host IPC caller bypasses the startup guard (not a session-scoped hook)', () => {
+    expect(shouldReturnAskStartupNotReady({
+      hasSession: false, sessionsRestored: false, trustedHost: true,
+    })).toBe(false);
   });
 });

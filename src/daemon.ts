@@ -368,6 +368,7 @@ import {
 } from './core/ask-broker.js';
 import { createAskPersistStore } from './core/ask-persist-store.js';
 import { parseAskBody } from './core/ask-api.js';
+import { shouldReturnAskStartupNotReady } from './core/ask-types.js';
 import { computeCocoPickerKeys } from './core/coco-picker-keys.js';
 import { createLarkAskCardDispatcher } from './im/lark/ask-card.js';
 import { normalizeVcMeetingEvents } from './vc-agent/normalizer.js';
@@ -5129,7 +5130,12 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
   // yet, so a reconnecting ask hook's session lookup misses and would otherwise
   // get a permanent 403. Return a RETRYABLE 503 so the hook keeps waiting
   // (blocking Claude, no native picker) until restore finishes and it can bind.
-  if (!askSession && !sessionsRestored && !isTrustedHostIpcRequest(req)) {
+  // Predicate is a shared pure function (unit-tested directly — codex P1-2 seam).
+  if (shouldReturnAskStartupNotReady({
+    hasSession: !!askSession,
+    sessionsRestored,
+    trustedHost: isTrustedHostIpcRequest(req),
+  })) {
     return jsonRes(res, 503, { ok: false, error: 'startup_not_ready' });
   }
   let boundAsk = parsed;
@@ -5219,6 +5225,12 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     // Invocation identity (from the hook; enables cross-restart re-attach).
     requestId: boundAsk.requestId,
     originKind: boundAsk.originKind,
+    // Authoritative persistence gate (codex P1-4): derive resumability from the
+    // authenticated session's FROZEN backend, not the client's origin string. A
+    // PTY-backed session dies with the daemon, so its ask must NOT persist; only
+    // a restart-surviving mux backend (tmux/herdr/zellij/zmx) is resumable.
+    backendSurvivesRestart:
+      !!askSession && getSessionPersistentBackendType(askSession) !== undefined,
   });
 
   // CoCo 专属：它的 hook 不能用 directive 代答（hook 客户端永远 passthrough，CoCo 会

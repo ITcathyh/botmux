@@ -4,6 +4,7 @@ import type {
   AskResult,
   PendingAsk,
 } from '../../core/ask-types.js';
+import { AskDispatchError } from '../../core/ask-types.js';
 import { getAskSnapshot, submitAsk, toggleAsk, tryResolveAsk } from '../../core/ask-broker.js';
 import { logger } from '../../utils/logger.js';
 import { t, localeForBot, type Locale } from '../../i18n/index.js';
@@ -54,10 +55,18 @@ export function createLarkAskCardDispatcher(
       // re-send after a daemon restart (restart-resume) dedupes server-side and
       // returns the ORIGINAL message_id instead of posting a second card.
       const uuid = ask.dispatchUuid;
-      const messageId = canReplyToRoot
-        ? await reply(ask.larkAppId, ask.rootMessageId!, cardJson, 'interactive', true, uuid)
-        : await send(ask.larkAppId, ask.chatId, cardJson, 'interactive', uuid);
-      return { messageId };
+      try {
+        const messageId = canReplyToRoot
+          ? await reply(ask.larkAppId, ask.rootMessageId!, cardJson, 'interactive', true, uuid)
+          : await send(ask.larkAppId, ask.chatId, cardJson, 'interactive', uuid);
+        return { messageId };
+      } catch (err) {
+        // Re-throw as a typed AskDispatchError so the broker's bounded retry can
+        // decide transient-vs-deterministic without importing HTTP types
+        // (codex P1-3). The same uuid is reused on retry → server-side dedupe.
+        const { retryable, detail } = classifyAskDispatchError(err);
+        throw new AskDispatchError(detail, retryable);
+      }
     },
     async onSettle(ask, result) {
       if (!ask.cardMessageId) return;
@@ -72,6 +81,53 @@ export function createLarkAskCardDispatcher(
       }
     },
   };
+}
+
+/**
+ * Classify a Feishu card-send failure into "worth retrying" vs "give up now"
+ * (codex P1-3). PURE + exported so the retry decision is unit-tested directly
+ * (executable decision seam) rather than asserted against source text.
+ *
+ * Retryable (transient — a re-send with the same uuid may succeed / dedupe):
+ *   - no HTTP response at all (network reset, DNS, timeout)
+ *   - HTTP 429 (rate limited) or any 5xx (server-side)
+ *   - a 2xx-body business error whose message carries no decisive 4xx status
+ *     BUT names a transient Feishu condition (rate limit / internal) — we stay
+ *     conservative and only mark the well-known transient codes retryable.
+ * Not retryable (deterministic — re-sending repeats the same failure):
+ *   - HTTP 4xx other than 429 (bad request, permission, not found)
+ *   - message withdrawn (target gone)
+ *   - anything we can't positively classify → fail closed (retry is unsafe when
+ *     we can't prove idempotency).
+ *
+ * Extraction mirrors bot-registry.formatLarkError: status at `response.status`
+ * or `.status`; Feishu code at `response.data.code` or `.code`.
+ */
+export function classifyAskDispatchError(err: unknown): { retryable: boolean; detail: string } {
+  const e = err as {
+    isAxiosError?: boolean; name?: string; message?: string;
+    response?: { status?: number; data?: { code?: number; msg?: string } };
+    status?: number; code?: number; config?: unknown;
+  } | null | undefined;
+
+  const detail =
+    (e && (e.response?.data?.msg || e.message)) ||
+    (typeof err === 'string' ? err : 'unknown dispatch error');
+
+  const looksAxios =
+    !!e && (e.isAxiosError === true || e.name === 'AxiosError' || (!!e.config && (!!e.response || e.status != null)));
+
+  if (looksAxios) {
+    const status = e!.response?.status ?? e!.status;
+    if (status === undefined) return { retryable: true, detail: `no-response: ${detail}` }; // network/transport
+    if (status === 429 || (status >= 500 && status <= 599)) return { retryable: true, detail: `http ${status}: ${detail}` };
+    return { retryable: false, detail: `http ${status}: ${detail}` }; // deterministic 4xx
+  }
+
+  // Non-axios (plain Error / string). MessageWithdrawnError and the
+  // `res.code !== 0` 2xx-body throws land here — HTTP already succeeded, so a
+  // re-send repeats the same deterministic outcome. Fail closed.
+  return { retryable: false, detail: `non-transport: ${detail}` };
 }
 
 export function isAskCardAction(action?: string): boolean {
