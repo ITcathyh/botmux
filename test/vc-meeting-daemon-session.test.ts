@@ -2080,6 +2080,82 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(JSON.parse(ownerDm!.content).text).toContain('invalid app secret');
   });
 
+  it('DMs the owner when the EAGER join (invite has meeting_no but no meeting.id) cannot provision the profile', async () => {
+    // Regression: an invite carrying only a meeting_no is joined eagerly BEFORE
+    // any session exists, to learn the meeting.id. A provision/join failure there
+    // used to only WARN and then hit the silent "no meeting id yet" return — the
+    // exact shape of the original "profile not found → bot rings forever" bug,
+    // with zero user-visible signal. The eager path must DM the owner too.
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      name: 'Meeting Bot',
+      cliId: 'claude-code',
+      sandbox: true,
+      backendType: 'pty',
+      workingDir: process.cwd(),
+      vcMeetingAgent: {
+        enabled: true,
+        larkCliProfile: APP_ID,
+        attentionTargetOpenId: TARGET_OPEN_ID,
+      },
+    });
+    profileProvisionResults.push({ ok: false, reason: 'add_failed', error: 'eager rotated secret' });
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_invited',
+      eventType: 'vc.bot.meeting_invited_v1',
+      eventId: 'evt_invite_eager_no_id',
+      // NB: NO meeting.id — only meeting_no. This forces the eager-join branch.
+      meeting: { meetingNo: '868686868', topic: 'Eager provision failure' },
+      raw: { event: { meeting: { meeting_no: '868686868' } } },
+    });
+
+    // Provision attempted, join never reached (id never resolved), owner DMed.
+    expect(profileProvisionCalls).toHaveLength(1);
+    expect(joinCalls).toHaveLength(0);
+    const ownerDm = sentMessages.find(msg => msg.receiveId === TARGET_OPEN_ID);
+    expect(ownerDm).toBeDefined();
+    expect(JSON.parse(ownerDm!.content).text).toContain('eager rotated secret');
+  });
+
+  it('de-dupes the eager-join failure DM across a redelivered invite for the same meeting_no', async () => {
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      name: 'Meeting Bot',
+      cliId: 'claude-code',
+      sandbox: true,
+      backendType: 'pty',
+      workingDir: process.cwd(),
+      vcMeetingAgent: {
+        enabled: true,
+        larkCliProfile: APP_ID,
+        attentionTargetOpenId: TARGET_OPEN_ID,
+      },
+    });
+    // Both deliveries fail to provision.
+    profileProvisionResults.push({ ok: false, reason: 'add_failed', error: 'still bad' });
+    profileProvisionResults.push({ ok: false, reason: 'add_failed', error: 'still bad' });
+
+    const eagerPush = {
+      larkAppId: APP_ID,
+      kind: 'meeting_invited' as const,
+      eventType: 'vc.bot.meeting_invited_v1',
+      eventId: 'evt_invite_eager_dupe',
+      meeting: { meetingNo: '959595959', topic: 'Eager dupe' },
+      raw: { event: { meeting: { meeting_no: '959595959' } } },
+    };
+    await __vcMeetingAgentTest.handlePush(eagerPush);
+    await __vcMeetingAgentTest.handlePush({ ...eagerPush, eventId: 'evt_invite_eager_dupe_2' });
+
+    // Provision attempted twice, but the owner is DMed only once (deduped).
+    expect(profileProvisionCalls).toHaveLength(2);
+    const ownerDms = sentMessages.filter(msg => msg.receiveId === TARGET_OPEN_ID);
+    expect(ownerDms).toHaveLength(1);
+  });
+
   it('durably fences its own removal and lets only an authorized card rejoin once after restart', async () => {
     registerListenerBotForRejoin({ realtimeVoice: true });
     expect(getBot(APP_ID).botOpenId).toBe(LISTENER_BOT_OPEN_ID);

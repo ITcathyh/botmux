@@ -1713,6 +1713,18 @@ const VC_MEETING_ACTIVATION_CONTEXT_FIELD = 'vc_meeting_activation_context';
 const VC_MEETING_ACTIVATION_CONTEXT_MAX_CHARS = 2_000;
 const vcMeetingEndedTombstones = new BoundedMap<string, number>(2_000);
 const vcMeetingPendingInvites = new BoundedMap<string, VcMeetingPendingInvite>(2_000);
+/**
+ * De-dupes the owner DM for an eager-join failure that happens BEFORE a session
+ * exists (invite carries only a meeting_no, no meeting.id — so there is no
+ * session to hang `inviteFailureNotified` on). Keyed by `${larkAppId}:${no}`;
+ * bounded and best-effort. Cleared once the meeting is successfully joined so a
+ * later genuine failure can still notify. */
+const vcMeetingEagerJoinFailureNotified = new BoundedMap<string, number>(2_000);
+const VC_MEETING_EAGER_JOIN_FAILURE_TTL_MS = 30 * 60 * 1000;
+
+function vcMeetingEagerJoinFailureKey(larkAppId: string, meetingNo: string): string {
+  return `${larkAppId}:${meetingNo}`;
+}
 
 function vcMeetingSessionKey(larkAppId: string, meetingId: string): string {
   return `${larkAppId}:${meetingId}`;
@@ -14934,16 +14946,40 @@ async function handleVcMeetingPush(ctx: VcMeetingPushContext): Promise<void> {
   if (ctx.kind === 'meeting_invited') {
     let meeting = ctx.meeting;
     let joinedByInvite = false;
-    if (!meeting.id && meeting.meetingNo && cfg.larkCliProfile) {
+    // Eager join: an invite that carries only a meeting_no (no meeting.id) must
+    // be joined here to learn the id. A failure in THIS block used to only WARN
+    // and then fall through to the silent "no meeting id yet" return below — so
+    // the original "profile not found → bot rings forever" bug produced no user
+    // signal at all (there is no session yet for the manual-invite DM path). We
+    // now DM the owner here too, deduped per meeting_no so redelivered invites
+    // don't spam.
+    if (!meeting.id && meeting.meetingNo) {
+      const eagerNo = meeting.meetingNo;
+      const notifyEagerFailure = (errorText: string): void => {
+        const dmKey = vcMeetingEagerJoinFailureKey(ctx.larkAppId, eagerNo);
+        const last = vcMeetingEagerJoinFailureNotified.get(dmKey);
+        const now = Date.now();
+        if (last !== undefined && now - last <= VC_MEETING_EAGER_JOIN_FAILURE_TTL_MS) return;
+        vcMeetingEagerJoinFailureNotified.set(dmKey, now);
+        // session is undefined here → notify skips per-session dedup and sends.
+        notifyVcMeetingInviteFailure(ctx.larkAppId, cfg, undefined, meeting, errorText);
+      };
       try {
+        // A missing larkCliProfile previously skipped this whole block (the old
+        // `&& cfg.larkCliProfile` guard) and died silently; surface it instead.
         const provisioned = ensureVcMeetingJoinProfile(ctx.larkAppId, cfg);
         if (!provisioned.ok) throw new Error(vcMeetingJoinProfileErrorText(ctx.larkAppId, provisioned));
-        const joined = joinMeetingAsBot({ meetingNumber: meeting.meetingNo, profile: provisioned.profile });
+        const joined = joinMeetingAsBot({ meetingNumber: eagerNo, profile: provisioned.profile });
         meeting = { ...meeting, id: joined.meetingId };
         joinedByInvite = true;
-        logger.info(`[vc-agent] manual invite joined before session create meeting=${meeting.id} meetingNo=${meeting.meetingNo} profile=${provisioned.profile}`);
+        // Success → clear any prior failure tombstone so a later real failure
+        // (e.g. rotated secret on a subsequent meeting) can notify again.
+        vcMeetingEagerJoinFailureNotified.delete(vcMeetingEagerJoinFailureKey(ctx.larkAppId, eagerNo));
+        logger.info(`[vc-agent] manual invite joined before session create meeting=${meeting.id} meetingNo=${eagerNo} profile=${provisioned.profile}`);
       } catch (err) {
-        logger.warn(`[vc-agent] manual invite join failed meetingNo=${meeting.meetingNo}: ${err instanceof Error ? err.message : String(err)}`);
+        const message = err instanceof Error ? err.message : String(err);
+        logger.warn(`[vc-agent] manual invite join failed meetingNo=${eagerNo}: ${message}`);
+        notifyEagerFailure(message);
       }
     }
     if (!meeting.id) {

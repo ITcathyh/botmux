@@ -547,6 +547,58 @@ describe('VcConsumerProfilesSection · 保存', () => {
     expect(errors.some(node => textOf(node) === 'id 与在会成员冲突')).toBe(true);
     expect(saveButton(r)!.props.disabled).toBe(false); // 仍 dirty，可改后重试
   });
+
+  it('seeds a NEW profile with the first SELECTABLE agent, not the disabled appId-sorted first one', async () => {
+    // Regression: addProfile used to seed agentOptions[0] blindly. If the
+    // appId-sorted first bot is disabled (un-spawnable), that hardcoded default
+    // bypassed the dropdown's disable and the server PUT (which only checks the
+    // id is a non-empty string) happily persisted an agent that never replies.
+    const fetchMock = stubFetchImmediate({
+      A: catalogBody('A', {
+        catalogState: 'profiles',
+        profiles: [],
+        // Sorted first is disabled; the eligible one sorts later.
+        agentOptions: [
+          {
+            appId: 'aaa_broken', label: 'Broken', online: true, workingDirReady: false,
+            reliableTurnTerminal: true, managedSideEffectEligible: false, sandboxIsolated: false,
+          },
+          {
+            appId: 'zzz_good', label: 'Good', online: true, workingDirReady: true,
+            reliableTurnTerminal: true, managedSideEffectEligible: true, sandboxIsolated: true,
+          },
+        ],
+      }),
+    }, () => jsonRes(200, catalogBody('A', { revision: 'rev-A-2' })));
+    const r = await mount();
+
+    await act(async () => { addButton(r)!.props.onClick(); });
+    await setInput(idInput(r), 'seeded');
+    await act(async () => { saveButton(r)!.props.onClick(); });
+    await flush();
+
+    const puts = putCalls(fetchMock);
+    expect(puts).toHaveLength(1);
+    const seeded = (puts[0].profiles as Json[]).find(p => p.id === 'seeded');
+    // NOT 'aaa_broken' (the disabled [0]); the first selectable agent instead.
+    expect(seeded?.agentAppId).toBe('zzz_good');
+  });
+
+  it('disables the Add button when no agent is structurally eligible', async () => {
+    stubFetchImmediate({
+      A: catalogBody('A', {
+        catalogState: 'profiles',
+        profiles: [],
+        agentOptions: [{
+          appId: 'only_broken', label: 'Broken', online: true, workingDirReady: false,
+          reliableTurnTerminal: false, managedSideEffectEligible: false, sandboxIsolated: false,
+        }],
+      }),
+    });
+    const r = await mount();
+    // No selectable agent ⇒ Add is disabled (can't seed a replying consumer).
+    expect(addButton(r)!.props.disabled).toBe(true);
+  });
 });
 
 describe('VcConsumerProfilesGate · 私有端点挂载门', () => {
