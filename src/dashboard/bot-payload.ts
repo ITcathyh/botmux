@@ -18,6 +18,25 @@ export interface DashboardBotDescriptor {
   model?: string;
 }
 
+/**
+ * per-bot brand（feishu / lark）按 larkAppId 的映射,供 dashboard 前端派生飞书
+ * 后台深链 host。brand 只在 bots.json 里(DaemonRegistry 的心跳态不带它),而
+ * 配置加载在 BOTS_CONFIG 缺失 / bots.json 尚未创建 / 临时不可读时会抛——这里
+ * 用 try/catch 兜底返回空 Map（与 dashboard 的 configuredCliIds /
+ * configuredBotAgentFields 同款失败语义）,保证冷缓存 /api/groups 与 /api/bots
+ * 仍能基于 DaemonRegistry 走降级 roster（前端拿不到 brand → normalizeBrand
+ * 兜底 feishu),不因缺配置而 500。`load` 注入配置源便于单测。
+ */
+export function brandMapByAppId(
+  load: () => ReadonlyArray<{ larkAppId: string; brand?: string }>,
+): Map<string, string | undefined> {
+  try {
+    return new Map(load().map(b => [b.larkAppId, b.brand]));
+  } catch {
+    return new Map();
+  }
+}
+
 export function botSummaryPayload(bot: DashboardBotDescriptor) {
   return {
     larkAppId: bot.larkAppId,

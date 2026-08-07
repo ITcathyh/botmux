@@ -168,7 +168,7 @@ import type { BotSkillPolicy, SkillPackage } from './core/skills/types.js';
 import { discoverNativeCliSkillGroups } from './core/skills/discovery.js';
 import { analyzeSkillReferences, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
 import { discoverDashboardSkills, installDashboardSkill, parseDashboardSkillInstallRequest, parseInstallLocalLinksSources, MAX_LOCAL_LINK_SOURCES } from './dashboard/skill-install-request.js';
-import { botDefaultsPayload, botSummaryPayload } from './dashboard/bot-payload.js';
+import { botDefaultsPayload, botSummaryPayload, brandMapByAppId } from './dashboard/bot-payload.js';
 import {
   handleVcMeetingConsumerProfilesGet,
   handleVcMeetingConsumerProfilesPut,
@@ -2048,6 +2048,16 @@ function configuredCliIds(): Map<string, string> {
   }
 }
 
+/**
+ * per-bot brand（feishu / lark）按 appId 的映射,供前端派生飞书后台深链 host。
+ * 失败安全逻辑在 brandMapByAppId（返回空 Map,与 configuredCliIds /
+ * configuredBotAgentFields 同款兜底,见其 doc）——冷缓存 /api/groups 与
+ * /api/bots 仍走 DaemonRegistry 降级 roster,前端 normalizeBrand 兜底 feishu。
+ */
+function configuredBrands(): Map<string, string | undefined> {
+  return brandMapByAppId(loadBotConfigs);
+}
+
 function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string }> {
   try {
     return new Map(loadBotConfigs().map(b => [b.larkAppId, {
@@ -2330,8 +2340,9 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
     })
     .map(({ _firstSeenAt, ...rest }) => rest);
   // brand 是 bots.json 的 per-bot 字段（DaemonRegistry 的心跳态不带它），
-  // 从 loadBotConfigs 按 appId 补进 summary，供前端派生飞书后台深链 host。
-  const brandByAppId = new Map(loadBotConfigs().map(b => [b.larkAppId, b.brand]));
+  // 从 configuredBrands（失败安全,返空 Map）按 appId 补进 summary,供前端
+  // 派生飞书后台深链 host；冷缓存 / 缺配置时前端 normalizeBrand 兜底 feishu。
+  const brandByAppId = configuredBrands();
   const bots = onlineBots.map(d => botSummaryPayload({ ...d, brand: brandByAppId.get(d.larkAppId) }));
   return { chats, bots };
 }
@@ -4523,8 +4534,9 @@ const server = createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/api/bots') {
       const agentFields = configuredBotAgentFields();
       // brand 是 bots.json 的 per-bot 字段（DaemonRegistry 心跳态不带它），
-      // 从 loadBotConfigs 按 appId 补进每个 descriptor，供前端派生飞书后台深链 host。
-      const brandByAppId = new Map(loadBotConfigs().map(b => [b.larkAppId, b.brand]));
+      // 从 configuredBrands（失败安全,返空 Map）按 appId 补进每个 descriptor,
+      // 供前端派生飞书后台深链 host;缺配置时前端 normalizeBrand 兜底 feishu。
+      const brandByAppId = configuredBrands();
       const onlineBots = [...registry.list()]
         .map(b => withConfiguredCliId(b, agentFields))
         .map(b => ({ ...b, brand: brandByAppId.get(b.larkAppId) }))

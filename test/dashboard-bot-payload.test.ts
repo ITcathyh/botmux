@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { botDefaultsPayload, botSummaryPayload } from '../src/dashboard/bot-payload.js';
+import { botDefaultsPayload, botSummaryPayload, brandMapByAppId } from '../src/dashboard/bot-payload.js';
 
 describe('dashboard bot payload helpers', () => {
   it('keeps every editable Bot Defaults field in the aggregated /api/bots row', () => {
@@ -332,5 +332,23 @@ describe('dashboard bot payload helpers', () => {
     // feishu(缺省)：不带 brand,前端兜底 feishu。
     expect(botDefaultsPayload({ larkAppId: 'cli_feishu', botName: 'FeishuBot', cliId: 'codex' }, {}))
       .not.toHaveProperty('brand');
+  });
+
+  it('brandMapByAppId maps appId→brand and fails safe to an empty map when config is unreadable', () => {
+    // 正常：按 appId 建 brand 映射（feishu bot 的 brand 为 undefined，仍入表）。
+    const map = brandMapByAppId(() => [
+      { larkAppId: 'cli_lark', brand: 'lark' },
+      { larkAppId: 'cli_feishu' },
+    ]);
+    expect(map.get('cli_lark')).toBe('lark');
+    expect(map.get('cli_feishu')).toBeUndefined();
+    expect(map.size).toBe(2);
+
+    // ⭐失败安全：loadBotConfigs 在 bots.json 未建 / 不可读 / BOTS_CONFIG 缺失时
+    // 会抛——必须吞掉返回空 Map,让冷缓存 /api/groups 与 /api/bots 仍基于
+    // DaemonRegistry 走降级 roster（前端 normalizeBrand 兜底 feishu),而非 500。
+    const empty = brandMapByAppId(() => { throw new Error('bots.json not found'); });
+    expect(empty.size).toBe(0);
+    expect(empty.get('cli_anything')).toBeUndefined();
   });
 });
