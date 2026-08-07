@@ -33,7 +33,7 @@ import {
   isolationPaneMarkerContent,
   type IsolationCapability,
 } from './adapters/cli/read-isolation.js';
-import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRedirectedAdapterAuthPaths, FsPolicyConfigError } from './adapters/cli/fs-policy.js';
+import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRedirectedAdapterAuthPaths, resolveLarkCliLinuxStoreDir, FsPolicyConfigError } from './adapters/cli/fs-policy.js';
 import { killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, probePersistentSession, shouldRejectPersistentPostKillProbe, type PersistentBackendType } from './core/persistent-backend.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
 import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
@@ -9204,6 +9204,18 @@ async function spawnCli(
       // arbitrary parent dir (`/tmp`, `/etc`, a project root) and bricking the
       // core CLI (codex P1). Canonicalized so it shares the roots' namespace.
       loadedBotsConfigPath: cfg.loadedBotsConfigPath ? canonical(cfg.loadedBotsConfigPath) : undefined,
+      // Linux lark-cli keystore (holds every bot's appsecret ciphertext + the shared
+      // master key). Resolve it EXACTLY as the in-sandbox lark-cli will: it reads the
+      // host env (redactChildEnv never rewrites HOME / XDG_DATA_HOME), so the store =
+      // `${XDG_DATA_HOME:-$HOME/.local/share}/lark-cli`. Freeze the value from the
+      // worker's OWN process.env (the frozen host env) — NOT agent-controllable — and
+      // canonicalize it (both engines match realpath'd mount sources). buildFsPolicy
+      // uses this to DENY the store + re-open ONLY this bot's own master.key +
+      // appsecret_<self>.enc read-only (transport), or freeze it as an authority root
+      // with no carve-out (no-transport). lexicalHome (raw $HOME) matches the child's
+      // own `$HOME` resolution; canonical() then aligns it to the mount namespace.
+      // Harmlessly ignored on darwin (that platform uses the Library/… keystore).
+      larkCliLinuxStore: canonical(resolveLarkCliLinuxStoreDir(process.env.XDG_DATA_HOME, lexicalHome)),
       redirectedCliData: willRedirectCliData,
       cliDataPaths: willRedirectCliData ? undefined : keepExisting([
         cliAdapter.claudeDataDir,
