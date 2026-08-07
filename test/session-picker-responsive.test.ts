@@ -30,7 +30,10 @@ afterEach(() => {
 // Build the xterm buffer the same way the project's own web terminal does
 // (src/worker.ts loads Unicode11Addon + activeVersion='11'). A bare xterm scores
 // emoji as one cell and would NOT reproduce emoji wrapping — this addon makes the
-// headless terminal count 🤖/🎉 as two cells, exactly as a real terminal paints.
+// headless terminal count 🤖/🎉/你 as two cells, exactly as a real terminal paints.
+// (Unicode 14+ emoji width is asserted at the unit level in
+// test/terminal-width-generated.test.ts — headless xterm's parser does not lay
+// those out two-wide, so a PTY test cannot observe them faithfully.)
 function makeTerminal(cols: number): InstanceType<typeof Terminal> {
   const terminal = new Terminal({ cols, rows: 24, allowProposedApi: true });
   terminal.loadAddon(new Unicode11Addon());
@@ -180,12 +183,30 @@ describe('session picker real terminal responsiveness', () => {
   });
 
   it('does not wrap when every session title is emoji-heavy', async () => {
-    // Regression for the Unicode-width gap: session titles routinely carry emoji
-    // (Lark topic names), and a real terminal paints each emoji two cells wide.
-    // If column math scores them as one cell, the row overflows, wraps onto a
-    // second physical line and the vertical viewport's one-row-per-session
-    // accounting breaks — pushing the pinned title back off the alt-screen.
+    // Regression for the Unicode-width gap: Lark topic titles routinely carry
+    // emoji, and the project's Unicode11 web terminal (and real terminals) paint
+    // each two cells wide. With an xterm-11-only width table that scored them as
+    // one, the row overflowed, wrapped, and the pinned title scrolled off. These
+    // 🤖/🎉/🚀/✅ are wide under xterm-11 itself, so this reproduces in headless
+    // xterm; modern Unicode 14+ emoji (🫠 etc.) are covered at the unit level in
+    // test/terminal-width-generated.test.ts, where the table's per-code-point
+    // upper bound can be asserted directly (headless xterm's parser does not lay
+    // those out two-wide, so a PTY test could not observe them faithfully).
     const picker = await spawnPicker(99, false, i => `🤖🎉🚀 session ${i + 1} 部署✅ 🔥🔥🔥`);
+    const screen = inspectScreen(picker.terminal);
+    expect(screen.lines[0]).toContain('botmux sessions  (1/48)');
+    expect(screen.lines.some(line => line.includes('❯'))).toBe(true);
+    expect(screen.wrappedRows).toEqual([]);
+    await closePicker(picker.child, picker.terminal);
+  });
+
+  it('does not wrap when titles contain tabs and other control characters', async () => {
+    // A raw Tab is a parser action (jump to the next tab stop), not a zero-width
+    // glyph, so it cannot be handled by the width table — the picker must strip
+    // it (and ESC/C0/C1) out of dynamic text before printing. Without that, a
+    // tab in a title advances the cursor past the column budget, wraps the row
+    // and hides the title.
+    const picker = await spawnPicker(99, false, i => `session\t${i + 1}\tbuild\x1b[31m done\x07`);
     const screen = inspectScreen(picker.terminal);
     expect(screen.lines[0]).toContain('botmux sessions  (1/48)');
     expect(screen.lines.some(line => line.includes('❯'))).toBe(true);

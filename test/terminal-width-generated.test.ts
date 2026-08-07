@@ -8,25 +8,24 @@ import { codePointCellWidth, terminalCellWidth } from '../src/cli/terminal-width
 
 const { Terminal } = xtermHeadless;
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+const EMOJI_PRESENTATION = /\p{Emoji_Presentation}/u;
 
 /**
  * src/cli/terminal-width.ts is a generated artifact (scripts/generate-terminal-width.mjs
- * sweeps @xterm/addon-unicode11's wcwidth). These tests prove two things:
- *   1. the committed file is exactly what the generator produces from the CURRENTLY
- *      installed addon — so a future xterm upgrade that shifts widths turns this red
- *      (regenerate + commit to fix), preventing silent drift;
- *   2. terminalCellWidth matches xterm's own getStringCellWidth per-code-point, which
- *      is the property the picker relies on to keep one session per physical row.
+ * sweeps @xterm/addon-unicode11's wcwidth ∪ Node's \p{Emoji_Presentation}). The table
+ * is a CROSS-TERMINAL CONSERVATIVE UPPER BOUND, not a match for one terminal: the
+ * picker must never UNDER-count (that wraps a row and hides the pinned title), while
+ * over-counting only truncates a cell slightly early. These tests pin that contract.
  */
 describe('terminal-width generated table', () => {
-  it('is up to date with the installed @xterm/addon-unicode11 (no drift)', () => {
+  it('is up to date with the installed deps (no drift)', () => {
     // Throws (non-zero exit) if the committed file differs from a fresh generation.
     expect(() =>
       execFileSync('node', ['scripts/generate-terminal-width.mjs', '--check'], { cwd: ROOT }),
     ).not.toThrow();
   });
 
-  it('matches xterm getStringCellWidth for every code point and mixed strings', () => {
+  it('never under-counts vs the project xterm Unicode-11 terminal', () => {
     const term = new Terminal({ cols: 80, rows: 10, allowProposedApi: true });
     term.loadAddon(new Unicode11Addon());
     term.unicode.activeVersion = '11';
@@ -35,17 +34,32 @@ describe('terminal-width generated table', () => {
     const svc = core._core?._inputHandler?._unicodeService ?? core._core?.unicodeService;
     expect(typeof svc?.wcwidth).toBe('function');
 
-    // Per-code-point parity across BMP + emoji planes.
-    for (let cp = 0; cp <= 0x40000; cp++) {
-      expect(codePointCellWidth(cp)).toBe(svc.wcwidth(cp));
+    // Upper-bound contract: our width >= what xterm-11 paints, for every code point.
+    // (Zero-width and wide code points must match; width-1 code points may be lifted
+    // to 2 for modern emoji — never dropped below xterm.)
+    for (let cp = 0; cp <= 0x10ffff; cp++) {
+      expect(codePointCellWidth(cp)).toBeGreaterThanOrEqual(svc.wcwidth(cp));
     }
+  });
 
-    // String parity, including the multi-code-point cases the picker must not wrap on.
-    for (const s of [
-      'A', '你好世界', '🤖', '🎉🚀✅', '👨‍👩‍👧', '🇺🇸',
-      'é', 'á', '👍🏽', '⚡️', '☃️', 'session-42 🤖 部署', '│ ─ ❯ ↑ ↓',
-    ]) {
-      expect(terminalCellWidth(s)).toBe(svc.getStringCellWidth(s));
+  it('counts modern (Unicode 14+) emoji as two cells that xterm-11 still scores as one', () => {
+    // These wrap the picker on any terminal that renders current emoji two cells
+    // wide; xterm-11 under-counts them, so the union with Emoji_Presentation matters.
+    for (const e of ['🫠', '🩷', '🫨', '🪿', '🫎', '🪼']) {
+      expect(EMOJI_PRESENTATION.test(e)).toBe(true);
+      expect(terminalCellWidth(e)).toBe(2);
     }
+    // Classic wide emoji + CJK stay 2; text-presentation symbols stay 1.
+    for (const two of ['🤖', '🎉', '你', '（']) expect(terminalCellWidth(two)).toBe(2);
+    for (const one of ['A', '©', '®', '™', '★', '①', '—']) expect(terminalCellWidth(one)).toBe(1);
+  });
+
+  it('keeps combining marks / ZWJ / variation selectors zero width (per-code-point sum)', () => {
+    expect(codePointCellWidth(0x200d)).toBe(0); // ZWJ
+    expect(codePointCellWidth(0xfe0f)).toBe(0); // VS16
+    expect(codePointCellWidth(0x0301)).toBe(0); // combining acute
+    // No grapheme clustering: a ZWJ family emoji sums its parts (2+0+2+0+2 = 6),
+    // which over-counts vs a single glyph — safe for the no-wrap invariant.
+    expect(terminalCellWidth('👨‍👩‍👧')).toBe(6);
   });
 });

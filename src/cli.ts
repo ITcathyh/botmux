@@ -3394,15 +3394,36 @@ function formatDuration(ms: number): string {
 /**
  * Get display width of a string in terminal cells.
  *
- * Delegates to the xterm Unicode 11 width table (see terminal-width.ts) so the
- * `botmux list` picker's column/row math matches what a real terminal — and the
- * project's own xterm.js web terminal — actually paints. The previous inline
- * table only covered CJK/Hangul and under-counted emoji (🤖 as 1 instead of 2),
- * which let emoji session titles overflow a row, wrap onto a second physical
- * line, and push the pinned title off the alt-screen.
+ * Delegates to a cross-terminal conservative width table (see terminal-width.ts):
+ * for any real terminal the width returned is >= what it paints, so the picker's
+ * `layoutWidth <= termWidth` genuinely implies rows never wrap. The previous
+ * inline table only covered CJK/Hangul and under-counted emoji (🤖/🫠 as 1),
+ * letting emoji session titles overflow a row, wrap onto a second physical line,
+ * and push the pinned title off the alt-screen.
+ *
+ * NOTE: cursor-moving control chars (Tab/ESC/C0/C1) are NOT sized here — width
+ * can't express a tab stop. Run text through `sanitizeCellText` first.
  */
 function displayWidth(str: string): number {
   return terminalCellWidth(str);
+}
+
+/**
+ * Strip everything that would move the cursor or otherwise desync column math
+ * from dynamic text (session titles, working dirs, flash messages) before it is
+ * measured or printed. A raw Tab jumps to the next tab stop and a raw ESC starts
+ * a control sequence — both make a "one physical line" cell silently span more
+ * columns (or lines) than displayWidth accounts for, wrapping the row and
+ * pushing the pinned title off screen. Collapse them all to a single space:
+ *   - C0 controls incl. Tab/CR/LF (U+0000–U+001F) and DEL (U+007F);
+ *   - C1 controls (U+0080–U+009F);
+ *   - stray ESC (U+001B) is covered by the C0 range.
+ * (ANSI colour sequences the picker itself emits are added AFTER sanitizing, so
+ * they are never fed through here.)
+ */
+function sanitizeCellText(str: string): string {
+  // eslint-disable-next-line no-control-regex
+  return str.replace(/[\x00-\x1F\x7F-\x9F]+/g, " ");
 }
 
 /** Truncate string to fit within maxWidth display columns, append '…' if truncated. */
@@ -3836,7 +3857,7 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
       const cells: Record<SessionPickerColumnKey, string> = {
         id: s.sessionId.substring(0, 8),
         bot: botLabel,
-        title: (s.title || '(untitled)').replace(/[\r\n]+/g, ' '),
+        title: s.title || '(untitled)',
         dir: shortenPath(s.workingDir || '-'),
         pid: displayPid ? String(displayPid) : '-',
         uptime: formatDuration(Date.now() - new Date(s.createdAt).getTime()),
@@ -3845,7 +3866,9 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
       };
       const text = layout.columns
         .map(column => {
-          const value = cells[column.key].replace(/[\r\n]+/g, ' ');
+          // Sanitize every cell (not just title): a Tab/ESC/control char in any
+          // dynamic field would move the cursor and desync the one-line-per-row math.
+          const value = sanitizeCellText(cells[column.key]);
           return padEndDisplay(truncate(value, column.width), column.width);
         })
         .join(' │ ');
@@ -3919,13 +3942,14 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
 
   const fitLine = (text: string, width: number): string => {
     if (width <= 0) return '';
-    const singleLine = text.replace(/[\r\n]+/g, ' ');
+    const singleLine = sanitizeCellText(text);
     return displayWidth(singleLine) <= width ? singleLine : truncate(singleLine, width);
   };
   const fitAnsiLine = (text: string, width: number): string => {
-    const plain = text
-      .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
-      .replace(/[\r\n]+/g, ' ');
+    // flashMsg carries the picker's own ANSI colour codes (added by us, trusted):
+    // strip the SGR sequences to measure the visible text, then sanitize any
+    // stray control chars from interpolated dynamic bits before printing.
+    const plain = sanitizeCellText(text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, ''));
     if (!/[\r\n]/.test(text) && displayWidth(plain) <= width) return text;
     return `\x1b[2m${fitLine(plain, width)}\x1b[0m`;
   };
