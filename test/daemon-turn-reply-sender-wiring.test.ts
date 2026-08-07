@@ -15,22 +15,35 @@ describe('daemon per-turn reply sender + participant wiring', () => {
     expect(daemonSource).toContain('buildTurnParticipants(larkAppId, senderOpenId, resolvedSenderIsBotTriState, undefined, initialPassthroughSender?.name)');
     expect(daemonSource).toMatch(/participants: initialWindow\.participants, participantsIncomplete: initialWindow\.incomplete/);
     // new-topic (business message → tri-state sender + parsed.mentions + resolved
-    // name + current & forward-seed raw messages for post inline-@ extraction)
-    expect(daemonSource).toContain('buildTurnParticipants(larkAppId, senderOpenId, senderIsBotTriState(parsed.senderType, isForeignBotSender), parsed.mentions, newTopicSender?.name, data?.message, ctx.forwardSeedData?.message)');
+    // name + post @s pre-extracted from current & forward-seed messages)
+    expect(daemonSource).toContain('const newTopicPostAt = collectPostAtMentions(data?.message, ctx.forwardSeedData?.message);');
+    expect(daemonSource).toContain('buildTurnParticipants(larkAppId, senderOpenId, senderIsBotTriState(parsed.senderType, isForeignBotSender), parsed.mentions, newTopicSender?.name, newTopicPostAt)');
     expect(daemonSource).toMatch(/participants: newTopicWindow\.participants, participantsIncomplete: newTopicWindow\.incomplete/);
-    // existing-session (name best-effort omitted — resolves after the barrier; post @s from data.message)
-    expect(daemonSource).toContain('buildTurnParticipants(larkAppId, callerOpenId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, undefined, data?.message)');
+    // existing-session: prepared (race-loser) handoff uses the COMPLETE pre-extracted
+    // set; otherwise extract from this message.
+    expect(daemonSource).toContain('const existingPostAt = prepared?.postParticipantMentions ?? collectPostAtMentions(data?.message);');
+    expect(daemonSource).toContain('buildTurnParticipants(larkAppId, callerOpenId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, undefined, existingPostAt)');
     expect(daemonSource).toMatch(/participants: existingWindow\.participants, participantsIncomplete: existingWindow\.incomplete/);
-    // auto-create
-    expect(daemonSource).toContain('buildTurnParticipants(larkAppId, senderOId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, autoCreateSender?.name, data?.message)');
+    // auto-create: same prepared-vs-fresh post-@ resolution
+    expect(daemonSource).toContain('const autoCreatePostAt = prepared?.postParticipantMentions ?? collectPostAtMentions(data?.message);');
+    expect(daemonSource).toContain('buildTurnParticipants(larkAppId, senderOId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, autoCreateSender?.name, autoCreatePostAt)');
     expect(daemonSource).toMatch(/participants: autoCreateWindow\.participants, participantsIncomplete: autoCreateWindow\.incomplete/);
   });
 
-  it('buildTurnParticipants folds post inline @s (extractPostAtParticipants) into the window', () => {
-    // post rich-text @s live outside message.mentions[]; the wrapper concats them
-    // (not key/name-merged) so a post "@self + @OtherBot" turn is not under-counted.
-    expect(daemonSource).toContain('const postAt = postMessages.flatMap(m => extractPostAtParticipants(m));');
-    expect(daemonSource).toMatch(/\[\.\.\.\(mentions \?\? \[\]\), \.\.\.postAt\]/);
+  it('a registration-race loser carries the pre-extracted seed+follow-up post @s through prepared', () => {
+    // The CAS-loser handoff must NOT drop the seed's post inline @s: winner rebinds
+    // with prepared.postParticipantMentions, not just the follow-up message.
+    expect(daemonSource).toMatch(/postParticipantMentions\?: LarkMention\[\];/);           // on the prepared type
+    expect(daemonSource).toContain('postParticipantMentions: newTopicPostAt,');            // passed at the loser handoff
+  });
+
+  it('buildTurnParticipants concats pre-extracted post @s (extractPostAtParticipants) into the window', () => {
+    // post rich-text @s live outside message.mentions[]; collectPostAtMentions
+    // extracts them, buildTurnParticipants concats (not key/name-merged) so a post
+    // "@self + @OtherBot" turn is not under-counted.
+    expect(daemonSource).toContain('function collectPostAtMentions(');
+    expect(daemonSource).toContain('return messages.flatMap(m => extractPostAtParticipants(m));');
+    expect(daemonSource).toMatch(/\[\.\.\.\(mentions \?\? \[\]\), \.\.\.\(postAtMentions \?\? \[\]\)\]/);
   });
 
   it('senderIsBotTriState maps unknown → undefined (not human) and keeps routing boolean separate', () => {

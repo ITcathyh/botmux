@@ -15398,28 +15398,35 @@ function senderIsBotTriState(
   return undefined;
 }
 
-/** Build the turn-window counterparts contributed by ONE inbound message via
- *  the pure {@link buildTurnParticipantsFrom}, supplying the daemon deps (self
+/** Extract post rich-text inline `at` participants from the given message(s),
+ *  concatenated (NOT key/name-merged — the core dedupes by open_id, and stable
+ *  cross-message identity is open/app id, never the per-message key). Pass the
+ *  current message and, when a forward seed folds into the same turn, the seed
+ *  too. Kept separate from buildTurnParticipants so a registration-race loser's
+ *  winner can carry the ALREADY-extracted seed+follow-up set through prepared
+ *  without re-depending on ctx.forwardSeedData. */
+function collectPostAtMentions(...messages: Array<{ content?: string } | null | undefined>): LarkMention[] {
+  return messages.flatMap(m => extractPostAtParticipants(m));
+}
+
+/** Build the turn-window counterparts contributed by ONE inbound turn via the
+ *  pure {@link buildTurnParticipantsFrom}, supplying the daemon deps (self
  *  open_id + self app_id for self-exclusion of app_id-form self @s + the
- *  peer-bot predicate). See that helper for the contract. */
+ *  peer-bot predicate). `postAtMentions` are post inline-@ participants already
+ *  extracted (see collectPostAtMentions) — concatenated with structured
+ *  `mentions`. See that helper for the contract. */
 function buildTurnParticipants(
   larkAppId: string,
   senderOpenId: string | undefined,
   senderIsBot: boolean | undefined,
   mentions: LarkMention[] | undefined,
   senderName?: string,
-  /** Raw inbound message(s) folded into this turn, so post rich-text inline
-   *  `at` @s (which live outside `message.mentions[]`) also count toward the
-   *  window. Pass the current message and, when a forward seed folds into the
-   *  same turn, the seed message too. Concatenated (NOT key/name-merged) with
-   *  `mentions`; the core dedupes by open_id, so duplicates are harmless. */
-  ...postMessages: Array<{ content?: string } | null | undefined>
+  postAtMentions?: LarkMention[],
 ): { participants: TurnParticipant[]; incomplete: boolean } {
   const selfBot = getBot(larkAppId);
-  const postAt = postMessages.flatMap(m => extractPostAtParticipants(m));
   return buildTurnParticipantsFrom(
     { openId: senderOpenId, isBot: senderIsBot, name: senderName },
-    [...(mentions ?? []), ...postAt],
+    [...(mentions ?? []), ...(postAtMentions ?? [])],
     selfBot.botOpenId,
     (openId) => isKnownPeerBot(config.session.dataDir, larkAppId, openId),
     selfBot.config.larkAppId,
@@ -16203,7 +16210,11 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const substituteReplyMode = substituteTrigger
     ? (botCfg.substituteMode?.replyMode ?? 'thread')
     : 'thread';
-  const newTopicWindow = buildTurnParticipants(larkAppId, senderOpenId, senderIsBotTriState(parsed.senderType, isForeignBotSender), parsed.mentions, newTopicSender?.name, data?.message, ctx.forwardSeedData?.message);
+  // Post inline-@ participants from BOTH the current message and a folded
+  // forward seed — extracted once so the CAS-loser handoff below can carry the
+  // exact same set (a race-losing scratch's seed @s must not vanish).
+  const newTopicPostAt = collectPostAtMentions(data?.message, ctx.forwardSeedData?.message);
+  const newTopicWindow = buildTurnParticipants(larkAppId, senderOpenId, senderIsBotTriState(parsed.senderType, isForeignBotSender), parsed.mentions, newTopicSender?.name, newTopicPostAt);
   beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId, participants: newTopicWindow.participants, participantsIncomplete: newTopicWindow.incomplete });
   sessionStore.updateSession(ds.session);
   const creationKey = sessionKey(anchor, larkAppId);
@@ -16225,6 +16236,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
           queueAlreadyAppended: true,
           senderResolved: true,
           sender: newTopicSender,
+          postParticipantMentions: newTopicPostAt,
         },
       );
     }
@@ -16809,6 +16821,13 @@ interface PreparedThreadReply {
   queueAlreadyAppended: true;
   senderResolved: true;
   sender: ResolvedSender | undefined;
+  /** Post inline-@ participants already extracted from the current AND
+   *  forward-seed messages at new-topic time. Carried so a registration-race
+   *  loser's winner rebinds the turn with the COMPLETE seed+follow-up window —
+   *  otherwise the seed's post @s (rolled back with the losing scratch) vanish
+   *  and a "seed post @OtherBot + follow-up @self only" turn fails open. Pre-
+   *  extracted (not raw messages) so this never re-depends on ctx.forwardSeedData. */
+  postParticipantMentions?: LarkMention[];
 }
 
 async function handleThreadReply(
@@ -17314,8 +17333,11 @@ async function handleThreadReply(
     // Sender name is best-effort here: getThreadSender() resolves later (this
     // hot path avoids an await before the buffering barrier), so the candidate
     // list may show open_id without a name — the ambiguity decision itself is
-    // unaffected.
-    const existingWindow = buildTurnParticipants(larkAppId, callerOpenId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, undefined, data?.message);
+    // unaffected. Post inline-@s: on a prepared (registration-race loser) handoff
+    // use the COMPLETE pre-extracted seed+follow-up set; otherwise extract from
+    // this message.
+    const existingPostAt = prepared?.postParticipantMentions ?? collectPostAtMentions(data?.message);
+    const existingWindow = buildTurnParticipants(larkAppId, callerOpenId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, undefined, existingPostAt);
     beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: callerOpenId, participants: existingWindow.participants, participantsIncomplete: existingWindow.incomplete });
     if (callerOpenId && ds.session.lastCallerOpenId !== callerOpenId) {
       ds.session.lastCallerOpenId = callerOpenId;
@@ -17541,7 +17563,8 @@ async function handleThreadReply(
     const substituteReplyMode = substituteTrigger
       ? (botCfg.substituteMode?.replyMode ?? 'thread')
       : 'thread';
-    const autoCreateWindow = buildTurnParticipants(larkAppId, senderOId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, autoCreateSender?.name, data?.message);
+    const autoCreatePostAt = prepared?.postParticipantMentions ?? collectPostAtMentions(data?.message);
+    const autoCreateWindow = buildTurnParticipants(larkAppId, senderOId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, autoCreateSender?.name, autoCreatePostAt);
     beginReplyTargetTurn(newDs, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: senderOId, participants: autoCreateWindow.participants, participantsIncomplete: autoCreateWindow.incomplete });
     sessionStore.updateSession(newDs.session);
     const creationKey = sessionKey(anchor, larkAppId);
