@@ -90,6 +90,7 @@ import {
   type SessionPickerLayout,
 } from './cli/session-picker-layout.js';
 import { computeSessionPickerScrollWindow } from './cli/session-picker-viewport.js';
+import { terminalCellWidth } from './cli/terminal-width.js';
 import {
   attachFrozenManagedZmxSession,
   freezeManagedZmxAttachTarget,
@@ -3390,31 +3391,18 @@ function formatDuration(ms: number): string {
   return `${days}d${hours % 24}h`;
 }
 
-/** Get display width of a string, accounting for CJK double-width characters. */
+/**
+ * Get display width of a string in terminal cells.
+ *
+ * Delegates to the xterm Unicode 11 width table (see terminal-width.ts) so the
+ * `botmux list` picker's column/row math matches what a real terminal — and the
+ * project's own xterm.js web terminal — actually paints. The previous inline
+ * table only covered CJK/Hangul and under-counted emoji (🤖 as 1 instead of 2),
+ * which let emoji session titles overflow a row, wrap onto a second physical
+ * line, and push the pinned title off the alt-screen.
+ */
 function displayWidth(str: string): number {
-  let width = 0;
-  for (const ch of str) {
-    const code = ch.codePointAt(0)!;
-    // CJK Unified Ideographs, CJK Compatibility, Fullwidth forms, Hangul, Kana, etc.
-    if (
-      (code >= 0x1100 && code <= 0x115f) ||   // Hangul Jamo
-      (code >= 0x2e80 && code <= 0x303e) ||   // CJK Radicals, Kangxi, CJK Symbols
-      (code >= 0x3040 && code <= 0x33bf) ||   // Hiragana, Katakana, Bopomofo, CJK Compat
-      (code >= 0x3400 && code <= 0x4dbf) ||   // CJK Unified Ext A
-      (code >= 0x4e00 && code <= 0xa4cf) ||   // CJK Unified, Yi
-      (code >= 0xac00 && code <= 0xd7af) ||   // Hangul Syllables
-      (code >= 0xf900 && code <= 0xfaff) ||   // CJK Compat Ideographs
-      (code >= 0xfe30 && code <= 0xfe6f) ||   // CJK Compat Forms
-      (code >= 0xff01 && code <= 0xff60) ||   // Fullwidth Forms
-      (code >= 0xffe0 && code <= 0xffe6) ||   // Fullwidth Signs
-      (code >= 0x20000 && code <= 0x2fa1f)    // CJK Unified Ext B-F, Compat Supplement
-    ) {
-      width += 2;
-    } else {
-      width += 1;
-    }
-  }
-  return width;
+  return terminalCellWidth(str);
 }
 
 /** Truncate string to fit within maxWidth display columns, append '…' if truncated. */

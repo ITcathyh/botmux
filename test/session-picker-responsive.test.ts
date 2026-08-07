@@ -1,5 +1,6 @@
 import * as pty from 'node-pty';
 import xtermHeadless from '@xterm/headless';
+import { Unicode11Addon } from '@xterm/addon-unicode11';
 import {
   mkdirSync,
   mkdtempSync,
@@ -26,7 +27,18 @@ afterEach(() => {
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-function makeFixture(multiBot: boolean): { root: string; dataDir: string } {
+// Build the xterm buffer the same way the project's own web terminal does
+// (src/worker.ts loads Unicode11Addon + activeVersion='11'). A bare xterm scores
+// emoji as one cell and would NOT reproduce emoji wrapping — this addon makes the
+// headless terminal count 🤖/🎉 as two cells, exactly as a real terminal paints.
+function makeTerminal(cols: number): InstanceType<typeof Terminal> {
+  const terminal = new Terminal({ cols, rows: 24, allowProposedApi: true });
+  terminal.loadAddon(new Unicode11Addon());
+  terminal.unicode.activeVersion = '11';
+  return terminal;
+}
+
+function makeFixture(multiBot: boolean, titleFor?: (index: number) => string): { root: string; dataDir: string } {
   const root = mkdtempSync(join(tmpdir(), 'botmux-picker-responsive-'));
   tempDirs.push(root);
   const dataDir = join(root, 'data');
@@ -49,7 +61,7 @@ function makeFixture(multiBot: boolean): { root: string; dataDir: string } {
       sessionId,
       chatId: 'oc_picker_test',
       rootMessageId: `om_${n}`,
-      title: `session-${n}`,
+      title: titleFor ? titleFor(i) : `session-${n}`,
       workingDir: '/workspace/botmux',
       status: 'active',
       createdAt: new Date(Date.UTC(2026, 7, 6, 0, 0, i)).toISOString(),
@@ -62,13 +74,13 @@ function makeFixture(multiBot: boolean): { root: string; dataDir: string } {
   return { root, dataDir };
 }
 
-async function spawnPicker(cols: number, multiBot: boolean): Promise<{
+async function spawnPicker(cols: number, multiBot: boolean, titleFor?: (index: number) => string): Promise<{
   child: pty.IPty;
   terminal: InstanceType<typeof Terminal>;
   renderCount: () => number;
   waitForRender: (minimum: number) => Promise<void>;
 }> {
-  const fixture = makeFixture(multiBot);
+  const fixture = makeFixture(multiBot, titleFor);
   const env: Record<string, string> = {
     ...(process.env as Record<string, string>),
     HOME: fixture.root,
@@ -90,7 +102,7 @@ async function spawnPicker(cols: number, multiBot: boolean): Promise<{
     name: 'xterm-256color',
   });
   children.push(child);
-  const terminal = new Terminal({ cols, rows: 24, allowProposedApi: true });
+  const terminal = makeTerminal(cols);
   let raw = '';
   let writes = Promise.resolve();
   child.onData(data => {
@@ -163,6 +175,20 @@ describe('session picker real terminal responsiveness', () => {
     const screen = inspectScreen(picker.terminal);
     expect(screen.lines[0]).toContain('botmux sessions  (1/48)');
     expect(screen.lines.some(line => line.includes('❯') && line.includes('48000000'))).toBe(true);
+    expect(screen.wrappedRows).toEqual([]);
+    await closePicker(picker.child, picker.terminal);
+  });
+
+  it('does not wrap when every session title is emoji-heavy', async () => {
+    // Regression for the Unicode-width gap: session titles routinely carry emoji
+    // (Lark topic names), and a real terminal paints each emoji two cells wide.
+    // If column math scores them as one cell, the row overflows, wraps onto a
+    // second physical line and the vertical viewport's one-row-per-session
+    // accounting breaks — pushing the pinned title back off the alt-screen.
+    const picker = await spawnPicker(99, false, i => `🤖🎉🚀 session ${i + 1} 部署✅ 🔥🔥🔥`);
+    const screen = inspectScreen(picker.terminal);
+    expect(screen.lines[0]).toContain('botmux sessions  (1/48)');
+    expect(screen.lines.some(line => line.includes('❯'))).toBe(true);
     expect(screen.wrappedRows).toEqual([]);
     await closePicker(picker.child, picker.terminal);
   });
