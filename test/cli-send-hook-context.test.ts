@@ -34,13 +34,13 @@ describe('cmdSend hook context wiring', () => {
   });
 
   it('gates --mention-back by turn-window participant ambiguity (no group-stats round-trip)', () => {
-    // 2+ distinct counterparts in the turn window → block --mention-back and
+    // 2+ distinct counterparts OR an incomplete window → block --mention-back and
     // hand the model explicit --mention candidates. Reads the persisted
     // participant window; no getGroupStats fetch. Explicit VC turns skip it.
     expect(cliSource).toContain('collectTurnWindowParticipants(s, currentTurnId)');
-    expect(cliSource).toContain('mentionBackAmbiguity({ chatType: s.chatType, participants: windowParticipants })');
+    expect(cliSource).toContain('mentionBackAmbiguity({ chatType: s.chatType, participants: window.participants, incomplete: window.incomplete })');
     expect(cliSource).toMatch(/if \(mentionBack && !explicitVcMeetingImOrigin && !sendTopLevel\)/);
-    expect(cliSource).toContain('console.error(mentionBackAmbiguityError(ambiguity.candidates))');
+    expect(cliSource).toContain('console.error(mentionBackAmbiguityError(ambiguity.candidates, ambiguity.incomplete))');
     // The old asymmetric/group-stats gate is fully gone.
     expect(cliSource).not.toContain('shouldBlockMentionBackByParticipants');
     expect(cliSource).not.toMatch(/mentionBack[\s\S]{0,300}getGroupStats/);

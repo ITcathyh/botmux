@@ -119,9 +119,15 @@ export type StreamStatus = ScreenStatus | 'starting';
  *  message's sender and @-mentions (type-ahead follow-ups included), excluding
  *  the answering bot itself. Drives `botmux send --mention-back`'s ambiguity
  *  gate: 2+ distinct counterparts → block --mention-back and list these as
- *  explicit --mention candidates. `isBot` labels each candidate person/bot. */
+ *  explicit --mention candidates. A participant WITHOUT `openId` (an app_id /
+ *  user_id / union_id-form @ that could not be reduced to a receiver-scoped
+ *  open_id) still counts toward the distinct-counterpart tally, but marks the
+ *  window incomplete (no id to hand back as a --mention candidate).
+ *  `isBot` labels each candidate: true = bot, false = human, undefined = unknown
+ *  (NOT provably a human — e.g. a third-party bot not in the peer cross-ref). */
 export interface TurnParticipant {
-  openId: string;
+  /** Receiver-scoped open_id when available; absent for app_id-form mentions. */
+  openId?: string;
   name?: string;
   isBot?: boolean;
 }
@@ -145,6 +151,12 @@ export interface ReplyTargetEntry {
    *  --mention-back is unambiguous (≤1 counterpart → allow) or must be replaced
    *  by an explicit --mention (≥2 → block + offer these as candidates). */
   participants?: TurnParticipant[];
+  /** True when this turn's counterpart set may be UNDER-counted — an @ arrived
+   *  in a non-open_id form (app_id / user_id / union_id) that we could not
+   *  reduce to a usable open_id, or a window-relevant sibling record was pruned.
+   *  `botmux send` treats an incomplete window as ambiguous → forces an explicit
+   *  --mention decision rather than risk auto-@-ing the wrong single counterpart. */
+  participantsIncomplete?: boolean;
 }
 
 export interface Session {
@@ -333,6 +345,15 @@ export interface Session {
    * when their turnId still exactly matches, otherwise it fails closed.
    */
   replyTargets?: Record<string, ReplyTargetEntry>;
+  /**
+   * High-water mark: the latest `updatedAt` of any `replyTargets` entry ever
+   * pruned by the bounded-map eviction. `botmux send`'s --mention-back
+   * ambiguity gate treats a turn window as incomplete (→ force an explicit
+   * --mention) when this watermark reaches into the turn's window, since a
+   * pruned sibling could have carried an unseen counterpart. Lets a busy
+   * message flood stay bounded without silently under-counting participants.
+   */
+  replyTargetsPrunedThrough?: string;
   /**
    * Durable receiver acknowledgement keyed by the exact inbound Lark
    * message_id. A receipt is written only after the worker has committed that

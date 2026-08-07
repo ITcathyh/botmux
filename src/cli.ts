@@ -7466,10 +7466,10 @@ async function cmdSend(rest: string[]): Promise<void> {
   // persisted per-turn participant window — no group-stats round-trip. Explicit
   // VC turns carry their own single-target origin, so they skip this gate.
   if (mentionBack && !explicitVcMeetingImOrigin && !sendTopLevel) {
-    const windowParticipants = collectTurnWindowParticipants(s, currentTurnId);
-    const ambiguity = mentionBackAmbiguity({ chatType: s.chatType, participants: windowParticipants });
+    const window = collectTurnWindowParticipants(s, currentTurnId);
+    const ambiguity = mentionBackAmbiguity({ chatType: s.chatType, participants: window.participants, incomplete: window.incomplete });
     if (ambiguity.ambiguous) {
-      console.error(mentionBackAmbiguityError(ambiguity.candidates));
+      console.error(mentionBackAmbiguityError(ambiguity.candidates, ambiguity.incomplete));
       process.exit(2);
     }
   }

@@ -1,5 +1,5 @@
 import type { DaemonSession } from './types.js';
-import type { ReplyTargetEntry, Session, TurnParticipant } from '../types.js';
+import type { LarkMention, ReplyTargetEntry, Session, TurnParticipant } from '../types.js';
 
 /** Merge participants by open_id, keeping the richest label (a later entry can
  *  fill a missing name / promote isBot). Order-stable on first appearance so a
@@ -17,6 +17,52 @@ export function dedupeParticipants(list: TurnParticipant[]): TurnParticipant[] {
   return [...byId.values()];
 }
 
+/** Pure core of a message's turn-window contribution (daemon wraps it with live
+ *  deps). Its sender plus everyone it @-mentioned, excluding the answering bot
+ *  (`selfOpenId`). `participants` holds ONLY executable receiver-scoped open_id
+ *  candidates (so `botmux send` can hand them back as `--mention <open_id>`),
+ *  each labelled bot (`isMentionBot` proves a known peer, or sender is a
+ *  platform-stamped bot) / unknown (NOT provably human — `isMentionBot=false`
+ *  does not prove a person; a third-party bot isn't in the cross-ref). Returns
+ *  `incomplete: true` when a real @-mention could not be reduced to a usable
+ *  open_id (app_id / user_id / union_id form — parser leaves `openId`
+ *  undefined): that counterpart is NOT listed as a candidate but forces the
+ *  window ambiguous so the gate demands an explicit decision rather than risk a
+ *  wrong single-target @. Sender name is best-effort — omitted when unknown. */
+export function buildTurnParticipantsFrom(
+  sender: { openId?: string; isBot?: boolean; name?: string },
+  mentions: LarkMention[] | undefined,
+  selfOpenId: string | undefined,
+  isMentionBot: (openId: string) => boolean,
+): { participants: TurnParticipant[]; incomplete: boolean } {
+  const out: TurnParticipant[] = [];
+  let incomplete = false;
+  if (sender.openId && sender.openId !== selfOpenId) {
+    out.push({
+      openId: sender.openId,
+      ...(sender.name ? { name: sender.name } : {}),
+      ...(sender.isBot !== undefined ? { isBot: sender.isBot } : {}),
+    });
+  }
+  for (const m of mentions ?? []) {
+    if (m.openId && m.openId === selfOpenId) continue;   // the answering bot itself
+    if (!m.openId) {
+      // app_id / user_id / union_id-form @ (parser leaves openId undefined): a
+      // real counterpart we can't reduce to a --mention <open_id> candidate.
+      // Don't fake an id into the candidate list; mark the window incomplete so
+      // the gate fails toward an explicit decision.
+      incomplete = true;
+      continue;
+    }
+    out.push({
+      openId: m.openId,
+      ...(m.name ? { name: m.name } : {}),
+      ...(isMentionBot(m.openId) ? { isBot: true } : {}),
+    });
+  }
+  return { participants: out, incomplete };
+}
+
 export type SessionReplyTarget =
   | { mode: 'plain'; chatId: string }
   | { mode: 'thread'; rootMessageId: string }
@@ -25,7 +71,33 @@ export type SessionReplyTarget =
 /** Bound on `Session.replyTargets`: long-lived sessions could otherwise grow
  * without limit. An evicted turn may use a legacy slot only when its turnId
  * still matches exactly; it never borrows a later turn's sender. */
-const REPLY_TARGETS_MAX = 32;
+export const REPLY_TARGETS_MAX = 32;
+
+/** Prune `targets` down to REPLY_TARGETS_MAX oldest-first, IN PLACE, and return
+ *  the new prune high-water mark = max(existing watermark, latest `updatedAt`
+ *  among the entries actually evicted). Both replyTargets writers
+ *  (beginReplyTargetTurn + trigger-final-suppression's inheritTriggerReplyAnchor)
+ *  MUST route eviction through here so a pruned sibling can never silently
+ *  under-count a turn's participant window — `botmux send` compares the returned
+ *  watermark against the turn window to decide incompleteness. */
+export function pruneReplyTargets(
+  targets: Record<string, ReplyTargetEntry>,
+  prevPrunedThrough: string | undefined,
+): string | undefined {
+  const keys = Object.keys(targets);
+  if (keys.length <= REPLY_TARGETS_MAX) return prevPrunedThrough;
+  const evict = keys
+    .sort((a, b) => (targets[a].updatedAt < targets[b].updatedAt ? -1 : 1))
+    .slice(0, keys.length - REPLY_TARGETS_MAX);
+  let watermark = prevPrunedThrough;
+  for (const k of evict) {
+    const ts = targets[k].updatedAt;
+    if (!watermark || watermark < ts) watermark = ts;
+    delete targets[k];
+  }
+  return watermark;
+}
+
 
 export interface TurnReplyTarget extends Omit<ReplyTargetEntry, 'updatedAt'> {
   turnId: string;
@@ -141,7 +213,7 @@ export function beginReplyTargetTurn(
   replyRootId: string | undefined,
   turnId: string,
   nowIso = new Date().toISOString(),
-  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: TurnParticipant[] },
+  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: TurnParticipant[]; participantsIncomplete?: boolean },
 ): void {
   // Routing and sender are one atomic per-turn record. Thread-scope and
   // rootless chat turns may have no rootMessageId, but still require their
@@ -163,14 +235,9 @@ export function beginReplyTargetTurn(
     ...(isChatScope ? { quoteOnly: opts?.quoteOnly, substitute: opts?.substitute } : {}),
     ...(opts?.senderOpenId ? { senderOpenId: opts.senderOpenId } : {}),
     ...(opts?.participants?.length ? { participants: dedupeParticipants(opts.participants) } : {}),
+    ...(opts?.participantsIncomplete ? { participantsIncomplete: true } : {}),
   };
-  const keys = Object.keys(targets);
-  if (keys.length > REPLY_TARGETS_MAX) {
-    keys
-      .sort((a, b) => (targets[a].updatedAt < targets[b].updatedAt ? -1 : 1))
-      .slice(0, keys.length - REPLY_TARGETS_MAX)
-      .forEach(k => { delete targets[k]; });
-  }
+  ds.session.replyTargetsPrunedThrough = pruneReplyTargets(targets, ds.session.replyTargetsPrunedThrough);
   ds.session.replyTargets = targets;
 
   if (ds.scope !== 'chat') return;
@@ -196,36 +263,58 @@ export function beginReplyTargetTurn(
  *  per-turn record (distinct message_id), and the model may resolve
  *  BOTMUX_TURN_ID to whichever was processed last — so `botmux send` unions the
  *  participants of every record updated within this window of the resolved
- *  turn. Deliberately an approximation (申晗-approved): erring wide can only add
- *  a candidate / over-suggest an explicit --mention, never wrongly auto-@ the
- *  wrong person (fail-safe). 90s comfortably spans a busy CLI batch while not
- *  bleeding into an unrelated later conversation. */
+ *  turn. Deliberate conservative approximation: uncertainty (an incomplete
+ *  window, a pruned sibling, no window at all) fails toward explicit addressing,
+ *  and erring wide can only over-suggest an explicit --mention, never wrongly
+ *  auto-@ the wrong single counterpart. 90s comfortably spans a busy CLI batch
+ *  while not bleeding into an unrelated later conversation. */
 export const TURN_WINDOW_MS = 90_000;
+
+export interface TurnWindow {
+  /** Executable receiver-scoped open_id candidates in the window (deduped). */
+  participants: TurnParticipant[];
+  /** True when the set may be UNDER-counted — a non-open_id @ we couldn't
+   *  resolve, a window-relevant sibling pruned by the bounded map, or the turn
+   *  window itself is unknown. Callers must fail toward an explicit --mention. */
+  incomplete: boolean;
+}
 
 /** The turn-window counterpart set for `currentTurnId`: the resolved turn's own
  *  participants unioned with those of any sibling turn record updated within
  *  TURN_WINDOW_MS (covers type-ahead follow-ups that folded into this model
- *  turn under different message_ids). Empty array when nothing is known. */
+ *  turn under different message_ids). `incomplete` is set when the set can't be
+ *  proven complete — no anchor, a window record self-marked incomplete
+ *  (unresolved @), or the prune watermark reaches into the window (a pruned
+ *  sibling may have carried an unseen counterpart). */
 export function collectTurnWindowParticipants(
-  s: Pick<Session, 'replyTargets'>,
+  s: Pick<Session, 'replyTargets' | 'replyTargetsPrunedThrough'>,
   currentTurnId: string | undefined,
-): TurnParticipant[] {
+): TurnWindow {
   const map = s.replyTargets;
-  if (!map || !currentTurnId) return [];
+  if (!map || !currentTurnId) return { participants: [], incomplete: true };
   const anchor = map[currentTurnId];
-  if (!anchor) return [];
+  // No anchor record → we cannot bound the turn; a sender may still resolve from
+  // legacy slots, so the caller must treat this as ambiguous (fail toward
+  // explicit) rather than assume a lone counterpart.
+  if (!anchor) return { participants: [], incomplete: true };
   const anchorMs = Date.parse(anchor.updatedAt);
   const collected: TurnParticipant[] = [];
+  let incomplete = false;
+  const windowLo = Number.isNaN(anchorMs) ? NaN : anchorMs - TURN_WINDOW_MS;
   for (const entry of Object.values(map)) {
-    if (!entry.participants?.length) continue;
     const ms = Date.parse(entry.updatedAt);
-    // Include the anchor itself and any record within the window on either side
-    // (a follow-up may be stamped slightly before or after the anchor).
-    if (Number.isNaN(ms) || Number.isNaN(anchorMs) || Math.abs(ms - anchorMs) <= TURN_WINDOW_MS) {
-      collected.push(...entry.participants);
-    }
+    // In-window if within ±TURN_WINDOW_MS of the anchor (a follow-up may be
+    // stamped slightly before or after). Unparseable timestamps count as in.
+    const inWindow = Number.isNaN(ms) || Number.isNaN(anchorMs) || Math.abs(ms - anchorMs) <= TURN_WINDOW_MS;
+    if (!inWindow) continue;
+    if (entry.participants?.length) collected.push(...entry.participants);
+    if (entry.participantsIncomplete) incomplete = true;
   }
-  return dedupeParticipants(collected);
+  // A prune whose watermark reaches into this window means an evicted sibling
+  // could have carried a counterpart we can no longer see → under-count risk.
+  const prunedMs = s.replyTargetsPrunedThrough ? Date.parse(s.replyTargetsPrunedThrough) : NaN;
+  if (!Number.isNaN(prunedMs) && (Number.isNaN(windowLo) || prunedMs >= windowLo)) incomplete = true;
+  return { participants: dedupeParticipants(collected), incomplete };
 }
 
 

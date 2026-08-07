@@ -13,7 +13,7 @@
  * Run:  pnpm vitest run test/reply-target-fallback.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { beginReplyTargetTurn, collectTurnWindowParticipants, fallbackTurnId, isSubstituteTurn, pickTurnReplyTarget, resolveSessionReplyTarget } from '../src/core/reply-target.js';
+import { beginReplyTargetTurn, buildTurnParticipantsFrom, collectTurnWindowParticipants, fallbackTurnId, isSubstituteTurn, pickTurnReplyTarget, resolveSessionReplyTarget } from '../src/core/reply-target.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 const NOW = new Date().toISOString();
@@ -220,7 +220,8 @@ describe('per-turn replyTargets — queued/concurrent turns keep their own ancho
     beginReplyTargetTurn(ds, 'om_2', 'turn-2', soon, { senderOpenId: 'ou_li', participants: [{ openId: 'ou_li', name: '李四' }] });
 
     const w = collectTurnWindowParticipants(ds.session, 'turn-2');
-    expect(w.map(p => p.openId).sort()).toEqual(['ou_li', 'ou_zhang']);
+    expect(w.participants.map(p => p.openId).sort()).toEqual(['ou_li', 'ou_zhang']);
+    expect(w.incomplete).toBe(false);
   });
 
   it('collectTurnWindowParticipants excludes records outside the time window', () => {
@@ -230,7 +231,53 @@ describe('per-turn replyTargets — queued/concurrent turns keep their own ancho
     beginReplyTargetTurn(ds, 'om_new', 'turn-new', wayLater, { senderOpenId: 'ou_new', participants: [{ openId: 'ou_new' }] });
 
     const w = collectTurnWindowParticipants(ds.session, 'turn-new');
-    expect(w.map(p => p.openId)).toEqual(['ou_new']); // old turn is out of window
+    expect(w.participants.map(p => p.openId)).toEqual(['ou_new']); // old turn is out of window
+  });
+
+  it('collectTurnWindowParticipants → incomplete when no anchor record (old session / evicted turn)', () => {
+    const ds = makeDs() as DaemonSession;
+    beginReplyTargetTurn(ds, 'om_1', 'turn-1', NOW, { senderOpenId: 'ou_a', participants: [{ openId: 'ou_a' }] });
+    const w = collectTurnWindowParticipants(ds.session, 'turn-unknown');
+    expect(w).toEqual({ participants: [], incomplete: true });
+  });
+
+  it('collectTurnWindowParticipants → incomplete when a window entry self-marks incomplete (unresolved @)', () => {
+    const ds = makeDs() as DaemonSession;
+    // human sender + an unresolved app_id-form @: participants has only the human,
+    // but the entry is flagged incomplete.
+    beginReplyTargetTurn(ds, 'om_1', 'turn-1', NOW, { senderOpenId: 'ou_human', participants: [{ openId: 'ou_human' }], participantsIncomplete: true });
+    const w = collectTurnWindowParticipants(ds.session, 'turn-1');
+    expect(w.participants.map(p => p.openId)).toEqual(['ou_human']);
+    expect(w.incomplete).toBe(true);
+  });
+
+  it('collectTurnWindowParticipants → incomplete when the prune watermark reaches into the window', () => {
+    const ds = makeDs() as DaemonSession;
+    beginReplyTargetTurn(ds, 'om_anchor', 'turn-anchor', NOW, { senderOpenId: 'ou_b', participants: [{ openId: 'ou_b' }] });
+    // Simulate a sibling within the window having been pruned (watermark inside window).
+    ds.session.replyTargetsPrunedThrough = new Date(Date.parse(NOW) - 1000).toISOString();
+    const w = collectTurnWindowParticipants(ds.session, 'turn-anchor');
+    expect(w.incomplete).toBe(true);
+  });
+
+  it('prune watermark OUTSIDE the window does not mark complete window incomplete', () => {
+    const ds = makeDs() as DaemonSession;
+    beginReplyTargetTurn(ds, 'om_anchor', 'turn-anchor', NOW, { senderOpenId: 'ou_b', participants: [{ openId: 'ou_b' }] });
+    ds.session.replyTargetsPrunedThrough = new Date(Date.parse(NOW) - 10 * 60_000).toISOString(); // long before window
+    const w = collectTurnWindowParticipants(ds.session, 'turn-anchor');
+    expect(w.incomplete).toBe(false);
+  });
+
+  it('pruneReplyTargets bounds the map and raises the watermark to the newest evicted entry', () => {
+    const ds = makeDs() as DaemonSession;
+    for (let i = 0; i < 40; i++) {
+      beginReplyTargetTurn(ds, `om_${i}`, `turn-${i}`, new Date(Date.parse(NOW) + i * 1000).toISOString(), { senderOpenId: `ou_${i}`, participants: [{ openId: `ou_${i}` }] });
+    }
+    const keys = Object.keys(ds.session.replyTargets ?? {});
+    expect(keys.length).toBe(32);
+    expect(keys).not.toContain('turn-0');       // oldest evicted
+    // Watermark = newest evicted entry (turn-7 = index 7, since 40-32=8 evicted: 0..7).
+    expect(ds.session.replyTargetsPrunedThrough).toBe(new Date(Date.parse(NOW) + 7 * 1000).toISOString());
   });
 
   it('keeps rootless chat sender A separate from topic sender/root B', () => {
@@ -310,5 +357,54 @@ describe('per-turn replyTargets — queued/concurrent turns keep their own ancho
     expect(resolveSessionReplyTarget(ds, 'turn-0')).toEqual({ mode: 'plain', chatId: 'oc_chat' });
     expect(pickTurnReplyTarget(ds.session, 'turn-0')).toBeUndefined();
     expect(pickTurnReplyTarget(ds.session, 'turn-39')?.senderOpenId).toBe('ou_39');
+  });
+});
+
+describe('buildTurnParticipantsFrom (pure per-message contribution)', () => {
+  const noPeer = () => false;
+
+  it('sender only (no mentions) → single candidate, complete', () => {
+    const r = buildTurnParticipantsFrom({ openId: 'ou_a', isBot: false, name: '张三' }, undefined, 'ou_self', noPeer);
+    expect(r).toEqual({ participants: [{ openId: 'ou_a', name: '张三', isBot: false }], incomplete: false });
+  });
+
+  it('excludes the answering bot itself as sender AND as a mention', () => {
+    const r = buildTurnParticipantsFrom(
+      { openId: 'ou_self', isBot: true },
+      [{ key: '@_1', name: 'me', openId: 'ou_self' }, { key: '@_2', name: '张三', openId: 'ou_a' }],
+      'ou_self',
+      noPeer,
+    );
+    expect(r.participants.map(p => p.openId)).toEqual(['ou_a']); // self dropped both times
+    expect(r.incomplete).toBe(false);
+  });
+
+  it('app_id/user_id/union_id-form @ (openId undefined) → NOT a candidate but marks incomplete', () => {
+    // The reported blocking: human sender + @OtherBot in app_id form. Parser
+    // leaves openId undefined; we must not under-count it as a lone human.
+    const r = buildTurnParticipantsFrom(
+      { openId: 'ou_human', isBot: false, name: '张三' },
+      [{ key: '@_1', name: 'OtherBot', idType: 'app_id' }], // no openId
+      'ou_self',
+      noPeer,
+    );
+    expect(r.participants.map(p => p.openId)).toEqual(['ou_human']); // only the resolvable one
+    expect(r.incomplete).toBe(true);                                // window under-counted
+  });
+
+  it('three-state is-bot: known peer → bot; unknown mention → undefined (NOT human)', () => {
+    const r = buildTurnParticipantsFrom(
+      { openId: 'ou_human', isBot: false },
+      [
+        { key: '@_1', name: 'Peer', openId: 'ou_peer' },     // known peer → bot
+        { key: '@_2', name: 'Third', openId: 'ou_third' },   // not a known peer → unknown
+      ],
+      'ou_self',
+      (id) => id === 'ou_peer',
+    );
+    const byId = Object.fromEntries(r.participants.map(p => [p.openId, p.isBot]));
+    expect(byId.ou_human).toBe(false);      // human sender: explicitly false
+    expect(byId.ou_peer).toBe(true);        // known peer bot
+    expect(byId.ou_third).toBeUndefined();  // unknown — NOT labelled human
   });
 });
