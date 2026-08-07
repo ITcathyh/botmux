@@ -31,19 +31,19 @@ import { fileURLToPath } from 'node:url';
 import xtermHeadless from '@xterm/headless';
 import unicode11 from '@xterm/addon-unicode11';
 import { EMOJI_PRESENTATION_RANGES } from './emoji-presentation.mjs';
+import { EAST_ASIAN_WIDE_RANGES } from './east-asian-width.mjs';
 
 const { Terminal } = xtermHeadless;
 const { Unicode11Addon } = unicode11;
 const OUT_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'cli', 'terminal-width.ts');
 const MAX_CODEPOINT = 0x10FFFF; // 全 Unicode 码点空间——高位 tag/VS 等也要正确归类
 
-// 用**固定**的 Unicode 17.0 Emoji_Presentation 区间判定(见 emoji-presentation.mjs,
-// 取自官方 emoji-data.txt),而不是运行时 \p{Emoji_Presentation} 正则——后者取决于当前
-// Node 捆绑的 ICU/Unicode 版本(Node 22 目前才 Unicode 16),既让生成表跨机器不一致
-// (CI build 因此红过),又落后于最新 Unicode 标准而漏掉新 emoji。钉死到官方 U17 数据
-// 保证生成结果处处逐字节相同,且已认识最新 emoji。
-const isEmojiPresentation = cp => {
-  const r = EMOJI_PRESENTATION_RANGES;
+// 现代 emoji 与 East_Asian_Width=W/F 都用**固定**的 Unicode 17.0 官方数据判定(见
+// emoji-presentation.mjs / east-asian-width.mjs),而不是运行时 \p{…}/EAW——后者取决于
+// 当前 Node 捆绑的 ICU/Unicode 版本(Node 22 目前才 Unicode 16),既让生成表跨机器不一致
+// (CI build 因此红过),又落后于最新 Unicode 标准而漏掉新 emoji/新判定为宽的码点。
+// 钉死到官方 U17 数据保证生成结果处处逐字节相同,且已认识最新 emoji 与最新 EAW。
+const inFlatRanges = (r, cp) => {
   let lo = 0;
   let hi = r.length / 2 - 1;
   while (lo <= hi) {
@@ -54,10 +54,13 @@ const isEmojiPresentation = cp => {
   }
   return false;
 };
+const isEmojiPresentation = cp => inFlatRanges(EMOJI_PRESENTATION_RANGES, cp);
+const isEastAsianWide = cp => inFlatRanges(EAST_ASIAN_WIDE_RANGES, cp);
 
 /**
- * 扫出宽度区间。宽度=2 取 xterm-11-wide ∪ Emoji_Presentation(保守上界);
- * 宽度=0 沿用 xterm-11 零宽集。返回互斥的两组 [start,end] 连续区间。
+ * 扫出宽度区间。宽度=2 取 xterm-11-wide ∪ U17 Emoji_Presentation ∪ U17 EAW(W/F)
+ * (保守上界);宽度=0 沿用 xterm-11 零宽集(优先级最高,组合记号/ZWJ 不会被误提为宽)。
+ * 返回互斥的两组 [start,end] 连续区间。
  */
 function extractRanges() {
   const term = new Terminal({ cols: 80, rows: 10, allowProposedApi: true });
@@ -67,12 +70,13 @@ function extractRanges() {
   if (!svc || typeof svc.wcwidth !== 'function') {
     throw new Error('无法从 @xterm/headless 取到 unicodeService.wcwidth;xterm 内部结构可能已变，需更新本脚本');
   }
-  // 每个码点归一到 0/1/2:先看 xterm-11(权威 EAW+零宽),再对 width-1 的 emoji 提到 2。
+  // 每个码点归一到 0/1/2:先看 xterm-11(权威零宽优先,组合记号/ZWJ 恒 0),
+  // 再对 width-1 的码点用固定 U17 数据提为 2(现代 emoji 或 East_Asian_Width=W/F)。
   const widthOf = cp => {
     const w = svc.wcwidth(cp);
     if (w === 0 || w === 2) return w;
-    // w === 1(含 xterm 对未知/负值的兜底):现代 emoji 提为 2。
-    return isEmojiPresentation(cp) ? 2 : 1;
+    // w === 1(含 xterm 对未知/负值的兜底):现代 emoji 或 U17 EAW 宽字符提为 2。
+    return (isEmojiPresentation(cp) || isEastAsianWide(cp)) ? 2 : 1;
   };
   const ranges = targetWidth => {
     const out = [];
@@ -117,12 +121,15 @@ function render({ wide, zero }) {
  *   - \`@xterm/addon-unicode11\` wcwidth == 2 (Unicode 11 EAW + then-current emoji;
  *     also what the project's own xterm web terminal paints, see src/worker.ts);
  *   - a pinned Unicode 17.0 Emoji_Presentation set (Unicode 14/15/16/17 emoji
- *     like 🫠🩷🛘🪊 that xterm-11 still scores as 1 but modern local/SSH terminals
- *     paint as 2). Pinned from the official emoji-data.txt (not the running Node's
- *     \\p{…}) so the table is identical on every Node regardless of the ICU/Unicode
- *     version it bundles, and does not lag the current Unicode standard.
+ *     like 🫠🩷🛘🪊 that xterm-11 still scores as 1 but modern terminals paint 2);
+ *   - a pinned Unicode 17.0 East_Asian_Width = W/F set (e.g. the trigram block
+ *     U+2630..U+2637 ☰, Wide since Unicode 16 — xterm-11 EAW is a decade behind).
+ *   Both pinned from official UCD files (not the running Node's \\p{…}/EAW) so the
+ *   table is identical on every Node regardless of the ICU/Unicode version it
+ *   bundles, and does not lag the current Unicode standard.
  * Width 0 = xterm-11 zero-width set (controls, combining marks, ZWJ, variation
- * selectors). Per-code-point sum, NO grapheme clustering (a ZWJ family emoji is
+ * selectors) — checked first, so a combining mark that is also EAW-wide stays 0.
+ * Per-code-point sum, NO grapheme clustering (a ZWJ family emoji is
  * 2+0+2+0+2 = 6) — over-counting there is harmless for the no-wrap invariant.
  *
  * Cursor-moving controls (Tab, ESC, C0/C1) are NOT handled here — width cannot

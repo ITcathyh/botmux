@@ -60,6 +60,16 @@ describe('terminal-width generated table', () => {
     for (const one of ['A', '©', '®', '™', '★', '①', '—']) expect(terminalCellWidth(one)).toBe(1);
   });
 
+  it('counts non-emoji code points that later Unicode marked East_Asian_Width Wide', () => {
+    // The width-2 set must union the current Unicode East_Asian_Width=W/F data, not
+    // just xterm-11's decade-old EAW. The trigram block U+2630..U+2637 (☰..☷) is
+    // Wide since Unicode 16 but xterm-11 scores it 1; a modern terminal paints it
+    // two wide, so an all-☰ title would wrap if we under-counted it.
+    for (let cp = 0x2630; cp <= 0x2637; cp++) {
+      expect(codePointCellWidth(cp)).toBe(2);
+    }
+  });
+
   it('keeps combining marks / ZWJ / variation selectors zero width (per-code-point sum)', () => {
     expect(codePointCellWidth(0x200d)).toBe(0); // ZWJ
     expect(codePointCellWidth(0xfe0f)).toBe(0); // VS16

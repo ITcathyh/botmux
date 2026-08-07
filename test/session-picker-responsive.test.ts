@@ -42,10 +42,14 @@ afterEach(() => {
 // directly: `(raw & ~6) | 4` forces width 2 so such emoji genuinely occupy two
 // buffer cells and the PTY test can observe wrapping if the picker under-counts them.
 const EMOJI_PRESENTATION = /\p{Emoji_Presentation}/u;
-// Unicode 17.0 Emoji_Presentation additions (not in Node 22's bundled Unicode 16).
+// Code points a modern terminal paints two wide but that Node 22's bundled Unicode 16
+// (and xterm-11) do not: Unicode 17 Emoji_Presentation additions, plus the trigram
+// block U+2630..U+2637 (East_Asian_Width=Wide since Unicode 16, non-emoji).
 const U17_EMOJI = new Set([0x1F6D8, 0x1FA8A, 0x1FA8E, 0x1FAC8, 0x1FACD, 0x1FAEA, 0x1FAEF]);
 const rendersTwoWide = (cp: number): boolean =>
-  U17_EMOJI.has(cp) || EMOJI_PRESENTATION.test(String.fromCodePoint(cp));
+  U17_EMOJI.has(cp)
+  || (cp >= 0x2630 && cp <= 0x2637)
+  || EMOJI_PRESENTATION.test(String.fromCodePoint(cp));
 function makeTerminal(cols: number, modern = false): InstanceType<typeof Terminal> {
   const terminal = new Terminal({ cols, rows: 24, allowProposedApi: true });
   terminal.loadAddon(new Unicode11Addon());
@@ -253,6 +257,25 @@ describe('session picker real terminal responsiveness', () => {
       99,
       false,
       i => Array.from({ length: 24 }, (_, k) => modern[(i + k) % modern.length]).join(''),
+      true,
+    );
+    const screen = inspectScreen(picker.terminal);
+    expect(screen.lines[0]).toContain('botmux sessions  (1/48)');
+    expect(screen.lines.some(line => line.includes('❯'))).toBe(true);
+    expect(screen.wrappedRows).toEqual([]);
+    await closePicker(picker.child, picker.terminal);
+  });
+
+  it('does not wrap on non-emoji code points later Unicode widened (East_Asian_Width)', async () => {
+    // The trigram block ☰..☷ (U+2630..U+2637) is East_Asian_Width=Wide since Unicode
+    // 16 but xterm-11 scores it 1. A modern terminal paints it two cells wide; if the
+    // width table only unions emoji (not current EAW), an all-☰ title under-counts,
+    // overflows the row, wraps, and pushes the pinned title off screen.
+    const trigrams = ['☰', '☱', '☲', '☳', '☴', '☵', '☶', '☷'];
+    const picker = await spawnPicker(
+      99,
+      false,
+      i => Array.from({ length: 24 }, (_, k) => trigrams[(i + k) % trigrams.length]).join(''),
       true,
     );
     const screen = inspectScreen(picker.terminal);
