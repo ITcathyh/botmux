@@ -32,14 +32,20 @@ afterEach(() => {
 // emoji as one cell and would NOT reproduce emoji wrapping — this addon makes the
 // headless terminal count 🤖/🎉/你 as two cells, exactly as a real terminal paints.
 //
-// `modern: true` also registers a provider that widens every
-// \p{Emoji_Presentation} code point to two cells, modelling a current local/SSH
-// terminal (Unicode 14/15/16) where 🫠/🩷/🫨 render two wide — code points that
-// xterm-11 still scores as one. The parser lays cells out from charProperties'
-// width BITS (not wcwidth), so we patch those directly: `(raw & ~6) | 4` forces
-// width 2. That makes such emoji genuinely occupy two buffer cells, so the PTY
-// test can observe wrapping if the picker under-counts them.
+// `modern: true` also registers a provider that widens Emoji_Presentation code
+// points to two cells, modelling a current local/SSH terminal where 🫠/🩷/🛘 render
+// two wide — code points xterm-11 still scores as one. The predicate unions the
+// runtime \p{Emoji_Presentation} with an explicit Unicode-17 set, so the modelled
+// terminal is "newer" even than the test-runner's Node (Node 22 only knows Unicode
+// 16 and would otherwise not treat the U17 code points as emoji at all). The parser
+// lays cells out from charProperties' width BITS (not wcwidth), so we patch those
+// directly: `(raw & ~6) | 4` forces width 2 so such emoji genuinely occupy two
+// buffer cells and the PTY test can observe wrapping if the picker under-counts them.
 const EMOJI_PRESENTATION = /\p{Emoji_Presentation}/u;
+// Unicode 17.0 Emoji_Presentation additions (not in Node 22's bundled Unicode 16).
+const U17_EMOJI = new Set([0x1F6D8, 0x1FA8A, 0x1FA8E, 0x1FAC8, 0x1FACD, 0x1FAEA, 0x1FAEF]);
+const rendersTwoWide = (cp: number): boolean =>
+  U17_EMOJI.has(cp) || EMOJI_PRESENTATION.test(String.fromCodePoint(cp));
 function makeTerminal(cols: number, modern = false): InstanceType<typeof Terminal> {
   const terminal = new Terminal({ cols, rows: 24, allowProposedApi: true });
   terminal.loadAddon(new Unicode11Addon());
@@ -54,13 +60,13 @@ function makeTerminal(cols: number, modern = false): InstanceType<typeof Termina
       version: 'modern-test',
       wcwidth(cp: number): number {
         const w = base.wcwidth(cp);
-        return w === 1 && EMOJI_PRESENTATION.test(String.fromCodePoint(cp)) ? 2 : w;
+        return w === 1 && rendersTwoWide(cp) ? 2 : w;
       },
       charProperties(cp: number, preceding: number): number {
         const raw = base.charProperties(cp, preceding);
         // Force the width bits to 2 for modern emoji so the parser lays them out
         // two cells wide (width lives in bits 1-2: clear with ~6, set 2 with |4).
-        return EMOJI_PRESENTATION.test(String.fromCodePoint(cp)) ? (raw & ~6) | 4 : raw;
+        return rendersTwoWide(cp) ? (raw & ~6) | 4 : raw;
       },
     });
     terminal.unicode.activeVersion = 'modern-test';
@@ -233,14 +239,16 @@ describe('session picker real terminal responsiveness', () => {
     await closePicker(picker.child, picker.terminal);
   });
 
-  it('does not wrap on modern (Unicode 14+) emoji a current terminal paints two wide', async () => {
-    // 🫠🩷🫨🪿🫎🪼 are width 1 under xterm-11 but two cells on modern local/SSH
-    // terminals — exactly what an xterm-11-only width table under-counted. The
-    // `modern` terminal forces these two wide in the buffer (see makeTerminal),
-    // and the titles are built ENTIRELY from them so they fill the truncated
-    // title cell: an under-count truncates at ~1x while the terminal paints ~2x,
-    // overflowing the row, wrapping it, and pushing the title off screen.
-    const modern = ['🫠', '🩷', '🫨', '🪿', '🫎', '🪼'];
+  it('does not wrap on modern (Unicode 14+/17) emoji a current terminal paints two wide', async () => {
+    // 🫠🩷🫨 (Unicode 14/15) and 🛘🪊🫯 (Unicode 17) are width 1 under xterm-11 but
+    // two cells on modern local/SSH terminals — exactly what an xterm-11-only (or a
+    // Unicode-16-pinned) width table under-counted. The `modern` terminal forces
+    // Emoji_Presentation code points two wide in the buffer (see makeTerminal), and
+    // the titles are built ENTIRELY from them so they fill the truncated title cell:
+    // an under-count truncates at ~1x while the terminal paints ~2x, overflowing the
+    // row, wrapping it, and pushing the title off screen. Including U17 code points
+    // is what catches a table pinned to an older Unicode version.
+    const modern = ['🫠', '🩷', '🫨', '🛘', '🪊', '🫯'];
     const picker = await spawnPicker(
       99,
       false,

@@ -43,10 +43,16 @@ describe('terminal-width generated table', () => {
 
   it('counts modern (Unicode 14+) emoji as two cells that xterm-11 still scores as one', () => {
     // These wrap the picker on any terminal that renders current emoji two cells
-    // wide; xterm-11 under-counts them, so the pinned Unicode-16 emoji set matters.
+    // wide; xterm-11 under-counts them, so the pinned Unicode-17 emoji set matters.
     // (Widths are checked against our table, not the running Node's \p{…} regex,
-    // so the assertion is deterministic regardless of Node's bundled ICU version.)
+    // so the assertion is deterministic regardless of Node's bundled ICU version —
+    // Node 22 ships Unicode 16 and would not even recognise the U17 ones below.)
     for (const e of ['🫠', '🩷', '🫨', '🪿', '🫎', '🪼']) {
+      expect(terminalCellWidth(e)).toBe(2);
+    }
+    // Unicode 17.0 additions (released after Node 22's bundled Unicode 16). These
+    // are the case a runtime \p{Emoji_Presentation} would miss on current Node.
+    for (const e of ['🛘', '🪊', '🪎', '🫈', '🫍', '🫪', '🫯']) {
       expect(terminalCellWidth(e)).toBe(2);
     }
     // Classic wide emoji + CJK stay 2; text-presentation symbols stay 1.

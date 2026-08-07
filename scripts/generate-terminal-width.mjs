@@ -7,10 +7,10 @@
 //
 // 宽度=2 的判据(取并集,只增不减):
 //   (a) @xterm/addon-unicode11 wcwidth==2(Unicode 11 East-Asian-Width + 当时的 emoji);
-//   (b) 固定的 Unicode 16.0 Emoji_Presentation 集(见 emoji-presentation-u16.mjs)——覆盖
-//       Unicode 14/15/16 新增 emoji(🫠🩷🫨…),这些在 xterm-11 表里还是 1,但现代本地/SSH
-//       终端按 2 画,只锁旧 oracle 会欠计。用固定集(而非运行时 \p{Emoji_Presentation})
-//       保证生成结果不随 Node 的 ICU 版本漂移。
+//   (b) 固定的 Unicode 17.0 Emoji_Presentation 集(见 emoji-presentation.mjs,取自官方
+//       emoji-data.txt)——覆盖 Unicode 14/15/16/17 新增 emoji(🫠🩷🛘🪊…),这些在
+//       xterm-11 表里还是 1,但现代本地/SSH 终端按 2 画,只锁旧 oracle 会欠计。用固定集
+//       (而非运行时 \p{Emoji_Presentation})保证生成结果不随 Node 的 ICU 版本漂移,也不落后标准。
 // 宽度=0 沿用 xterm-11 的零宽集(控制符、组合记号、ZWJ、VS 选择符…);这些即使个别
 // 终端画成别的宽度,过计方向也安全。逐码点求和、不做 grapheme 聚合(与 xterm 一致:
 // ZWJ 家庭 = 2+0+2+0+2 = 6;过计对不折行无害)。
@@ -30,18 +30,20 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import xtermHeadless from '@xterm/headless';
 import unicode11 from '@xterm/addon-unicode11';
-import { EMOJI_PRESENTATION_RANGES_U16 } from './emoji-presentation-u16.mjs';
+import { EMOJI_PRESENTATION_RANGES } from './emoji-presentation.mjs';
 
 const { Terminal } = xtermHeadless;
 const { Unicode11Addon } = unicode11;
 const OUT_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'cli', 'terminal-width.ts');
 const MAX_CODEPOINT = 0x10FFFF; // 全 Unicode 码点空间——高位 tag/VS 等也要正确归类
 
-// 用**固定**的 Unicode 16.0 Emoji_Presentation 区间判定,而不是运行时 \p{Emoji_Presentation}
-// 正则——后者取决于当前 Node 捆绑的 ICU/Unicode 版本(同为 Node 22,不同 patch 的 ICU 可能不同),
-// 会让生成表在不同机器上不一致(CI build 因此红过)。钉死到 U16 保证生成结果处处逐字节相同。
+// 用**固定**的 Unicode 17.0 Emoji_Presentation 区间判定(见 emoji-presentation.mjs,
+// 取自官方 emoji-data.txt),而不是运行时 \p{Emoji_Presentation} 正则——后者取决于当前
+// Node 捆绑的 ICU/Unicode 版本(Node 22 目前才 Unicode 16),既让生成表跨机器不一致
+// (CI build 因此红过),又落后于最新 Unicode 标准而漏掉新 emoji。钉死到官方 U17 数据
+// 保证生成结果处处逐字节相同,且已认识最新 emoji。
 const isEmojiPresentation = cp => {
-  const r = EMOJI_PRESENTATION_RANGES_U16;
+  const r = EMOJI_PRESENTATION_RANGES;
   let lo = 0;
   let hi = r.length / 2 - 1;
   while (lo <= hi) {
@@ -114,10 +116,11 @@ function render({ wide, zero }) {
  * Width 2 = union of:
  *   - \`@xterm/addon-unicode11\` wcwidth == 2 (Unicode 11 EAW + then-current emoji;
  *     also what the project's own xterm web terminal paints, see src/worker.ts);
- *   - a pinned Unicode 16.0 Emoji_Presentation set (Unicode 14/15/16 emoji like
- *     🫠🩷🫨 that xterm-11 still scores as 1 but modern local/SSH terminals paint
- *     as 2). Pinned (not the running Node's \\p{…}) so the table is identical on
- *     every Node regardless of the ICU/Unicode version it bundles.
+ *   - a pinned Unicode 17.0 Emoji_Presentation set (Unicode 14/15/16/17 emoji
+ *     like 🫠🩷🛘🪊 that xterm-11 still scores as 1 but modern local/SSH terminals
+ *     paint as 2). Pinned from the official emoji-data.txt (not the running Node's
+ *     \\p{…}) so the table is identical on every Node regardless of the ICU/Unicode
+ *     version it bundles, and does not lag the current Unicode standard.
  * Width 0 = xterm-11 zero-width set (controls, combining marks, ZWJ, variation
  * selectors). Per-code-point sum, NO grapheme clustering (a ZWJ family emoji is
  * 2+0+2+0+2 = 6) — over-counting there is harmless for the no-wrap invariant.
