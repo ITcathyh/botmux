@@ -428,43 +428,85 @@ export class FsPolicyConfigError extends Error {
 
 /**
  * The Linux lark-cli keystore dir. lark-cli stores keys at
- * `${XDG_DATA_HOME:-$HOME/.local/share}/lark-cli`, so it is NOT purely a function
- * of homeDir. The worker resolves the real (XDG-aware) path from the FROZEN host
- * env and canonicalizes it, passing it as `override`; when absent this falls back
- * to the XDG-default under homeDir — correct whenever XDG_DATA_HOME is unset (the
- * common case) and still protective (it denies the default location) otherwise.
- * PURE — never reads env (that would break single-testability). Exported so the
- * worker's real assembly and the unit matrix share ONE resolver.
+ * `${LARKSUITE_CLI_DATA_DIR}/lark-cli` (absolute) else `$HOME/.local/share/lark-cli`.
+ * The worker resolves the real (env-aware, cleaned) path via
+ * resolveLarkCliLinuxStoreDir + a nearest-existing-ancestor canonicalize, passing
+ * it as `override`; when absent this falls back to the default under homeDir. PURE
+ * — never reads env (that would break single-testability). Exported so the worker's
+ * real assembly and the unit matrix share ONE resolver.
+ *
+ * `override` is expected to already be lexically clean (resolveLarkCliLinuxStoreDir
+ * Cleans it); a defensive normalizeFsPath still rejects a `..`-bearing value — but
+ * that must NEVER silently fall back to the default store (that was codex P1-3: the
+ * default gets denied while the real `..`-cleaned store lark-cli reads stays exposed).
+ * So a non-null-but-unnormalizable override returns null → the caller (buildFsPolicy)
+ * emits NO Linux carve-out, and the store stays denied-by-default rather than
+ * mis-anchored. In practice the worker always Cleans first, so this path is defensive.
  */
 export function larkCliLinuxStorePath(homeDir: string, override?: string): string | null {
-  const explicit = override ? normalizeFsPath(override) : null;
-  return explicit ?? normalizeFsPath(`${homeDir}/.local/share/lark-cli`);
+  if (override) return normalizeFsPath(override); // may be null → no carve-out (never silent default fallback)
+  return normalizeFsPath(`${homeDir}/.local/share/lark-cli`);
+}
+
+/**
+ * Lexically clean an ABSOLUTE POSIX path the way Go's `filepath.Clean` does
+ * (resolve `.`/`..` segments, collapse `//`, drop trailing `/`, clamp `..` at root)
+ * — WITHOUT touching the filesystem. Returns null for a non-absolute input or one
+ * containing NUL / control chars (lark-cli's `SafeEnvDirPath` rejects those). This
+ * mirrors lark-cli's own env-path handling so the policy anchors the SAME dir the
+ * in-sandbox CLI will open (codex P1-3: a `..`-bearing `LARKSUITE_CLI_DATA_DIR` is
+ * Clean'd by lark-cli to a real store, but an un-cleaned policy path was rejected by
+ * normalizeFsPath and silently fell back to the default — leaving the real store
+ * exposed). Pure + total.
+ */
+export function cleanPosixAbsPath(p: string): string | null {
+  if (!p || typeof p !== 'string' || !p.startsWith('/')) return null;
+  // Reject control chars (0x00–0x1F, 0x7F) — lark-cli's validator treats them as
+  // invalid → falls back to $HOME; matching keeps policy == CLI.
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1f\x7f]/.test(p)) return null;
+  const out: string[] = [];
+  for (const seg of p.split('/')) {
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') { out.pop(); continue; } // clamp at root (Go filepath.Clean semantics)
+    out.push(seg);
+  }
+  return '/' + out.join('/');
 }
 
 /**
  * Resolve the lark-cli Linux store dir BEFORE canonicalization, replicating
- * lark-cli's OWN resolution (`internal/keychain/keychain_other.go::StorageDir`,
- * verified by strace against v1.0.76): the keystore dir is
- * `${LARKSUITE_CLI_DATA_DIR}/lark-cli` when `LARKSUITE_CLI_DATA_DIR` is an
- * ABSOLUTE path, else `$HOME/.local/share/lark-cli`. lark-cli does NOT consult
- * `XDG_DATA_HOME` for the keystore at all (strace: setting it has zero effect),
- * and it IGNORES a relative / tilde / empty `LARKSUITE_CLI_DATA_DIR` (spec-invalid
- * → falls back to $HOME). PURE (exported so the "absolute honored / relative
- * ignored / unset fallback" branching is unit-locked against the strace matrix).
+ * lark-cli's OWN resolution (`internal/keychain/keychain_other.go::StorageDir` +
+ * `SafeEnvDirPath`, verified by strace against v1.0.76): the keystore dir is
+ * `<clean(LARKSUITE_CLI_DATA_DIR)>/lark-cli` when `LARKSUITE_CLI_DATA_DIR` is a VALID
+ * ABSOLUTE path (lexically Cleaned — `..`/`.`/`//` resolved, control chars rejected),
+ * else `$HOME/.local/share/lark-cli`. lark-cli does NOT consult `XDG_DATA_HOME` for
+ * the keystore at all (strace: setting it has zero effect), and it IGNORES a relative
+ * / tilde / empty / control-char `LARKSUITE_CLI_DATA_DIR` (spec-invalid → falls back
+ * to $HOME). PURE (exported so the "absolute-cleaned / relative-ignored / unset /
+ * `..`-cleaned / control-char-rejected" matrix is unit-locked against strace).
  *
- * The worker passes `process.env.LARKSUITE_CLI_DATA_DIR` + the (lexical) home,
- * `canonical()`s the result, and hands it to buildFsPolicy as `larkCliLinuxStore`.
+ * CRITICAL (codex P1-3): the `..` Clean must happen HERE, lexically, so the returned
+ * path is already normalized (no `..`) — otherwise the worker's realpath throws on a
+ * not-yet-existent store leaf, keeps the raw `..` path, normalizeFsPath rejects it,
+ * and the policy silently anchors the DEFAULT store while lark-cli (which Cleans)
+ * opens the real one → the real store stays exposed.
+ *
+ * The worker passes `process.env.LARKSUITE_CLI_DATA_DIR` + the (lexical) home, then
+ * nearest-existing-ancestor `canonical()`s the result (a full-path realpath would
+ * throw on the nonexistent leaf), and hands it to buildFsPolicy as `larkCliLinuxStore`.
  * This is the AUTHORITATIVE value the in-sandbox lark-cli reads: bwrap has NO
  * `--clearenv`, so the sandboxed child INHERITS `LARKSUITE_CLI_DATA_DIR` from the
- * worker's process env (redactChildEnv doesn't strip it), and the sandbox does NOT
- * `--setenv` a per-bot override for it — so freezing the worker's own env value
- * pins the policy to exactly the dir lark-cli will open. (The worker ALSO
- * `--unsetenv`s it in the sandbox as belt-and-suspenders so the child can never
- * see a value the policy didn't freeze — see sandbox.ts.)
+ * worker's process env (redactChildEnv doesn't strip it), and the sandbox pins the
+ * child's value to the SAME cleaned resolution (`--setenv`/`--unsetenv` in sandbox.ts)
+ * so policy == CLI by construction.
  */
 export function resolveLarkCliLinuxStoreDir(rawDataDir: string | undefined, homeDir: string): string {
-  const base = rawDataDir && rawDataDir.startsWith('/') ? rawDataDir : `${homeDir}/.local/share`;
-  return `${base}/lark-cli`;
+  const cleaned = rawDataDir ? cleanPosixAbsPath(rawDataDir) : null;
+  const base = cleaned ?? `${homeDir}/.local/share`;
+  // Strip a trailing slash so a root base ('/') doesn't yield '//lark-cli' (the only
+  // case that produces one — cleanPosixAbsPath returns '/' when all segments pop).
+  return `${base === '/' ? '' : base}/lark-cli`;
 }
 
 /**

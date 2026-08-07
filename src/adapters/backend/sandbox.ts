@@ -23,7 +23,7 @@ import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
-import { compileToBwrap, type FsPolicy } from '../cli/fs-policy.js';
+import { compileToBwrap, cleanPosixAbsPath, type FsPolicy } from '../cli/fs-policy.js';
 import { PROXY_ENV_KEYS } from '../../utils/child-env.js';
 import {
   MCP_GATEWAY_REQUIRED_ENV,
@@ -706,18 +706,19 @@ export function prepareDirectSandbox(opts: {
   args.push('--unsetenv', 'BOTS_CONFIG');
   args.push('--unsetenv', 'BOTMUX_HOST_RELAY_AUTHORIZED');
   // LARKSUITE_CLI_DATA_DIR relocates the lark-cli keystore dir on Linux to
-  // `<value>/lark-cli` (only when ABSOLUTE; relative/unset → `$HOME/.local/share`).
-  // The fs-policy froze the keystore path from the worker's OWN process.env value
-  // (resolveLarkCliLinuxStoreDir). Pin the CHILD to that SAME resolution so the
-  // in-sandbox lark-cli opens exactly the dir the policy denied/carved-out — immune
-  // to a divergent value injected by a tmux pane rc or inherited drift (bwrap has no
-  // --clearenv, and --setenv/--unsetenv here is authoritative, applied last). Both
-  // sides read the same process.env in the same worker process, so they agree by
-  // construction: absolute → re-pin the child to it; else force the default by
-  // unsetting (matching the policy's `$HOME/.local/share` fallback).
-  const larkCliDataDir = process.env.LARKSUITE_CLI_DATA_DIR;
-  if (larkCliDataDir && larkCliDataDir.startsWith('/')) {
-    args.push('--setenv', 'LARKSUITE_CLI_DATA_DIR', larkCliDataDir);
+  // `<value>/lark-cli` (only when a VALID ABSOLUTE path; relative/unset/control-char
+  // → `$HOME/.local/share`). The fs-policy froze the keystore path from the worker's
+  // OWN process.env value via the SAME resolver. Pin the CHILD to the CLEANED data
+  // root (Clean resolves `..`/`.`/`//` and rejects control chars, exactly as lark-cli's
+  // SafeEnvDirPath does) so the in-sandbox lark-cli's `<value>/lark-cli` lands on the
+  // dir the policy denied/carved-out — immune to a divergent value injected by a tmux
+  // pane rc or inherited drift (bwrap has no --clearenv; this --setenv/--unsetenv is
+  // authoritative, applied last). Both sides read the same process.env in the same
+  // worker process, so they agree by construction: valid-absolute → pin the cleaned
+  // value; else unset → child falls back to $HOME, matching the policy's default.
+  const cleanedLarkCliDataDir = cleanPosixAbsPath(process.env.LARKSUITE_CLI_DATA_DIR ?? '');
+  if (cleanedLarkCliDataDir) {
+    args.push('--setenv', 'LARKSUITE_CLI_DATA_DIR', cleanedLarkCliDataDir);
   } else {
     args.push('--unsetenv', 'LARKSUITE_CLI_DATA_DIR');
   }

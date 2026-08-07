@@ -16,6 +16,7 @@ import {
   computeNoTransportAuthorityRoots,
   larkCliLinuxStorePath,
   resolveLarkCliLinuxStoreDir,
+  cleanPosixAbsPath,
   FsPolicyConfigError,
   type FsPolicyContext,
   type FsRule,
@@ -1234,30 +1235,56 @@ describe('no-Lark-transport credential profile (larkTransportEnabled=false)', ()
     expect(custom).toEqual(expect.arrayContaining(['/data00/cli-data/lark-cli']));
   });
 
-  it('resolveLarkCliLinuxStoreDir mirrors lark-cli resolution (LARKSUITE_CLI_DATA_DIR absolute wins, relative/unset → $HOME; XDG ignored)', () => {
-    // strace-verified against lark-cli v1.0.76 keychain_other.go::StorageDir:
-    // absolute LARKSUITE_CLI_DATA_DIR → <value>/lark-cli
+  it('resolveLarkCliLinuxStoreDir mirrors lark-cli SafeEnvDirPath (absolute Cleaned; relative/tilde/empty/control-char → $HOME; XDG ignored)', () => {
+    // strace-verified against lark-cli v1.0.76 keychain_other.go::StorageDir + SafeEnvDirPath:
+    // absolute LARKSUITE_CLI_DATA_DIR → <clean(value)>/lark-cli
     expect(resolveLarkCliLinuxStoreDir('/data00/cli-data', '/home/u')).toBe('/data00/cli-data/lark-cli');
-    // unset → $HOME/.local/share/lark-cli
+    // codex P1-3: a `..`-bearing absolute value is CLEANED (lark-cli does filepath.Clean),
+    // NOT rejected+fallback — else policy anchors the default while lark-cli opens the real dir.
+    expect(resolveLarkCliLinuxStoreDir('/srv/review/data/../actual', '/home/u')).toBe('/srv/review/actual/lark-cli');
+    expect(resolveLarkCliLinuxStoreDir('/a/b/../../etc', '/home/u')).toBe('/etc/lark-cli');
+    expect(resolveLarkCliLinuxStoreDir('/srv/review/actual//', '/home/u')).toBe('/srv/review/actual/lark-cli'); // // collapsed
+    expect(resolveLarkCliLinuxStoreDir('/srv/../..', '/home/u')).toBe('/lark-cli');                             // .. clamped at root
+    // unset / empty → $HOME/.local/share/lark-cli
     expect(resolveLarkCliLinuxStoreDir(undefined, '/home/u')).toBe('/home/u/.local/share/lark-cli');
     expect(resolveLarkCliLinuxStoreDir('', '/home/u')).toBe('/home/u/.local/share/lark-cli');
     // RELATIVE / tilde values are spec-invalid → lark-cli IGNORES them, falls back to
     // $HOME (verified by strace: `relseg/x` and `~/t` both opened ~/.local/share).
-    // Never a cwd-relative store the agent could plant a fake keystore into.
     expect(resolveLarkCliLinuxStoreDir('relseg/x', '/home/u')).toBe('/home/u/.local/share/lark-cli');
     expect(resolveLarkCliLinuxStoreDir('~/tildetest', '/home/u')).toBe('/home/u/.local/share/lark-cli');
     expect(resolveLarkCliLinuxStoreDir('.', '/home/u')).toBe('/home/u/.local/share/lark-cli');
+    // CONTROL CHARS are rejected by lark-cli's validator → fallback to $HOME (strace-verified)
+    expect(resolveLarkCliLinuxStoreDir('/srv/\x01bad', '/home/u')).toBe('/home/u/.local/share/lark-cli');
+    expect(resolveLarkCliLinuxStoreDir('/srv/\x00nul', '/home/u')).toBe('/home/u/.local/share/lark-cli');
   });
 
-  it('larkCliLinuxStorePath: override wins, unnormalizable inputs fail closed', () => {
-    // override used when given (already-resolved absolute path)
-    expect(larkCliLinuxStorePath('/home/u', '/data00/xdg/lark-cli')).toBe('/data00/xdg/lark-cli');
-    // no override → XDG-default under homeDir
+  it('cleanPosixAbsPath: Go filepath.Clean semantics + control-char rejection (mirrors lark-cli SafeEnvDirPath)', () => {
+    expect(cleanPosixAbsPath('/a/b/../c')).toBe('/a/c');
+    expect(cleanPosixAbsPath('/a/./b//c/')).toBe('/a/b/c');
+    expect(cleanPosixAbsPath('/a/../../b')).toBe('/b');   // .. clamps at root
+    expect(cleanPosixAbsPath('/')).toBe('/');
+    expect(cleanPosixAbsPath('/srv/../..')).toBe('/');
+    // non-absolute → null
+    expect(cleanPosixAbsPath('rel/x')).toBeNull();
+    expect(cleanPosixAbsPath('~/x')).toBeNull();
+    expect(cleanPosixAbsPath('')).toBeNull();
+    // control chars → null (lark-cli treats as invalid)
+    expect(cleanPosixAbsPath('/a/\x01b')).toBeNull();
+    expect(cleanPosixAbsPath('/a/\x7f')).toBeNull();
+    expect(cleanPosixAbsPath('/a/\nb')).toBeNull();
+  });
+
+  it('larkCliLinuxStorePath: override wins; unnormalizable override → NULL (no carve-out), never silent default fallback (codex P1-3)', () => {
+    // a clean absolute override is used verbatim
+    expect(larkCliLinuxStorePath('/home/u', '/data00/cli-data/lark-cli')).toBe('/data00/cli-data/lark-cli');
+    // no override → default under homeDir
     expect(larkCliLinuxStorePath('/home/u')).toBe('/home/u/.local/share/lark-cli');
-    // a `..`-bearing / relative override is rejected by normalizeFsPath → falls back
-    // to the homeDir default rather than trusting an unnormalizable path
-    expect(larkCliLinuxStorePath('/home/u', '/a/../b')).toBe('/home/u/.local/share/lark-cli');
-    expect(larkCliLinuxStorePath('/home/u', 'relative')).toBe('/home/u/.local/share/lark-cli');
+    // codex P1-3: a `..`-bearing override must NOT silently fall back to the default
+    // store (that leaves the real store exposed). It returns NULL → buildFsPolicy emits
+    // NO Linux carve-out and the store stays denied-by-default. (In practice the worker
+    // Cleans first via resolveLarkCliLinuxStoreDir, so a `..` never reaches here.)
+    expect(larkCliLinuxStorePath('/home/u', '/a/../b')).toBeNull();
+    expect(larkCliLinuxStorePath('/home/u', 'relative')).toBeNull();
   });
 
   it('CLI runtime still works under no-transport (.data-dir / bin / bots-info / own session)', () => {
