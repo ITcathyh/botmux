@@ -30,11 +30,15 @@ describe('daemon per-turn reply sender + participant wiring', () => {
     expect(daemonSource).toMatch(/participants: autoCreateWindow\.participants, participantsIncomplete: autoCreateWindow\.incomplete/);
   });
 
-  it('a registration-race loser carries the pre-extracted seed+follow-up post @s through prepared', () => {
-    // The CAS-loser handoff must NOT drop the seed's post inline @s: winner rebinds
-    // with prepared.postParticipantMentions, not just the follow-up message.
-    expect(daemonSource).toMatch(/postParticipantMentions\?: LarkMention\[\];/);           // on the prepared type
-    expect(daemonSource).toContain('postParticipantMentions: newTopicPostAt,');            // passed at the loser handoff
+  it('BOTH registration-race loser handoffs carry the pre-extracted seed+follow-up post @s', () => {
+    // Two CAS-loser handoffs (new-topic loser → handleThreadReply, and the
+    // auto-create loser inside it) must EACH forward the complete pre-extracted
+    // set, or a double-race drops the seed's post inline @s.
+    expect(daemonSource).toMatch(/postParticipantMentions\?: LarkMention\[\];/);   // on the prepared type
+    expect(daemonSource).toContain('postParticipantMentions: newTopicPostAt,');    // new-topic loser handoff
+    expect(daemonSource).toContain('postParticipantMentions: autoCreatePostAt,');  // auto-create loser handoff
+    // Exactly the two loser handoffs pass it (not accidentally dropped from one).
+    expect(daemonSource.match(/postParticipantMentions: (?:newTopicPostAt|autoCreatePostAt),/g)).toHaveLength(2);
   });
 
   it('buildTurnParticipants concats pre-extracted post @s (extractPostAtParticipants) into the window', () => {

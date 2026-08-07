@@ -17583,6 +17583,10 @@ async function handleThreadReply(
           queueAlreadyAppended: true,
           senderResolved: true,
           sender: autoCreateSender,
+          // Second CAS loser: carry the complete pre-extracted seed+follow-up
+          // post @s too, or a double-race (new-topic scratch → auto-create →
+          // auto-create loses again) drops the seed's post participants.
+          postParticipantMentions: autoCreatePostAt,
         });
       }
       return;
