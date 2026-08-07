@@ -8,13 +8,12 @@ import { codePointCellWidth, terminalCellWidth } from '../src/cli/terminal-width
 
 const { Terminal } = xtermHeadless;
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
-const EMOJI_PRESENTATION = /\p{Emoji_Presentation}/u;
 
 /**
  * src/cli/terminal-width.ts is a generated artifact (scripts/generate-terminal-width.mjs
- * sweeps @xterm/addon-unicode11's wcwidth ∪ Node's \p{Emoji_Presentation}). The table
- * is a CROSS-TERMINAL CONSERVATIVE UPPER BOUND, not a match for one terminal: the
- * picker must never UNDER-count (that wraps a row and hides the pinned title), while
+ * sweeps @xterm/addon-unicode11's wcwidth ∪ a pinned Unicode-16 Emoji_Presentation set).
+ * The table is a CROSS-TERMINAL CONSERVATIVE UPPER BOUND, not a match for one terminal:
+ * the picker must never UNDER-count (that wraps a row and hides the pinned title), while
  * over-counting only truncates a cell slightly early. These tests pin that contract.
  */
 describe('terminal-width generated table', () => {
@@ -44,9 +43,10 @@ describe('terminal-width generated table', () => {
 
   it('counts modern (Unicode 14+) emoji as two cells that xterm-11 still scores as one', () => {
     // These wrap the picker on any terminal that renders current emoji two cells
-    // wide; xterm-11 under-counts them, so the union with Emoji_Presentation matters.
+    // wide; xterm-11 under-counts them, so the pinned Unicode-16 emoji set matters.
+    // (Widths are checked against our table, not the running Node's \p{…} regex,
+    // so the assertion is deterministic regardless of Node's bundled ICU version.)
     for (const e of ['🫠', '🩷', '🫨', '🪿', '🫎', '🪼']) {
-      expect(EMOJI_PRESENTATION.test(e)).toBe(true);
       expect(terminalCellWidth(e)).toBe(2);
     }
     // Classic wide emoji + CJK stay 2; text-presentation symbols stay 1.

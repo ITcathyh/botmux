@@ -11,8 +11,10 @@
  * Width 2 = union of:
  *   - `@xterm/addon-unicode11` wcwidth == 2 (Unicode 11 EAW + then-current emoji;
  *     also what the project's own xterm web terminal paints, see src/worker.ts);
- *   - \p{Emoji_Presentation} (Unicode 14/15/16 emoji like 🫠🩷🫨 that xterm-11
- *     still scores as 1 but modern local/SSH terminals paint as 2).
+ *   - a pinned Unicode 16.0 Emoji_Presentation set (Unicode 14/15/16 emoji like
+ *     🫠🩷🫨 that xterm-11 still scores as 1 but modern local/SSH terminals paint
+ *     as 2). Pinned (not the running Node's \p{…}) so the table is identical on
+ *     every Node regardless of the ICU/Unicode version it bundles.
  * Width 0 = xterm-11 zero-width set (controls, combining marks, ZWJ, variation
  * selectors). Per-code-point sum, NO grapheme clustering (a ZWJ family emoji is
  * 2+0+2+0+2 = 6) — over-counting there is harmless for the no-wrap invariant.

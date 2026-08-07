@@ -68,7 +68,7 @@ function makeTerminal(cols: number, modern = false): InstanceType<typeof Termina
   return terminal;
 }
 
-function makeFixture(multiBot: boolean, titleFor?: (index: number) => string): { root: string; dataDir: string } {
+function makeFixture(multiBot: boolean, titleFor?: (index: number) => string, adoptTmuxTarget?: string): { root: string; dataDir: string } {
   const root = mkdtempSync(join(tmpdir(), 'botmux-picker-responsive-'));
   tempDirs.push(root);
   const dataDir = join(root, 'data');
@@ -100,17 +100,28 @@ function makeFixture(multiBot: boolean, titleFor?: (index: number) => string): {
       pid: process.pid,
     };
   }
+  if (adoptTmuxTarget !== undefined) {
+    // The picker sorts newest-first, so the last-created session (index 47,
+    // id 48000000) is the one selected at cursor 0. Make IT the adopted tmux
+    // session whose attacker-controlled target string lands in the footer hint.
+    const selectedId = `48000000-1111-2222-3333-444444444444`;
+    (sessions[selectedId] as Record<string, unknown>).adoptedFrom = {
+      source: 'tmux',
+      tmuxTarget: adoptTmuxTarget,
+      originalCliPid: process.pid,
+    };
+  }
   writeFileSync(join(dataDir, 'sessions.json'), JSON.stringify(sessions));
   return { root, dataDir };
 }
 
-async function spawnPicker(cols: number, multiBot: boolean, titleFor?: (index: number) => string, modern = false): Promise<{
+async function spawnPicker(cols: number, multiBot: boolean, titleFor?: (index: number) => string, modern = false, adoptTmuxTarget?: string): Promise<{
   child: pty.IPty;
   terminal: InstanceType<typeof Terminal>;
   renderCount: () => number;
   waitForRender: (minimum: number) => Promise<void>;
 }> {
-  const fixture = makeFixture(multiBot, titleFor);
+  const fixture = makeFixture(multiBot, titleFor, adoptTmuxTarget);
   const env: Record<string, string> = {
     ...(process.env as Record<string, string>),
     HOME: fixture.root,
@@ -254,6 +265,23 @@ describe('session picker real terminal responsiveness', () => {
     expect(screen.lines[0]).toContain('botmux sessions  (1/48)');
     expect(screen.lines.some(line => line.includes('❯'))).toBe(true);
     expect(screen.wrappedRows).toEqual([]);
+    await closePicker(picker.child, picker.terminal);
+  });
+
+  it('does not let a malicious adopt target label inject control sequences into the footer', async () => {
+    // The footer shows the selected session's target label. An adopted session's
+    // tmux target is attacker-controllable; a raw ESC[2J there would clear the
+    // whole alt-screen (title included) if the footer emitted the label without
+    // sanitizing. The label must be scrubbed before the whitelist SGR is applied.
+    const picker = await spawnPicker(99, false, undefined, false, 'evil\x1b[2Jinjected\x1b]0;pwned\x07\ttab');
+    const screen = inspectScreen(picker.terminal);
+    // Screen not cleared: title still on line 0, rows still present.
+    expect(screen.lines[0]).toContain('botmux sessions  (1/48)');
+    expect(screen.lines.some(line => line.includes('❯'))).toBe(true);
+    expect(screen.wrappedRows).toEqual([]);
+    // The visible (printable) part of the payload still shows — only the control
+    // bytes were stripped, so the label is not silently dropped.
+    expect(screen.lines.some(line => line.includes('evil') && line.includes('injected'))).toBe(true);
     await closePicker(picker.child, picker.terminal);
   });
 });

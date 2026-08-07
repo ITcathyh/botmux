@@ -3915,7 +3915,11 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
   let cursor = 0;
   let scrollTop = 0;              // index of the first visible row (vertical scroll)
   let confirmDelete = false;  // true when waiting for y/n confirmation
-  let flashMsg = '';
+  // Transient status line. Stored as {style, text} where text is UNSTYLED and may
+  // contain untrusted session metadata — it is sanitized + SGR-wrapped only at
+  // render time, so a control char in `text` can never reach the terminal raw.
+  type FooterStyle = 'error' | 'success' | 'warn' | 'dim';
+  let flash: { style: FooterStyle; text: string } | null = null;
 
   // Fixed chrome around the scrolling row window: title(2) + header block(3) +
   // bottom separator(1) + target hint(2) + flash/confirm(2) + hints(2) + a
@@ -3945,14 +3949,20 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
     const singleLine = sanitizeCellText(text);
     return displayWidth(singleLine) <= width ? singleLine : truncate(singleLine, width);
   };
-  const fitAnsiLine = (text: string, width: number): string => {
-    // flashMsg carries the picker's own ANSI colour codes (added by us, trusted):
-    // strip the SGR sequences to measure the visible text, then sanitize any
-    // stray control chars from interpolated dynamic bits before printing.
-    const plain = sanitizeCellText(text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, ''));
-    if (!/[\r\n]/.test(text) && displayWidth(plain) <= width) return text;
-    return `\x1b[2m${fitLine(plain, width)}\x1b[0m`;
+  // The ONLY place footer SGR colour is applied. `text` is treated as untrusted:
+  // it is sanitized (control chars stripped) and width-fitted first, then wrapped
+  // in a fixed whitelist SGR from `style`. No caller-supplied escape can survive,
+  // and there is no fast path that returns a raw/mixed string — closing the two
+  // bypasses where a session's target label / flash message could inject e.g.
+  // `\x1b[2J` (clear screen) into the footer and scroll the pinned title away.
+  const SGR: Record<FooterStyle, string> = {
+    error: '\x1b[31m',
+    success: '\x1b[32m',
+    warn: '\x1b[33m',
+    dim: '\x1b[2m',
   };
+  const styledFooter = (style: FooterStyle, text: string, width: number): string =>
+    `${SGR[style]}${fitLine(text, width)}\x1b[0m`;
   const blankRowPrefix = (): string => ' '.repeat(layout.prefixWidth);
   const rowPrefix = (selected: boolean): string => {
     if (!selected) return blankRowPrefix();
@@ -4020,30 +4030,31 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
       ? `${blankRowPrefix()}\x1b[36m${sepWithMarker(`↓ ${hiddenBelow} 更多`)}\x1b[0m\n`
       : `${blankRowPrefix()}${separator}\n`);
 
-    // Footer info
+    // Footer info. Every dynamic field (targetLabel, backend session name) is
+    // untrusted session metadata, so it only ever reaches the terminal via
+    // styledFooter (sanitize → fit → whitelist SGR). The adopt hint's fixed
+    // suffix is trusted static text, appended after the fitted label.
     const selected = rows[cursor];
-    const targetHintText = selected.isAdopt
-      ? `${selected.targetLabel}  Enter 已禁用；请直接使用原 tmux/zellij/herdr 客户端。`
-      : selected.canAttach
-        ? `${selected.attachBackend}: ${selected.backendTarget?.sessionName}`
-        : `${selected.targetLabel}（不可连接）`;
-    const targetHint = selected.isAdopt
-      ? `\x1b[33m${selected.targetLabel}\x1b[0m  \x1b[2mEnter 已禁用；请直接使用原 tmux/zellij/herdr 客户端。\x1b[0m`
-      : selected.canAttach
-        ? `\x1b[32m${targetHintText}\x1b[0m`
-        : `\x1b[2m${targetHintText}\x1b[0m`;
-    const fittedTargetHint = displayWidth(targetHintText) <= footerContentWidth()
-      ? targetHint
-      : `\x1b[2m${fitLine(targetHintText, footerContentWidth())}\x1b[0m`;
-    process.stdout.write(`\n${footerPrefix()}${fittedTargetHint}\n`);
+    const width = footerContentWidth();
+    let footerLine: string;
+    if (selected.isAdopt) {
+      const suffix = '  Enter 已禁用；请直接使用原 tmux/zellij/herdr 客户端。';
+      const labelWidth = Math.max(0, width - displayWidth(suffix));
+      footerLine = `${styledFooter('warn', selected.targetLabel, labelWidth)}\x1b[2m${fitLine(suffix, width)}\x1b[0m`;
+    } else if (selected.canAttach) {
+      footerLine = styledFooter('success', `${selected.attachBackend}: ${selected.backendTarget?.sessionName}`, width);
+    } else {
+      footerLine = styledFooter('dim', `${selected.targetLabel}（不可连接）`, width);
+    }
+    process.stdout.write(`\n${footerPrefix()}${footerLine}\n`);
 
     // Flash message or confirmation prompt
     if (confirmDelete) {
       const s = selected.session;
       const confirmation = `确认删除 ${s.sessionId.substring(0, 8)} "${truncate(s.title || '', 20)}"? (y/n)`;
-      process.stdout.write(`\n${footerPrefix()}\x1b[33m${fitLine(confirmation, footerContentWidth())}\x1b[0m\n`);
-    } else if (flashMsg) {
-      process.stdout.write(`\n${footerPrefix()}${fitAnsiLine(flashMsg, footerContentWidth())}\n`);
+      process.stdout.write(`\n${footerPrefix()}${styledFooter('warn', confirmation, width)}\n`);
+    } else if (flash) {
+      process.stdout.write(`\n${footerPrefix()}${styledFooter(flash.style, flash.text, width)}\n`);
     } else {
       process.stdout.write('\n');
     }
@@ -4051,8 +4062,8 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
     // Keybinding hints
     const fullHints = `↑/↓ 选择  ⏎ ${selected?.canAttach ? '连接' : '不可连接'}  d 删除  q 退出`;
     const compactHints = '↑/↓ 选择  ⏎  d  q';
-    const hints = displayWidth(fullHints) <= footerContentWidth() ? fullHints : compactHints;
-    process.stdout.write(`\n${footerPrefix()}\x1b[2m${fitLine(hints, footerContentWidth())}\x1b[0m\n`);
+    const hints = displayWidth(fullHints) <= width ? fullHints : compactHints;
+    process.stdout.write(`\n${footerPrefix()}${styledFooter('dim', hints, width)}\n`);
   }
 
   return new Promise<void>((resolve) => {
@@ -4088,7 +4099,7 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
       const s = r.session;
       const result = await closeSessionForDelete(s);
       if (!result.ok) {
-        flashMsg = `\x1b[31m✗ 删除失败: ${result.error}\x1b[0m`;
+        flash = { style: 'error', text: `✗ 删除失败: ${result.error}` };
         return;
       }
 
@@ -4098,9 +4109,9 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
       rows.splice(idx, 1);
 
       if (cursor >= rows.length) cursor = Math.max(0, rows.length - 1);
-      flashMsg = result.via === 'daemon'
-        ? `\x1b[32m✓ 已删除 ${s.sessionId.substring(0, 8)}\x1b[0m`
-        : `\x1b[33m✓ 已离线删除 ${s.sessionId.substring(0, 8)}\x1b[0m`;
+      flash = result.via === 'daemon'
+        ? { style: 'success', text: `✓ 已删除 ${s.sessionId.substring(0, 8)}` }
+        : { style: 'warn', text: `✓ 已离线删除 ${s.sessionId.substring(0, 8)}` };
     }
 
     process.stdin.on('data', async (key: string) => {
@@ -4113,13 +4124,13 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
           try { await deleteSession(cursor); }
           finally { deleteInFlight = false; }
         } else {
-          flashMsg = '\x1b[2m取消删除\x1b[0m';
+          flash = { style: 'dim', text: '取消删除' };
         }
         render();
         return;
       }
 
-      flashMsg = '';
+      flash = null;
 
       // Ctrl-C or q or Esc
       if (key === '\x03' || key === 'q' || key === '\x1b') {
@@ -4159,19 +4170,19 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
       if (key === '\r' || key === '\n') {
         const selected = rows[cursor];
         if (selected.isAdopt) {
-          flashMsg = `\x1b[33m这是 adopt 会话；botmux 不 attach 用户 pane。目标: ${selected.targetLabel}\x1b[0m`;
+          flash = { style: 'warn', text: `这是 adopt 会话；botmux 不 attach 用户 pane。目标: ${selected.targetLabel}` };
           render();
           return;
         }
         if (!selected.canAttach) {
-          flashMsg = '\x1b[33m该会话没有可连接的持久后端\x1b[0m';
+          flash = { style: 'warn', text: '该会话没有可连接的持久后端' };
           render();
           return;
         }
         if (selected.attachBackend === 'zmx') {
           const target = selected.backendTarget;
           if (!target || target.backendType !== 'zmx') {
-            flashMsg = '\x1b[31mZMX attach target is missing or inconsistent\x1b[0m';
+            flash = { style: 'error', text: 'ZMX attach target is missing or inconsistent' };
             render();
             return;
           }
@@ -4183,7 +4194,7 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
             selected.session.sessionId,
           );
           if (!frozen.ok) {
-            flashMsg = `\x1b[31m${frozen.message}\x1b[0m`;
+            flash = { style: 'error', text: frozen.message };
             render();
             return;
           }
@@ -4197,7 +4208,7 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
         } else {
           const target = selected.backendTarget;
           if (!target || target.backendType !== 'tmux') {
-            flashMsg = '\x1b[31mtmux attach target is missing or inconsistent\x1b[0m';
+            flash = { style: 'error', text: 'tmux attach target is missing or inconsistent' };
             render();
             return;
           }
