@@ -15347,6 +15347,7 @@ export const __vcMeetingAgentTest = {
     vcMeetingConsumerCloseTimingOverrideForTest = undefined;
     vcMeetingEndedTombstones.clear();
     for (const key of [...vcMeetingPendingInvites.keys()]) deleteVcMeetingPendingInvite(key);
+    vcMeetingEagerJoinFailureNotified.clear();
   },
 };
 

@@ -598,6 +598,14 @@ describe('VcConsumerProfilesSection · 保存', () => {
     const r = await mount();
     // No selectable agent ⇒ Add is disabled (can't seed a replying consumer).
     expect(addButton(r)!.props.disabled).toBe(true);
+
+    // The template "Use" button must be disabled for the same reason — applying
+    // a template also seeds an agent, so it can't be a second way to create an
+    // un-spawnable profile when nothing is eligible.
+    await act(async () => {
+      r.root.findAllByProps({ className: 'vc-profile-template-card' })[0].props.onClick();
+    });
+    expect(buttonByClass(r, 'vc-profile-template-use')!.props.disabled).toBe(true);
   });
 });
 
