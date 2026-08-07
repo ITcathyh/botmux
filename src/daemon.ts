@@ -15383,9 +15383,25 @@ function fastToggleUnsupportedBackend(ds: DaemonSession | undefined): boolean {
   return ds.initConfig?.codexRpcInput === true;
 }
 
+/** Three-state is-bot for a turn's SENDER (candidate display, not routing):
+ *  true = provably a bot (platform sender_type app/bot, OR a known peer via the
+ *  foreign-bot signal); false = provably human (sender_type === 'user'); and
+ *  undefined = unknown (sender_type missing/other AND not a recognised peer) —
+ *  must NOT be coerced to "human". Distinct from the routing/owner boolean
+ *  `isForeignBot*`, which is false for both "human" and "unknown". */
+function senderIsBotTriState(
+  senderType: string | undefined,
+  isForeignBot: boolean,
+): boolean | undefined {
+  if (isForeignBot || senderType === 'app' || senderType === 'bot') return true;
+  if (senderType === 'user') return false;
+  return undefined;
+}
+
 /** Build the turn-window counterparts contributed by ONE inbound message via
- *  the pure {@link buildTurnParticipantsFrom}, supplying the daemon deps
- *  (self open_id + the peer-bot predicate). See that helper for the contract. */
+ *  the pure {@link buildTurnParticipantsFrom}, supplying the daemon deps (self
+ *  open_id + self app_id for self-exclusion of app_id-form self @s + the
+ *  peer-bot predicate). See that helper for the contract. */
 function buildTurnParticipants(
   larkAppId: string,
   senderOpenId: string | undefined,
@@ -15393,11 +15409,13 @@ function buildTurnParticipants(
   mentions: LarkMention[] | undefined,
   senderName?: string,
 ): { participants: TurnParticipant[]; incomplete: boolean } {
+  const selfBot = getBot(larkAppId);
   return buildTurnParticipantsFrom(
     { openId: senderOpenId, isBot: senderIsBot, name: senderName },
     mentions,
-    getBot(larkAppId).botOpenId,
+    selfBot.botOpenId,
     (openId) => isKnownPeerBot(config.session.dataDir, larkAppId, openId),
+    selfBot.config.larkAppId,
   );
 }
 
@@ -15511,10 +15529,12 @@ async function startInitialPassthroughSession(args: {
   if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId, memberUnionId, chatType, botSender)) {
     return;
   }
-  // Reply attribution's is-bot: prefer the caller's cross-ref-resolved identity
-  // (passed as senderIsBot); fall back to the platform sender_type only when a
-  // caller didn't supply it. Used for --mention-back's asymmetric gate, quote
-  // target, and pendingSender — NOT for quota (that stays on botSender above).
+  // Reply attribution's is-bot. `resolvedSenderIsBot` is a BOOLEAN for the
+  // legacy consumers that need one (pendingSender.type, quoteTargetSenderIsBot,
+  // loser-handoff turn.senderIsBot). `resolvedSenderIsBotTriState` keeps
+  // "unknown" as undefined for the participant candidate label — never coerce an
+  // unknown sender to "human". NOT for quota (that stays on botSender above).
+  const resolvedSenderIsBotTriState = senderIsBotTriState(parsed.senderType, senderIsBot === true);
   const resolvedSenderIsBot = senderIsBot ?? (parsed.senderType === 'app' || parsed.senderType === 'bot');
 
   const botCfg = getBot(larkAppId).config;
@@ -15579,7 +15599,7 @@ async function startInitialPassthroughSession(args: {
     ds.session.workingDir = pinnedWorkingDir;
     sessionStore.updateSession(ds.session);
   }
-  const initialWindow = buildTurnParticipants(larkAppId, senderOpenId, resolvedSenderIsBot, undefined, initialPassthroughSender?.name);
+  const initialWindow = buildTurnParticipants(larkAppId, senderOpenId, resolvedSenderIsBotTriState, undefined, initialPassthroughSender?.name);
   beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { senderOpenId, participants: initialWindow.participants, participantsIncomplete: initialWindow.incomplete });
   sessionStore.updateSession(ds.session);
   const creationKey = sessionKey(anchor, larkAppId);
@@ -16176,7 +16196,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const substituteReplyMode = substituteTrigger
     ? (botCfg.substituteMode?.replyMode ?? 'thread')
     : 'thread';
-  const newTopicWindow = buildTurnParticipants(larkAppId, senderOpenId, isForeignBotSender || parsed.senderType === 'app' || parsed.senderType === 'bot', parsed.mentions, newTopicSender?.name);
+  const newTopicWindow = buildTurnParticipants(larkAppId, senderOpenId, senderIsBotTriState(parsed.senderType, isForeignBotSender), parsed.mentions, newTopicSender?.name);
   beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId, participants: newTopicWindow.participants, participantsIncomplete: newTopicWindow.incomplete });
   sessionStore.updateSession(ds.session);
   const creationKey = sessionKey(anchor, larkAppId);
@@ -17288,7 +17308,7 @@ async function handleThreadReply(
     // hot path avoids an await before the buffering barrier), so the candidate
     // list may show open_id without a name — the ambiguity decision itself is
     // unaffected.
-    const existingWindow = buildTurnParticipants(larkAppId, callerOpenId, isForeignBot, parsed.mentions);
+    const existingWindow = buildTurnParticipants(larkAppId, callerOpenId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions);
     beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: callerOpenId, participants: existingWindow.participants, participantsIncomplete: existingWindow.incomplete });
     if (callerOpenId && ds.session.lastCallerOpenId !== callerOpenId) {
       ds.session.lastCallerOpenId = callerOpenId;
@@ -17514,7 +17534,7 @@ async function handleThreadReply(
     const substituteReplyMode = substituteTrigger
       ? (botCfg.substituteMode?.replyMode ?? 'thread')
       : 'thread';
-    const autoCreateWindow = buildTurnParticipants(larkAppId, senderOId, isForeignBot, parsed.mentions, autoCreateSender?.name);
+    const autoCreateWindow = buildTurnParticipants(larkAppId, senderOId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, autoCreateSender?.name);
     beginReplyTargetTurn(newDs, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: senderOId, participants: autoCreateWindow.participants, participantsIncomplete: autoCreateWindow.incomplete });
     sessionStore.updateSession(newDs.session);
     const creationKey = sessionKey(anchor, larkAppId);

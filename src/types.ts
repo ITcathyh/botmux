@@ -534,6 +534,7 @@ export interface LarkMention {
   openId?: string;    // open_id of the mentioned user/bot
   userId?: string;    // user_id of the mentioned user, when Lark includes it
   unionId?: string;   // stable user id across bot app namespaces when present
+  appId?: string;      // app_id of a mentioned BOT (app_id-form @; open_id absent)
   idType?: string;     // e.g. "open_id" or "app_id" from Lark event payloads
 }
 

@@ -407,4 +407,54 @@ describe('buildTurnParticipantsFrom (pure per-message contribution)', () => {
     expect(byId.ou_peer).toBe(true);        // known peer bot
     expect(byId.ou_third).toBeUndefined();  // unknown — NOT labelled human
   });
+
+  it('excludes a self @ that arrives in app_id form (plain 1v1 stays complete, NOT incomplete)', () => {
+    // isBotMentioned recognises the answering bot via app_id; a normal
+    // "@currentBot help me" whose self-mention is app_id-form must not be
+    // mis-counted as an unresolved counterpart and wrongly block --mention-back.
+    const r = buildTurnParticipantsFrom(
+      { openId: 'ou_human', isBot: false, name: '张三' },
+      [{ key: '@_1', name: 'Me', appId: 'cli_self', idType: 'app_id' }], // self @ in app_id form
+      'ou_self',
+      noPeer,
+      'cli_self', // selfAppId
+    );
+    expect(r.participants.map(p => p.openId)).toEqual(['ou_human']);
+    expect(r.incomplete).toBe(false); // self app_id @ excluded, not treated as unresolved
+  });
+
+  it('an app_id @ of ANOTHER bot (not self) still marks incomplete', () => {
+    const r = buildTurnParticipantsFrom(
+      { openId: 'ou_human', isBot: false },
+      [{ key: '@_1', name: 'OtherBot', appId: 'cli_other', idType: 'app_id' }],
+      'ou_self',
+      noPeer,
+      'cli_self',
+    );
+    expect(r.participants.map(p => p.openId)).toEqual(['ou_human']);
+    expect(r.incomplete).toBe(true); // other-bot app_id @ is a real unaccountable counterpart
+  });
+
+  it('a real inbound message with NO resolvable sender open_id → incomplete', () => {
+    // e.g. an app_id-only bot sender routed via realtime/message-listener: the
+    // sender is a genuine counterpart we cannot list, so fail toward explicit.
+    const r = buildTurnParticipantsFrom({ openId: undefined }, undefined, 'ou_self', noPeer);
+    expect(r.participants).toEqual([]);
+    expect(r.incomplete).toBe(true);
+  });
+});
+
+describe('collectTurnWindowParticipants — legacy pre-participants anchor', () => {
+  it('anchor has senderOpenId but no participants field (upgrade in-flight) → synthesize sender candidate + incomplete', () => {
+    // Old-schema record: knows its sender, never recorded mentions. Must surface
+    // the sender as a candidate AND mark incomplete (a hidden @ may exist), NOT
+    // return a "complete empty" window that would allow --mention-back.
+    const now = '2026-08-06T00:00:00.000Z';
+    const s = {
+      replyTargets: { 'turn-legacy': { updatedAt: now, senderOpenId: 'ou_legacy' } } as any,
+    };
+    const w = collectTurnWindowParticipants(s, 'turn-legacy');
+    expect(w.participants.map(p => p.openId)).toEqual(['ou_legacy']); // sender surfaced
+    expect(w.incomplete).toBe(true);                                   // but window not proven complete
+  });
 });

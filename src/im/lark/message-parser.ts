@@ -474,6 +474,7 @@ export function parseEventMessage(
           openId: mentionOpenId(m),
           userId: mentionIdentity(m).userId,
           unionId: mentionUnionId(m),
+          appId: mentionIdentity(m).appId,
           idType: m.id_type,
         }))
       : undefined;

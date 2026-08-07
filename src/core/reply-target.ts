@@ -19,38 +19,51 @@ export function dedupeParticipants(list: TurnParticipant[]): TurnParticipant[] {
 
 /** Pure core of a message's turn-window contribution (daemon wraps it with live
  *  deps). Its sender plus everyone it @-mentioned, excluding the answering bot
- *  (`selfOpenId`). `participants` holds ONLY executable receiver-scoped open_id
- *  candidates (so `botmux send` can hand them back as `--mention <open_id>`),
- *  each labelled bot (`isMentionBot` proves a known peer, or sender is a
- *  platform-stamped bot) / unknown (NOT provably human — `isMentionBot=false`
- *  does not prove a person; a third-party bot isn't in the cross-ref). Returns
- *  `incomplete: true` when a real @-mention could not be reduced to a usable
- *  open_id (app_id / user_id / union_id form — parser leaves `openId`
- *  undefined): that counterpart is NOT listed as a candidate but forces the
- *  window ambiguous so the gate demands an explicit decision rather than risk a
- *  wrong single-target @. Sender name is best-effort — omitted when unknown. */
+ *  (by `selfOpenId` OR `selfAppId` — a self @ often arrives in app_id form, so
+ *  open_id alone would miss it and wrongly mark a plain 1v1 incomplete).
+ *  `participants` holds ONLY executable receiver-scoped open_id candidates (so
+ *  `botmux send` can hand them back as `--mention <open_id>`), each labelled bot
+ *  (`isMentionBot` proves a known peer, or sender is a platform-stamped bot) /
+ *  unknown (NOT provably human — `isMentionBot=false` does not prove a person; a
+ *  third-party bot isn't in the cross-ref). Returns `incomplete: true` when a
+ *  real, NON-self @-mention could not be reduced to a usable open_id (app_id /
+ *  user_id / union_id form — parser leaves `openId` undefined): that counterpart
+ *  is NOT listed as a candidate but forces the window ambiguous so the gate
+ *  demands an explicit decision rather than risk a wrong single-target @. Sender
+ *  name is best-effort — omitted when unknown. */
 export function buildTurnParticipantsFrom(
   sender: { openId?: string; isBot?: boolean; name?: string },
   mentions: LarkMention[] | undefined,
   selfOpenId: string | undefined,
   isMentionBot: (openId: string) => boolean,
+  selfAppId?: string,
 ): { participants: TurnParticipant[]; incomplete: boolean } {
   const out: TurnParticipant[] = [];
   let incomplete = false;
-  if (sender.openId && sender.openId !== selfOpenId) {
-    out.push({
-      openId: sender.openId,
-      ...(sender.name ? { name: sender.name } : {}),
-      ...(sender.isBot !== undefined ? { isBot: sender.isBot } : {}),
-    });
+  if (sender.openId) {
+    if (sender.openId !== selfOpenId) {
+      out.push({
+        openId: sender.openId,
+        ...(sender.name ? { name: sender.name } : {}),
+        ...(sender.isBot !== undefined ? { isBot: sender.isBot } : {}),
+      });
+    }
+  } else {
+    // A real inbound message with no resolvable sender open_id (e.g. an app_id-
+    // only bot sender routed via realtime/message-listener). The sender is never
+    // the answering bot, so this is an unaccountable counterpart → incomplete.
+    incomplete = true;
   }
   for (const m of mentions ?? []) {
-    if (m.openId && m.openId === selfOpenId) continue;   // the answering bot itself
+    // The answering bot itself — matched by open_id OR app_id (a self @ frequently
+    // arrives as an app_id-form mention with no open_id).
+    if (m.openId && m.openId === selfOpenId) continue;
+    if (!m.openId && selfAppId && m.appId === selfAppId) continue;
     if (!m.openId) {
-      // app_id / user_id / union_id-form @ (parser leaves openId undefined): a
-      // real counterpart we can't reduce to a --mention <open_id> candidate.
-      // Don't fake an id into the candidate list; mark the window incomplete so
-      // the gate fails toward an explicit decision.
+      // A NON-self @ in app_id / user_id / union_id form (parser leaves openId
+      // undefined): a real counterpart we can't reduce to a --mention <open_id>
+      // candidate. Don't fake an id into the candidate list; mark the window
+      // incomplete so the gate fails toward an explicit decision.
       incomplete = true;
       continue;
     }
@@ -307,8 +320,21 @@ export function collectTurnWindowParticipants(
     // stamped slightly before or after). Unparseable timestamps count as in.
     const inWindow = Number.isNaN(ms) || Number.isNaN(anchorMs) || Math.abs(ms - anchorMs) <= TURN_WINDOW_MS;
     if (!inWindow) continue;
-    if (entry.participants?.length) collected.push(...entry.participants);
-    if (entry.participantsIncomplete) incomplete = true;
+    if (entry.participants) {
+      collected.push(...entry.participants);
+      if (entry.participantsIncomplete) incomplete = true;
+    } else if (entry.senderOpenId) {
+      // Pre-upgrade record (persisted before the participant set existed): it
+      // knows its sender but never recorded mentions. Surface the sender as a
+      // best-effort candidate AND mark incomplete — a hidden @-ed counterpart
+      // may exist, so the gate must still fail toward an explicit decision.
+      collected.push({ openId: entry.senderOpenId });
+      incomplete = true;
+    } else {
+      // A window record with neither participants nor a sender we can name still
+      // represents an in-flight turn we cannot fully account for.
+      incomplete = true;
+    }
   }
   // A prune whose watermark reaches into this window means an evicted sibling
   // could have carried a counterpart we can no longer see → under-count risk.

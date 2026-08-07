@@ -11,28 +11,37 @@ describe('daemon per-turn reply sender + participant wiring', () => {
     // passthrough (raw command → sender-only window)
     expect(daemonSource).toContain('buildTurnParticipants(larkAppId, turn.senderOpenId, turn.senderIsBot, undefined)');
     expect(daemonSource).toMatch(/participants: passthroughWindow\.participants,\s*participantsIncomplete: passthroughWindow\.incomplete/);
-    // initial passthrough (raw command → caller-resolved is-bot, best-effort name)
-    expect(daemonSource).toContain('buildTurnParticipants(larkAppId, senderOpenId, resolvedSenderIsBot, undefined, initialPassthroughSender?.name)');
+    // initial passthrough (raw command → tri-state is-bot for the label, best-effort name)
+    expect(daemonSource).toContain('buildTurnParticipants(larkAppId, senderOpenId, resolvedSenderIsBotTriState, undefined, initialPassthroughSender?.name)');
     expect(daemonSource).toMatch(/participants: initialWindow\.participants, participantsIncomplete: initialWindow\.incomplete/);
-    // new-topic (business message → sender + parsed.mentions + resolved name)
-    expect(daemonSource).toMatch(/buildTurnParticipants\(larkAppId, senderOpenId, isForeignBotSender \|\|[^\n]+parsed\.mentions, newTopicSender\?\.name\)/);
+    // new-topic (business message → tri-state sender + parsed.mentions + resolved name)
+    expect(daemonSource).toContain('buildTurnParticipants(larkAppId, senderOpenId, senderIsBotTriState(parsed.senderType, isForeignBotSender), parsed.mentions, newTopicSender?.name)');
     expect(daemonSource).toMatch(/participants: newTopicWindow\.participants, participantsIncomplete: newTopicWindow\.incomplete/);
     // existing-session (name best-effort omitted — resolves after the barrier)
-    expect(daemonSource).toContain('buildTurnParticipants(larkAppId, callerOpenId, isForeignBot, parsed.mentions)');
+    expect(daemonSource).toContain('buildTurnParticipants(larkAppId, callerOpenId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions)');
     expect(daemonSource).toMatch(/participants: existingWindow\.participants, participantsIncomplete: existingWindow\.incomplete/);
     // auto-create
-    expect(daemonSource).toContain('buildTurnParticipants(larkAppId, senderOId, isForeignBot, parsed.mentions, autoCreateSender?.name)');
+    expect(daemonSource).toContain('buildTurnParticipants(larkAppId, senderOId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, autoCreateSender?.name)');
     expect(daemonSource).toMatch(/participants: autoCreateWindow\.participants, participantsIncomplete: autoCreateWindow\.incomplete/);
   });
 
-  it('buildTurnParticipants wraps the pure helper with live deps (self open_id + peer-bot predicate)', () => {
+  it('senderIsBotTriState maps unknown → undefined (not human) and keeps routing boolean separate', () => {
+    expect(daemonSource).toContain('function senderIsBotTriState(');
+    expect(daemonSource).toMatch(/if \(isForeignBot \|\| senderType === 'app' \|\| senderType === 'bot'\) return true;/);
+    expect(daemonSource).toMatch(/if \(senderType === 'user'\) return false;/);
+    expect(daemonSource).toMatch(/return undefined;/);
+  });
+
+  it('buildTurnParticipants wraps the pure helper with live deps (self open_id + self app_id + peer predicate)', () => {
     // The self-exclusion / app_id-incomplete / three-state logic lives in the
     // pure buildTurnParticipantsFrom (behaviorally tested in reply-target-fallback);
-    // the daemon wrapper just supplies getBot().botOpenId + isKnownPeerBot.
+    // the daemon wrapper supplies botOpenId + isKnownPeerBot + self larkAppId
+    // (so an app_id-form self @ is excluded, not mis-counted as unresolved).
     expect(daemonSource).toContain('function buildTurnParticipants(');
     expect(daemonSource).toMatch(/return buildTurnParticipantsFrom\(\s*\{ openId: senderOpenId, isBot: senderIsBot, name: senderName \},/);
-    expect(daemonSource).toContain('getBot(larkAppId).botOpenId,');
+    expect(daemonSource).toContain('selfBot.botOpenId,');
     expect(daemonSource).toContain('(openId) => isKnownPeerBot(config.session.dataDir, larkAppId, openId)');
+    expect(daemonSource).toContain('selfBot.config.larkAppId,');
   });
 
   it('cold-start passthrough resolves is-bot from the caller (cross-ref), falling back to sender_type only when absent', () => {
