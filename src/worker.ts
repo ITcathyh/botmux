@@ -9205,17 +9205,18 @@ async function spawnCli(
       // core CLI (codex P1). Canonicalized so it shares the roots' namespace.
       loadedBotsConfigPath: cfg.loadedBotsConfigPath ? canonical(cfg.loadedBotsConfigPath) : undefined,
       // Linux lark-cli keystore (holds every bot's appsecret ciphertext + the shared
-      // master key). Resolve it EXACTLY as the in-sandbox lark-cli will: it reads the
-      // host env (redactChildEnv never rewrites HOME / XDG_DATA_HOME), so the store =
-      // `${XDG_DATA_HOME:-$HOME/.local/share}/lark-cli`. Freeze the value from the
-      // worker's OWN process.env (the frozen host env) — NOT agent-controllable — and
-      // canonicalize it (both engines match realpath'd mount sources). buildFsPolicy
-      // uses this to DENY the store + re-open ONLY this bot's own master.key +
-      // appsecret_<self>.enc read-only (transport), or freeze it as an authority root
-      // with no carve-out (no-transport). lexicalHome (raw $HOME) matches the child's
-      // own `$HOME` resolution; canonical() then aligns it to the mount namespace.
+      // master key). Resolve it EXACTLY as the in-sandbox lark-cli will:
+      // `${LARKSUITE_CLI_DATA_DIR}/lark-cli` when that env var is ABSOLUTE, else
+      // `$HOME/.local/share/lark-cli` — lark-cli does NOT read XDG_DATA_HOME for the
+      // keystore (verified by strace on v1.0.76 + its keychain_other.go::StorageDir).
+      // bwrap has no --clearenv, so the sandboxed child INHERITS this bot's
+      // LARKSUITE_CLI_DATA_DIR from the worker's own (frozen, non-agent-controllable)
+      // process.env — freezing that same value pins the policy to the dir lark-cli
+      // opens. (sandbox.ts ALSO --unsetenv's it in the child as belt-and-suspenders so
+      // no unfrozen value can drift in.) canonical() aligns it to the mount namespace;
+      // lexicalHome (raw $HOME) matches the child's own $HOME resolution.
       // Harmlessly ignored on darwin (that platform uses the Library/… keystore).
-      larkCliLinuxStore: canonical(resolveLarkCliLinuxStoreDir(process.env.XDG_DATA_HOME, lexicalHome)),
+      larkCliLinuxStore: canonical(resolveLarkCliLinuxStoreDir(process.env.LARKSUITE_CLI_DATA_DIR, lexicalHome)),
       redirectedCliData: willRedirectCliData,
       cliDataPaths: willRedirectCliData ? undefined : keepExisting([
         cliAdapter.claudeDataDir,

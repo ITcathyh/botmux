@@ -264,11 +264,11 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(p.rules, '/home/u/.local/share/bytedcli/data/sso.json').access).toBe('readOnly');
   });
 
-  it('LINUX lark-cli key store honours a custom XDG_DATA_HOME (store rehomes) — darwin unaffected', () => {
-    // A custom XDG_DATA_HOME moves the store OUT of ~/.local/share. The worker
+  it('LINUX lark-cli key store honours a custom store dir (LARKSUITE_CLI_DATA_DIR rehomes it) — darwin unaffected', () => {
+    // A custom LARKSUITE_CLI_DATA_DIR moves the store OUT of ~/.local/share. The worker
     // resolves + canonicalizes it and passes larkCliLinuxStore; the policy must
     // deny THAT dir + carve out own keys there, and NOT the stale default path.
-    const store = '/data00/xdg/lark-cli';
+    const store = '/data00/cli-data/lark-cli';
     const p = buildFsPolicy(ctx({
       platform: 'linux', homeDir: '/home/u', botHome: '/home/u/.botmux/bots/cli_self',
       botmuxHome: '/home/u/.botmux', sessionDataDir: '/home/u/.botmux/data', workingDir: '/home/u/proj',
@@ -284,6 +284,26 @@ describe('buildFsPolicy', () => {
     // darwin never emits a Linux store rule even when larkCliLinuxStore is set
     const dar = buildFsPolicy(ctx({ larkCliLinuxStore: store }));
     expect(dar.rules.some(r => r.path === store)).toBe(false);
+  });
+
+  it('LINUX lark-cli key store NESTED INSIDE BOT_HOME (LARKSUITE_CLI_DATA_DIR=<BOT_HOME>): own keys RO, siblings deny — transport', () => {
+    // codex P1-2 surface: a deployment may set LARKSUITE_CLI_DATA_DIR into BOT_HOME so
+    // the store resolves to `<BOT_HOME>/lark-cli`. The transport carve-out must STILL
+    // isolate — the store deny + own-key carve-out ride on top of the BOT_HOME rw grant
+    // (deeper prefix wins), so siblings/master stay isolated even though the whole
+    // BOT_HOME is otherwise writable.
+    const botHome = '/home/u/.botmux/bots/cli_self';
+    const store = `${botHome}/lark-cli`;
+    const p = buildFsPolicy(ctx({
+      platform: 'linux', homeDir: '/home/u', botHome,
+      botmuxHome: '/home/u/.botmux', sessionDataDir: '/home/u/.botmux/data', workingDir: '/home/u/proj',
+      larkCliLinuxStore: store,
+    }));
+    expect(accessForPath(p.rules, `${store}/master.key`).access).toBe('readOnly');
+    expect(accessForPath(p.rules, `${store}/appsecret_cli_self.enc`).access).toBe('readOnly');
+    expect(accessForPath(p.rules, `${store}/appsecret_cli_other.enc`).access).toBe('deny');
+    // BOT_HOME scratch OUTSIDE the store stays writable (the carve-out is scoped)
+    expect(accessForPath(p.rules, `${botHome}/scratch.txt`).access).toBe('readWrite');
   });
 
   it('internal injections: workingDir + BOT_HOME rw, own session store + attachments ro; siblings uncovered', () => {
@@ -941,6 +961,44 @@ describe('no-Lark-transport credential profile (larkTransportEnabled=false)', ()
     expect(accessForPath(p.rules, `${store}/master.key`).access).toBe('deny');
   });
 
+  it('LINUX no-transport: keystore NESTED INSIDE BOT_HOME still denies — BOT_HOME carve-out must not shadow a nested authority (codex P1-2)', () => {
+    // The reproduced escape: LARKSUITE_CLI_DATA_DIR=<BOT_HOME> → store=<BOT_HOME>/lark-cli.
+    // The old `insideAuthority = under(anyRoot) && !under(botHome)` exempted EVERYTHING
+    // under BOT_HOME, so a deeper hostile user RW under the nested store escaped
+    // dropAuthority and `master.key` resolved readWrite. The per-root BOT_HOME exception
+    // (only exempts a root that is an ANCESTOR of BOT_HOME) must keep the nested store
+    // restricting. Exercise ALL hostile channels: user RW/RO, readonlyRoots, extraWrite.
+    const botHome = '/home/u/.botmux/bots/cli_self';
+    const store = `${botHome}/lark-cli`;
+    const p = buildFsPolicy(ctx({
+      platform: 'linux', larkTransportEnabled: false, homeDir: '/home/u', workingDir: '/home/u',
+      botmuxHome: '/home/u/.botmux', sessionDataDir: '/home/u/.botmux/data',
+      botHome, redirectedCliData: false, authPaths: ['/home/u/.codex'],
+      larkCliLinuxStore: store,
+      userPaths: {
+        readWrite: [`${store}/master.key`, `${store}/appsecret_cli_other.enc`, store],
+        readOnly: [`${store}/appsecret_cli_sneaky.enc`],
+      },
+      readonlyRoots: [`${store}/via-readonly.enc`],
+      extraWritePaths: [`${store}/via-extrawrite.enc`],
+    }));
+    // NO channel may re-open any keystore file — all must resolve deny
+    expect(accessForPath(p.rules, `${store}/master.key`).access).toBe('deny');            // the reproduced leak
+    expect(accessForPath(p.rules, `${store}/appsecret_cli_other.enc`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${store}/appsecret_cli_sneaky.enc`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${store}/via-readonly.enc`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${store}/via-extrawrite.enc`).access).toBe('deny');
+    expect(accessForPath(p.rules, store).access).toBe('deny');
+    // own appsecret ALSO denied under no-transport (no carve-out at all), and the
+    // dropped hostile paths are recorded for diagnosability.
+    expect(accessForPath(p.rules, `${store}/appsecret_cli_self.enc`).access).toBe('deny');
+    expect(p.suppressedAuthorityPaths?.some(s => s.startsWith(store))).toBe(true);
+    // BOT_HOME scratch OUTSIDE the nested store stays writable (exception still valid there)
+    expect(accessForPath(p.rules, `${botHome}/scratch.txt`).access).toBe('readWrite');
+    // ~/.codex (CLI's own auth, outside every authority root) still works
+    expect(accessForPath(p.rules, '/home/u/.codex/auth.json').access).toBe('readWrite');
+  });
+
   it('KEEPS the model CLI own auth (~/.codex) readWrite under no-transport — core functionality intact', () => {
     // The regression codex caught: authPaths are the CLI's OWN login (not Feishu),
     // so a core-only turn must still authenticate its CLI. ~/.codex stays RW even
@@ -1165,26 +1223,29 @@ describe('no-Lark-transport credential profile (larkTransportEnabled=false)', ()
     expect(dual).toEqual(expect.arrayContaining(['/srv/botmux', '/home/u/.botmux']));
   });
 
-  it('computeNoTransportAuthorityRoots includes the Linux keystore (XDG-default and custom override)', () => {
-    // default: XDG unset → store under ~/.local/share
+  it('computeNoTransportAuthorityRoots includes the Linux keystore (default and custom store dir)', () => {
+    // default: LARKSUITE_CLI_DATA_DIR unset → store under ~/.local/share
     const def = computeNoTransportAuthorityRoots({ homeDir: '/home/u', botmuxHome: '/home/u/.botmux' });
     expect(def).toEqual(expect.arrayContaining(['/home/u/.local/share/lark-cli']));
-    // custom store (worker resolved a non-default XDG_DATA_HOME) is frozen instead
+    // custom store (worker resolved an absolute LARKSUITE_CLI_DATA_DIR) is frozen instead
     const custom = computeNoTransportAuthorityRoots({
-      homeDir: '/home/u', botmuxHome: '/home/u/.botmux', larkCliLinuxStore: '/data00/xdg/lark-cli',
+      homeDir: '/home/u', botmuxHome: '/home/u/.botmux', larkCliLinuxStore: '/data00/cli-data/lark-cli',
     });
-    expect(custom).toEqual(expect.arrayContaining(['/data00/xdg/lark-cli']));
+    expect(custom).toEqual(expect.arrayContaining(['/data00/cli-data/lark-cli']));
   });
 
-  it('resolveLarkCliLinuxStoreDir mirrors lark-cli XDG resolution (absolute wins, relative ignored, unset falls back)', () => {
-    // absolute XDG_DATA_HOME → used verbatim + /lark-cli
-    expect(resolveLarkCliLinuxStoreDir('/data00/xdg', '/home/u')).toBe('/data00/xdg/lark-cli');
+  it('resolveLarkCliLinuxStoreDir mirrors lark-cli resolution (LARKSUITE_CLI_DATA_DIR absolute wins, relative/unset → $HOME; XDG ignored)', () => {
+    // strace-verified against lark-cli v1.0.76 keychain_other.go::StorageDir:
+    // absolute LARKSUITE_CLI_DATA_DIR → <value>/lark-cli
+    expect(resolveLarkCliLinuxStoreDir('/data00/cli-data', '/home/u')).toBe('/data00/cli-data/lark-cli');
     // unset → $HOME/.local/share/lark-cli
     expect(resolveLarkCliLinuxStoreDir(undefined, '/home/u')).toBe('/home/u/.local/share/lark-cli');
     expect(resolveLarkCliLinuxStoreDir('', '/home/u')).toBe('/home/u/.local/share/lark-cli');
-    // RELATIVE XDG_DATA_HOME is spec-invalid → ignored, falls back to the default
-    // (never a cwd-relative store the agent could plant a fake key store into)
-    expect(resolveLarkCliLinuxStoreDir('relative/xdg', '/home/u')).toBe('/home/u/.local/share/lark-cli');
+    // RELATIVE / tilde values are spec-invalid → lark-cli IGNORES them, falls back to
+    // $HOME (verified by strace: `relseg/x` and `~/t` both opened ~/.local/share).
+    // Never a cwd-relative store the agent could plant a fake keystore into.
+    expect(resolveLarkCliLinuxStoreDir('relseg/x', '/home/u')).toBe('/home/u/.local/share/lark-cli');
+    expect(resolveLarkCliLinuxStoreDir('~/tildetest', '/home/u')).toBe('/home/u/.local/share/lark-cli');
     expect(resolveLarkCliLinuxStoreDir('.', '/home/u')).toBe('/home/u/.local/share/lark-cli');
   });
 

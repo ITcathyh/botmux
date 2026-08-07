@@ -146,19 +146,21 @@ export interface FsPolicyContext {
   /** LINUX ONLY: the CANONICAL lark-cli data store dir that holds EVERY bot's
    *  `appsecret_<appId>.enc` + the shared `master.key` (the Linux analogue of the
    *  macOS `~/Library/Application Support/lark-cli` keystore). lark-cli resolves it
-   *  to `${XDG_DATA_HOME:-$HOME/.local/share}/lark-cli`, so it is NOT purely a
-   *  function of homeDir — a custom `XDG_DATA_HOME` rehomes it. The worker resolves
-   *  it from the FROZEN host env and canonicalizes it (this fn stays pure — it must
-   *  never read env). Under the baseline `ro(~/.local/share)` grant the whole store
-   *  is otherwise exposed read-only → a sandboxed bot could read its SIBLINGS'
-   *  ciphertext + the shared master key and impersonate them (the pre-refactor
-   *  cross-bot leak macOS already closes). buildFsPolicy DENIES the store and, for a
-   *  transport-enabled turn, re-opens ONLY this bot's own `master.key` +
-   *  `appsecret_<currentAppId>.enc` read-only at a deeper path (longest-prefix-wins),
-   *  mirroring the darwin carve-out. A no-transport turn freezes it as an authority
-   *  root with NO carve-out. Absent on Linux → falls back to the XDG-default
-   *  `${homeDir}/.local/share/lark-cli` (correct whenever XDG_DATA_HOME is unset — the
-   *  common case — and still protective otherwise). Ignored on darwin. */
+   *  to `${LARKSUITE_CLI_DATA_DIR}/lark-cli` (when that env var is ABSOLUTE) else
+   *  `$HOME/.local/share/lark-cli` — it does NOT consult XDG_DATA_HOME (verified by
+   *  strace on v1.0.76). So it is NOT purely a function of homeDir. The worker
+   *  resolves it from the FROZEN host env (`resolveLarkCliLinuxStoreDir`) and
+   *  canonicalizes it (this fn stays pure — it must never read env). Under the
+   *  baseline `ro(~/.local/share)` grant the whole store is otherwise exposed
+   *  read-only → a sandboxed bot could read its SIBLINGS' ciphertext + the shared
+   *  master key and impersonate them (the pre-refactor cross-bot leak macOS already
+   *  closes). buildFsPolicy DENIES the store and, for a transport-enabled turn,
+   *  re-opens ONLY this bot's own `master.key` + `appsecret_<currentAppId>.enc`
+   *  read-only at a deeper path (longest-prefix-wins), mirroring the darwin carve-out.
+   *  A no-transport turn freezes it as an authority root with NO carve-out. Absent on
+   *  Linux → falls back to the default `${homeDir}/.local/share/lark-cli` (correct
+   *  whenever LARKSUITE_CLI_DATA_DIR is unset/relative — the common case — and still
+   *  protective otherwise). Ignored on darwin. */
   larkCliLinuxStore?: string;
 }
 
@@ -440,19 +442,28 @@ export function larkCliLinuxStorePath(homeDir: string, override?: string): strin
 }
 
 /**
- * Resolve the lark-cli Linux store dir BEFORE canonicalization, replicating the
- * XDG Base Directory spec (and lark-cli's own resolution): use `$XDG_DATA_HOME`
- * ONLY when it is an ABSOLUTE path — the spec mandates ignoring a relative value —
- * else fall back to `$HOME/.local/share`. Appends `/lark-cli`. PURE (exported so
- * the "XDG absolute vs relative-ignored vs unset" branching is unit-locked): the
- * worker passes `process.env.XDG_DATA_HOME` + the (lexical) home, `canonical()`s
- * the result, and hands it to buildFsPolicy as `larkCliLinuxStore`. Because the
- * sandboxed CLI inherits the host env unchanged (the worker never rewrites HOME /
- * XDG_DATA_HOME in the child), this yields EXACTLY the dir the in-sandbox lark-cli
- * will read — the anchor the deny + own-key carve-out bind against.
+ * Resolve the lark-cli Linux store dir BEFORE canonicalization, replicating
+ * lark-cli's OWN resolution (`internal/keychain/keychain_other.go::StorageDir`,
+ * verified by strace against v1.0.76): the keystore dir is
+ * `${LARKSUITE_CLI_DATA_DIR}/lark-cli` when `LARKSUITE_CLI_DATA_DIR` is an
+ * ABSOLUTE path, else `$HOME/.local/share/lark-cli`. lark-cli does NOT consult
+ * `XDG_DATA_HOME` for the keystore at all (strace: setting it has zero effect),
+ * and it IGNORES a relative / tilde / empty `LARKSUITE_CLI_DATA_DIR` (spec-invalid
+ * → falls back to $HOME). PURE (exported so the "absolute honored / relative
+ * ignored / unset fallback" branching is unit-locked against the strace matrix).
+ *
+ * The worker passes `process.env.LARKSUITE_CLI_DATA_DIR` + the (lexical) home,
+ * `canonical()`s the result, and hands it to buildFsPolicy as `larkCliLinuxStore`.
+ * This is the AUTHORITATIVE value the in-sandbox lark-cli reads: bwrap has NO
+ * `--clearenv`, so the sandboxed child INHERITS `LARKSUITE_CLI_DATA_DIR` from the
+ * worker's process env (redactChildEnv doesn't strip it), and the sandbox does NOT
+ * `--setenv` a per-bot override for it — so freezing the worker's own env value
+ * pins the policy to exactly the dir lark-cli will open. (The worker ALSO
+ * `--unsetenv`s it in the sandbox as belt-and-suspenders so the child can never
+ * see a value the policy didn't freeze — see sandbox.ts.)
  */
-export function resolveLarkCliLinuxStoreDir(rawXdgDataHome: string | undefined, homeDir: string): string {
-  const base = rawXdgDataHome && rawXdgDataHome.startsWith('/') ? rawXdgDataHome : `${homeDir}/.local/share`;
+export function resolveLarkCliLinuxStoreDir(rawDataDir: string | undefined, homeDir: string): string {
+  const base = rawDataDir && rawDataDir.startsWith('/') ? rawDataDir : `${homeDir}/.local/share`;
   return `${base}/lark-cli`;
 }
 
@@ -542,10 +553,20 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     loadedBotsConfigPath: ctx.loadedBotsConfigPath,
     larkCliLinuxStore: ctx.larkCliLinuxStore,
   });
-  // A path is authority-restricted when it's inside an authority root but NOT
-  // inside the bot's own BOT_HOME (which is legitimately re-allowed).
+  // A path is authority-restricted when SOME authority root covers it — EXCEPT the
+  // bot's own BOT_HOME carve-out (legitimately re-allowed deeper, minus send-cred).
+  // That exception is scoped PER-ROOT: it fires only for a root that is an ANCESTOR
+  // of BOT_HOME (the botmux root, of which BOT_HOME is a re-allowed subtree). An
+  // authority root NESTED INSIDE BOT_HOME — e.g. the lark-cli keystore when a
+  // deployment sets LARKSUITE_CLI_DATA_DIR into BOT_HOME so the store resolves to
+  // `<BOT_HOME>/lark-cli` — is MORE SPECIFIC than the BOT_HOME carve-out and must
+  // STILL restrict, or a deeper hostile user RW under the nested store escapes
+  // dropAuthority and re-opens `master.key`/sibling appsecrets (codex P1-2). So for
+  // each root the BOT_HOME exception applies only when that root is an ancestor of
+  // BOT_HOME AND p is inside BOT_HOME; a root at/under BOT_HOME keeps restricting.
   const insideAuthority = (p: string): boolean =>
-    authorityRoots.some(root => coversPath(root, p)) && !coversPath(ctx.botHome, p);
+    authorityRoots.some(root =>
+      coversPath(root, p) && !(coversPath(root, ctx.botHome) && coversPath(ctx.botHome, p)));
   // Dropped caller allow paths are RECORDED so the worker can log the suppression
   // (codex: a silently-dropped grant is a diagnosability hole).
   const suppressedAuthorityPaths: string[] = [];

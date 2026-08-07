@@ -705,6 +705,22 @@ export function prepareDirectSandbox(opts: {
   }
   args.push('--unsetenv', 'BOTS_CONFIG');
   args.push('--unsetenv', 'BOTMUX_HOST_RELAY_AUTHORIZED');
+  // LARKSUITE_CLI_DATA_DIR relocates the lark-cli keystore dir on Linux to
+  // `<value>/lark-cli` (only when ABSOLUTE; relative/unset → `$HOME/.local/share`).
+  // The fs-policy froze the keystore path from the worker's OWN process.env value
+  // (resolveLarkCliLinuxStoreDir). Pin the CHILD to that SAME resolution so the
+  // in-sandbox lark-cli opens exactly the dir the policy denied/carved-out — immune
+  // to a divergent value injected by a tmux pane rc or inherited drift (bwrap has no
+  // --clearenv, and --setenv/--unsetenv here is authoritative, applied last). Both
+  // sides read the same process.env in the same worker process, so they agree by
+  // construction: absolute → re-pin the child to it; else force the default by
+  // unsetting (matching the policy's `$HOME/.local/share` fallback).
+  const larkCliDataDir = process.env.LARKSUITE_CLI_DATA_DIR;
+  if (larkCliDataDir && larkCliDataDir.startsWith('/')) {
+    args.push('--setenv', 'LARKSUITE_CLI_DATA_DIR', larkCliDataDir);
+  } else {
+    args.push('--unsetenv', 'LARKSUITE_CLI_DATA_DIR');
+  }
   for (const [k, v] of Object.entries(env)) args.push('--setenv', k, v);
   // Canonicalize the CLI binary before execvp: on a symlinked-$HOME host
   // (e.g. /home/u → /data00/home/u shared-drive mount) the worker hands us the
