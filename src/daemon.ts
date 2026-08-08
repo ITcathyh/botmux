@@ -206,7 +206,7 @@ import {
   ensureSessionWhiteboard,
   closeCliMismatchedSessionsForBot,
 } from './core/session-manager.js';
-import { triggerSessionTurn } from './core/trigger-session.js';
+import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit } from './core/trigger-session.js';
 import {
   runDetachedBotTurnMutation,
   tryWithBotTurnMutation,
@@ -20175,6 +20175,29 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       }
     })();
   };
+  // Converge an incomplete keyed idempotent async turn on CLI/worker exit, and if
+  // the durable dispatch_unknown write itself FAILS (EIO/ENOSPC/foreign slot),
+  // take the session to an OBSERVABLE fail-closed terminal by closing it —
+  // trigger-result's closed-branch then resolves `failed` instead of stranding the
+  // poller on `running` while the same Node worker auto-restarts to a healthy idle
+  // CLI (codex #776 round-8 finding #2). Never throws into the exit handler.
+  const failCloseIdempotentTurnIfConvergenceWriteFailed = (ds: DaemonSession, exitingWorkerGeneration: number): void => {
+    let outcome: ReturnType<typeof convergeIdempotentAsyncTurnOnWorkerExit>;
+    try {
+      outcome = convergeIdempotentAsyncTurnOnWorkerExit(ds, exitingWorkerGeneration);
+    } catch (err) {
+      logger.error(`[idempotency] exit convergence threw for ${ds.session.sessionId.slice(0, 8)}: ${err instanceof Error ? err.message : err}`);
+      outcome = 'write_failed';
+    }
+    if (outcome === 'write_failed') {
+      // Durable terminal could not be written. Close the session so its persisted
+      // status becomes `closed` → trigger-result resolves `failed` (soft terminal),
+      // and resolveIdempotencyHit sees a not-live session on retry. This is the
+      // observable fail-closed path the round-8 finding requires.
+      void closeSessionHelper(ds.session.sessionId).catch(() => { /* idempotent; already terminal-intent */ });
+      logger.error(`[idempotency] fail-closed session ${ds.session.sessionId.slice(0, 8)} after exit-convergence write failure`);
+    }
+  };
   // Initialise worker pool with daemon callbacks
   initWorkerPool({
     sessionReply,
@@ -20217,7 +20240,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     onDeferredScheduleTurnSettled(ds, context) {
       scheduleDeferredScheduleSettlement(ds, context);
     },
-    onCliExit(_ds, context) {
+    onCliExit(ds, context) {
+      // Same idempotent-async convergence as onWorkerExit: the MANAGED CLI can
+      // exit inside a still-live Node worker (persistent-pane / codex-app
+      // auto-restart), in which case onWorkerExit never fires. An incomplete
+      // keyed async turn whose CLI died with no final_output must still converge
+      // to a durable dispatch_unknown, or trigger-result polls `running` and a
+      // same-key retry reuses the dead generation forever (codex #776 round-6
+      // finding #1 — the onCliExit half of that path). Idempotent + generation-
+      // gated: safe under the onCliExit/onWorkerExit double-callback race, and a
+      // no-op once final_output cleared the stamp.
+      failCloseIdempotentTurnIfConvergenceWriteFailed(ds, context.workerGeneration);
       const result = handleVcMeetingWorkerGenerationExit(context, {
         dataDir: config.session.dataDir,
         selfAppId: cfg.larkAppId,
@@ -20229,7 +20262,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         );
       }
     },
-    onWorkerExit(_ds, context) {
+    onWorkerExit(ds, context) {
+      // Converge an incomplete idempotent async turn (options.idempotencyKey):
+      // a worker that died with no final_output would otherwise poll `running`
+      // and let a same-key retry `reuse` the dead session forever, until the next
+      // boot reconcile (codex #776 round-6 finding #1). Best-effort + never throws
+      // into the exit handler; a durable-write failure fail-closes the session.
+      failCloseIdempotentTurnIfConvergenceWriteFailed(ds, context.workerGeneration);
       const result = handleVcMeetingWorkerGenerationExit(context, {
         dataDir: config.session.dataDir,
         selfAppId: cfg.larkAppId,
@@ -20269,6 +20308,30 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Expose the activeSessions Map (owned by daemon) to worker-pool readers,
   // so dashboard IPC and other consumers can list/lookup live sessions.
   setActiveSessionsRegistry(activeSessions);
+
+  // Idempotency boot reconcile — MUST run before startIpcServer binds (a normal
+  // fleet has no core-only readiness gate, so a live /api/trigger could otherwise
+  // interleave with the sweep and have its fresh lease mistaken for stale) and is
+  // scoped to THIS bot (the dataDir is shared across bots). Converges leases left
+  // by a previous boot: `attempting` → durable failed(dispatch_unknown) + close;
+  // `reserved` → CAS-remove + close. Returns the sessionIds it terminalized/closed
+  // so restoreActiveSessions can quarantine them from re-attach (else a session the
+  // poller now sees `failed` could be reattached and keep running — state/exec
+  // divergence). sessionStore is init'd + worker pool is up by here.
+  //
+  // FAIL-CLOSED: if reconcile throws (a lease it could not prove converged — a
+  // strict-failed write that failed, a corrupt lease, an unlink/close that
+  // errored), we must NOT bind the IPC server and restore sessions as if
+  // everything converged — that is exactly the "poller hangs running / orphan
+  // re-attach" this feature exists to prevent. Abort this bot's startup so an
+  // operator/supervisor sees it, rather than fail-open into an inconsistent state.
+  let idempotencyQuarantinedSessionIds: Set<string>;
+  try {
+    idempotencyQuarantinedSessionIds = await reconcileIdempotencyLeasesOnBoot(cfg.larkAppId, getDaemonBootId());
+  } catch (err) {
+    logger.error(`[idempotency] boot reconcile failed to converge — aborting bot startup (fail-closed): ${err instanceof Error ? err.message : err}`);
+    throw err instanceof Error ? err : new Error(String(err));
+  }
   // Seed dashboard IPC botName with the custom displayName (falling back to the
   // bot's config id); the friendly name from /bot/v3/info is wired into the
   // registry descriptor (below) but the IPC server also needs its own copy for
@@ -20649,7 +20712,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   reapOrphanWorkers();
 
   // Restore active sessions from previous run
-  await restoreActiveSessions(activeSessions);
+  // Restore active sessions from previous run
+  await restoreActiveSessions(activeSessions, idempotencyQuarantinedSessionIds);
   // Restore complete → /api/asks may now safely 403 unknown sessions again; a
   // reconnecting ask hook that raced the restore got retryable 503s until here.
   sessionsRestored = true;

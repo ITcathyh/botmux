@@ -11940,9 +11940,30 @@ async function spawnCli(
     // onCliExit tells the daemon to mark that receipt ambiguous; replaying the
     // same attempt locally as ordinary carry-over would race hub attempt N+1
     // and execute the prompt twice.
-    const stashed = inflightInputs.onCliExit(item => item.dispatchAttempt === undefined);
+    // At-most-once (idempotency lease) inputs are ALSO excluded — but PER ITEM,
+    // never per session. The daemon terminalizes the keyed turn to
+    // dispatch_unknown on this exit, so replaying THAT input on the auto-restarted
+    // CLI would run a turn the caller already saw failed (codex #776 round-7
+    // finding #1). It must NOT, however, drop a later PLAIN (no-key) turn folded
+    // into the same http_async_ session via target.sessionId — the API allows that
+    // resume, so a whole-session flag would strand a legitimate follow-up input
+    // (codex #776 round-8). The keyed input is tagged item.noReplay at enqueue;
+    // only it is excluded, from BOTH the inflight carry-over and the still-queued
+    // pendingMessages.
+    const stashed = inflightInputs.onCliExit(
+      item => item.dispatchAttempt === undefined && !item.noReplay,
+    );
     if (stashed > 0) {
       log(`CLI exited with ${stashed} in-flight message(s); will re-queue after restart`);
+    }
+    const droppedPending = pendingMessages.filter(m => m.noReplay).length;
+    if (droppedPending > 0) {
+      // Remove ONLY the no-replay items still queued (never written); keep any
+      // ordinary follow-up input for the restart's normal flush.
+      for (let i = pendingMessages.length - 1; i >= 0; i--) {
+        if (pendingMessages[i].noReplay) pendingMessages.splice(i, 1);
+      }
+      log(`Dropped ${droppedPending} at-most-once pending message(s) on CLI exit (no replay)`);
     }
     backend = null;
     isPromptReady = false;
@@ -13956,6 +13977,11 @@ process.on('message', async (raw: unknown) => {
             // group root — accepted[0] — to be steerable). Without this the first
             // turn of a codex-app session could never absorb a follow-up steer.
             ...(msg.codexAppSteerable ? { codexAppSteerable: true } : {}),
+            // At-most-once (idempotency lease): tag the KEYED init prompt so a CLI
+            // exit never replays it onto the auto-restarted CLI — while leaving a
+            // later plain follow-up turn on the same http_async_ session intact
+            // (codex #776 round-8: per-item, not per-session).
+            ...(msg.atMostOnce ? { noReplay: true } : {}),
           });
           initialInputCommitted = true;
         } else if (msg.cliId === 'codex-app') {
