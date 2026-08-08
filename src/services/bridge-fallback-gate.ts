@@ -99,29 +99,46 @@ function hasTrailingBridgeSentinelLine(finalText: string): boolean {
   return false;
 }
 
-/** Remove a single trailing standalone sentinel line (current or legacy token)
- *  from `finalText`, returning the text that should actually reach Lark.
+/** Remove the trailing RUN of standalone sentinel lines (current or legacy
+ *  token, mixable) plus interleaved blank lines from `finalText`, returning the
+ *  text that should actually reach Lark.
  *
- *  Rules mirror hasTrailingBridgeSentinelLine — only the LAST non-empty line is
- *  considered, so:
- *    - `BOTMUX_NOTHING_TO_SEND`                 → "" (nothing to post → silence)
+ *  Stripping the whole trailing run — not just one line — is required to keep the
+ *  "literal token never reaches Lark" guarantee: a model can emit the sentinel
+ *  more than once (`prose\nTOKEN\nTOKEN`, or a bare `TOKEN\nTOKEN`). A one-line
+ *  strip would leave a surviving token to leak, and a bare multi-token final
+ *  would be misjudged as "not silence" and post a literal token — a regression
+ *  vs the old whole-turn suppression. We peel blank + sentinel lines off the end
+ *  until the last remaining line is real prose (or nothing is left).
+ *
+ *    - `BOTMUX_NOTHING_TO_SEND`                 → "" (silence)
+ *    - `TOKEN\nTOKEN` / `TOKEN\n\nTOKEN`        → "" (silence — all tokens peeled)
  *    - `<prose>\n\nBOTMUX_NOTHING_TO_SEND`      → `<prose>` (the real answer)
- *    - `<prose ending mid-sentence …TOKEN>`     → unchanged (token inline, not a
- *      terminator — a normal answer that mentions the token)
+ *    - `<prose>\nTOKEN\nTOKEN`                  → `<prose>` (both tokens peeled)
+ *    - `<prose ending mid-sentence …TOKEN>`     → unchanged (token inline)
  *    - `TOKEN\n\n<more prose>`                  → unchanged (token not trailing)
- *  When the last non-empty line is NOT a sentinel, the input is returned as-is.
- *  Trailing blank lines left behind after removing the sentinel line are
- *  trimmed off the end; leading content is untouched. */
+ *  When the last non-empty line is NOT a sentinel, the input is returned as-is;
+ *  leading content is untouched. Mixed current/legacy tokens in the run all peel. */
 export function stripTrailingBridgeSentinelLine(finalText: string): string {
   const lines = finalText.split('\n');
-  let lastNonEmpty = -1;
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (lines[i].trim().length > 0) { lastNonEmpty = i; break; }
+  // Walk back from the end, skipping blank lines and standalone sentinel lines.
+  // Stop at the first line that is real prose (or run off the top).
+  let end = lines.length - 1;
+  let strippedASentinel = false;
+  while (end >= 0) {
+    const trimmed = lines[end].trim();
+    if (trimmed.length === 0) { end--; continue; }          // blank — peel
+    if (BRIDGE_SENTINEL_TOKENS.includes(trimmed)) {          // standalone token — peel
+      strippedASentinel = true;
+      end--;
+      continue;
+    }
+    break;                                                   // real prose — stop
   }
-  if (lastNonEmpty === -1) return finalText; // all blank — nothing to strip
-  if (!BRIDGE_SENTINEL_TOKENS.includes(lines[lastNonEmpty].trim())) return finalText;
-  // Drop the sentinel line and any now-trailing blank lines before it.
-  let end = lastNonEmpty - 1;
+  // If the tail had no standalone sentinel at all, return verbatim (don't trim
+  // trailing blanks of an ordinary answer — matches prior behavior).
+  if (!strippedASentinel) return finalText;
+  // Drop any blank lines now orphaned before the first surviving prose line.
   while (end >= 0 && lines[end].trim().length === 0) end--;
   return lines.slice(0, end + 1).join('\n');
 }

@@ -54,6 +54,21 @@ describe('stripTrailingBridgeSentinelLine', () => {
     expect(stripTrailingBridgeSentinelLine(`para one\n\npara two\n\n${BRIDGE_NOTHING_TO_SEND_SENTINEL}`))
       .toBe('para one\n\npara two');
   });
+
+  it('peels a trailing RUN of consecutive sentinels (codex #791 leak edge)', () => {
+    const NEW = BRIDGE_NOTHING_TO_SEND_SENTINEL;
+    const OLD = BRIDGE_NO_REPLY_SENTINEL_LEGACY;
+    // pure repeated token → empty (old gate suppressed the whole turn; a
+    // one-line strip would have left a literal token to leak)
+    expect(stripTrailingBridgeSentinelLine(`${NEW}\n${NEW}`)).toBe('');
+    expect(stripTrailingBridgeSentinelLine(`${NEW}\n\n${NEW}`)).toBe('');
+    // new + legacy mixed in the run → empty
+    expect(stripTrailingBridgeSentinelLine(`${NEW}\n${OLD}`)).toBe('');
+    expect(stripTrailingBridgeSentinelLine(`${OLD}\n\n${NEW}\n${NEW}`)).toBe('');
+    // prose + repeated / mixed tokens → just the prose (all tokens peeled)
+    expect(stripTrailingBridgeSentinelLine(`answer\n${NEW}\n${OLD}`)).toBe('answer');
+    expect(stripTrailingBridgeSentinelLine(`answer\n\n${NEW}\n${NEW}`)).toBe('answer');
+  });
 });
 
 describe('bridgePostText (adopt contract — codex #791 blocker)', () => {
@@ -87,6 +102,9 @@ describe('isBridgeNothingToSendFinal', () => {
   it('true only when the final is empty after stripping a trailing sentinel', () => {
     expect(isBridgeNothingToSendFinal(BRIDGE_NOTHING_TO_SEND_SENTINEL)).toBe(true);
     expect(isBridgeNothingToSendFinal(`\n  ${BRIDGE_NO_REPLY_SENTINEL_LEGACY}\n`)).toBe(true);
+    // repeated / mixed tokens with no prose is still pure silence (codex #791)
+    expect(isBridgeNothingToSendFinal(`${BRIDGE_NOTHING_TO_SEND_SENTINEL}\n${BRIDGE_NOTHING_TO_SEND_SENTINEL}`)).toBe(true);
+    expect(isBridgeNothingToSendFinal(`${BRIDGE_NO_REPLY_SENTINEL_LEGACY}\n\n${BRIDGE_NOTHING_TO_SEND_SENTINEL}`)).toBe(true);
   });
 
   it('false for prose + sentinel (there is a real answer to forward)', () => {
