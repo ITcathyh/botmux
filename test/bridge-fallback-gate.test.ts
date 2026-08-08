@@ -4,6 +4,7 @@ import {
   BRIDGE_NO_REPLY_SENTINEL_LEGACY,
   buildBridgeSendMarkerContent,
   buildBridgeSendPreviewText,
+  bridgePostText,
   isBridgeNothingToSendFinal,
   shouldEmitEmptyCompletedBridgeFallback,
   shouldSuppressBridgeEmit,
@@ -52,6 +53,33 @@ describe('stripTrailingBridgeSentinelLine', () => {
   it('preserves interior blank lines but trims those orphaned before the stripped sentinel', () => {
     expect(stripTrailingBridgeSentinelLine(`para one\n\npara two\n\n${BRIDGE_NOTHING_TO_SEND_SENTINEL}`))
       .toBe('para one\n\npara two');
+  });
+});
+
+describe('bridgePostText (adopt contract — codex #791 blocker)', () => {
+  it('non-adopt strips a trailing sentinel line (posts the prose)', () => {
+    expect(bridgePostText(`Here is the answer.\n\n${BRIDGE_NOTHING_TO_SEND_SENTINEL}`, false))
+      .toBe('Here is the answer.');
+    // bare sentinel → empty (caller skips on !adopt empty-guard)
+    expect(bridgePostText(BRIDGE_NOTHING_TO_SEND_SENTINEL, false)).toBe('');
+  });
+
+  it('ADOPT returns text VERBATIM — never strips the sentinel', () => {
+    // The adopted CLI is botmux-unaware; transcript drain is its only channel and
+    // it may output the literal token as content. Stripping here would truncate a
+    // real answer / drop a verbatim-token reply. shouldSuppressBridgeEmit(adopt)
+    // already refuses to interpret the sentinel; this keeps the two consistent.
+    const prose = `Here is the answer.\n\n${BRIDGE_NOTHING_TO_SEND_SENTINEL}`;
+    expect(bridgePostText(prose, true)).toBe(prose);
+    // a pure-token adopt final is returned as-is (NOT emptied)
+    expect(bridgePostText(BRIDGE_NOTHING_TO_SEND_SENTINEL, true)).toBe(BRIDGE_NOTHING_TO_SEND_SENTINEL);
+    // legacy token, verbatim under adopt too
+    expect(bridgePostText(BRIDGE_NO_REPLY_SENTINEL_LEGACY, true)).toBe(BRIDGE_NO_REPLY_SENTINEL_LEGACY);
+  });
+
+  it('leaves ordinary answers untouched in both modes', () => {
+    expect(bridgePostText('a normal reply', false)).toBe('a normal reply');
+    expect(bridgePostText('a normal reply', true)).toBe('a normal reply');
   });
 });
 

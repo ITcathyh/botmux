@@ -126,6 +126,26 @@ export function stripTrailingBridgeSentinelLine(finalText: string): string {
   return lines.slice(0, end + 1).join('\n');
 }
 
+/** The text a transcript-drain emit path should actually post for `finalText`.
+ *
+ *  NON-ADOPT: strip a trailing sentinel line so the literal token never reaches
+ *  Lark (prose+sentinel = the "did work, forgot to send" shape → post the prose).
+ *
+ *  ADOPT: return the text VERBATIM. The adopted CLI is botmux-unaware, transcript
+ *  drain is its only channel to Lark, and it may legitimately output the literal
+ *  sentinel string as content. shouldSuppressBridgeEmit(adoptMode) already
+ *  refuses to interpret the sentinel; stripping here would break that contract
+ *  (a real answer ending in the token would be truncated, and a verbatim token
+ *  reply would be dropped by the caller's empty-guard). Callers must gate their
+ *  own "skip if empty after post" check on !adoptMode to match.
+ *
+ *  Shared by emitReadyTurns and emitReadyCodexTurns so the per-mode rule lives in
+ *  one place and is unit-tested directly. codex-app does not use adopt and drives
+ *  its own strip on the deliverable content path. */
+export function bridgePostText(finalText: string, adoptMode: boolean): string {
+  return adoptMode ? finalText : stripTrailingBridgeSentinelLine(finalText);
+}
+
 export interface BridgeSendMarker {
   sentAtMs: number;
   messageId?: string;

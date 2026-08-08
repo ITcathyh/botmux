@@ -40,7 +40,7 @@ import { readProcessStartIdentity } from './core/session-marker.js';
 import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
-import { shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { bridgePostText, shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import {
   decideHardTimeoutAction,
   decideSettleMarkReady,
@@ -4526,14 +4526,18 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
       continue;
     }
 
-    // Gate let this through, so the final is a real answer. If the model
-    // appended a trailing sentinel line (the "did work, forgot to send, ended
-    // with the sentinel" shape), strip it so the literal token never reaches
-    // Lark — the prose before it is what the user should see. A pure-sentinel
-    // final would have been suppressed above (isBridgeNothingToSendFinal), so
-    // whatever remains here is non-empty; guard anyway and skip if not.
-    const postText = stripTrailingBridgeSentinelLine(assistantText);
-    if (postText.trim().length === 0) continue;
+    // Gate let this through, so the final is a real answer. NON-ADOPT only: if
+    // the model appended a trailing sentinel line (the "did work, forgot to
+    // send, ended with the sentinel" shape), strip it so the literal token never
+    // reaches Lark — the prose before it is what the user should see; a
+    // pure-sentinel final was already suppressed by isBridgeNothingToSendFinal,
+    // so what remains is non-empty (guard and skip if not). ADOPT must NEVER
+    // touch the text: the adopted CLI is botmux-unaware, transcript drain is its
+    // only channel, and it may legitimately output that literal string as
+    // content — shouldSuppressBridgeEmit(adoptMode) already refuses to interpret
+    // the sentinel, so stripping here would break that contract.
+    const postText = bridgePostText(assistantText, adoptMode);
+    if (!adoptMode && postText.trim().length === 0) continue;
 
     if (turn.isLocal) {
       if (turn.userUuid) {
@@ -5439,12 +5443,15 @@ function emitReadyCodexTurns(): void {
       );
       continue;
     }
-    // Strip any trailing sentinel line so the literal token never reaches Lark
-    // (prose+sentinel = "did work, forgot to send" — post the prose). A
-    // pure-sentinel final was suppressed above, and the fallback string carries
-    // no sentinel, so `postContent` is normally non-empty; guard and skip if not.
-    const postContent = stripTrailingBridgeSentinelLine(content);
-    if (postContent.trim().length === 0) continue;
+    // NON-ADOPT only: strip a trailing sentinel line so the literal token never
+    // reaches Lark (prose+sentinel = "did work, forgot to send" — post the
+    // prose). A pure-sentinel final was suppressed above, and the fallback
+    // string carries no sentinel, so `postContent` is normally non-empty (guard
+    // and skip if not). ADOPT must NEVER touch the text — the adopted CLI is
+    // botmux-unaware and may output that literal string as content; the gate
+    // already refuses to interpret the sentinel under adoptMode.
+    const postContent = bridgePostText(content, adoptMode);
+    if (!adoptMode && postContent.trim().length === 0) continue;
     if (turn.isLocal) {
       // Local turn (adopt only): user typed in iTerm. Surface both sides
       // so the Lark thread sees a complete exchange instead of an orphan
