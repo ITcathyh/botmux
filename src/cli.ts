@@ -8759,6 +8759,14 @@ async function cmdSend(rest: string[]): Promise<void> {
       ? `@${mentions.map(m => m.name || m.open_id).join(',')}`
       : '未@任何人';
     console.error(`✓ 已发送 ${messageId} ｜ ${primaryQuotedId ? `引用 ${primaryQuotedId}` : '未引用'} ｜ ${atSummary}`);
+    // Sentinel guidance is surfaced HERE — in the send-success output the model
+    // reads back — rather than only in the injected system prompt. A model only
+    // learns about BOTMUX_NOTHING_TO_SEND after it has actually sent, so it
+    // cannot use the sentinel to end a turn where it did work but forgot to send
+    // (the ghosting shape). The injected prompt keeps a one-line sentinel note
+    // only for the genuine never-send silence case (message addressed to another
+    // bot). See services/bridge-fallback-gate.ts for the matching strip-and-forward gate.
+    console.error(t('ai.send.after_success_hint', undefined, localeForBot(appId)));
 
     // --attention: message is already delivered above; now flip the dashboard
     // needs-you state via the daemon (botmux send is direct-to-Lark, so the

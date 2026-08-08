@@ -4,8 +4,10 @@ import {
   BRIDGE_NO_REPLY_SENTINEL_LEGACY,
   buildBridgeSendMarkerContent,
   buildBridgeSendPreviewText,
+  isBridgeNothingToSendFinal,
   shouldEmitEmptyCompletedBridgeFallback,
   shouldSuppressBridgeEmit,
+  stripTrailingBridgeSentinelLine,
   type BridgeSendMarker,
 } from '../src/services/bridge-fallback-gate.js';
 
@@ -19,6 +21,56 @@ const markerForContent = (sentAtMs: number, content: string): BridgeSendMarker =
     ...buildBridgeSendMarkerContent(content),
   } as BridgeSendMarker;
 };
+
+describe('stripTrailingBridgeSentinelLine', () => {
+  it('bare sentinel strips to empty (genuine silence)', () => {
+    expect(stripTrailingBridgeSentinelLine(BRIDGE_NOTHING_TO_SEND_SENTINEL)).toBe('');
+    expect(stripTrailingBridgeSentinelLine(`  ${BRIDGE_NOTHING_TO_SEND_SENTINEL}\n`)).toBe('');
+    // legacy token too
+    expect(stripTrailingBridgeSentinelLine(BRIDGE_NO_REPLY_SENTINEL_LEGACY)).toBe('');
+  });
+
+  it('prose + trailing sentinel line strips to just the prose (the real answer)', () => {
+    expect(stripTrailingBridgeSentinelLine(`Here is the answer.\n\n${BRIDGE_NOTHING_TO_SEND_SENTINEL}`))
+      .toBe('Here is the answer.');
+    // legacy token, single blank line before it
+    expect(stripTrailingBridgeSentinelLine(`Line one\nLine two\n${BRIDGE_NO_REPLY_SENTINEL_LEGACY}`))
+      .toBe('Line one\nLine two');
+  });
+
+  it('leaves finals whose last non-empty line is NOT a bare sentinel untouched', () => {
+    // token inline in a sentence
+    const inline = `I will stay quiet. ${BRIDGE_NOTHING_TO_SEND_SENTINEL}`;
+    expect(stripTrailingBridgeSentinelLine(inline)).toBe(inline);
+    // token followed by more prose (not trailing)
+    const notTrailing = `${BRIDGE_NOTHING_TO_SEND_SENTINEL}\n\nActually here is more.`;
+    expect(stripTrailingBridgeSentinelLine(notTrailing)).toBe(notTrailing);
+    // ordinary answer, no sentinel at all
+    expect(stripTrailingBridgeSentinelLine('just a normal reply')).toBe('just a normal reply');
+  });
+
+  it('preserves interior blank lines but trims those orphaned before the stripped sentinel', () => {
+    expect(stripTrailingBridgeSentinelLine(`para one\n\npara two\n\n${BRIDGE_NOTHING_TO_SEND_SENTINEL}`))
+      .toBe('para one\n\npara two');
+  });
+});
+
+describe('isBridgeNothingToSendFinal', () => {
+  it('true only when the final is empty after stripping a trailing sentinel', () => {
+    expect(isBridgeNothingToSendFinal(BRIDGE_NOTHING_TO_SEND_SENTINEL)).toBe(true);
+    expect(isBridgeNothingToSendFinal(`\n  ${BRIDGE_NO_REPLY_SENTINEL_LEGACY}\n`)).toBe(true);
+  });
+
+  it('false for prose + sentinel (there is a real answer to forward)', () => {
+    expect(isBridgeNothingToSendFinal(`Here is the answer.\n\n${BRIDGE_NOTHING_TO_SEND_SENTINEL}`)).toBe(false);
+  });
+
+  it('false for finals with no trailing sentinel at all', () => {
+    expect(isBridgeNothingToSendFinal('a normal reply')).toBe(false);
+    expect(isBridgeNothingToSendFinal(undefined)).toBe(false);
+    expect(isBridgeNothingToSendFinal('')).toBe(false);
+  });
+});
 
 describe('buildBridgeSendMarkerContent', () => {
   it('keeps normalized length semantics and a newline-preserving dashboard preview', () => {
@@ -71,26 +123,43 @@ describe('shouldSuppressBridgeEmit', () => {
     )).toBe(true);
   });
 
-  it('non-adopt: the legacy no-reply token is still recognized as a sentinel', () => {
+  it('non-adopt: the legacy no-reply token is still recognized as a pure-silence sentinel', () => {
     // Rollout / restore safety: sessions spawned before the rename still carry
-    // the old token in their captured system prompt. The reader stays liberal
-    // so their sentinel line does NOT leak into Lark; only the instruction
-    // surface moved to the new name.
+    // the old token in their captured system prompt. A BARE legacy token (empty
+    // after stripping) is still genuine silence → suppress, so the literal token
+    // never leaks into Lark. (Prose + legacy token is covered below as the
+    // ghosting/strip-and-forward case.)
     expect(shouldSuppressBridgeEmit(
-      { ...turn(100), finalText: `Nothing for me to do here.\n\n${BRIDGE_NO_REPLY_SENTINEL_LEGACY}` },
+      { ...turn(100), finalText: `  ${BRIDGE_NO_REPLY_SENTINEL_LEGACY}\n` },
       undefined,
       [],
       false,
     )).toBe(true);
   });
 
-  it('non-adopt: prose then a standalone sentinel LINE suppresses the whole turn', () => {
-    // The real-world shape: the model explains the silence, then appends the
-    // token on its own trailing line. Full-string exact match let this leak.
+  it('non-adopt: prose then a standalone sentinel line is NOT silence (strip-and-forward)', () => {
+    // Behavior change (the ghosting fix): earlier this whole turn was dropped,
+    // which lost the real answer of a model that did work, forgot to `botmux
+    // send`, and ended with the sentinel. Now the prose is a real answer with no
+    // send marker → NOT suppressed; callers strip the sentinel line and post the
+    // prose. (Bare-sentinel silence stays suppressed — see the case above.)
     expect(shouldSuppressBridgeEmit(
-      { ...turn(100), finalText: `Codex acknowledged and is reviewing. Nothing for me to do — no reply needed.\n\n${BRIDGE_NOTHING_TO_SEND_SENTINEL}` },
+      { ...turn(100), finalText: `Codex acknowledged and is reviewing. Here is the summary you asked for.\n\n${BRIDGE_NOTHING_TO_SEND_SENTINEL}` },
       undefined,
       [],
+      false,
+    )).toBe(false);
+  });
+
+  it('non-adopt: prose + sentinel IS suppressed when the model already sent the same content in-window', () => {
+    // The strip-and-forward path must still honor send markers: if the prose was
+    // already delivered via `botmux send`, forwarding it again would duplicate.
+    // The gate compares the SENTINEL-STRIPPED final against the marker length.
+    const prose = 'Here is the full answer to your question, delivered explicitly.';
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: `${prose}\n\n${BRIDGE_NOTHING_TO_SEND_SENTINEL}` },
+      500,
+      [{ sentAtMs: 200, ...buildBridgeSendMarkerContent(prose) }],
       false,
     )).toBe(true);
   });
