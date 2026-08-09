@@ -14,6 +14,12 @@ class TestDirectory implements SessionDirectory {
     key: string;
     sessionId: string;
     route: { kind: 'thread'; anchorId: string } | { kind: 'chat'; chatId: string };
+    ordinaryIngressBinding: {
+      scope: 'thread' | 'chat';
+      canonicalAnchor: string;
+      chatId: string;
+      chatType: 'group' | 'p2p';
+    };
     recordStatus: 'active' | 'closed';
     executorStatus: 'working' | 'idle' | 'dormant';
   }>) {}
@@ -157,6 +163,12 @@ function host(
         key: 'session-1',
         sessionId: 'session-1',
         route: { kind: 'thread', anchorId: 'om_root' },
+        ordinaryIngressBinding: {
+          scope: 'thread',
+          canonicalAnchor: 'om_root',
+          chatId: 'oc_chat',
+          chatType: 'group',
+        },
         recordStatus: 'active',
         executorStatus: 'working',
       }]),

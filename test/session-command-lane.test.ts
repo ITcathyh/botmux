@@ -43,6 +43,12 @@ const oneSessionDirectory: SessionDirectory = {
         key: 'session-1',
         sessionId: 'session-1',
         route: { kind: 'thread', anchorId: 'om_root' },
+        ordinaryIngressBinding: {
+          scope: 'thread',
+          canonicalAnchor: 'om_root',
+          chatId: 'oc_chat',
+          chatType: 'group',
+        },
         recordStatus: 'active',
         executorStatus: 'working',
       },
@@ -209,7 +215,7 @@ describe('SessionCommandLane', () => {
       commandLane: laneHost.lane,
       sessionLaneAddress: sessionId => laneHost.addressFor(`owner-a\0${sessionId}`),
       ordinaryIngress: {
-        commit: () => {
+        begin: () => {
           order.push('ordinary:start');
           control = session.runtime.submit({
             target: { kind: 'session', address: sessionAddress },
@@ -234,6 +240,8 @@ describe('SessionCommandLane', () => {
           order.push('ordinary:end');
           return { kind: 'committed' };
         },
+        execute: async () => { throw new Error('no ordinary effect expected'); },
+        resume: () => { throw new Error('no ordinary continuation expected'); },
       },
     });
     const projected = await session.projection.read({
@@ -246,7 +254,25 @@ describe('SessionCommandLane', () => {
     await expect(session.runtime.submit({
       target: { kind: 'session', address: projected.session.address },
       idempotencyKey: 'ordinary-1',
-      command: { kind: 'ordinary.ingress', input: { semantic: { text: 'hello' } } },
+      command: {
+        kind: 'ordinary.ingress',
+        input: {
+          turn: {
+            route: {
+              scope: 'thread',
+              canonicalAnchor: 'om_root',
+              chatId: 'oc_chat',
+              chatType: 'group',
+            },
+            source: 'lark.im',
+            messageKey: 'ordinary-1',
+            content: 'hello',
+            sender: { kind: 'human', openId: 'ou_sender' },
+            attachments: [],
+            mentions: [],
+          },
+        },
+      },
     })).resolves.toMatchObject({ kind: 'applied' });
     await expect(control).resolves.toMatchObject({ kind: 'applied', action: 'control.renamed' });
     await expect(report).resolves.toMatchObject({ kind: 'current' });

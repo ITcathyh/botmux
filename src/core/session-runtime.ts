@@ -9,6 +9,11 @@
 
 import { computeInputHash } from '../utils/canonical-input-hash.js';
 import type { ExternalTriggerBusinessInput } from './external-trigger-envelope.js';
+import {
+  normalizeOrdinaryImTurn,
+  type NormalizedOrdinaryImTurn,
+  type OrdinaryImTransportEnvelope,
+} from './ordinary-im-turn.js';
 import type {
   SessionStore,
   StoredSessionState,
@@ -42,6 +47,9 @@ export type SessionRoute =
   | { kind: 'thread'; anchorId: string }
   | { kind: 'chat'; chatId: string };
 
+/** Private exact transport binding; SessionProjection never exposes it. */
+export type OrdinaryIngressRouteBinding = NormalizedOrdinaryImTurn['route'];
+
 export type SessionCommandRoute = SessionRoute | { kind: 'idempotency'; key: string };
 
 export interface SessionDirectoryRow {
@@ -49,6 +57,7 @@ export interface SessionDirectoryRow {
   key: string;
   sessionId: string;
   route: SessionRoute;
+  ordinaryIngressBinding: OrdinaryIngressRouteBinding;
   recordStatus: 'active' | 'closed';
   executorStatus: 'working' | 'idle' | 'dormant';
 }
@@ -185,34 +194,35 @@ export interface KeyedTriggerTurnPort {
   failClose(token: unknown): Promise<KeyedTriggerTurnCloseResult>;
 }
 
-export type SessionCommandValue =
-  | null
-  | boolean
-  | number
-  | string
-  | readonly SessionCommandValue[]
-  | { readonly [key: string]: SessionCommandValue | undefined };
-
 export interface OrdinaryIngressInput {
-  /** Stable business input after transport normalization. */
-  semantic: SessionCommandValue;
+  /** State-neutral transport-shaped input; Runtime owns exact normalization. */
+  readonly turn: OrdinaryImTransportEnvelope;
 }
 
-export type OrdinaryIngressCommitResult =
+export type OrdinaryIngressTransitionResult =
   | { kind: 'committed' }
   | { kind: 'notCommitted'; message: string }
-  | { kind: 'unknown'; message: string };
+  | { kind: 'unknown'; message: string }
+  | { kind: 'effect'; intent: unknown; continuation: unknown };
+
+export type OrdinaryIngressEffectSettlement =
+  | { kind: 'returned'; value: unknown }
+  | { kind: 'threw'; error: unknown };
 
 /**
  * Current ingress effect seam. It can prove only this process' hand-off to the
  * current input path; it is deliberately not a durable mailbox Adapter.
  */
 export interface OrdinaryIngressPort {
-  commit(input: {
-    sessionId: string;
-    idempotencyKey: string;
-    semantic: SessionCommandValue;
-  }): OrdinaryIngressCommitResult;
+  begin(input: {
+    readonly sessionId: string;
+    readonly turn: NormalizedOrdinaryImTurn;
+  }): OrdinaryIngressTransitionResult;
+  execute(intent: unknown): Promise<unknown>;
+  resume(
+    continuation: unknown,
+    settlement: OrdinaryIngressEffectSettlement,
+  ): OrdinaryIngressTransitionResult;
 }
 
 export type ExecutorBindingObservation =
@@ -445,6 +455,8 @@ export interface SessionRuntime {
 
 interface AddressSlot {
   sessionId: string;
+  route: SessionRoute;
+  ordinaryIngressBinding: OrdinaryIngressRouteBinding;
 }
 
 type AdmissionDecision =
@@ -473,6 +485,16 @@ function reflectsRename(state: StoredSessionState, input: ControlRenameInput): b
   return state.title === input.title
     && state.titleUpdatedAt === input.updatedAt
     && state.titleSource === input.source;
+}
+
+function ordinaryTurnMatchesRoute(
+  turn: NormalizedOrdinaryImTurn,
+  binding: OrdinaryIngressRouteBinding,
+): boolean {
+  return turn.route.scope === binding.scope
+    && turn.route.canonicalAnchor === binding.canonicalAnchor
+    && turn.route.chatId === binding.chatId
+    && turn.route.chatType === binding.chatType;
 }
 
 function inputCommitMatches(
@@ -629,12 +651,38 @@ export function createSessionRuntimeHost(options: {
     : createSessionCommandLaneHost();
   const commandLane = options.commandLane ?? localLaneHost!.lane;
   const sessionLaneAddress = options.sessionLaneAddress ?? localLaneHost!.addressFor;
-  const addresses = new Map<string, SessionAddress>();
-  const addressSlots = new WeakMap<object, AddressSlot>();
-  const ordinaryInputs = new Map<string, {
-    requestHash: string;
-    state: 'received' | 'inputCommitted' | 'commitUnknown';
+  const addresses = new Map<string, {
+    address: SessionAddress;
+    sessionId: string;
+    route: SessionRoute;
+    ordinaryIngressBinding: OrdinaryIngressRouteBinding;
   }>();
+  const addressSlots = new WeakMap<object, AddressSlot>();
+  interface OrdinaryAttempt {
+    readonly terminal: Promise<OrdinaryIngressCommandOutcome>;
+    settle(outcome: OrdinaryIngressCommandOutcome): void;
+  }
+  type OrdinaryInputRecord =
+    | {
+        requestHash: string;
+        state: 'received';
+        attempt: OrdinaryAttempt;
+      }
+    | {
+        requestHash: string;
+        state: 'inputCommitted';
+      }
+    | {
+        requestHash: string;
+        state: 'retryable';
+        attempt: OrdinaryAttempt;
+      }
+    | {
+        requestHash: string;
+        state: 'commitUnknown';
+        message: string;
+      };
+  const ordinaryInputs = new Map<string, OrdinaryInputRecord>();
   const controlCommands = new Map<string, {
     requestHash: string;
     sessionId: string;
@@ -653,17 +701,64 @@ export function createSessionRuntimeHost(options: {
     `${sessionId}\u0000${idempotencyKey}`
   );
 
-  const addressFor = (key: string, sessionId: string): SessionAddress => {
-    const existing = addresses.get(key);
-    if (existing) return existing;
+  const createOrdinaryAttempt = (): OrdinaryAttempt => {
+    let resolveTerminal!: (outcome: OrdinaryIngressCommandOutcome) => void;
+    let settled = false;
+    const terminal = new Promise<OrdinaryIngressCommandOutcome>((resolve) => {
+      resolveTerminal = resolve;
+    });
+    return {
+      terminal,
+      settle(outcome) {
+        if (settled) return;
+        settled = true;
+        resolveTerminal(outcome);
+      },
+    };
+  };
+
+  const sameSessionRoute = (left: SessionRoute, right: SessionRoute): boolean => (
+    left.kind === right.kind
+    && (left.kind === 'thread'
+      ? left.anchorId === (right as Extract<SessionRoute, { kind: 'thread' }>).anchorId
+      : left.chatId === (right as Extract<SessionRoute, { kind: 'chat' }>).chatId)
+  );
+  const sameOrdinaryBinding = (
+    left: OrdinaryIngressRouteBinding,
+    right: OrdinaryIngressRouteBinding,
+  ): boolean => left.scope === right.scope
+    && left.canonicalAnchor === right.canonicalAnchor
+    && left.chatId === right.chatId
+    && left.chatType === right.chatType;
+
+  const addressFor = (row: SessionDirectoryRow): SessionAddress => {
+    const existing = addresses.get(row.key);
+    if (existing
+      && existing.sessionId === row.sessionId
+      && sameSessionRoute(existing.route, row.route)
+      && sameOrdinaryBinding(existing.ordinaryIngressBinding, row.ordinaryIngressBinding)) {
+      return existing.address;
+    }
+    if (existing) addressSlots.delete(existing.address);
     const address = opaque<SessionAddress>();
-    addresses.set(key, address);
-    addressSlots.set(address, { sessionId });
+    const route = { ...row.route } as SessionRoute;
+    const ordinaryIngressBinding = { ...row.ordinaryIngressBinding };
+    addresses.set(row.key, {
+      address,
+      sessionId: row.sessionId,
+      route,
+      ordinaryIngressBinding,
+    });
+    addressSlots.set(address, {
+      sessionId: row.sessionId,
+      route,
+      ordinaryIngressBinding,
+    });
     return address;
   };
 
   const view = (row: SessionDirectoryRow): SessionView => ({
-    address: addressFor(row.key, row.sessionId),
+    address: addressFor(row),
     sessionId: row.sessionId,
     route: { ...row.route },
     recordStatus: row.recordStatus,
@@ -684,8 +779,31 @@ export function createSessionRuntimeHost(options: {
     },
   };
 
+  interface OrdinaryEffectStep {
+    readonly kind: 'ordinaryEffect';
+    readonly sessionId: string;
+    readonly ordinaryKey: string;
+    readonly requestHash: string;
+    readonly attempt: OrdinaryAttempt;
+    readonly intent: unknown;
+    readonly continuation: unknown;
+  }
+
   type CriticalResult =
     | { kind: 'outcome'; outcome: CommandOutcome }
+    | OrdinaryEffectStep
+    | {
+        kind: 'ordinaryJoin';
+        sessionId: string;
+        attempt: OrdinaryAttempt;
+      }
+    | {
+        kind: 'ordinaryRetryable';
+        sessionId: string;
+        ordinaryKey: string;
+        attempt: OrdinaryAttempt;
+        outcome: Extract<OrdinaryIngressCommandOutcome, { kind: 'retryable' }>;
+      }
     | {
         kind: 'failClose';
         token: unknown;
@@ -694,6 +812,120 @@ export function createSessionRuntimeHost(options: {
       };
 
   const outcome = (value: CommandOutcome): CriticalResult => ({ kind: 'outcome', outcome: value });
+
+  const ordinaryAmbiguous = (
+    sessionId: string,
+    message: string,
+    idempotent: boolean,
+  ): OrdinaryIngressCommandOutcome => ({
+    kind: 'ambiguous',
+    state: 'commitUnknown',
+    policy: 'ordinary-replayable',
+    durability: 'processLocal',
+    sessionId,
+    message,
+    idempotent,
+  });
+
+  const ordinaryDuplicate = (sessionId: string): OrdinaryIngressCommandOutcome => ({
+    kind: 'duplicate',
+    state: 'inputCommitted',
+    policy: 'ordinary-replayable',
+    durability: 'processLocal',
+    sessionId,
+    message: 'ordinary input was already committed in this runtime epoch',
+  });
+
+  const settleOrdinaryTransition = (
+    step: Pick<OrdinaryEffectStep, 'sessionId' | 'ordinaryKey' | 'requestHash' | 'attempt'>,
+    transition: Exclude<OrdinaryIngressTransitionResult, { kind: 'effect' }>,
+  ): CriticalResult => {
+    let terminal: OrdinaryIngressCommandOutcome;
+    if (transition.kind === 'committed') {
+      ordinaryInputs.set(step.ordinaryKey, {
+        requestHash: step.requestHash,
+        state: 'inputCommitted',
+      });
+      terminal = {
+        kind: 'applied',
+        action: 'ordinary.inputCommitted',
+        policy: 'ordinary-replayable',
+        durability: 'processLocal',
+        sessionId: step.sessionId,
+      };
+    } else if (transition.kind === 'notCommitted') {
+      ordinaryInputs.set(step.ordinaryKey, {
+        requestHash: step.requestHash,
+        state: 'retryable',
+        attempt: step.attempt,
+      });
+      terminal = { kind: 'retryable', message: transition.message };
+    } else {
+      ordinaryInputs.set(step.ordinaryKey, {
+        requestHash: step.requestHash,
+        state: 'commitUnknown',
+        message: transition.message,
+      });
+      terminal = ordinaryAmbiguous(step.sessionId, transition.message, false);
+    }
+    step.attempt.settle(terminal);
+    if (terminal.kind === 'retryable') {
+      return {
+        kind: 'ordinaryRetryable',
+        sessionId: step.sessionId,
+        ordinaryKey: step.ordinaryKey,
+        attempt: step.attempt,
+        outcome: terminal,
+      };
+    }
+    return outcome(terminal);
+  };
+
+  const quarantineOrdinaryAttempt = (
+    step: Pick<OrdinaryEffectStep, 'sessionId' | 'ordinaryKey' | 'requestHash' | 'attempt'>,
+    message: string,
+  ): CriticalResult => {
+    ordinaryInputs.set(step.ordinaryKey, {
+      requestHash: step.requestHash,
+      state: 'commitUnknown',
+      message,
+    });
+    const terminal: OrdinaryIngressCommandOutcome = { kind: 'quarantined', message };
+    step.attempt.settle(terminal);
+    return outcome(terminal);
+  };
+
+  const transitionOrdinaryAttempt = (
+    step: Pick<OrdinaryEffectStep, 'sessionId' | 'ordinaryKey' | 'requestHash' | 'attempt'>,
+    transition: OrdinaryIngressTransitionResult,
+  ): CriticalResult => {
+    try {
+      if (!transition || typeof transition !== 'object') {
+        return quarantineOrdinaryAttempt(step, 'ordinary ingress transition is invalid');
+      }
+      if (transition.kind === 'effect') {
+        return {
+          ...step,
+          kind: 'ordinaryEffect',
+          intent: transition.intent,
+          continuation: transition.continuation,
+        };
+      }
+      if (transition.kind === 'committed') {
+        return settleOrdinaryTransition(step, transition);
+      }
+      if ((transition.kind === 'notCommitted' || transition.kind === 'unknown')
+          && typeof transition.message === 'string') {
+        return settleOrdinaryTransition(step, transition);
+      }
+      return quarantineOrdinaryAttempt(step, 'ordinary ingress transition is invalid');
+    } catch (error) {
+      return quarantineOrdinaryAttempt(
+        step,
+        `ordinary ingress transition could not be inspected: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  };
 
   const settleObservedAttempt = (
     observation: PresentKeyedTriggerObservation,
@@ -1294,6 +1526,29 @@ export function createSessionRuntimeHost(options: {
       }
       const slot = addressSlots.get(request.target.address)!;
       const ordinaryInput = request.command.input;
+      const normalized = normalizeOrdinaryImTurn(ordinaryInput.turn);
+      if (normalized.kind === 'rejected') {
+        return outcome({
+          kind: 'rejected',
+          reason: 'invalidCommand',
+          message: `ordinary ingress transport turn is invalid: ${normalized.message}`,
+        });
+      }
+      const ordinaryTurn = normalized.turn;
+      if (request.idempotencyKey !== ordinaryTurn.messageKey) {
+        return outcome({
+          kind: 'rejected',
+          reason: 'invalidCommand',
+          message: 'ordinary ingress idempotency key must equal the transport message key',
+        });
+      }
+      if (!ordinaryTurnMatchesRoute(ordinaryTurn, slot.ordinaryIngressBinding)) {
+        return outcome({
+          kind: 'rejected',
+          reason: 'invalidCommand',
+          message: 'ordinary ingress turn route does not match the target Session address',
+        });
+      }
       if (!options.ordinaryIngress) {
         return outcome({
           kind: 'notWired',
@@ -1303,12 +1558,12 @@ export function createSessionRuntimeHost(options: {
       }
       let requestHash: string;
       try {
-        requestHash = computeInputHash(ordinaryInput.semantic);
+        requestHash = computeInputHash(ordinaryTurn);
       } catch (error) {
         return outcome({
           kind: 'rejected',
           reason: 'invalidCommand',
-          message: `ordinary ingress semantic input is not canonicalizable: ${error instanceof Error ? error.message : String(error)}`,
+          message: `ordinary ingress transport turn is not canonicalizable: ${error instanceof Error ? error.message : String(error)}`,
         });
       }
       const ordinaryKey = scopedCommandKey(slot.sessionId, request.idempotencyKey);
@@ -1322,26 +1577,16 @@ export function createSessionRuntimeHost(options: {
           });
         }
         if (prior.state === 'commitUnknown') {
-          return outcome({
-            kind: 'ambiguous',
-            state: 'commitUnknown',
-            policy: 'ordinary-replayable',
-            durability: 'processLocal',
-            sessionId: slot.sessionId,
-            message: 'ordinary input commitment is unknown in this runtime epoch; do not blindly re-submit',
-            idempotent: true,
-          });
+          return outcome(ordinaryAmbiguous(slot.sessionId, prior.message, true));
         }
-        return outcome({
-          kind: 'duplicate',
-          state: prior.state,
-          policy: 'ordinary-replayable',
-          durability: 'processLocal',
-          sessionId: slot.sessionId,
-          message: prior.state === 'received'
-            ? 'ordinary input was already received in this runtime epoch'
-            : 'ordinary input was already committed in this runtime epoch',
-        });
+        if (prior.state === 'received' || prior.state === 'retryable') {
+          return {
+            kind: 'ordinaryJoin',
+            sessionId: slot.sessionId,
+            attempt: prior.attempt,
+          };
+        }
+        return outcome(ordinaryDuplicate(slot.sessionId));
       }
       const existingIdentity = sessionCommandIdentities.get(ordinaryKey);
       if (existingIdentity
@@ -1356,63 +1601,32 @@ export function createSessionRuntimeHost(options: {
       if (!existingIdentity) {
         sessionCommandIdentities.set(ordinaryKey, { kind: request.command.kind, requestHash });
       }
+      const attempt = createOrdinaryAttempt();
       ordinaryInputs.set(ordinaryKey, {
         requestHash,
         state: 'received',
+        attempt,
       });
-      let committed: OrdinaryIngressCommitResult;
+      const step = {
+        sessionId: slot.sessionId,
+        ordinaryKey,
+        requestHash,
+        attempt,
+      };
+      let transition: OrdinaryIngressTransitionResult;
       try {
-        committed = invokeSynchronousPort(
-          'OrdinaryIngressPort.commit',
-          () => options.ordinaryIngress!.commit({
+        transition = invokeSynchronousPort(
+          'OrdinaryIngressPort.begin',
+          () => options.ordinaryIngress!.begin({
             sessionId: slot.sessionId,
-            idempotencyKey: request.idempotencyKey,
-            semantic: ordinaryInput.semantic,
+            turn: ordinaryTurn,
           }),
         );
       } catch (error) {
-        if (error instanceof SynchronousPortContractError) {
-          ordinaryInputs.set(ordinaryKey, {
-            requestHash,
-            state: 'commitUnknown',
-          });
-          return outcome({ kind: 'quarantined', message: error.message });
-        }
-        committed = {
-          kind: 'unknown',
-          message: error instanceof Error ? error.message : String(error),
-        };
+        const message = error instanceof Error ? error.message : String(error);
+        return quarantineOrdinaryAttempt(step, message);
       }
-      if (committed.kind === 'notCommitted') {
-        ordinaryInputs.delete(ordinaryKey);
-        return outcome({ kind: 'retryable', message: committed.message });
-      }
-      if (committed.kind === 'unknown') {
-        ordinaryInputs.set(ordinaryKey, {
-          requestHash,
-          state: 'commitUnknown',
-        });
-        return outcome({
-          kind: 'ambiguous',
-          state: 'commitUnknown',
-          policy: 'ordinary-replayable',
-          durability: 'processLocal',
-          sessionId: slot.sessionId,
-          message: committed.message,
-          idempotent: false,
-        });
-      }
-      ordinaryInputs.set(ordinaryKey, {
-        requestHash,
-        state: 'inputCommitted',
-      });
-      return outcome({
-        kind: 'applied',
-        action: 'ordinary.inputCommitted',
-        policy: 'ordinary-replayable',
-        durability: 'processLocal',
-        sessionId: slot.sessionId,
-      });
+      return transitionOrdinaryAttempt(step, transition);
     }
     if (request.target.kind !== 'route'
       || request.target.route.kind !== 'idempotency'
@@ -1568,6 +1782,83 @@ export function createSessionRuntimeHost(options: {
     });
   };
 
+  const resumeOrdinaryAttempt = (
+    step: OrdinaryEffectStep,
+    settlement: OrdinaryIngressEffectSettlement,
+  ): CriticalResult => {
+    const current = ordinaryInputs.get(step.ordinaryKey);
+    if (current?.state !== 'received' || current.attempt !== step.attempt) {
+      const message = 'ordinary ingress continuation no longer owns the Current attempt';
+      const terminal: OrdinaryIngressCommandOutcome = { kind: 'quarantined', message };
+      step.attempt.settle(terminal);
+      return outcome(terminal);
+    }
+    let transition: OrdinaryIngressTransitionResult;
+    try {
+      transition = invokeSynchronousPort(
+        'OrdinaryIngressPort.resume',
+        () => options.ordinaryIngress!.resume(step.continuation, settlement),
+      );
+    } catch (error) {
+      return quarantineOrdinaryAttempt(
+        step,
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+    return transitionOrdinaryAttempt(step, transition);
+  };
+
+  const runOrdinaryEffects = async (
+    initial: OrdinaryEffectStep,
+  ): Promise<OrdinaryIngressCommandOutcome> => {
+    let step = initial;
+    for (;;) {
+      let settlement: OrdinaryIngressEffectSettlement;
+      try {
+        settlement = {
+          kind: 'returned',
+          value: await options.ordinaryIngress!.execute(step.intent),
+        };
+      } catch (error) {
+        settlement = { kind: 'threw', error };
+      }
+      const resumed = await commandLane.submit(
+        sessionLaneAddress(step.sessionId),
+        () => resumeOrdinaryAttempt(step, settlement),
+      );
+      if (resumed.kind === 'ordinaryEffect') {
+        step = resumed;
+        continue;
+      }
+      if (resumed.kind === 'outcome') {
+        return resumed.outcome as OrdinaryIngressCommandOutcome;
+      }
+      if (resumed.kind === 'ordinaryRetryable') {
+        await commandLane.submit(sessionLaneAddress(resumed.sessionId), () => {
+          const current = ordinaryInputs.get(resumed.ordinaryKey);
+          if (current?.state === 'retryable' && current.attempt === resumed.attempt) {
+            ordinaryInputs.delete(resumed.ordinaryKey);
+          }
+        });
+        return resumed.outcome;
+      }
+      return {
+        kind: 'quarantined',
+        message: 'ordinary ingress continuation produced an invalid Runtime transition',
+      };
+    }
+  };
+
+  const joinOrdinaryAttempt = async (
+    sessionId: string,
+    attempt: OrdinaryAttempt,
+  ): Promise<OrdinaryIngressCommandOutcome> => {
+    const terminal = await attempt.terminal;
+    if (terminal.kind === 'applied') return ordinaryDuplicate(sessionId);
+    if (terminal.kind === 'ambiguous') return { ...terminal, idempotent: true };
+    return terminal;
+  };
+
   const submit = async <C extends SessionCommand>(
     request: SessionCommandRequest<C>,
   ): Promise<CommandOutcomeFor<C>> => {
@@ -1587,6 +1878,21 @@ export function createSessionRuntimeHost(options: {
       // segment; C1 moves route creation behind the lane once identity exists.
       : run(request as SessionCommandRequest);
     if (result.kind === 'outcome') return result.outcome as CommandOutcomeFor<C>;
+    if (result.kind === 'ordinaryEffect') {
+      return await runOrdinaryEffects(result) as CommandOutcomeFor<C>;
+    }
+    if (result.kind === 'ordinaryJoin') {
+      return await joinOrdinaryAttempt(result.sessionId, result.attempt) as CommandOutcomeFor<C>;
+    }
+    if (result.kind === 'ordinaryRetryable') {
+      await commandLane.submit(sessionLaneAddress(result.sessionId), () => {
+        const current = ordinaryInputs.get(result.ordinaryKey);
+        if (current?.state === 'retryable' && current.attempt === result.attempt) {
+          ordinaryInputs.delete(result.ordinaryKey);
+        }
+      });
+      return result.outcome as CommandOutcomeFor<C>;
+    }
     let closed: KeyedTriggerTurnCloseResult;
     try {
       closed = await options.keyedTriggerTurns.failClose(result.token);

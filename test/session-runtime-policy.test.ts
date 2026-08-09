@@ -7,9 +7,10 @@ import {
   type KeyedTriggerTurnPort,
   type OrdinaryIngressPort,
   type SessionAddress,
-  type SessionCommandValue,
   type SessionDirectory,
+  type SessionDirectoryRow,
 } from '../src/core/session-runtime.js';
+import type { OrdinaryImTransportEnvelope } from '../src/core/ordinary-im-turn.js';
 import type {
   SessionStore,
   SessionStoreVersion,
@@ -30,6 +31,12 @@ class OneSessionDirectory implements SessionDirectory {
           key: 'session-1',
           sessionId: 'session-1',
           route: { kind: 'thread' as const, anchorId: 'om_root' },
+          ordinaryIngressBinding: {
+            scope: 'thread' as const,
+            canonicalAnchor: 'om_root',
+            chatId: 'oc_chat',
+            chatType: 'group' as const,
+          },
           recordStatus: 'active' as const,
           executorStatus: 'working' as const,
         }],
@@ -41,6 +48,12 @@ class OneSessionDirectory implements SessionDirectory {
         key: 'session-1',
         sessionId: 'session-1',
         route: { kind: 'thread' as const, anchorId: 'om_root' },
+        ordinaryIngressBinding: {
+          scope: 'thread' as const,
+          canonicalAnchor: 'om_root',
+          chatId: 'oc_chat',
+          chatType: 'group' as const,
+        },
         recordStatus: 'active' as const,
         executorStatus: 'working' as const,
       },
@@ -53,6 +66,12 @@ class TwoSessionDirectory implements SessionDirectory {
     key: sessionId,
     sessionId,
     route: { kind: 'thread' as const, anchorId: `om_root_${index + 1}` },
+    ordinaryIngressBinding: {
+      scope: 'thread' as const,
+      canonicalAnchor: `om_root_${index + 1}`,
+      chatId: `oc_chat_${index + 1}`,
+      chatType: 'group' as const,
+    },
     recordStatus: 'active' as const,
     executorStatus: 'working' as const,
   }));
@@ -63,6 +82,15 @@ class TwoSessionDirectory implements SessionDirectory {
       ? this.rows.find(candidate => candidate.sessionId === query.sessionId)
       : this.rows.find(candidate => candidate.route.anchorId === query.route.anchorId);
     return row ? { kind: 'one' as const, row } : { kind: 'notFound' as const };
+  }
+}
+
+class MutableSessionDirectory implements SessionDirectory {
+  constructor(public row: SessionDirectoryRow) {}
+
+  async read(query: Parameters<SessionDirectory['read']>[0]) {
+    if (query.kind === 'list') return { kind: 'list' as const, rows: [this.row] };
+    return { kind: 'one' as const, row: this.row };
   }
 }
 
@@ -79,6 +107,58 @@ const unusedKeyedTurns: KeyedTriggerTurnPort = {
   failClose: async () => ({ kind: 'unreadable', message: 'not used' }),
 };
 
+function ordinaryTurn(messageKey: string, content = 'hello'): OrdinaryImTransportEnvelope {
+  return {
+    route: {
+      scope: 'thread',
+      canonicalAnchor: 'om_root',
+      chatId: 'oc_chat',
+      chatType: 'group',
+    },
+    source: 'lark.im',
+    messageKey,
+    content,
+    sender: { kind: 'human', openId: 'ou_sender', name: 'Sender' },
+    attachments: [],
+    mentions: [],
+  };
+}
+
+function ordinaryPort(begin: OrdinaryIngressPort['begin']): OrdinaryIngressPort {
+  return {
+    begin,
+    execute: async () => { throw new Error('ordinary test port has no effect'); },
+    resume: () => { throw new Error('ordinary test port has no continuation'); },
+  };
+}
+
+function mutableRow(overrides: Partial<SessionDirectoryRow> = {}): SessionDirectoryRow {
+  return {
+    key: 'stable-row-key',
+    sessionId: 'session-1',
+    route: { kind: 'thread', anchorId: 'om_root' },
+    ordinaryIngressBinding: {
+      scope: 'thread',
+      canonicalAnchor: 'om_root',
+      chatId: 'oc_chat',
+      chatType: 'group',
+    },
+    recordStatus: 'active',
+    executorStatus: 'working',
+    ...overrides,
+  } as SessionDirectoryRow;
+}
+
+async function onlyProjectedAddress(
+  host: ReturnType<typeof createSessionRuntimeHost>,
+): Promise<SessionAddress> {
+  const projected = await host.projection.read({ kind: 'list' });
+  if (projected.kind !== 'list' || projected.sessions.length !== 1) {
+    throw new Error('expected one projected Session');
+  }
+  return projected.sessions[0]!.address;
+}
+
 async function addressFor(host: ReturnType<typeof createSessionRuntimeHost>): Promise<SessionAddress> {
   const result = await host.projection.read({ kind: 'byExternalSession', sessionId: 'session-1' });
   if (result.kind !== 'one') throw new Error('expected Session projection');
@@ -86,9 +166,126 @@ async function addressFor(host: ReturnType<typeof createSessionRuntimeHost>): Pr
 }
 
 describe('SessionRuntime ordinary ingress policy', () => {
+  it.each([
+    {
+      label: 'scope',
+      mutate: (turn: OrdinaryImTransportEnvelope): OrdinaryImTransportEnvelope => ({
+        ...turn,
+        route: { ...turn.route, scope: 'chat' },
+      }),
+    },
+    {
+      label: 'canonical anchor',
+      mutate: (turn: OrdinaryImTransportEnvelope): OrdinaryImTransportEnvelope => ({
+        ...turn,
+        route: { ...turn.route, canonicalAnchor: 'om_other' },
+      }),
+    },
+    {
+      label: 'chat id',
+      mutate: (turn: OrdinaryImTransportEnvelope): OrdinaryImTransportEnvelope => ({
+        ...turn,
+        route: { ...turn.route, chatId: 'oc_other' },
+      }),
+    },
+    {
+      label: 'chat type',
+      mutate: (turn: OrdinaryImTransportEnvelope): OrdinaryImTransportEnvelope => ({
+        ...turn,
+        route: { ...turn.route, chatType: 'p2p' },
+      }),
+    },
+  ])('rejects a mismatched ordinary $label before ledger/port mutation', async ({ mutate }) => {
+    const begin = vi.fn(() => ({ kind: 'committed' as const }));
+    const host = createSessionRuntimeHost({
+      directory: new OneSessionDirectory(),
+      keyedTriggers: unusedKeyedAuthority,
+      keyedTriggerTurns: unusedKeyedTurns,
+      ordinaryIngress: ordinaryPort(begin),
+    });
+    const address = await addressFor(host);
+    const correct = ordinaryTurn('route-fence');
+
+    const invalid = await host.runtime.submit({
+      target: { kind: 'session', address },
+      idempotencyKey: correct.messageKey,
+      command: { kind: 'ordinary.ingress', input: { turn: mutate(correct) } },
+    });
+    expect(invalid).toEqual({
+      kind: 'rejected',
+      reason: 'invalidCommand',
+      message: 'ordinary ingress turn route does not match the target Session address',
+    });
+    expect(begin).not.toHaveBeenCalled();
+
+    await expect(host.runtime.submit({
+      target: { kind: 'session', address },
+      idempotencyKey: correct.messageKey,
+      command: { kind: 'ordinary.ingress', input: { turn: correct } },
+    })).resolves.toMatchObject({ kind: 'applied' });
+    expect(begin).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    {
+      label: 'Session id',
+      replace: () => mutableRow({ sessionId: 'session-2' }),
+      nextTurn: () => ordinaryTurn('binding-rotation'),
+    },
+    {
+      label: 'full route binding',
+      replace: () => mutableRow({
+        route: { kind: 'thread', anchorId: 'om_next' },
+        ordinaryIngressBinding: {
+          scope: 'thread',
+          canonicalAnchor: 'om_next',
+          chatId: 'oc_next',
+          chatType: 'p2p',
+        },
+      }),
+      nextTurn: () => ({
+        ...ordinaryTurn('binding-rotation'),
+        route: {
+          scope: 'thread' as const,
+          canonicalAnchor: 'om_next',
+          chatId: 'oc_next',
+          chatType: 'p2p' as const,
+        },
+      }),
+    },
+  ])('rotates an address when one row key changes its $label binding', async ({ replace, nextTurn }) => {
+    const directory = new MutableSessionDirectory(mutableRow());
+    const begin = vi.fn(() => ({ kind: 'committed' as const }));
+    const host = createSessionRuntimeHost({
+      directory,
+      keyedTriggers: unusedKeyedAuthority,
+      keyedTriggerTurns: unusedKeyedTurns,
+      ordinaryIngress: ordinaryPort(begin),
+    });
+    const oldAddress = await onlyProjectedAddress(host);
+
+    directory.row = replace();
+    const nextAddress = await onlyProjectedAddress(host);
+
+    expect(nextAddress).not.toBe(oldAddress);
+    await expect(host.runtime.submit({
+      target: { kind: 'session', address: oldAddress },
+      idempotencyKey: 'binding-rotation',
+      command: {
+        kind: 'ordinary.ingress',
+        input: { turn: ordinaryTurn('binding-rotation') },
+      },
+    })).resolves.toEqual({ kind: 'staleAddress' });
+    await expect(host.runtime.submit({
+      target: { kind: 'session', address: nextAddress },
+      idempotencyKey: 'binding-rotation',
+      command: { kind: 'ordinary.ingress', input: { turn: nextTurn() } },
+    })).resolves.toMatchObject({ kind: 'applied' });
+  });
+
   it('records only process-local input commitment and joins a same-payload duplicate', async () => {
     const commit = vi.fn(() => ({ kind: 'committed' as const }));
-    const ordinaryIngress: OrdinaryIngressPort = { commit };
+    const ordinaryIngress = ordinaryPort(commit);
     const host = createSessionRuntimeHost({
       directory: new OneSessionDirectory(),
       keyedTriggers: unusedKeyedAuthority,
@@ -101,7 +298,7 @@ describe('SessionRuntime ordinary ingress policy', () => {
       idempotencyKey: 'event-1',
       command: {
         kind: 'ordinary.ingress' as const,
-        input: { semantic: { text: 'hello' } },
+        input: { turn: ordinaryTurn('event-1') },
       },
     };
 
@@ -135,7 +332,7 @@ describe('SessionRuntime ordinary ingress policy', () => {
     let request!: {
       target: { kind: 'session'; address: SessionAddress };
       idempotencyKey: string;
-      command: { kind: 'ordinary.ingress'; input: { semantic: SessionCommandValue } };
+      command: { kind: 'ordinary.ingress'; input: { turn: OrdinaryImTransportEnvelope } };
     };
     const commit = vi.fn(() => {
       order.push('outer:commit:start');
@@ -147,13 +344,13 @@ describe('SessionRuntime ordinary ingress policy', () => {
       directory: new OneSessionDirectory(),
       keyedTriggers: unusedKeyedAuthority,
       keyedTriggerTurns: unusedKeyedTurns,
-      ordinaryIngress: { commit },
+      ordinaryIngress: ordinaryPort(commit),
     });
     const address = await addressFor(host);
     request = {
       target: { kind: 'session', address },
       idempotencyKey: 'event-reentrant',
-      command: { kind: 'ordinary.ingress', input: { semantic: { text: 'hello' } } },
+      command: { kind: 'ordinary.ingress', input: { turn: ordinaryTurn('event-reentrant') } },
     };
 
     const first = await host.runtime.submit(request);
@@ -171,13 +368,14 @@ describe('SessionRuntime ordinary ingress policy', () => {
   });
 
   it('fails closed when a sync-only ordinary Adapter returns a Promise', async () => {
-    const asyncCommit = vi.fn(async () => ({ kind: 'committed' as const }));
+    const asyncBegin = vi.fn(async () => ({ kind: 'committed' as const }));
     const host = createSessionRuntimeHost({
       directory: new OneSessionDirectory(),
       keyedTriggers: unusedKeyedAuthority,
       keyedTriggerTurns: unusedKeyedTurns,
       ordinaryIngress: {
-        commit: asyncCommit as unknown as OrdinaryIngressPort['commit'],
+        ...ordinaryPort(() => ({ kind: 'committed' })),
+        begin: asyncBegin as unknown as OrdinaryIngressPort['begin'],
       },
     });
     const address = await addressFor(host);
@@ -185,14 +383,14 @@ describe('SessionRuntime ordinary ingress policy', () => {
     const result = await host.runtime.submit({
       target: { kind: 'session', address },
       idempotencyKey: 'event-async-adapter',
-      command: { kind: 'ordinary.ingress', input: { semantic: { text: 'hello' } } },
+      command: { kind: 'ordinary.ingress', input: { turn: ordinaryTurn('event-async-adapter') } },
     });
 
     expect(result).toEqual({
       kind: 'quarantined',
-      message: 'OrdinaryIngressPort.commit must return synchronously',
+      message: 'OrdinaryIngressPort.begin must return synchronously',
     });
-    expect(asyncCommit).toHaveBeenCalledTimes(1);
+    expect(asyncBegin).toHaveBeenCalledTimes(1);
   });
 
   it('keeps an unknown input commitment sticky and never turns it into a blind replay', async () => {
@@ -203,13 +401,13 @@ describe('SessionRuntime ordinary ingress policy', () => {
       directory: new OneSessionDirectory(),
       keyedTriggers: unusedKeyedAuthority,
       keyedTriggerTurns: unusedKeyedTurns,
-      ordinaryIngress: { commit },
+      ordinaryIngress: ordinaryPort(commit),
     });
     const address = await addressFor(host);
     const request = {
       target: { kind: 'session' as const, address },
       idempotencyKey: 'event-unknown',
-      command: { kind: 'ordinary.ingress' as const, input: { semantic: { text: 'hello' } } },
+      command: { kind: 'ordinary.ingress' as const, input: { turn: ordinaryTurn('event-unknown') } },
     };
 
     const first = await host.runtime.submit(request);
@@ -240,21 +438,21 @@ describe('SessionRuntime ordinary ingress policy', () => {
       directory: new OneSessionDirectory(),
       keyedTriggers: unusedKeyedAuthority,
       keyedTriggerTurns: unusedKeyedTurns,
-      ordinaryIngress: { commit },
+      ordinaryIngress: ordinaryPort(commit),
     });
     const firstHost = makeHost();
     const firstAddress = await addressFor(firstHost);
     const first = await firstHost.runtime.submit({
       target: { kind: 'session', address: firstAddress },
       idempotencyKey: 'event-process-local',
-      command: { kind: 'ordinary.ingress', input: { semantic: { text: 'hello' } } },
+      command: { kind: 'ordinary.ingress', input: { turn: ordinaryTurn('event-process-local') } },
     });
     const nextHost = makeHost();
     const nextAddress = await addressFor(nextHost);
     const afterRestart = await nextHost.runtime.submit({
       target: { kind: 'session', address: nextAddress },
       idempotencyKey: 'event-process-local',
-      command: { kind: 'ordinary.ingress', input: { semantic: { text: 'hello' } } },
+      command: { kind: 'ordinary.ingress', input: { turn: ordinaryTurn('event-process-local') } },
     });
 
     expect(first).toMatchObject({ kind: 'applied', durability: 'processLocal' });
@@ -268,24 +466,48 @@ describe('SessionRuntime ordinary ingress policy', () => {
       directory: new TwoSessionDirectory(),
       keyedTriggers: unusedKeyedAuthority,
       keyedTriggerTurns: unusedKeyedTurns,
-      ordinaryIngress: { commit },
+      ordinaryIngress: ordinaryPort(commit),
     });
     const firstProjection = await host.projection.read({ kind: 'byExternalSession', sessionId: 'session-1' });
     const secondProjection = await host.projection.read({ kind: 'byExternalSession', sessionId: 'session-2' });
     if (firstProjection.kind !== 'one' || secondProjection.kind !== 'one') {
       throw new Error('expected both Session projections');
     }
-    const command = { kind: 'ordinary.ingress' as const, input: { semantic: { text: 'same event key' } } };
+    const baseTurn = ordinaryTurn('provider-event-1', 'same event key');
 
     const first = await host.runtime.submit({
       target: { kind: 'session', address: firstProjection.session.address },
       idempotencyKey: 'provider-event-1',
-      command,
+      command: {
+        kind: 'ordinary.ingress',
+        input: {
+          turn: {
+            ...baseTurn,
+            route: {
+              ...baseTurn.route,
+              canonicalAnchor: 'om_root_1',
+              chatId: 'oc_chat_1',
+            },
+          },
+        },
+      },
     });
     const second = await host.runtime.submit({
       target: { kind: 'session', address: secondProjection.session.address },
       idempotencyKey: 'provider-event-1',
-      command,
+      command: {
+        kind: 'ordinary.ingress',
+        input: {
+          turn: {
+            ...baseTurn,
+            route: {
+              ...baseTurn.route,
+              canonicalAnchor: 'om_root_2',
+              chatId: 'oc_chat_2',
+            },
+          },
+        },
+      },
     });
 
     expect(first).toMatchObject({ kind: 'applied', sessionId: 'session-1' });
@@ -528,7 +750,7 @@ describe('SessionRuntime control policy', () => {
       directory: new OneSessionDirectory(),
       keyedTriggers: unusedKeyedAuthority,
       keyedTriggerTurns: unusedKeyedTurns,
-      ordinaryIngress: { commit: () => ({ kind: 'committed' }) },
+      ordinaryIngress: ordinaryPort(() => ({ kind: 'committed' })),
       sessionStore: {
         load: () => ({ kind: 'loaded', state: storedState(), version: storeVersion() }),
         apply,
@@ -539,7 +761,10 @@ describe('SessionRuntime control policy', () => {
     await host.runtime.submit({
       target: { kind: 'session', address },
       idempotencyKey: 'shared-command-key',
-      command: { kind: 'ordinary.ingress', input: { semantic: { text: 'hello' } } },
+      command: {
+        kind: 'ordinary.ingress',
+        input: { turn: ordinaryTurn('shared-command-key') },
+      },
     });
     const result = await host.runtime.submit({
       target: { kind: 'session', address },
@@ -1168,7 +1393,10 @@ describe('SessionRuntime unwired Current policy ports', () => {
     const ordinary = await host.runtime.submit({
       target: { kind: 'session', address },
       idempotencyKey: 'unwired-ordinary',
-      command: { kind: 'ordinary.ingress', input: { semantic: { text: 'hello' } } },
+      command: {
+        kind: 'ordinary.ingress',
+        input: { turn: ordinaryTurn('unwired-ordinary') },
+      },
     });
     const control = await host.runtime.submit({
       target: { kind: 'session', address },
@@ -1300,7 +1528,7 @@ describe('FI-P1 command-policy separation', () => {
       directory: new OneSessionDirectory(),
       keyedTriggers: keyedAuthority,
       keyedTriggerTurns: keyedTurns,
-      ordinaryIngress: { commit: ordinaryCommit },
+      ordinaryIngress: ordinaryPort(ordinaryCommit),
       sessionStore: {
         load: () => ({
           kind: 'loaded',
@@ -1322,7 +1550,10 @@ describe('FI-P1 command-policy separation', () => {
     const ordinaryRequest = {
       target: { kind: 'session' as const, address },
       idempotencyKey: 'ordinary-duplicate',
-      command: { kind: 'ordinary.ingress' as const, input: { semantic: { text: 'ordinary' } } },
+      command: {
+        kind: 'ordinary.ingress' as const,
+        input: { turn: ordinaryTurn('ordinary-duplicate', 'ordinary') },
+      },
     };
     await host.runtime.submit(ordinaryRequest);
     const ordinaryDuplicate = await host.runtime.submit(ordinaryRequest);

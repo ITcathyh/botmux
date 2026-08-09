@@ -172,6 +172,7 @@ describe('SessionRuntime coverage ledger', () => {
   it('binds A3 ordering structurally without stealing A1/A2 authority sites', () => {
     const ledger = cloneLedger();
     const lane = ledger.coverage.find((entry: any) => entry.id === 'per-session-command-lane');
+    const ordinary = ledger.coverage.find((entry: any) => entry.id === 'ordinary-im');
 
     expect(lane).toBeDefined();
     expect(lane.selectors).toEqual([]);
@@ -180,7 +181,52 @@ describe('SessionRuntime coverage ledger', () => {
       mutationCount: 0,
       digest: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
     });
+    expect(lane.productionBinding).toMatchObject({
+      sessionTransitionFunction: 'run',
+      ordinaryEffectRunnerFunction: 'runOrdinaryEffects',
+      ordinaryResumeFunction: 'resumeOrdinaryAttempt',
+      synchronousPortGuardFunction: 'invokeSynchronousPort',
+      ordinaryFakeAdapterSource: 'src/core/current-ordinary-ingress.ts',
+      ordinaryFakeAdapterFactory: 'createCurrentOrdinaryIngressPort',
+      ordinaryProductionWired: false,
+    });
+    expect(ordinary).toMatchObject({
+      targetMilestone: 'C1',
+      disposition: 'remaining',
+    });
+    expect(ordinary.productionBinding).toBeUndefined();
     expect(() => auditSessionRuntimeCoverage({ ledger })).not.toThrow();
+  });
+
+  it.each([
+    ['Session first-transition lane', 'sessionTransitionFunction', 'run'],
+    ['ordinary effect outside the lane', 'ordinaryEffectRunnerFunction', 'runOrdinaryEffects'],
+    ['ordinary resume into the lane', 'ordinaryResumeFunction', 'resumeOrdinaryAttempt'],
+  ])('rejects deleting the %s proof', (_label, field, expectedSymbol) => {
+    const ledger = cloneLedger();
+    const lane = ledger.coverage.find((entry: any) => entry.id === 'per-session-command-lane');
+    lane.productionBinding[field] = `removed${expectedSymbol}`;
+
+    expect(() => auditSessionRuntimeCoverage({ ledger }))
+      .toThrow(new RegExp(`${field} must be ${expectedSymbol}`, 'i'));
+  });
+
+  it('rejects deleting the ordinary begin/resume synchronous guard proof', () => {
+    const ledger = cloneLedger();
+    const lane = ledger.coverage.find((entry: any) => entry.id === 'per-session-command-lane');
+    lane.productionBinding.synchronousPortGuardFunction = 'removedSynchronousPortGuard';
+
+    expect(() => auditSessionRuntimeCoverage({ ledger }))
+      .toThrow(/synchronousPortGuardFunction must be invokeSynchronousPort/i);
+  });
+
+  it('rejects claiming the fake ordinary Current port as production-wired', () => {
+    const ledger = cloneLedger();
+    const lane = ledger.coverage.find((entry: any) => entry.id === 'per-session-command-lane');
+    lane.productionBinding.ordinaryProductionWired = true;
+
+    expect(() => auditSessionRuntimeCoverage({ ledger }))
+      .toThrow(/ordinaryProductionWired.*false|ordinary.*must remain unwired/i);
   });
 
   it('rejects deleting the shared Current lane composition seam', () => {

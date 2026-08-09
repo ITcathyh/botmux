@@ -79,7 +79,7 @@
       "id": "ordinary-im",
       "targetMilestone": "C1",
       "disposition": "remaining",
-      "description": "ordinary new/follow-up、queued/parked、pending-repo、worker-replacement caller 与 keyed route admission/fail-close 尚未统一经 submit；A3 不将长路由失败收口伪装为已迁移。",
+      "description": "ordinary staged contract kernel 已证明 first transition/resume 共用 Session lane、effect 在 lane 外且 begin/resume 同步，但 fake Current boundary 尚未接入 production composition；new/follow-up、queued/parked、pending-repo、worker-replacement caller 与 keyed route admission/fail-close 仍属于 C1。",
       "selectors": [
         {
           "sourceFile": "src/daemon.ts",
@@ -260,7 +260,7 @@
       "id": "per-session-command-lane",
       "targetMilestone": "A3",
       "disposition": "migrated",
-      "description": "SessionRuntime command 与 executor report/continuation 共用 owner/epoch-bound per-Session FIFO lane；lane 内只执行同步权威 transition，长 I/O 保持在 lane 外。该项仅以结构 binding 证明排序边界，不重复认领 A1/A2 authority sites。",
+      "description": "SessionRuntime Session-targeted first transition 与 ordinary resume、executor report/continuation 共用 owner/epoch-bound per-Session FIFO lane；ordinary execute 与其它长 I/O 保持在 lane 外，begin/resume 经同步 guard。fake ordinary Current boundary 未接入 production，仍属 C1；该项只以结构 binding 证明 A3 排序边界，不重复认领 A1/A2 authority sites。",
       "selectors": [],
       "authoritySites": {
         "recordCount": 0,
@@ -275,8 +275,15 @@
         "sessionRuntimeSource": "src/core/session-runtime.ts",
         "sessionRuntimeFactory": "createSessionRuntimeHost",
         "sessionSubmitFunction": "submit",
+        "sessionTransitionFunction": "run",
+        "ordinaryEffectRunnerFunction": "runOrdinaryEffects",
+        "ordinaryResumeFunction": "resumeOrdinaryAttempt",
+        "synchronousPortGuardFunction": "invokeSynchronousPort",
         "currentSessionRuntimeSource": "src/core/current-session-runtime.ts",
         "currentSessionRuntimeFactory": "currentSessionRuntimeHost",
+        "ordinaryFakeAdapterSource": "src/core/current-ordinary-ingress.ts",
+        "ordinaryFakeAdapterFactory": "createCurrentOrdinaryIngressPort",
+        "ordinaryProductionWired": false,
         "executorRuntimeSource": "src/core/session-executor-runtime.ts",
         "executorRuntimeFactory": "createSessionExecutorRuntime",
         "currentExecutorAdapterSource": "src/core/current-session-executor-runtime.ts",

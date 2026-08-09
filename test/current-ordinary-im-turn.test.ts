@@ -2,8 +2,8 @@ import { describe, expect, it } from 'vitest';
 
 import {
   createCurrentOrdinaryImTurnPreparationPort,
-  type OrdinaryImTransportEnvelope,
 } from '../src/core/current-ordinary-im-turn.js';
+import type { OrdinaryImTransportEnvelope } from '../src/core/ordinary-im-turn.js';
 
 function transportEnvelope(): OrdinaryImTransportEnvelope {
   return {
@@ -103,6 +103,52 @@ describe('Current ordinary IM turn preparation', () => {
       reason: 'unsafeField',
       message: 'ordinary IM attachment descriptor contains unsupported field: path',
     });
+  });
+
+  it.each([
+    {
+      label: 'required envelope content',
+      field: 'content',
+      inherited: 'inherited content',
+      mutate(input: any) { delete input.content; },
+    },
+    {
+      label: 'optional sender identity',
+      field: 'openId',
+      inherited: 'ou_inherited',
+      mutate(input: any) { delete input.sender.openId; },
+    },
+  ])('rejects $label inherited from Object.prototype', ({ field, inherited, mutate }) => {
+    const port = createCurrentOrdinaryImTurnPreparationPort();
+    const input = transportEnvelope() as any;
+    const prior = Object.getOwnPropertyDescriptor(Object.prototype, field);
+    Object.defineProperty(Object.prototype, field, {
+      value: inherited,
+      configurable: true,
+    });
+    try {
+      mutate(input);
+      const result = port.prepare(input);
+
+      expect(result).toMatchObject({ kind: 'rejected' });
+      if (result.kind !== 'rejected') throw new Error('expected rejected turn');
+      expect(result.message).toMatch(/must be detached data/i);
+    } finally {
+      if (prior) Object.defineProperty(Object.prototype, field, prior);
+      else Reflect.deleteProperty(Object.prototype, field);
+    }
+  });
+
+  it('rejects a transparent Proxy instead of trusting virtual own descriptors', () => {
+    const port = createCurrentOrdinaryImTurnPreparationPort();
+    const input = transportEnvelope() as any;
+    input.sender = new Proxy(input.sender, {});
+
+    const result = port.prepare(input);
+
+    expect(result).toMatchObject({ kind: 'rejected' });
+    if (result.kind !== 'rejected') throw new Error('expected rejected turn');
+    expect(result.message).toMatch(/proxy/i);
   });
 
   it.each([

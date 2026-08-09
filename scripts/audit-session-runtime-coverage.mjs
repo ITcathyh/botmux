@@ -86,8 +86,15 @@ const mandatorySessionLaneBinding = Object.freeze({
   sessionRuntimeSource: 'src/core/session-runtime.ts',
   sessionRuntimeFactory: 'createSessionRuntimeHost',
   sessionSubmitFunction: 'submit',
+  sessionTransitionFunction: 'run',
+  ordinaryEffectRunnerFunction: 'runOrdinaryEffects',
+  ordinaryResumeFunction: 'resumeOrdinaryAttempt',
+  synchronousPortGuardFunction: 'invokeSynchronousPort',
   currentSessionRuntimeSource: 'src/core/current-session-runtime.ts',
   currentSessionRuntimeFactory: 'currentSessionRuntimeHost',
+  ordinaryFakeAdapterSource: 'src/core/current-ordinary-ingress.ts',
+  ordinaryFakeAdapterFactory: 'createCurrentOrdinaryIngressPort',
+  ordinaryProductionWired: false,
   executorRuntimeSource: 'src/core/session-executor-runtime.ts',
   executorRuntimeFactory: 'createSessionExecutorRuntime',
   currentExecutorAdapterSource: 'src/core/current-session-executor-runtime.ts',
@@ -794,6 +801,12 @@ function assertSynchronousCallback(node, label) {
 function calledName(call) {
   const render = expression => {
     if (ts.isIdentifier(expression)) return expression.text;
+    if (ts.isNonNullExpression(expression)
+      || ts.isParenthesizedExpression(expression)
+      || ts.isAsExpression(expression)
+      || ts.isTypeAssertionExpression(expression)) {
+      return render(expression.expression);
+    }
     if (ts.isPropertyAccessExpression(expression)) {
       const owner = render(expression.expression);
       return owner ? `${owner}.${expression.name.text}` : expression.name.text;
@@ -831,6 +844,47 @@ function callExpressionsWithin(node, expected) {
   };
   visit(node);
   return calls;
+}
+
+function nodeContains(ancestor, descendant) {
+  return ancestor.pos <= descendant.pos && descendant.end <= ancestor.end;
+}
+
+function ancestorWithin(node, boundary, predicate) {
+  let current = node.parent;
+  while (current && current !== boundary) {
+    if (predicate(current)) return current;
+    current = current.parent;
+  }
+  return undefined;
+}
+
+function guardedPortCallback(parsed, scope, guardName, portCall, label) {
+  const guards = callExpressionsWithin(scope, guardName)
+    .filter(call => nodeContains(call, portCall));
+  assert(guards.length === 1, `${label} must pass through exactly one ${guardName} call`);
+  const callback = resolvedTransitionCallback(parsed, guards[0].arguments[1], label);
+  assertSynchronousCallback(callback, label);
+  assert(nodeContains(callback, portCall), `${label} guard callback must invoke the port`);
+  return guards[0];
+}
+
+function objectLiteralOwnPropertyNames(node) {
+  assert(ts.isObjectLiteralExpression(node), 'production composition options must be an object literal');
+  assert(
+    node.properties.every(property => (
+      !ts.isSpreadAssignment(property)
+      && (!property.name || !ts.isComputedPropertyName(property.name))
+    )),
+    'production composition options must not hide capabilities behind spreads or computed keys',
+  );
+  return new Set(node.properties.flatMap(property => {
+    if (!property.name) return [];
+    if (ts.isIdentifier(property.name) || ts.isStringLiteralLike(property.name)) {
+      return [property.name.text];
+    }
+    return [];
+  }));
 }
 
 function importedModules(parsed) {
@@ -1008,26 +1062,167 @@ function validateSessionLaneProductionBinding(binding) {
   const sessionRuntime = sourceFile(binding.sessionRuntimeSource);
   findNamedFunction(sessionRuntime, binding.sessionRuntimeFactory);
   const sessionSubmit = findNamedFunction(sessionRuntime, binding.sessionSubmitFunction);
-  const sessionLaneCalls = callExpressionsWithin(sessionSubmit, 'commandLane.submit');
-  assert(
-    sessionLaneCalls.length === 1,
-    `A3 SessionRuntime ${binding.sessionRuntimeSource}#${binding.sessionSubmitFunction} must enter exactly one Session lane`,
+  const sessionTransition = findNamedFunction(
+    sessionRuntime,
+    binding.sessionTransitionFunction,
   );
+  const sessionLaneCalls = callExpressionsWithin(sessionSubmit, 'commandLane.submit');
+  const firstTransitionLaneCalls = sessionLaneCalls.filter(call => {
+    const reducer = resolvedTransitionCallback(
+      sessionRuntime,
+      call.arguments[1],
+      'A3 SessionRuntime candidate first-transition reducer',
+    );
+    return callExpressionsWithin(reducer, binding.sessionTransitionFunction).length === 1;
+  });
+  assert(
+    firstTransitionLaneCalls.length === 1,
+    `A3 SessionRuntime ${binding.sessionRuntimeSource}#${binding.sessionSubmitFunction} Session-targeted first transition must enter exactly one shared Session lane`,
+  );
+  const firstTransitionLaneCall = firstTransitionLaneCalls[0];
   const sessionReducer = resolvedTransitionCallback(
     sessionRuntime,
-    sessionLaneCalls[0].arguments[1],
-    'A3 SessionRuntime lane reducer',
+    firstTransitionLaneCall.arguments[1],
+    'A3 SessionRuntime first-transition lane reducer',
   );
-  assertSynchronousCallback(sessionReducer, 'A3 SessionRuntime lane reducer');
+  assertSynchronousCallback(sessionReducer, 'A3 SessionRuntime first-transition lane reducer');
+  const targetConditional = ancestorWithin(
+    firstTransitionLaneCall,
+    sessionSubmit,
+    ts.isConditionalExpression,
+  );
   assert(
-    containsIdentifier(sessionLaneCalls[0], 'sessionLaneAddress')
-      && containsStringLiteral(sessionSubmit, 'session'),
-    `A3 SessionRuntime ${binding.sessionSubmitFunction} must route resolved Session targets by logical Session address`,
+    targetConditional
+      && containsIdentifier(targetConditional.condition, 'addressSlot')
+      && nodeContains(targetConditional.whenTrue, firstTransitionLaneCall)
+      && callExpressionsWithin(
+        targetConditional.whenFalse,
+        binding.sessionTransitionFunction,
+      ).length === 1
+      && containsIdentifier(firstTransitionLaneCall, 'sessionLaneAddress')
+      && containsStringLiteral(sessionSubmit, 'session')
+      && callExpressionsWithin(sessionSubmit, 'addressSlots.get').length === 1,
+    `A3 SessionRuntime ${binding.sessionSubmitFunction} must route every resolved Session first transition through the logical Session address and leave only unresolved keyed routes outside`,
   );
   assert(
     callExpressionsWithin(sessionSubmit, 'keyedTriggerTurns.failClose').length === 1
-      && callExpressionsWithin(sessionLaneCalls[0], 'keyedTriggerTurns.failClose').length === 0,
+      && callExpressionsWithin(firstTransitionLaneCall, 'keyedTriggerTurns.failClose').length === 0,
     'A3 must leave keyed route fail-close outside the resolved-Session lane as an explicit C1 remainder',
+  );
+
+  const synchronousPortGuard = findNamedFunction(
+    sessionRuntime,
+    binding.synchronousPortGuardFunction,
+  );
+  assert(
+    containsIdentifier(synchronousPortGuard, 'then')
+      && callExpressionsWithin(synchronousPortGuard, 'Promise.resolve').length === 1,
+    `A3 ${binding.synchronousPortGuardFunction} must reject thenable port results`,
+  );
+  const ordinaryBeginCalls = callExpressionsWithin(
+    sessionTransition,
+    'options.ordinaryIngress.begin',
+  );
+  assert(
+    ordinaryBeginCalls.length === 1,
+    'A3 ordinary ingress must have exactly one staged begin transition',
+  );
+  guardedPortCallback(
+    sessionRuntime,
+    sessionTransition,
+    binding.synchronousPortGuardFunction,
+    ordinaryBeginCalls[0],
+    'A3 ordinary begin transition',
+  );
+
+  const ordinaryResume = findNamedFunction(
+    sessionRuntime,
+    binding.ordinaryResumeFunction,
+  );
+  const ordinaryResumePortCalls = callExpressionsWithin(
+    ordinaryResume,
+    'options.ordinaryIngress.resume',
+  );
+  assert(
+    ordinaryResumePortCalls.length === 1,
+    'A3 ordinary ingress must have exactly one staged resume transition',
+  );
+  guardedPortCallback(
+    sessionRuntime,
+    ordinaryResume,
+    binding.synchronousPortGuardFunction,
+    ordinaryResumePortCalls[0],
+    'A3 ordinary resume transition',
+  );
+
+  const ordinaryEffectRunner = findNamedFunction(
+    sessionRuntime,
+    binding.ordinaryEffectRunnerFunction,
+  );
+  const ordinaryEffectRunnerCalls = callExpressionsWithin(
+    sessionSubmit,
+    binding.ordinaryEffectRunnerFunction,
+  );
+  assert(
+    ordinaryEffectRunnerCalls.length === 1
+      && ordinaryEffectRunnerCalls[0].pos > firstTransitionLaneCall.pos
+      && sessionLaneCalls.every(call => {
+        const reducer = resolvedTransitionCallback(
+          sessionRuntime,
+          call.arguments[1],
+          'A3 SessionRuntime ordinary-effect exclusion reducer',
+        );
+        return !nodeContains(reducer, ordinaryEffectRunnerCalls[0]);
+      }),
+    'A3 ordinary effect runner must start once, after and outside the first-transition Session lane',
+  );
+  const ordinaryExecuteCalls = callExpressionsWithin(
+    ordinaryEffectRunner,
+    'options.ordinaryIngress.execute',
+  );
+  assert(
+    ordinaryExecuteCalls.length === 1
+      && !!ancestorWithin(ordinaryExecuteCalls[0], ordinaryEffectRunner, ts.isAwaitExpression),
+    'A3 ordinary execute must be one awaited effect',
+  );
+  const ordinaryEffectLaneCalls = callExpressionsWithin(
+    ordinaryEffectRunner,
+    'commandLane.submit',
+  );
+  for (const call of ordinaryEffectLaneCalls) {
+    const reducer = resolvedTransitionCallback(
+      sessionRuntime,
+      call.arguments[1],
+      'A3 ordinary effect lane reducer',
+    );
+    assert(
+      !nodeContains(reducer, ordinaryExecuteCalls[0]),
+      'A3 ordinary execute must remain outside every Session lane reducer',
+    );
+  }
+  const ordinaryResumeLaneCalls = ordinaryEffectLaneCalls.filter(call => {
+    const reducer = resolvedTransitionCallback(
+      sessionRuntime,
+      call.arguments[1],
+      'A3 ordinary candidate resume reducer',
+    );
+    return callExpressionsWithin(reducer, binding.ordinaryResumeFunction).length === 1;
+  });
+  assert(
+    ordinaryResumeLaneCalls.length === 1,
+    'A3 ordinary resume must re-enter exactly one shared Session lane',
+  );
+  const ordinaryResumeReducer = resolvedTransitionCallback(
+    sessionRuntime,
+    ordinaryResumeLaneCalls[0].arguments[1],
+    'A3 ordinary resume lane reducer',
+  );
+  assertSynchronousCallback(ordinaryResumeReducer, 'A3 ordinary resume lane reducer');
+  assert(
+    containsIdentifier(ordinaryResumeLaneCalls[0], 'sessionLaneAddress')
+      && containsIdentifier(ordinaryResumeLaneCalls[0], 'sessionId')
+      && ordinaryExecuteCalls[0].pos < ordinaryResumeLaneCalls[0].pos,
+    'A3 ordinary execute must finish outside the lane before resume re-enters the same Session address lane',
   );
 
   const currentSessionRuntime = sourceFile(binding.currentSessionRuntimeSource);
@@ -1044,6 +1239,18 @@ function validateSessionLaneProductionBinding(binding) {
       && containsIdentifier(currentSessionComposition[0], binding.sharedLaneExport)
       && containsIdentifier(currentSessionComposition[0], 'currentSessionLaneAddress'),
     'A3 Current SessionRuntime must inject the shared owner/epoch Session lane and address resolver',
+  );
+  const currentSessionCompositionProperties = objectLiteralOwnPropertyNames(
+    currentSessionComposition[0].arguments[0],
+  );
+  assert(
+    !currentSessionCompositionProperties.has('ordinaryIngress')
+      && !importedModules(currentSessionRuntime).includes('./current-ordinary-ingress.js'),
+    'A3 fake ordinary Current port must remain unwired from production composition until C1',
+  );
+  findNamedFunction(
+    sourceFile(binding.ordinaryFakeAdapterSource),
+    binding.ordinaryFakeAdapterFactory,
   );
 
   const executorRuntime = sourceFile(binding.executorRuntimeSource);

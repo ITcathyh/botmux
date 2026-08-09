@@ -19,6 +19,7 @@ import {
   type SessionDirectoryQuery,
   type SessionDirectoryRead,
   type SessionDirectoryRow,
+  type OrdinaryIngressRouteBinding,
   type SessionProjection,
   type SessionRuntime,
   type SessionRoute,
@@ -348,6 +349,19 @@ function routeFor(session: Pick<Session, 'scope' | 'chatId' | 'rootMessageId'>):
   return { kind: 'thread', anchorId: session.rootMessageId };
 }
 
+function ordinaryIngressBindingFor(
+  session: Pick<Session, 'scope' | 'chatId' | 'chatType' | 'rootMessageId'>,
+  chatType = session.chatType ?? 'group',
+): OrdinaryIngressRouteBinding {
+  const scope = session.scope === 'chat' ? 'chat' : 'thread';
+  return {
+    scope,
+    canonicalAnchor: scope === 'chat' ? session.chatId : session.rootMessageId,
+    chatId: session.chatId,
+    chatType,
+  };
+}
+
 function executorStatusFor(ds: DaemonSession): SessionDirectoryRow['executorStatus'] {
   if (ds.session.queued) return 'idle';
   if (!ds.worker || ds.worker.killed) return 'dormant';
@@ -369,6 +383,7 @@ class CurrentSessionDirectory implements SessionDirectory {
         key: ds.session.sessionId,
         sessionId: ds.session.sessionId,
         route: routeFor(ds.session),
+        ordinaryIngressBinding: ordinaryIngressBindingFor(ds.session, ds.chatType),
         recordStatus: ds.session.status === 'active' ? 'active' : 'closed',
         executorStatus: executorStatusFor(ds),
       });
@@ -379,6 +394,7 @@ class CurrentSessionDirectory implements SessionDirectory {
         key: session.sessionId,
         sessionId: session.sessionId,
         route: routeFor(session),
+        ordinaryIngressBinding: ordinaryIngressBindingFor(session),
         recordStatus: session.status === 'active' ? 'active' : 'closed',
         executorStatus: session.queued ? 'idle' : 'dormant',
       });
