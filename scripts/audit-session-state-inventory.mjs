@@ -26,6 +26,11 @@ const targetInterfaces = [
     sourceFile: 'src/core/dispatch.ts',
     name: 'DispatchAcceptanceSession',
   },
+  {
+    receiverKind: 'Session',
+    sourceFile: 'src/core/vc-meeting-im-turn-origin.ts',
+    name: 'VcMeetingImTurnOriginSession',
+  },
 ];
 
 const sessionStoreMutators = new Set([
@@ -621,6 +626,9 @@ function accessLaneFor(receiverKind, path, operation) {
   }
   if (path === 'src/services/session-store.ts') return 'current-session-store-internal';
   if (path === 'src/core/pending-repo-journal.ts') return 'pending-repo-adapter';
+  if (path === 'src/core/vc-meeting-im-turn-origin.ts') {
+    return 'current-vc-meeting-im-turn-origin-adapter';
+  }
   return 'direct-caller-mutation';
 }
 

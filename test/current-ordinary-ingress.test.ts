@@ -4,6 +4,15 @@ import {
   createCurrentOrdinaryImTurnPreparationPort,
   type CurrentOrdinaryImTurnPreparationPort,
 } from '../src/core/current-ordinary-im-turn.js';
+import type {
+  CurrentOrdinaryIngressCommand,
+  CurrentOrdinaryIngressCommandAdapter,
+  CurrentOrdinaryIngressCommandKind,
+  CurrentOrdinaryIngressCommandResult,
+  CurrentOrdinaryIngressExternalEffect,
+  CurrentOrdinaryIngressExternalEffectExecutor,
+  CurrentOrdinaryIngressExternalEffectResult,
+} from '../src/core/current-ordinary-ingress.js';
 import type { OrdinaryImTransportEnvelope } from '../src/core/ordinary-im-turn.js';
 import {
   createSessionRuntimeHost,
@@ -542,44 +551,27 @@ describe('SessionRuntime staged ordinary ingress protocol', () => {
   });
 });
 
-type BoundaryResult =
-  | { kind: 'accepted' }
-  | { kind: 'refused'; message: string }
-  | { kind: 'unknown'; message: string }
-  | { kind: 'stateChanged' };
-
-type BoundaryMethod =
-  | 'sendLive'
-  | 'parkOpeningFollower'
-  | 'parkPendingRepoFollower'
-  | 'startColdReplacement'
-  | 'startQueuedActivation'
-  | 'recoverParkedActivation';
-
-interface BoundaryDriver {
-  sendLive(input: unknown): Promise<BoundaryResult>;
-  parkOpeningFollower(input: unknown): Promise<BoundaryResult>;
-  parkPendingRepoFollower(input: unknown): Promise<BoundaryResult>;
-  startColdReplacement(input: unknown): Promise<BoundaryResult>;
-  startQueuedActivation(input: unknown): Promise<BoundaryResult>;
-  recoverParkedActivation(input: unknown): Promise<BoundaryResult>;
+interface CurrentAdapters {
+  readonly externalEffects: CurrentOrdinaryIngressExternalEffectExecutor;
+  readonly commands: CurrentOrdinaryIngressCommandAdapter;
 }
 
-function boundaryDriver(): BoundaryDriver {
-  const accepted = async (): Promise<BoundaryResult> => ({ kind: 'accepted' });
+function currentAdapters(): CurrentAdapters {
   return {
-    sendLive: vi.fn(accepted),
-    parkOpeningFollower: vi.fn(accepted),
-    parkPendingRepoFollower: vi.fn(accepted),
-    startColdReplacement: vi.fn(accepted),
-    startQueuedActivation: vi.fn(accepted),
-    recoverParkedActivation: vi.fn(accepted),
+    externalEffects: {
+      execute: vi.fn(async (): Promise<CurrentOrdinaryIngressExternalEffectResult> => (
+        { kind: 'materialized' }
+      )),
+    },
+    commands: {
+      apply: vi.fn((): CurrentOrdinaryIngressCommandResult => ({ kind: 'accepted' })),
+    },
   };
 }
 
 async function currentHost(
   registry: Map<string, DaemonSession>,
-  driver: BoundaryDriver,
+  adapters: CurrentAdapters,
   turnPreparation: CurrentOrdinaryImTurnPreparationPort = createCurrentOrdinaryImTurnPreparationPort(),
 ) {
   const { createCurrentOrdinaryIngressPort } = await import(
@@ -589,26 +581,42 @@ async function currentHost(
     ownerLarkAppId: OWNER,
     activeSessions: registry,
     turnPreparation,
-    boundaryDriver: driver,
+    ...adapters,
   });
   return hostWith(registry, ordinaryIngress);
 }
 
-function callsByMethod(driver: BoundaryDriver): Record<BoundaryMethod, number> {
+function callsByMethod(
+  adapters: CurrentAdapters,
+): Record<CurrentOrdinaryIngressCommandKind, number> {
+  const kinds = vi.mocked(adapters.commands.apply).mock.calls
+    .map(([command]) => command.kind);
+  const count = (kind: CurrentOrdinaryIngressCommandKind) => (
+    kinds.filter(candidate => candidate === kind).length
+  );
   return {
-    sendLive: vi.mocked(driver.sendLive).mock.calls.length,
-    parkOpeningFollower: vi.mocked(driver.parkOpeningFollower).mock.calls.length,
-    parkPendingRepoFollower: vi.mocked(driver.parkPendingRepoFollower).mock.calls.length,
-    startColdReplacement: vi.mocked(driver.startColdReplacement).mock.calls.length,
-    startQueuedActivation: vi.mocked(driver.startQueuedActivation).mock.calls.length,
-    recoverParkedActivation: vi.mocked(driver.recoverParkedActivation).mock.calls.length,
+    sendLive: count('sendLive'),
+    parkOpeningFollower: count('parkOpeningFollower'),
+    parkPendingRepoFollower: count('parkPendingRepoFollower'),
+    startColdReplacement: count('startColdReplacement'),
+    startQueuedActivation: count('startQueuedActivation'),
+    recoverParkedActivation: count('recoverParkedActivation'),
   };
+}
+
+function commandCalls(
+  adapters: CurrentAdapters,
+  kind: CurrentOrdinaryIngressCommandKind,
+): CurrentOrdinaryIngressCommand[] {
+  return vi.mocked(adapters.commands.apply).mock.calls
+    .map(([command]) => command)
+    .filter(command => command.kind === kind);
 }
 
 describe('Current ordinary ingress existing-route policy', () => {
   const matrix: Array<{
     name: string;
-    expected: BoundaryMethod;
+    expected: CurrentOrdinaryIngressCommandKind;
     arrange(ds: DaemonSession): void;
   }> = [
     {
@@ -666,8 +674,8 @@ describe('Current ordinary ingress existing-route policy', () => {
     const ds = makeDaemonSession();
     arrange(ds);
     register(registry, ds);
-    const driver = boundaryDriver();
-    const host = await currentHost(registry, driver);
+    const adapters = currentAdapters();
+    const host = await currentHost(registry, adapters);
 
     const result = await submitOrdinary(
       host,
@@ -681,7 +689,7 @@ describe('Current ordinary ingress existing-route policy', () => {
       durability: 'processLocal',
       sessionId: ds.session.sessionId,
     });
-    expect(callsByMethod(driver)).toEqual({
+    expect(callsByMethod(adapters)).toEqual({
       sendLive: expected === 'sendLive' ? 1 : 0,
       parkOpeningFollower: expected === 'parkOpeningFollower' ? 1 : 0,
       parkPendingRepoFollower: expected === 'parkPendingRepoFollower' ? 1 : 0,
@@ -736,15 +744,15 @@ describe('Current ordinary ingress existing-route policy', () => {
     ds.worker = { killed: false } as DaemonSession['worker'];
     arrange(ds);
     register(registry, ds);
-    const driver = boundaryDriver();
-    const host = await currentHost(registry, driver);
+    const adapters = currentAdapters();
+    const host = await currentHost(registry, adapters);
 
     await expect(submitOrdinary(
       host,
       envelope(`om_park_${id}`, 'preserve activation order'),
     )).resolves.toMatchObject({ kind: 'applied' });
-    expect(driver.sendLive).not.toHaveBeenCalled();
-    expect(driver.parkOpeningFollower).toHaveBeenCalledTimes(1);
+    expect(commandCalls(adapters, 'sendLive')).toHaveLength(0);
+    expect(commandCalls(adapters, 'parkOpeningFollower')).toHaveLength(1);
   });
 
   it('compiles only after Runtime accepts the exact transport key', async () => {
@@ -752,15 +760,15 @@ describe('Current ordinary ingress existing-route policy', () => {
     register(registry, makeDaemonSession());
     const realPreparation = createCurrentOrdinaryImTurnPreparationPort();
     const prepare = vi.fn(realPreparation.prepare.bind(realPreparation));
-    const driver = boundaryDriver();
-    const host = await currentHost(registry, driver, { prepare });
+    const adapters = currentAdapters();
+    const host = await currentHost(registry, adapters, { prepare });
     const turn = envelope('om_exact_key', 'exact key');
 
     const mismatch = await submitOrdinary(host, turn, 'om_wrong_key');
 
     expect(mismatch).toMatchObject({ kind: 'rejected', reason: 'invalidCommand' });
     expect(prepare).not.toHaveBeenCalled();
-    expect(callsByMethod(driver)).toEqual({
+    expect(callsByMethod(adapters)).toEqual({
       sendLive: 0,
       parkOpeningFollower: 0,
       parkPendingRepoFollower: 0,
@@ -796,8 +804,8 @@ describe('Current ordinary ingress existing-route policy', () => {
         } as unknown as ReturnType<CurrentOrdinaryImTurnPreparationPort['prepare']>;
       },
     };
-    const driver = boundaryDriver();
-    const host = await currentHost(registry, driver, turnPreparation);
+    const adapters = currentAdapters();
+    const host = await currentHost(registry, adapters, turnPreparation);
 
     const result = await submitOrdinary(
       host,
@@ -809,7 +817,8 @@ describe('Current ordinary ingress existing-route policy', () => {
       state: 'commitUnknown',
       idempotent: false,
     });
-    expect(Object.values(callsByMethod(driver))).toEqual([0, 0, 0, 0, 0, 0]);
+    expect(Object.values(callsByMethod(adapters))).toEqual([0, 0, 0, 0, 0, 0]);
+    expect(adapters.externalEffects.execute).not.toHaveBeenCalled();
   });
 
   it('joins an in-flight same-key duplicate without a second effect', async () => {
@@ -817,14 +826,14 @@ describe('Current ordinary ingress existing-route policy', () => {
     const ds = makeDaemonSession();
     ds.worker = { killed: false } as DaemonSession['worker'];
     register(registry, ds);
-    const driver = boundaryDriver();
-    const gate = deferred<BoundaryResult>();
+    const adapters = currentAdapters();
+    const gate = deferred<CurrentOrdinaryIngressExternalEffectResult>();
     const started = deferred<void>();
-    vi.mocked(driver.sendLive).mockImplementationOnce(async () => {
+    vi.mocked(adapters.externalEffects.execute).mockImplementationOnce(async () => {
       started.resolve();
       return gate.promise;
     });
-    const host = await currentHost(registry, driver);
+    const host = await currentHost(registry, adapters);
     const turn = envelope('om_duplicate', 'deliver once');
 
     const first = submitOrdinary(host, turn);
@@ -835,8 +844,9 @@ describe('Current ordinary ingress existing-route policy', () => {
 
     await Promise.resolve();
     expect(duplicateSettled).toBe(false);
-    expect(driver.sendLive).toHaveBeenCalledTimes(1);
-    gate.resolve({ kind: 'accepted' });
+    expect(adapters.externalEffects.execute).toHaveBeenCalledTimes(1);
+    expect(adapters.commands.apply).not.toHaveBeenCalled();
+    gate.resolve({ kind: 'materialized' });
     await expect(first).resolves.toMatchObject({ kind: 'applied' });
     await expect(duplicate).resolves.toMatchObject({
       kind: 'duplicate',
@@ -845,7 +855,8 @@ describe('Current ordinary ingress existing-route policy', () => {
 
     const afterCommit = await submitOrdinary(host, turn);
     expect(afterCommit).toMatchObject({ kind: 'duplicate', state: 'inputCommitted' });
-    expect(driver.sendLive).toHaveBeenCalledTimes(1);
+    expect(adapters.externalEffects.execute).toHaveBeenCalledTimes(1);
+    expect(commandCalls(adapters, 'sendLive')).toHaveLength(1);
   });
 
   it('reclassifies live-to-dead and cold-to-live races inside the same submit', async () => {
@@ -853,36 +864,38 @@ describe('Current ordinary ingress existing-route policy', () => {
     const live = makeDaemonSession();
     live.worker = { killed: false } as DaemonSession['worker'];
     register(liveRegistry, live);
-    const liveDriver = boundaryDriver();
-    vi.mocked(liveDriver.sendLive).mockImplementationOnce(async () => {
+    const liveAdapters = currentAdapters();
+    vi.mocked(liveAdapters.commands.apply).mockImplementationOnce(() => {
       live.worker = null;
       return { kind: 'stateChanged' };
     });
-    const liveHost = await currentHost(liveRegistry, liveDriver);
+    const liveHost = await currentHost(liveRegistry, liveAdapters);
 
     await expect(submitOrdinary(
       liveHost,
       envelope('om_live_to_dead', 'survive live to dead'),
     )).resolves.toMatchObject({ kind: 'applied' });
-    expect(liveDriver.sendLive).toHaveBeenCalledTimes(1);
-    expect(liveDriver.startColdReplacement).toHaveBeenCalledTimes(1);
+    expect(commandCalls(liveAdapters, 'sendLive')).toHaveLength(1);
+    expect(commandCalls(liveAdapters, 'startColdReplacement')).toHaveLength(1);
+    expect(liveAdapters.externalEffects.execute).toHaveBeenCalledTimes(1);
 
     const coldRegistry = new Map<string, DaemonSession>();
     const cold = makeDaemonSession('session-2', 'om_root_2', 'oc_chat_2');
     register(coldRegistry, cold);
-    const coldDriver = boundaryDriver();
-    vi.mocked(coldDriver.startColdReplacement).mockImplementationOnce(async () => {
+    const coldAdapters = currentAdapters();
+    vi.mocked(coldAdapters.commands.apply).mockImplementationOnce(() => {
       cold.worker = { killed: false } as DaemonSession['worker'];
       return { kind: 'stateChanged' };
     });
-    const coldHost = await currentHost(coldRegistry, coldDriver);
+    const coldHost = await currentHost(coldRegistry, coldAdapters);
 
     await expect(submitOrdinary(
       coldHost,
       envelope('om_cold_to_live', 'survive cold to live', 'om_root_2', 'oc_chat_2'),
     )).resolves.toMatchObject({ kind: 'applied' });
-    expect(coldDriver.startColdReplacement).toHaveBeenCalledTimes(1);
-    expect(coldDriver.sendLive).toHaveBeenCalledTimes(1);
+    expect(commandCalls(coldAdapters, 'startColdReplacement')).toHaveLength(1);
+    expect(commandCalls(coldAdapters, 'sendLive')).toHaveLength(1);
+    expect(coldAdapters.externalEffects.execute).toHaveBeenCalledTimes(1);
   });
 
   it('fails closed when the delivery boundary never reaches a stable state', async () => {
@@ -890,15 +903,15 @@ describe('Current ordinary ingress existing-route policy', () => {
     const ds = makeDaemonSession();
     ds.worker = { killed: false } as DaemonSession['worker'];
     register(registry, ds);
-    const driver = boundaryDriver();
+    const adapters = currentAdapters();
     let changes = 0;
-    vi.mocked(driver.sendLive).mockImplementation(async () => {
+    vi.mocked(adapters.commands.apply).mockImplementation(() => {
       changes += 1;
       return changes <= 5
         ? { kind: 'stateChanged' }
         : { kind: 'accepted' };
     });
-    const host = await currentHost(registry, driver);
+    const host = await currentHost(registry, adapters);
 
     await expect(submitOrdinary(
       host,
@@ -908,7 +921,109 @@ describe('Current ordinary ingress existing-route policy', () => {
       state: 'commitUnknown',
       message: expect.stringContaining('did not stabilize'),
     });
-    expect(driver.sendLive).toHaveBeenCalledTimes(4);
+    expect(commandCalls(adapters, 'sendLive')).toHaveLength(4);
+    expect(adapters.externalEffects.execute).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    {
+      name: 'resolved Promise carrying a fabricated accepted kind',
+      result: () => Object.assign(
+        Promise.resolve({ kind: 'accepted' as const }),
+        { kind: 'accepted' as const },
+      ),
+    },
+    {
+      name: 'rejected Promise carrying a fabricated accepted kind',
+      result: () => Object.assign(
+        Promise.reject(new Error('async command rejection')),
+        { kind: 'accepted' as const },
+      ),
+    },
+  ])('fails closed and absorbs a $name', async ({ result }) => {
+    const registry = new Map<string, DaemonSession>();
+    const ds = makeDaemonSession();
+    ds.worker = { killed: false } as DaemonSession['worker'];
+    register(registry, ds);
+    const adapters = currentAdapters();
+    vi.mocked(adapters.commands.apply).mockImplementationOnce(() => (
+      result() as unknown as CurrentOrdinaryIngressCommandResult
+    ));
+    const host = await currentHost(registry, adapters);
+    const input = envelope(
+      `om_thenable_command_${result.name}`,
+      'a command Adapter must settle synchronously',
+    );
+
+    const first = await submitOrdinary(host, input);
+    const duplicate = await submitOrdinary(host, input);
+
+    expect(first).toMatchObject({
+      kind: 'ambiguous',
+      state: 'commitUnknown',
+      idempotent: false,
+      message: expect.stringContaining('must return synchronously'),
+    });
+    expect(duplicate).toMatchObject({
+      kind: 'ambiguous',
+      state: 'commitUnknown',
+      idempotent: true,
+    });
+    expect(adapters.commands.apply).toHaveBeenCalledTimes(1);
+  });
+
+  it('absorbs a rejected thenable before reporting a binding replacement', async () => {
+    const registry = new Map<string, DaemonSession>();
+    const ds = makeDaemonSession();
+    ds.worker = { killed: false } as DaemonSession['worker'];
+    register(registry, ds);
+    const adapters = currentAdapters();
+    vi.mocked(adapters.commands.apply).mockImplementationOnce(() => {
+      register(registry, makeDaemonSession());
+      return Object.assign(
+        Promise.reject(new Error('async command rejection after replacement')),
+        { kind: 'accepted' as const },
+      ) as unknown as CurrentOrdinaryIngressCommandResult;
+    });
+    const host = await currentHost(registry, adapters);
+
+    await expect(submitOrdinary(
+      host,
+      envelope('om_thenable_replacement', 'replace while returning a thenable'),
+    )).resolves.toMatchObject({
+      kind: 'ambiguous',
+      state: 'commitUnknown',
+      message: expect.stringContaining('must return synchronously'),
+    });
+  });
+
+  it('snapshots a command result before accepting it across a binding-changing accessor', async () => {
+    const registry = new Map<string, DaemonSession>();
+    const ds = makeDaemonSession();
+    ds.worker = { killed: false } as DaemonSession['worker'];
+    register(registry, ds);
+    const adapters = currentAdapters();
+    vi.mocked(adapters.commands.apply).mockImplementationOnce(() => {
+      const result = Object.create(null) as Record<string, unknown>;
+      Object.defineProperty(result, 'kind', {
+        enumerable: true,
+        get() {
+          register(registry, makeDaemonSession());
+          return 'accepted';
+        },
+      });
+      return result as CurrentOrdinaryIngressCommandResult;
+    });
+    const host = await currentHost(registry, adapters);
+
+    await expect(submitOrdinary(
+      host,
+      envelope('om_accessor_replacement', 'replace while reading command result'),
+    )).resolves.toMatchObject({
+      kind: 'ambiguous',
+      state: 'commitUnknown',
+      message: expect.stringContaining('identity changed'),
+    });
   });
 
   it('restores the opening marker after a live send refusal and permits an exact retry', async () => {
@@ -917,21 +1032,27 @@ describe('Current ordinary ingress existing-route policy', () => {
     ds.worker = { killed: false } as DaemonSession['worker'];
     ds.session.initialUserTurnPending = true;
     register(registry, ds);
-    const driver = boundaryDriver();
+    const adapters = currentAdapters();
     const persistedOpeningStates: Array<boolean | undefined> = [];
     sessionStoreMocks.updateSession.mockImplementation((session: Session) => {
       persistedOpeningStates.push(session.initialUserTurnPending);
     });
     sessionStoreMocks.updateSession.mockClear();
-    const firstGate = deferred<BoundaryResult>();
+    const firstGate = deferred<void>();
     const firstStarted = deferred<void>();
-    vi.mocked(driver.sendLive)
+    vi.mocked(adapters.externalEffects.execute)
       .mockImplementationOnce(async () => {
         firstStarted.resolve();
-        return firstGate.promise;
+        await firstGate.promise;
+        return { kind: 'materialized' };
+      });
+    vi.mocked(adapters.commands.apply)
+      .mockReturnValueOnce({
+        kind: 'refused',
+        message: 'worker refused current ordinary turn',
       })
-      .mockResolvedValueOnce({ kind: 'accepted' });
-    const host = await currentHost(registry, driver);
+      .mockReturnValueOnce({ kind: 'accepted' });
+    const host = await currentHost(registry, adapters);
     const turn = envelope('om_refused', 'opening delivery');
 
     const owner = submitOrdinary(host, turn);
@@ -941,12 +1062,10 @@ describe('Current ordinary ingress existing-route policy', () => {
     follower.then(() => { followerSettled = true; });
     await Promise.resolve();
     expect(followerSettled).toBe(false);
-    expect(driver.sendLive).toHaveBeenCalledTimes(1);
+    expect(adapters.externalEffects.execute).toHaveBeenCalledTimes(1);
+    expect(adapters.commands.apply).not.toHaveBeenCalled();
 
-    firstGate.resolve({
-      kind: 'refused',
-      message: 'worker refused current ordinary turn',
-    });
+    firstGate.resolve();
     const refused = await owner;
 
     expect(refused).toEqual({
@@ -961,37 +1080,41 @@ describe('Current ordinary ingress existing-route policy', () => {
 
     // Only a submit that arrives after the joined owner settled may retry.
     await expect(submitOrdinary(host, turn)).resolves.toMatchObject({ kind: 'applied' });
-    expect(driver.sendLive).toHaveBeenCalledTimes(2);
+    expect(adapters.externalEffects.execute).toHaveBeenCalledTimes(2);
+    expect(commandCalls(adapters, 'sendLive')).toHaveLength(2);
     expect(ds.session.initialUserTurnPending).not.toBe(true);
     expect(persistedOpeningStates).toEqual([undefined, true, undefined]);
     sessionStoreMocks.updateSession.mockReset();
   });
 
-  it('keeps an unknown live-send outcome sticky instead of restoring and blindly retrying', async () => {
+  it('keeps an unknown synchronous command sticky instead of restoring and blindly retrying', async () => {
     const registry = new Map<string, DaemonSession>();
     const ds = makeDaemonSession();
     ds.worker = { killed: false } as DaemonSession['worker'];
     ds.session.initialUserTurnPending = true;
     register(registry, ds);
-    const driver = boundaryDriver();
-    const firstGate = deferred<BoundaryResult>();
+    const adapters = currentAdapters();
+    const firstGate = deferred<void>();
     const firstStarted = deferred<void>();
-    vi.mocked(driver.sendLive).mockImplementationOnce(async () => {
+    vi.mocked(adapters.externalEffects.execute).mockImplementationOnce(async () => {
       firstStarted.resolve();
-      return firstGate.promise;
+      await firstGate.promise;
+      return { kind: 'materialized' };
     });
-    const host = await currentHost(registry, driver);
+    vi.mocked(adapters.commands.apply).mockReturnValueOnce({
+      kind: 'unknown',
+      message: 'worker acceptance response lost',
+    });
+    const host = await currentHost(registry, adapters);
     const turn = envelope('om_unknown', 'unknown delivery');
 
     const owner = submitOrdinary(host, turn);
     await firstStarted.promise;
     const follower = submitOrdinary(host, turn);
-    expect(driver.sendLive).toHaveBeenCalledTimes(1);
+    expect(adapters.externalEffects.execute).toHaveBeenCalledTimes(1);
+    expect(adapters.commands.apply).not.toHaveBeenCalled();
 
-    firstGate.resolve({
-      kind: 'unknown',
-      message: 'worker acceptance response lost',
-    });
+    firstGate.resolve();
     const first = await owner;
 
     expect(first).toMatchObject({
@@ -1010,7 +1133,9 @@ describe('Current ordinary ingress existing-route policy', () => {
       state: 'commitUnknown',
       idempotent: true,
     });
-    expect(driver.sendLive).toHaveBeenCalledTimes(1);
+    expect(adapters.externalEffects.execute).toHaveBeenCalledTimes(1);
+    expect(commandCalls(adapters, 'sendLive')).toHaveLength(1);
+    expect(commandCalls(adapters, 'sendLive')[0]?.input.opening).toBe(true);
     expect(ds.session.initialUserTurnPending).not.toBe(true);
   });
 
@@ -1019,14 +1144,14 @@ describe('Current ordinary ingress existing-route policy', () => {
     const original = makeDaemonSession();
     original.worker = { killed: false } as DaemonSession['worker'];
     register(registry, original);
-    const driver = boundaryDriver();
-    vi.mocked(driver.sendLive).mockImplementationOnce(async () => {
+    const adapters = currentAdapters();
+    vi.mocked(adapters.commands.apply).mockImplementationOnce(() => {
       const replacement = makeDaemonSession();
       replacement.worker = { killed: false } as DaemonSession['worker'];
       register(registry, replacement);
       return { kind: 'accepted' };
     });
-    const host = await currentHost(registry, driver);
+    const host = await currentHost(registry, adapters);
     const turn = envelope('om_replaced_binding', 'effect raced Session replacement');
 
     const first = await submitOrdinary(host, turn);
@@ -1042,7 +1167,31 @@ describe('Current ordinary ingress existing-route policy', () => {
       state: 'commitUnknown',
       idempotent: true,
     });
-    expect(driver.sendLive).toHaveBeenCalledTimes(1);
+    expect(commandCalls(adapters, 'sendLive')).toHaveLength(1);
+    expect(adapters.externalEffects.execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects an in-place Session record replacement behind the same daemon container', async () => {
+    const registry = new Map<string, DaemonSession>();
+    const ds = makeDaemonSession();
+    ds.worker = { killed: false } as DaemonSession['worker'];
+    register(registry, ds);
+    const adapters = currentAdapters();
+    vi.mocked(adapters.commands.apply).mockImplementationOnce(() => {
+      ds.session = makeSession();
+      return { kind: 'accepted' };
+    });
+    const host = await currentHost(registry, adapters);
+
+    await expect(submitOrdinary(
+      host,
+      envelope('om_replaced_session_record', 'same container, different Session record'),
+    )).resolves.toMatchObject({
+      kind: 'ambiguous',
+      state: 'commitUnknown',
+      idempotent: false,
+    });
+    expect(commandCalls(adapters, 'sendLive')).toHaveLength(1);
   });
 
   it('lets a different Session complete while one boundary effect is slow', async () => {
@@ -1053,23 +1202,25 @@ describe('Current ordinary ingress existing-route policy', () => {
     secondDs.worker = { killed: false } as DaemonSession['worker'];
     register(registry, firstDs);
     register(registry, secondDs);
-    const driver = boundaryDriver();
-    const firstGate = deferred<BoundaryResult>();
+    const adapters = currentAdapters();
+    const firstGate = deferred<void>();
     const firstStarted = deferred<void>();
     const order: string[] = [];
-    vi.mocked(driver.sendLive).mockImplementation(async (input: unknown) => {
-      const sessionId = (input as { sessionId: string }).sessionId;
+    vi.mocked(adapters.externalEffects.execute).mockImplementation(async (
+      effect: CurrentOrdinaryIngressExternalEffect,
+    ) => {
+      const { sessionId } = effect.input;
       order.push(`${sessionId}:start`);
       if (sessionId === firstDs.session.sessionId) {
         firstStarted.resolve();
-        const result = await firstGate.promise;
+        await firstGate.promise;
         order.push(`${sessionId}:done`);
-        return result;
+        return { kind: 'materialized' };
       }
       order.push(`${sessionId}:done`);
-      return { kind: 'accepted' };
+      return { kind: 'materialized' };
     });
-    const host = await currentHost(registry, driver);
+    const host = await currentHost(registry, adapters);
 
     const first = submitOrdinary(
       host,
@@ -1084,7 +1235,7 @@ describe('Current ordinary ingress existing-route policy', () => {
     expect(second).toMatchObject({ kind: 'applied', sessionId: 'session-2' });
     expect(order).toEqual(['session-1:start', 'session-2:start', 'session-2:done']);
 
-    firstGate.resolve({ kind: 'accepted' });
+    firstGate.resolve();
     await expect(first).resolves.toMatchObject({ kind: 'applied', sessionId: 'session-1' });
     expect(order).toEqual([
       'session-1:start',

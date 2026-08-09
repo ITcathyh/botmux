@@ -104,7 +104,7 @@ import { hasProtectedSessionMutationOwnership } from './core/session-mutation-gu
 import { delay } from './utils/timing.js';
 import { BoundedMap } from './utils/bounded-map.js';
 import { checkAllowedChatGroupsConfig } from './services/allowed-chat-groups.js';
-import type { CliTurnPayload, Session, VcMeetingImTurnOrigin, TurnParticipant, LarkMention } from './types.js';
+import type { CliTurnPayload, Session, TurnParticipant, LarkMention } from './types.js';
 import { ensureCjkFontsInstalled } from './utils/font-installer.js';
 import { scrubTmuxServerGlobalEnv } from './setup/ensure-tmux.js';
 import { entryNeedsContactResolve } from './setup/bot-config-editor.js';
@@ -121,6 +121,7 @@ import {
   larkTransportEnabled,
 } from './core/types.js';
 import { stagePendingRepoSetup, persistPendingRepoCardMessageId } from './core/pending-repo-journal.js';
+import { rememberVcMeetingImTurnOrigin } from './core/vc-meeting-im-turn-origin.js';
 import { buildTerminalUrl, setTerminalProxyPort, setTerminalExternalPort } from './core/terminal-url.js';
 import { startTerminalProxy, type TerminalProxyHandle } from './core/terminal-proxy.js';
 import type { CliId } from './adapters/cli/types.js';
@@ -2654,26 +2655,6 @@ async function requestVcMeetingConsumerCatchUp(
   }, { timeoutMs: 8_000 });
   if (body && typeof body === 'object' && 'ok' in body) return body as VcMeetingConsumerInjectResult;
   return { ok: false, injected: 0, error: 'invalid catch-up response from meeting daemon' };
-}
-
-const MAX_VC_MEETING_IM_TURN_ORIGINS = 256;
-
-function rememberVcMeetingImTurnOrigin(
-  session: Session,
-  origin: VcMeetingImTurnOrigin,
-): void {
-  if (origin.receiverSessionId !== session.sessionId || !origin.larkMessageId) return;
-  const origins = session.vcMeetingImTurnOrigins ??= {};
-  // Delete/reinsert exact redeliveries so insertion order remains the pruning
-  // order. 256 entries comfortably exceeds the normal worker queue while a
-  // pathological flood still fails old turns closed instead of growing state
-  // without bound.
-  delete origins[origin.larkMessageId];
-  origins[origin.larkMessageId] = structuredClone(origin);
-  const keys = Object.keys(origins);
-  for (let index = 0; index < keys.length - MAX_VC_MEETING_IM_TURN_ORIGINS; index += 1) {
-    delete origins[keys[index]!];
-  }
 }
 
 async function maybeCatchUpVcMeetingConsumerBeforeTurn(

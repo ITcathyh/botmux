@@ -1,16 +1,15 @@
 /**
  * Current existing-route policy for ordinary IM turns.
  *
- * This Adapter owns only the synchronous classification around an asynchronous
- * boundary. It does not drive a real worker yet: production composition must
- * provide the boundary driver. Runtime sees only one-shot opaque effect and
- * continuation tokens, so neither mutable Session state nor a route decision
- * can escape the Session lane.
+ * `begin` reserves the Session-local arrival slot and validates the transport
+ * compiler. `execute` materializes detached input outside the Session lane.
+ * `resume` re-resolves the exact Current binding, classifies it, and applies
+ * one synchronous worker/current command. Later materializations may finish
+ * first, but their command cannot cross an earlier arrival slot.
  */
 
 import { types as nodeUtilTypes } from 'node:util';
 
-import type { Session } from '../types.js';
 import {
   createCurrentOrdinaryImTurnPreparationPort,
   CurrentOrdinaryImTurnPreparationPort,
@@ -20,7 +19,6 @@ import {
 import type {
   OrdinaryIngressEffectSettlement,
   OrdinaryIngressPort,
-  OrdinaryIngressTransitionResult,
 } from './session-runtime.js';
 import {
   claimInitialUserTurn,
@@ -33,70 +31,100 @@ import {
   type DaemonSession,
 } from './types.js';
 
-export type CurrentOrdinaryIngressBoundaryResult =
+export interface CurrentOrdinaryIngressMaterializeInput {
+  readonly sessionId: string;
+  readonly turn: PreparedOrdinaryImTurn;
+}
+
+export type CurrentOrdinaryIngressExternalEffect = {
+  readonly kind: 'materialize';
+  readonly input: CurrentOrdinaryIngressMaterializeInput;
+};
+
+export type CurrentOrdinaryIngressExternalEffectResult =
+  | { readonly kind: 'materialized' }
+  | { readonly kind: 'refused'; readonly message: string }
+  | { readonly kind: 'unknown'; readonly message: string };
+
+/** The only asynchronous seam; it always runs outside the Session lane. */
+export interface CurrentOrdinaryIngressExternalEffectExecutor {
+  execute(
+    effect: CurrentOrdinaryIngressExternalEffect,
+  ): Promise<CurrentOrdinaryIngressExternalEffectResult>;
+}
+
+export type CurrentOrdinaryIngressCommandKind =
+  | 'sendLive'
+  | 'parkOpeningFollower'
+  | 'parkPendingRepoFollower'
+  | 'startColdReplacement'
+  | 'startQueuedActivation'
+  | 'recoverParkedActivation';
+
+export interface CurrentOrdinaryIngressCommand {
+  readonly kind: CurrentOrdinaryIngressCommandKind;
+  readonly input: CurrentOrdinaryIngressMaterializeInput & {
+    /** True only when this arrival synchronously consumed the empty-start marker. */
+    readonly opening: boolean;
+  };
+  /** Detached guard for adapters that hand input to an already-live worker. */
+  readonly guard: {
+    readonly workerGeneration: number | undefined;
+  };
+}
+
+export type CurrentOrdinaryIngressCommandResult =
   | { readonly kind: 'accepted' }
   | { readonly kind: 'refused'; readonly message: string }
   | { readonly kind: 'unknown'; readonly message: string }
   | { readonly kind: 'stateChanged' };
 
-/** Detached input for the not-yet-wired production boundary. */
-export interface CurrentOrdinaryIngressBoundaryInput {
-  readonly sessionId: string;
-  readonly turn: PreparedOrdinaryImTurn;
-  /**
-   * Whether this delivery owns the current empty-start marker. Persistence
-   * keeps the legacy best-effort semantics and is not a durable receipt.
-   */
-  readonly opening: boolean;
-}
-
-export interface CurrentOrdinaryIngressBoundaryDriver {
-  sendLive(
-    input: CurrentOrdinaryIngressBoundaryInput,
-  ): Promise<CurrentOrdinaryIngressBoundaryResult>;
-  parkOpeningFollower(
-    input: CurrentOrdinaryIngressBoundaryInput,
-  ): Promise<CurrentOrdinaryIngressBoundaryResult>;
-  parkPendingRepoFollower(
-    input: CurrentOrdinaryIngressBoundaryInput,
-  ): Promise<CurrentOrdinaryIngressBoundaryResult>;
-  startColdReplacement(
-    input: CurrentOrdinaryIngressBoundaryInput,
-  ): Promise<CurrentOrdinaryIngressBoundaryResult>;
-  startQueuedActivation(
-    input: CurrentOrdinaryIngressBoundaryInput,
-  ): Promise<CurrentOrdinaryIngressBoundaryResult>;
-  recoverParkedActivation(
-    input: CurrentOrdinaryIngressBoundaryInput,
-  ): Promise<CurrentOrdinaryIngressBoundaryResult>;
+/** Synchronous Adapter for all worker/current mutations selected by policy. */
+export interface CurrentOrdinaryIngressCommandAdapter {
+  apply(command: CurrentOrdinaryIngressCommand): CurrentOrdinaryIngressCommandResult;
 }
 
 export interface CurrentOrdinaryIngressOptions {
   readonly ownerLarkAppId: string;
   readonly activeSessions: ReadonlyMap<string, DaemonSession>;
   readonly turnPreparation: CurrentOrdinaryImTurnPreparationPort;
-  readonly boundaryDriver: CurrentOrdinaryIngressBoundaryDriver;
+  readonly externalEffects: CurrentOrdinaryIngressExternalEffectExecutor;
+  readonly commands: CurrentOrdinaryIngressCommandAdapter;
 }
 
-type BoundaryMethod = keyof CurrentOrdinaryIngressBoundaryDriver;
-
-interface CurrentIdentity {
+interface BindingStamp {
   readonly key: string;
   readonly sessionId: string;
-  readonly daemonSession: DaemonSession;
-  readonly session: Session;
+  readonly token: object;
+  readonly sessionToken: object;
+}
+
+interface ResolvedBinding {
+  readonly stamp: BindingStamp;
+  readonly current: DaemonSession;
+}
+
+interface ArrivalQueue {
+  nextSlot: number;
+  deliverableSlot: number;
+  readonly waiters: Map<number, () => void>;
+}
+
+interface ArrivalReservation {
+  readonly queue: ArrivalQueue;
+  readonly slot: number;
+  readonly ready: Promise<void>;
 }
 
 interface EffectPlan {
-  readonly method: BoundaryMethod;
-  readonly input: CurrentOrdinaryIngressBoundaryInput;
+  readonly effect: CurrentOrdinaryIngressExternalEffect;
+  readonly arrival: ArrivalReservation;
 }
 
 interface ContinuationPlan {
-  readonly identity: CurrentIdentity;
-  readonly turn: PreparedOrdinaryImTurn;
-  readonly openingClaimed: boolean;
-  readonly reclassifications: number;
+  readonly binding: BindingStamp;
+  readonly input: CurrentOrdinaryIngressMaterializeInput;
+  readonly arrival: ArrivalReservation;
 }
 
 const MAX_STATE_RECLASSIFICATIONS = 3;
@@ -180,7 +208,7 @@ function hasQueuedActivationAdmissionGate(ds: DaemonSession): boolean {
       && ds.session.queuedActivationInput !== undefined);
 }
 
-function classify(ds: DaemonSession): BoundaryMethod {
+function classify(ds: DaemonSession): CurrentOrdinaryIngressCommandKind {
   const workerIsLive = ds.worker !== null && !ds.worker.killed;
   const liveTakeoverReady = workerIsLive
     && !hasQueuedActivationAdmissionGate(ds)
@@ -198,15 +226,18 @@ function classify(ds: DaemonSession): BoundaryMethod {
   return 'startColdReplacement';
 }
 
-function canOwnOpening(method: BoundaryMethod): boolean {
-  return method === 'sendLive'
-    || method === 'startColdReplacement';
+function canOwnOpening(kind: CurrentOrdinaryIngressCommandKind): boolean {
+  return kind === 'sendLive' || kind === 'startColdReplacement';
+}
+
+function isObject(value: unknown): value is Record<PropertyKey, unknown> {
+  return value !== null && (typeof value === 'object' || typeof value === 'function');
 }
 
 /**
- * Build the Current staged port. `begin` and `resume` are synchronous lane
- * transitions; `execute` performs exactly one injected boundary call outside
- * the lane.
+ * Build the Current staged port. No mutable Session or worker reference is
+ * retained across the asynchronous seam; continuations carry an immutable
+ * binding stamp and re-resolve Current state on resume.
  */
 export function createCurrentOrdinaryIngressPort(
   options: CurrentOrdinaryIngressOptions,
@@ -214,72 +245,110 @@ export function createCurrentOrdinaryIngressPort(
   const trustedTurnPreparation = createCurrentOrdinaryImTurnPreparationPort();
   const effects = new WeakMap<object, EffectPlan>();
   const continuations = new WeakMap<object, ContinuationPlan>();
+  const bindingTokens = new WeakMap<DaemonSession, object>();
+  const sessionTokens = new WeakMap<object, object>();
+  const arrivalQueues = new WeakMap<object, ArrivalQueue>();
 
-  const resolveIdentity = (
+  const tokenFor = (current: DaemonSession): object => {
+    const existing = bindingTokens.get(current);
+    if (existing) return existing;
+    const token = frozenToken();
+    bindingTokens.set(current, token);
+    return token;
+  };
+
+  const sessionTokenFor = (session: object): object => {
+    const existing = sessionTokens.get(session);
+    if (existing) return existing;
+    const token = frozenToken();
+    sessionTokens.set(session, token);
+    return token;
+  };
+
+  const resolveBinding = (
     sessionId: string,
     turn: OrdinaryImTransportEnvelope | PreparedOrdinaryImTurn,
-  ): CurrentIdentity | undefined => {
+  ): ResolvedBinding | undefined => {
     const key = sessionKey(turn.route.canonicalAnchor, options.ownerLarkAppId);
-    const ds = options.activeSessions.get(key);
-    if (!ds
-      || activeSessionKey(ds) !== key
-      || ds.larkAppId !== options.ownerLarkAppId
-      || ds.session.sessionId !== sessionId
-      || !routeMatches(ds, turn)) {
+    const current = options.activeSessions.get(key);
+    if (!current
+      || activeSessionKey(current) !== key
+      || current.larkAppId !== options.ownerLarkAppId
+      || current.session.sessionId !== sessionId
+      || !routeMatches(current, turn)) {
       return undefined;
     }
     return {
-      key,
-      sessionId: ds.session.sessionId,
-      daemonSession: ds,
-      session: ds.session,
+      stamp: Object.freeze({
+        key,
+        sessionId,
+        token: tokenFor(current),
+        sessionToken: sessionTokenFor(current.session),
+      }),
+      current,
     };
   };
 
-  const identityIsCurrent = (
-    identity: CurrentIdentity,
+  const resolveCurrent = (
+    stamp: BindingStamp,
     turn: OrdinaryImTransportEnvelope | PreparedOrdinaryImTurn,
-  ): boolean => {
-    const current = options.activeSessions.get(identity.key);
-    return current === identity.daemonSession
-      && current.session === identity.session
-      && current.session.sessionId === identity.sessionId
-      && current.larkAppId === options.ownerLarkAppId
-      && activeSessionKey(current) === identity.key
-      && routeMatches(current, turn);
+  ): DaemonSession | undefined => {
+    const current = options.activeSessions.get(stamp.key);
+    if (!current
+      || tokenFor(current) !== stamp.token
+      || sessionTokenFor(current.session) !== stamp.sessionToken
+      || activeSessionKey(current) !== stamp.key
+      || current.larkAppId !== options.ownerLarkAppId
+      || current.session.sessionId !== stamp.sessionId
+      || !routeMatches(current, turn)) {
+      return undefined;
+    }
+    return current;
   };
 
-  const nextEffect = (
-    plan: ContinuationPlan,
-  ): OrdinaryIngressTransitionResult => {
-    const method = classify(plan.identity.daemonSession);
-    let openingClaimed = plan.openingClaimed;
-    if (!openingClaimed
-      && canOwnOpening(method)
-      && claimInitialUserTurn(plan.identity.daemonSession)) {
-      openingClaimed = true;
+  const reserveArrival = (binding: BindingStamp): ArrivalReservation => {
+    let queue = arrivalQueues.get(binding.token);
+    if (!queue) {
+      queue = { nextSlot: 0, deliverableSlot: 0, waiters: new Map() };
+      arrivalQueues.set(binding.token, queue);
     }
+    const slot = queue.nextSlot;
+    queue.nextSlot += 1;
+    let ready: Promise<void>;
+    if (slot === queue.deliverableSlot) {
+      ready = Promise.resolve();
+    } else {
+      ready = new Promise<void>((resolve) => {
+        queue!.waiters.set(slot, resolve);
+      });
+    }
+    return { queue, slot, ready };
+  };
 
-    const input = Object.freeze({
-      sessionId: plan.identity.session.sessionId,
-      turn: plan.turn,
-      opening: openingClaimed,
-    });
-    const intent = frozenToken();
-    const continuation = frozenToken();
-    effects.set(intent, { method, input });
-    continuations.set(continuation, {
-      identity: plan.identity,
-      turn: plan.turn,
-      openingClaimed,
-      reclassifications: plan.reclassifications,
-    });
-    return { kind: 'effect', intent, continuation };
+  const releaseArrival = (arrival: ArrivalReservation): void => {
+    if (arrival.slot !== arrival.queue.deliverableSlot) {
+      throw new Error('Current ordinary ingress arrival slot lost linearization');
+    }
+    arrival.queue.deliverableSlot += 1;
+    const releaseNext = arrival.queue.waiters.get(arrival.queue.deliverableSlot);
+    if (releaseNext) {
+      arrival.queue.waiters.delete(arrival.queue.deliverableSlot);
+      releaseNext();
+    }
+  };
+
+  const releaseOpening = (
+    plan: ContinuationPlan,
+    openingClaimed: boolean,
+  ): void => {
+    if (!openingClaimed) return;
+    const current = resolveCurrent(plan.binding, plan.input.turn);
+    if (current) releaseInitialUserTurn(current);
   };
 
   const begin: OrdinaryIngressPort['begin'] = ({ sessionId, turn }) => {
-    const identity = resolveIdentity(sessionId, turn);
-    if (!identity) {
+    const resolved = resolveBinding(sessionId, turn);
+    if (!resolved) {
       return {
         kind: 'notCommitted',
         message: 'Current ordinary ingress route is no longer owned by this Session',
@@ -288,10 +357,7 @@ export function createCurrentOrdinaryIngressPort(
 
     const trustedPrepared = trustedTurnPreparation.prepare(turn);
     if (trustedPrepared.kind !== 'prepared') {
-      return {
-        kind: 'notCommitted',
-        message: trustedPrepared.message,
-      };
+      return { kind: 'notCommitted', message: trustedPrepared.message };
     }
 
     let prepared;
@@ -304,10 +370,7 @@ export function createCurrentOrdinaryIngressPort(
       };
     }
     if (prepared.kind !== 'prepared') {
-      return {
-        kind: 'notCommitted',
-        message: prepared.message,
-      };
+      return { kind: 'notCommitted', message: prepared.message };
     }
     if (!exactPreparedOutputMatches(prepared.turn, trustedPrepared.turn)) {
       return {
@@ -315,36 +378,62 @@ export function createCurrentOrdinaryIngressPort(
         message: 'ordinary IM turn preparation violated the exact compiler contract',
       };
     }
-    if (!identityIsCurrent(identity, prepared.turn)) {
+
+    const current = resolveCurrent(resolved.stamp, prepared.turn);
+    if (!current) {
       return {
         kind: 'notCommitted',
         message: 'Current Session identity changed during ordinary IM turn preparation',
       };
     }
-    return nextEffect({
-      identity,
+    const input = Object.freeze({
+      sessionId: resolved.stamp.sessionId,
       turn: prepared.turn,
-      openingClaimed: false,
-      reclassifications: 0,
     });
+    const arrival = reserveArrival(resolved.stamp);
+    const intent = frozenToken();
+    const continuation = frozenToken();
+    const effect = Object.freeze({ kind: 'materialize' as const, input });
+    effects.set(intent, { effect, arrival });
+    continuations.set(continuation, {
+      binding: resolved.stamp,
+      input,
+      arrival,
+    });
+    return { kind: 'effect', intent, continuation };
   };
 
   const execute: OrdinaryIngressPort['execute'] = async (intent) => {
-    if ((typeof intent !== 'object' && typeof intent !== 'function') || intent === null) {
+    if (!isObject(intent)) {
       throw new Error('invalid Current ordinary ingress effect token');
     }
     const plan = effects.get(intent);
     if (!plan) throw new Error('Current ordinary ingress effect token was already consumed');
     effects.delete(intent);
-    return options.boundaryDriver[plan.method](plan.input);
+
+    let materialization: Promise<
+      | { kind: 'returned'; value: CurrentOrdinaryIngressExternalEffectResult }
+      | { kind: 'threw'; error: unknown }
+    >;
+    try {
+      materialization = Promise.resolve(options.externalEffects.execute(plan.effect)).then(
+        value => ({ kind: 'returned' as const, value }),
+        error => ({ kind: 'threw' as const, error }),
+      );
+    } catch (error) {
+      materialization = Promise.resolve({ kind: 'threw', error });
+    }
+    const settled = await materialization;
+    await plan.arrival.ready;
+    if (settled.kind === 'threw') throw settled.error;
+    return settled.value;
   };
 
   const resume: OrdinaryIngressPort['resume'] = (
     continuation,
     settlement: OrdinaryIngressEffectSettlement,
   ) => {
-    if ((typeof continuation !== 'object' && typeof continuation !== 'function')
-      || continuation === null) {
+    if (!isObject(continuation)) {
       return { kind: 'unknown', message: 'invalid Current ordinary ingress continuation token' };
     }
     const plan = continuations.get(continuation);
@@ -356,58 +445,149 @@ export function createCurrentOrdinaryIngressPort(
     }
     continuations.delete(continuation);
 
-    if (!identityIsCurrent(plan.identity, plan.turn)) {
-      return {
-        kind: 'unknown',
-        message: 'Current Session identity changed while ordinary ingress outcome was in flight',
-      };
-    }
-    if (settlement.kind === 'threw') {
-      return {
-        kind: 'unknown',
-        message: `ordinary ingress boundary outcome is unknown: ${settlement.error instanceof Error
-          ? settlement.error.message
-          : String(settlement.error)}`,
-      };
-    }
-
-    const boundaryResult = settlement.value as Partial<CurrentOrdinaryIngressBoundaryResult> | null;
-    if (!boundaryResult || typeof boundaryResult !== 'object') {
-      return { kind: 'unknown', message: 'ordinary ingress boundary returned an invalid result' };
-    }
-    if (boundaryResult.kind === 'accepted') return { kind: 'committed' };
-    if (boundaryResult.kind === 'refused') {
-      if (plan.openingClaimed && identityIsCurrent(plan.identity, plan.turn)) {
-        releaseInitialUserTurn(plan.identity.daemonSession);
-      }
-      return {
-        kind: 'notCommitted',
-        message: typeof boundaryResult.message === 'string'
-          ? boundaryResult.message
-          : 'ordinary ingress boundary refused the turn',
-      };
-    }
-    if (boundaryResult.kind === 'unknown') {
-      return {
-        kind: 'unknown',
-        message: typeof boundaryResult.message === 'string'
-          ? boundaryResult.message
-          : 'ordinary ingress boundary outcome is unknown',
-      };
-    }
-    if (boundaryResult.kind === 'stateChanged') {
-      if (plan.reclassifications >= MAX_STATE_RECLASSIFICATIONS) {
+    try {
+      if (!resolveCurrent(plan.binding, plan.input.turn)) {
         return {
           kind: 'unknown',
-          message: 'ordinary ingress delivery state did not stabilize before the retry limit',
+          message: 'Current Session identity changed while ordinary ingress outcome was in flight',
         };
       }
-      return nextEffect({
-        ...plan,
-        reclassifications: plan.reclassifications + 1,
-      });
+      if (settlement.kind === 'threw') {
+        return {
+          kind: 'unknown',
+          message: `ordinary ingress materialization outcome is unknown: ${settlement.error instanceof Error
+            ? settlement.error.message
+            : String(settlement.error)}`,
+        };
+      }
+
+      const materialization = settlement.value as Partial<CurrentOrdinaryIngressExternalEffectResult> | null;
+      if (!materialization || typeof materialization !== 'object') {
+        return { kind: 'unknown', message: 'ordinary ingress materializer returned an invalid result' };
+      }
+      if (materialization.kind === 'refused') {
+        return {
+          kind: 'notCommitted',
+          message: typeof materialization.message === 'string'
+            ? materialization.message
+            : 'ordinary ingress materializer refused the turn',
+        };
+      }
+      if (materialization.kind === 'unknown') {
+        return {
+          kind: 'unknown',
+          message: typeof materialization.message === 'string'
+            ? materialization.message
+            : 'ordinary ingress materialization outcome is unknown',
+        };
+      }
+      if (materialization.kind !== 'materialized') {
+        return { kind: 'unknown', message: 'ordinary ingress materializer returned an invalid result' };
+      }
+
+      let openingClaimed = false;
+      for (let reclassifications = 0; ; reclassifications += 1) {
+        const current = resolveCurrent(plan.binding, plan.input.turn);
+        if (!current) {
+          return {
+            kind: 'unknown',
+            message: 'Current Session identity changed before ordinary ingress delivery',
+          };
+        }
+        const commandKind = classify(current);
+        if (!openingClaimed && canOwnOpening(commandKind)) {
+          openingClaimed = claimInitialUserTurn(current);
+        }
+        const command = Object.freeze({
+          kind: commandKind,
+          input: Object.freeze({ ...plan.input, opening: openingClaimed }),
+          guard: Object.freeze({ workerGeneration: current.workerGeneration }),
+        });
+        let commandResult: CurrentOrdinaryIngressCommandResult;
+        try {
+          commandResult = options.commands.apply(command);
+        } catch (error) {
+          return {
+            kind: 'unknown',
+            message: `ordinary ingress command outcome is unknown: ${error instanceof Error
+              ? error.message
+              : String(error)}`,
+          };
+        }
+        let commandResultKind: unknown;
+        let commandResultMessage: unknown;
+        if (isObject(commandResult)) {
+          let then: unknown;
+          try {
+            then = (commandResult as { readonly then?: unknown }).then;
+          } catch {
+            return {
+              kind: 'unknown',
+              message: 'Current ordinary ingress command Adapter must return synchronously',
+            };
+          }
+          if (typeof then === 'function') {
+            try {
+              void Promise.resolve(commandResult).catch(() => undefined);
+            } catch {
+              // A hostile thenable can throw during assimilation; the outcome
+              // remains unknown and must never be replayed.
+            }
+            return {
+              kind: 'unknown',
+              message: 'Current ordinary ingress command Adapter must return synchronously',
+            };
+          }
+          try {
+            commandResultKind = (commandResult as { readonly kind?: unknown }).kind;
+            commandResultMessage = (commandResult as { readonly message?: unknown }).message;
+          } catch {
+            return {
+              kind: 'unknown',
+              message: 'Current ordinary ingress command returned an unreadable result',
+            };
+          }
+        }
+        if (!resolveCurrent(plan.binding, plan.input.turn)) {
+          return {
+            kind: 'unknown',
+            message: 'Current Session identity changed during ordinary ingress delivery',
+          };
+        }
+        if (!commandResult || typeof commandResult !== 'object') {
+          return { kind: 'unknown', message: 'ordinary ingress command returned an invalid result' };
+        }
+        if (commandResultKind === 'accepted') return { kind: 'committed' };
+        if (commandResultKind === 'refused') {
+          releaseOpening(plan, openingClaimed);
+          return {
+            kind: 'notCommitted',
+            message: typeof commandResultMessage === 'string'
+              ? commandResultMessage
+              : 'ordinary ingress command refused the turn',
+          };
+        }
+        if (commandResultKind === 'unknown') {
+          return {
+            kind: 'unknown',
+            message: typeof commandResultMessage === 'string'
+              ? commandResultMessage
+              : 'ordinary ingress command outcome is unknown',
+          };
+        }
+        if (commandResultKind !== 'stateChanged') {
+          return { kind: 'unknown', message: 'ordinary ingress command returned an invalid result' };
+        }
+        if (reclassifications >= MAX_STATE_RECLASSIFICATIONS) {
+          return {
+            kind: 'unknown',
+            message: 'ordinary ingress delivery state did not stabilize before the retry limit',
+          };
+        }
+      }
+    } finally {
+      releaseArrival(plan.arrival);
     }
-    return { kind: 'unknown', message: 'ordinary ingress boundary returned an invalid result' };
   };
 
   return { begin, execute, resume };

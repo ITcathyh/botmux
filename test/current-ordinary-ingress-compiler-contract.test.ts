@@ -7,7 +7,8 @@ import {
 } from '../src/core/current-ordinary-im-turn.js';
 import {
   createCurrentOrdinaryIngressPort,
-  type CurrentOrdinaryIngressBoundaryDriver,
+  type CurrentOrdinaryIngressCommandAdapter,
+  type CurrentOrdinaryIngressExternalEffectExecutor,
 } from '../src/core/current-ordinary-ingress.js';
 import {
   normalizeOrdinaryImTurn,
@@ -120,15 +121,17 @@ function clonePrepared(
   return Object.freeze(Object.create(prototype, descriptors)) as PreparedOrdinaryImTurn;
 }
 
-function driver(): CurrentOrdinaryIngressBoundaryDriver {
-  const accepted = vi.fn(async () => ({ kind: 'accepted' as const }));
+function adapters(): {
+  externalEffects: CurrentOrdinaryIngressExternalEffectExecutor;
+  commands: CurrentOrdinaryIngressCommandAdapter;
+} {
   return {
-    sendLive: accepted,
-    parkOpeningFollower: accepted,
-    parkPendingRepoFollower: accepted,
-    startColdReplacement: accepted,
-    startQueuedActivation: accepted,
-    recoverParkedActivation: accepted,
+    externalEffects: {
+      execute: vi.fn(async () => ({ kind: 'materialized' as const })),
+    },
+    commands: {
+      apply: vi.fn(() => ({ kind: 'accepted' as const })),
+    },
   };
 }
 
@@ -236,12 +239,12 @@ describe('Current ordinary ingress compiler contract', () => {
     const activeSessions = new Map<string, DaemonSession>();
     const ds = daemonSession();
     activeSessions.set(activeSessionKey(ds), ds);
-    const boundaryDriver = driver();
+    const currentAdapters = adapters();
     const port = createCurrentOrdinaryIngressPort({
       ownerLarkAppId: OWNER,
       activeSessions,
       turnPreparation,
-      boundaryDriver,
+      ...currentAdapters,
     });
 
     const result = port.begin({
@@ -253,8 +256,7 @@ describe('Current ordinary ingress compiler contract', () => {
       kind: 'unknown',
       message: 'ordinary IM turn preparation violated the exact compiler contract',
     });
-    for (const method of Object.values(boundaryDriver)) {
-      expect(method).not.toHaveBeenCalled();
-    }
+    expect(currentAdapters.externalEffects.execute).not.toHaveBeenCalled();
+    expect(currentAdapters.commands.apply).not.toHaveBeenCalled();
   });
 });

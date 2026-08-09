@@ -149,6 +149,65 @@ describe('Session authority inventory', () => {
     expect(sites.some(site => site.enclosingFunction === 'derivedCopiesAreNotMutations')).toBe(false);
   });
 
+  it('keeps the narrow VC turn-origin Adapter inside the Session authority census', () => {
+    const sourcePath = 'src/core/vc-meeting-im-turn-origin.ts';
+    const sites = collectSessionStateInventory({
+      includeSourcePaths: [sourcePath],
+    });
+
+    expect(sites.map(site => ({
+      sourceFile: site.sourceFile,
+      enclosingFunction: site.enclosingFunction,
+      receiverKind: site.receiverKind,
+      fieldPath: site.fieldPath,
+      operation: site.operation,
+      classification: site.classification,
+      authorityId: site.authorityId,
+      accessLane: site.accessLane,
+    }))).toEqual([
+      {
+        sourceFile: sourcePath,
+        enclosingFunction: 'rememberVcMeetingImTurnOrigin',
+        receiverKind: 'Session',
+        fieldPath: 'vcMeetingImTurnOrigins',
+        operation: 'assign',
+        classification: 'path_specific_authority',
+        authorityId: 'vc-action-and-delivery',
+        accessLane: 'current-vc-meeting-im-turn-origin-adapter',
+      },
+      {
+        sourceFile: sourcePath,
+        enclosingFunction: 'rememberVcMeetingImTurnOrigin',
+        receiverKind: 'Session',
+        fieldPath: 'vcMeetingImTurnOrigins',
+        operation: 'compound_assign',
+        classification: 'path_specific_authority',
+        authorityId: 'vc-action-and-delivery',
+        accessLane: 'current-vc-meeting-im-turn-origin-adapter',
+      },
+      {
+        sourceFile: sourcePath,
+        enclosingFunction: 'rememberVcMeetingImTurnOrigin',
+        receiverKind: 'Session',
+        fieldPath: 'vcMeetingImTurnOrigins',
+        operation: 'delete',
+        classification: 'path_specific_authority',
+        authorityId: 'vc-action-and-delivery',
+        accessLane: 'current-vc-meeting-im-turn-origin-adapter',
+      },
+      {
+        sourceFile: sourcePath,
+        enclosingFunction: 'rememberVcMeetingImTurnOrigin',
+        receiverKind: 'Session',
+        fieldPath: 'vcMeetingImTurnOrigins',
+        operation: 'delete',
+        classification: 'path_specific_authority',
+        authorityId: 'vc-action-and-delivery',
+        accessLane: 'current-vc-meeting-im-turn-origin-adapter',
+      },
+    ]);
+  });
+
   it('discovers raw Session file publishers instead of trusting a manual symbol list', () => {
     const program = createSessionStateAuditProgram([fixturePath]);
     const writers = collectRawSessionFileWriters({

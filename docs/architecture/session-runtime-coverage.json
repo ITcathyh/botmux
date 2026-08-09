@@ -3,7 +3,7 @@
   "purpose": "Target-A 可执行覆盖台账：由源码和 A0 authority inventory 证明已迁移边界与 remaining bypass，不声明 Target-B durability。",
   "authorityInventory": {
     "path": "docs/architecture/session-authority-inventory.json",
-    "sha256": "ecbb8a846e60111f994e4b28e27fd55b440b444f2d59f2c8f4a39b7cd7022905"
+    "sha256": "86cf5d3f5647cf0bf9810c50d19f43abe854f9e03b5fd165d8bde19634b27fbd"
   },
   "coverage": [
     {
@@ -79,7 +79,7 @@
       "id": "ordinary-im",
       "targetMilestone": "C1",
       "disposition": "remaining",
-      "description": "ordinary staged contract kernel 已证明 first transition/resume 共用 Session lane、effect 在 lane 外且 begin/resume 同步，但 fake Current boundary 尚未接入 production composition；new/follow-up、queued/parked、pending-repo、worker-replacement caller 与 keyed route admission/fail-close 仍属于 C1。",
+      "description": "ordinary staged reducer 已证明 first transition/resume 共用 Session lane、effect 在 lane 外且 begin/resume 同步，Current Host 也只允许 injected optional port 透传；production daemon 尚未 import/create/inject 该 port，new/follow-up、queued/parked、pending-repo、worker-replacement caller 与 keyed route admission/fail-close 仍属于 C1。",
       "selectors": [
         {
           "sourceFile": "src/daemon.ts",
@@ -260,7 +260,7 @@
       "id": "per-session-command-lane",
       "targetMilestone": "A3",
       "disposition": "migrated",
-      "description": "SessionRuntime Session-targeted first transition 与 ordinary resume、executor report/continuation 共用 owner/epoch-bound per-Session FIFO lane；ordinary execute 与其它长 I/O 保持在 lane 外，begin/resume 经同步 guard。fake ordinary Current boundary 未接入 production，仍属 C1；该项只以结构 binding 证明 A3 排序边界，不重复认领 A1/A2 authority sites。",
+      "description": "SessionRuntime Session-targeted first transition 与 ordinary resume、executor report/continuation 共用 owner/epoch-bound per-Session FIFO lane；ordinary execute 与其它长 I/O 保持在 lane 外，begin/resume 经同步 guard。Current Host 仅透传 injected optional ordinary port，production daemon 尚未 import/create/inject，ordinary reducer 仍属 C1；该项只以结构 binding 证明 A3 排序边界，不重复认领 A1/A2 authority sites。",
       "selectors": [],
       "authoritySites": {
         "recordCount": 0,
@@ -284,6 +284,18 @@
         "ordinaryFakeAdapterSource": "src/core/current-ordinary-ingress.ts",
         "ordinaryFakeAdapterFactory": "createCurrentOrdinaryIngressPort",
         "ordinaryProductionWired": false,
+        "ordinaryUnwiredProductionProof": {
+          "sourceFile": "src/daemon.ts",
+          "forbiddenImports": [
+            "./core/current-session-runtime.js",
+            "./core/current-ordinary-ingress.js"
+          ],
+          "forbiddenCalls": [
+            "currentSessionRuntimeHost",
+            "createCurrentOrdinaryIngressPort"
+          ],
+          "forbiddenOption": "ordinaryIngress"
+        },
         "executorRuntimeSource": "src/core/session-executor-runtime.ts",
         "executorRuntimeFactory": "createSessionExecutorRuntime",
         "currentExecutorAdapterSource": "src/core/current-session-executor-runtime.ts",
@@ -423,9 +435,9 @@
         }
       ],
       "authoritySites": {
-        "recordCount": 24,
-        "mutationCount": 24,
-        "digest": "ea2a396d75d9992121a034e380849093ee10d42aff0887d82abf418a004cd0da"
+        "recordCount": 28,
+        "mutationCount": 28,
+        "digest": "4294e718ffee15b3fafece59fc93101fcf01677347fd1f2f5b69540b10c31485"
       },
       "rawPublisherSelectors": [
         {
@@ -471,9 +483,9 @@
         }
       ],
       "authoritySites": {
-        "recordCount": 522,
-        "mutationCount": 525,
-        "digest": "13b73b5954619a4d2edadd74c7a421d7b24e83355adf6014c1dfb24ac3a5a995"
+        "recordCount": 518,
+        "mutationCount": 521,
+        "digest": "4322ba72135184630398accdd1c16852145b456cb1e9c598af4dde225e80d3d8"
       },
       "rawPublisherSelectors": [
         {

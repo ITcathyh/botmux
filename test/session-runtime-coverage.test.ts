@@ -189,6 +189,18 @@ describe('SessionRuntime coverage ledger', () => {
       ordinaryFakeAdapterSource: 'src/core/current-ordinary-ingress.ts',
       ordinaryFakeAdapterFactory: 'createCurrentOrdinaryIngressPort',
       ordinaryProductionWired: false,
+      ordinaryUnwiredProductionProof: {
+        sourceFile: 'src/daemon.ts',
+        forbiddenImports: [
+          './core/current-session-runtime.js',
+          './core/current-ordinary-ingress.js',
+        ],
+        forbiddenCalls: [
+          'currentSessionRuntimeHost',
+          'createCurrentOrdinaryIngressPort',
+        ],
+        forbiddenOption: 'ordinaryIngress',
+      },
     });
     expect(ordinary).toMatchObject({
       targetMilestone: 'C1',
@@ -227,6 +239,38 @@ describe('SessionRuntime coverage ledger', () => {
 
     expect(() => auditSessionRuntimeCoverage({ ledger }))
       .toThrow(/ordinaryProductionWired.*false|ordinary.*must remain unwired/i);
+  });
+
+  it.each([
+    {
+      label: 'production source',
+      remove: (proof: Record<string, any>) => { delete proof.sourceFile; },
+    },
+    {
+      label: 'forbidden production imports',
+      remove: (proof: Record<string, any>) => {
+        proof.forbiddenImports = (proof.forbiddenImports ?? []).slice(0, -1);
+      },
+    },
+    {
+      label: 'forbidden production factories',
+      remove: (proof: Record<string, any>) => {
+        proof.forbiddenCalls = (proof.forbiddenCalls ?? []).slice(0, -1);
+      },
+    },
+    {
+      label: 'forbidden ordinary port injection',
+      remove: (proof: Record<string, any>) => { delete proof.forbiddenOption; },
+    },
+  ])('rejects deleting the false ordinary-wiring proof for $label', ({ remove }) => {
+    const ledger = cloneLedger();
+    const lane = ledger.coverage.find((entry: any) => entry.id === 'per-session-command-lane');
+    const proof = lane.productionBinding.ordinaryUnwiredProductionProof ?? {};
+    remove(proof);
+    lane.productionBinding.ordinaryUnwiredProductionProof = proof;
+
+    expect(() => auditSessionRuntimeCoverage({ ledger }))
+      .toThrow(/ordinaryUnwiredProductionProof|ordinary production.*unwired/i);
   });
 
   it('rejects deleting the shared Current lane composition seam', () => {

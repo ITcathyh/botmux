@@ -10,16 +10,20 @@ import {
 import { createCurrentKeyedTriggerTurnPort } from './current-keyed-trigger-turn.js';
 import {
   createSessionRuntimeHost,
+  type CommandOutcomeFor,
   type KeyedTriggerAuthority,
   type KeyedTriggerBeginResult,
   type KeyedTriggerObservation,
   type KeyedTriggerReserveResult,
   type KeyedTriggerSettlementResult,
+  type OrdinaryIngressPort,
   type SessionDirectory,
   type SessionDirectoryQuery,
   type SessionDirectoryRead,
   type SessionDirectoryRow,
   type OrdinaryIngressRouteBinding,
+  type SessionCommand,
+  type SessionCommandRequest,
   type SessionProjection,
   type SessionRuntime,
   type SessionRoute,
@@ -437,6 +441,8 @@ export interface CurrentSessionRuntimeHost {
 
 interface CachedCurrentSessionRuntimeHost {
   runtimeEpoch: string;
+  ordinaryIngress?: OrdinaryIngressPort;
+  lease: { active: boolean };
   host: CurrentSessionRuntimeHost;
 }
 
@@ -444,6 +450,35 @@ const hostsByRegistry = new WeakMap<
   Map<string, DaemonSession>,
   Map<string, CachedCurrentSessionRuntimeHost>
 >();
+
+function leaseCurrentSessionRuntimeHost(
+  host: CurrentSessionRuntimeHost,
+  lease: { active: boolean },
+): CurrentSessionRuntimeHost {
+  return {
+    runtime: {
+      submit<C extends SessionCommand>(
+        request: SessionCommandRequest<C>,
+      ): Promise<CommandOutcomeFor<C>> {
+        if (!lease.active) {
+          return Promise.resolve({ kind: 'staleAddress' } as CommandOutcomeFor<C>);
+        }
+        return host.runtime.submit(request);
+      },
+    },
+    projection: {
+      read(query) {
+        if (!lease.active) {
+          return Promise.resolve({
+            kind: 'notReady',
+            message: 'Current SessionRuntime Host lease was superseded',
+          });
+        }
+        return host.projection.read(query);
+      },
+    },
+  };
+}
 
 /** One owner-bound runtime instance per immutable registry/daemon epoch. */
 export function currentSessionRuntimeHost(options: {
@@ -454,6 +489,8 @@ export function currentSessionRuntimeHost(options: {
   keyedTriggerAdmissionBlocked: () => boolean;
   /** Internal execution seam used by fault tests; production uses Current. */
   keyedTriggerTurns?: KeyedTriggerTurnPort;
+  /** Production composition seam for ordinary Lark message ingress. */
+  ordinaryIngress?: OrdinaryIngressPort;
 }): CurrentSessionRuntimeHost {
   const runtimeEpoch = options.runtimeEpoch ?? options.ownerBootId;
   const cacheable = options.keyedTriggerTurns === undefined;
@@ -463,8 +500,16 @@ export function currentSessionRuntimeHost(options: {
     hostsByRegistry.set(options.activeSessions, byOwner);
   }
   const cached = byOwner.get(options.ownerLarkAppId);
-  if (cacheable && cached?.runtimeEpoch === runtimeEpoch) return cached.host;
-  const host = createSessionRuntimeHost({
+  if (cacheable && cached?.runtimeEpoch === runtimeEpoch) {
+    if (options.ordinaryIngress === undefined
+        || cached.ordinaryIngress === options.ordinaryIngress) {
+      return cached.host;
+    }
+    if (cached.ordinaryIngress !== undefined) {
+      throw new Error('Current SessionRuntime owner epoch already has a different ordinary ingress port');
+    }
+  }
+  const innerHost = createSessionRuntimeHost({
     directory: new CurrentSessionDirectory(options.ownerLarkAppId, options.activeSessions),
     keyedTriggers: new CurrentKeyedTriggerAuthority(
       options.ownerLarkAppId,
@@ -476,6 +521,7 @@ export function currentSessionRuntimeHost(options: {
       ownerLarkAppId: options.ownerLarkAppId,
       activeSessions: options.activeSessions,
     }),
+    ordinaryIngress: options.ordinaryIngress,
     sessionStore: sessionStore.createCurrentSessionStore({
       ownerLarkAppId: options.ownerLarkAppId,
       runtimeEpoch,
@@ -487,6 +533,16 @@ export function currentSessionRuntimeHost(options: {
       sessionId,
     ),
   });
-  if (cacheable) byOwner.set(options.ownerLarkAppId, { runtimeEpoch, host });
+  if (!cacheable) return innerHost;
+
+  const lease = { active: true };
+  const host = leaseCurrentSessionRuntimeHost(innerHost, lease);
+  if (cached) cached.lease.active = false;
+  byOwner.set(options.ownerLarkAppId, {
+    runtimeEpoch,
+    ordinaryIngress: options.ordinaryIngress,
+    lease,
+    host,
+  });
   return host;
 }

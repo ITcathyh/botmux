@@ -10,7 +10,8 @@
     ],
     "structuralWriterTypes": [
       "src/cli.ts#SessionData",
-      "src/core/dispatch.ts#DispatchAcceptanceSession"
+      "src/core/dispatch.ts#DispatchAcceptanceSession",
+      "src/core/vc-meeting-im-turn-origin.ts#VcMeetingImTurnOriginSession"
     ],
     "rawSessionFileWriters": [
       {
@@ -258,7 +259,7 @@
     {
       "id": "vc-action-and-delivery",
       "classification": "path_specific_authority",
-      "owner": "VC meeting IM-turn origin helper plus action, receiver, delivery, feed, and hub stores",
+      "owner": "Current VC meeting IM-turn origin Adapter plus action, receiver, delivery, feed, and hub stores",
       "location": "Session.vcMeetingImTurnOrigins and <dataDir>/vc-meeting-* roots",
       "semantics": "Meeting-specific per-turn origin, action approval, delivery lease, terminal, and feed evidence."
     },
@@ -6072,6 +6073,54 @@
       "classification": "ephemeral_runtime",
       "authorityId": "actor-host-runtime",
       "accessLane": "actor-host-direct"
+    },
+    {
+      "sourceFile": "src/core/vc-meeting-im-turn-origin.ts",
+      "enclosingFunction": "rememberVcMeetingImTurnOrigin",
+      "receiverKind": "Session",
+      "fieldPath": "vcMeetingImTurnOrigins",
+      "operation": "assign",
+      "normalizedAstHash": "8913d3a37de57c2a",
+      "count": 1,
+      "classification": "path_specific_authority",
+      "authorityId": "vc-action-and-delivery",
+      "accessLane": "current-vc-meeting-im-turn-origin-adapter"
+    },
+    {
+      "sourceFile": "src/core/vc-meeting-im-turn-origin.ts",
+      "enclosingFunction": "rememberVcMeetingImTurnOrigin",
+      "receiverKind": "Session",
+      "fieldPath": "vcMeetingImTurnOrigins",
+      "operation": "compound_assign",
+      "normalizedAstHash": "42677d320a20ef94",
+      "count": 1,
+      "classification": "path_specific_authority",
+      "authorityId": "vc-action-and-delivery",
+      "accessLane": "current-vc-meeting-im-turn-origin-adapter"
+    },
+    {
+      "sourceFile": "src/core/vc-meeting-im-turn-origin.ts",
+      "enclosingFunction": "rememberVcMeetingImTurnOrigin",
+      "receiverKind": "Session",
+      "fieldPath": "vcMeetingImTurnOrigins",
+      "operation": "delete",
+      "normalizedAstHash": "72dfe2d13dde58d8",
+      "count": 1,
+      "classification": "path_specific_authority",
+      "authorityId": "vc-action-and-delivery",
+      "accessLane": "current-vc-meeting-im-turn-origin-adapter"
+    },
+    {
+      "sourceFile": "src/core/vc-meeting-im-turn-origin.ts",
+      "enclosingFunction": "rememberVcMeetingImTurnOrigin",
+      "receiverKind": "Session",
+      "fieldPath": "vcMeetingImTurnOrigins",
+      "operation": "delete",
+      "normalizedAstHash": "efc7697437356aa3",
+      "count": 1,
+      "classification": "path_specific_authority",
+      "authorityId": "vc-action-and-delivery",
+      "accessLane": "current-vc-meeting-im-turn-origin-adapter"
     },
     {
       "sourceFile": "src/core/worker-pool.ts",
@@ -15420,54 +15469,6 @@
       "classification": "ephemeral_runtime",
       "authorityId": "actor-host-runtime",
       "accessLane": "actor-host-direct"
-    },
-    {
-      "sourceFile": "src/daemon.ts",
-      "enclosingFunction": "rememberVcMeetingImTurnOrigin",
-      "receiverKind": "Session",
-      "fieldPath": "vcMeetingImTurnOrigins",
-      "operation": "assign",
-      "normalizedAstHash": "8913d3a37de57c2a",
-      "count": 1,
-      "classification": "path_specific_authority",
-      "authorityId": "vc-action-and-delivery",
-      "accessLane": "direct-caller-mutation"
-    },
-    {
-      "sourceFile": "src/daemon.ts",
-      "enclosingFunction": "rememberVcMeetingImTurnOrigin",
-      "receiverKind": "Session",
-      "fieldPath": "vcMeetingImTurnOrigins",
-      "operation": "compound_assign",
-      "normalizedAstHash": "42677d320a20ef94",
-      "count": 1,
-      "classification": "path_specific_authority",
-      "authorityId": "vc-action-and-delivery",
-      "accessLane": "direct-caller-mutation"
-    },
-    {
-      "sourceFile": "src/daemon.ts",
-      "enclosingFunction": "rememberVcMeetingImTurnOrigin",
-      "receiverKind": "Session",
-      "fieldPath": "vcMeetingImTurnOrigins",
-      "operation": "delete",
-      "normalizedAstHash": "72dfe2d13dde58d8",
-      "count": 1,
-      "classification": "path_specific_authority",
-      "authorityId": "vc-action-and-delivery",
-      "accessLane": "direct-caller-mutation"
-    },
-    {
-      "sourceFile": "src/daemon.ts",
-      "enclosingFunction": "rememberVcMeetingImTurnOrigin",
-      "receiverKind": "Session",
-      "fieldPath": "vcMeetingImTurnOrigins",
-      "operation": "delete",
-      "normalizedAstHash": "efc7697437356aa3",
-      "count": 1,
-      "classification": "path_specific_authority",
-      "authorityId": "vc-action-and-delivery",
-      "accessLane": "direct-caller-mutation"
     },
     {
       "sourceFile": "src/daemon.ts",

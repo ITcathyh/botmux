@@ -4,10 +4,16 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { currentSessionRuntimeHost } from '../src/core/current-session-runtime.js';
 import type { DaemonSession } from '../src/core/types.js';
+import type { Session } from '../src/types.js';
 import * as idempotencyStore from '../src/services/idempotency-store.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { computeInputHash } from '../src/utils/canonical-input-hash.js';
-import type { KeyedTriggerStartInput, KeyedTriggerTurnPort } from '../src/core/session-runtime.js';
+import type { OrdinaryImTransportEnvelope } from '../src/core/ordinary-im-turn.js';
+import type {
+  KeyedTriggerStartInput,
+  KeyedTriggerTurnPort,
+  OrdinaryIngressPort,
+} from '../src/core/session-runtime.js';
 
 const APP = 'cli_runtime_projection';
 let dataDir: string;
@@ -59,6 +65,42 @@ class TestTurns implements KeyedTriggerTurnPort {
     return { kind: 'accepted' as const };
   }
   async failClose() { return { kind: 'closed' as const }; }
+}
+
+function ordinaryTurn(
+  session: Pick<Session, 'chatId' | 'chatType' | 'rootMessageId' | 'scope'>,
+  messageKey: string,
+): OrdinaryImTransportEnvelope {
+  const scope = session.scope === 'chat' ? 'chat' : 'thread';
+  return {
+    route: {
+      scope,
+      canonicalAnchor: scope === 'chat' ? session.chatId : session.rootMessageId,
+      chatId: session.chatId,
+      chatType: session.chatType ?? 'group',
+    },
+    source: 'lark.im',
+    messageKey,
+    content: 'production ordinary input',
+    sender: { kind: 'human', openId: 'ou_sender' },
+    mentions: [],
+    postParticipantMentions: [],
+    resources: [],
+    messageListener: false,
+    vc: { contextMayLag: false },
+  };
+}
+
+function committedOrdinaryIngress(): OrdinaryIngressPort {
+  return {
+    begin: vi.fn(() => ({ kind: 'committed' as const })),
+    execute: vi.fn(async () => {
+      throw new Error('committed ordinary ingress must not execute an effect');
+    }),
+    resume: vi.fn(() => {
+      throw new Error('committed ordinary ingress must not resume an effect');
+    }),
+  };
 }
 
 beforeEach(() => {
@@ -247,6 +289,135 @@ describe('Current SessionRuntime projection adapter', () => {
       kind: 'byRoute',
       route: { kind: 'thread', anchorId: 'om_collision' },
     })).resolves.toMatchObject({ kind: 'notReady' });
+  });
+
+  it('keeps the production-wired ordinary port when a trigger-only caller reuses the owner epoch Host', async () => {
+    const session = sessionStore.createSession('oc_wired', 'om_wired', 'wired', 'group');
+    session.larkAppId = APP;
+    session.scope = 'thread';
+    sessionStore.updateSession(session);
+    const registry = new Map<string, DaemonSession>();
+    const ordinaryIngress = committedOrdinaryIngress();
+    const productionOptions = {
+      ownerLarkAppId: APP,
+      activeSessions: registry,
+      ownerBootId: 'boot-wired',
+      runtimeEpoch: 'epoch-wired',
+      keyedTriggerAdmissionBlocked: () => false,
+      ordinaryIngress,
+    };
+    const production = currentSessionRuntimeHost(productionOptions);
+    const projected = await production.projection.read({
+      kind: 'byExternalSession',
+      sessionId: session.sessionId,
+    });
+    if (projected.kind !== 'one') throw new Error('expected production projection');
+
+    const triggerOnly = currentSessionRuntimeHost({
+      ownerLarkAppId: APP,
+      activeSessions: registry,
+      ownerBootId: 'boot-wired',
+      runtimeEpoch: 'epoch-wired',
+      keyedTriggerAdmissionBlocked: () => false,
+    });
+    const turn = ordinaryTurn(session, 'om_wired_followup');
+    const outcome = await triggerOnly.runtime.submit({
+      target: { kind: 'session', address: projected.session.address },
+      idempotencyKey: turn.messageKey,
+      command: { kind: 'ordinary.ingress', input: { turn } },
+    });
+
+    expect(outcome).toMatchObject({
+      kind: 'applied',
+      action: 'ordinary.inputCommitted',
+      durability: 'processLocal',
+    });
+    expect(ordinaryIngress.begin).toHaveBeenCalledTimes(1);
+  });
+
+  it('replaces an unwired owner epoch Host when production installs ordinary ingress', async () => {
+    const session = sessionStore.createSession('oc_install', 'om_install', 'install', 'group');
+    session.larkAppId = APP;
+    session.scope = 'thread';
+    sessionStore.updateSession(session);
+    const registry = new Map<string, DaemonSession>();
+    const baseOptions = {
+      ownerLarkAppId: APP,
+      activeSessions: registry,
+      ownerBootId: 'boot-install',
+      runtimeEpoch: 'epoch-install',
+      keyedTriggerAdmissionBlocked: () => false,
+    };
+    const unwired = currentSessionRuntimeHost(baseOptions);
+    const before = await unwired.projection.read({
+      kind: 'byExternalSession',
+      sessionId: session.sessionId,
+    });
+    if (before.kind !== 'one') throw new Error('expected unwired projection');
+
+    const ordinaryIngress = committedOrdinaryIngress();
+    const production = currentSessionRuntimeHost({ ...baseOptions, ordinaryIngress });
+    const after = await production.projection.read({
+      kind: 'byExternalSession',
+      sessionId: session.sessionId,
+    });
+    if (after.kind !== 'one') throw new Error('expected production projection');
+    const staleTurn = ordinaryTurn(session, 'om_install_stale');
+
+    await expect(production.runtime.submit({
+      target: { kind: 'session', address: before.session.address },
+      idempotencyKey: staleTurn.messageKey,
+      command: { kind: 'ordinary.ingress', input: { turn: staleTurn } },
+    })).resolves.toEqual({ kind: 'staleAddress' });
+    expect(after.session.address).not.toBe(before.session.address);
+
+    await expect(unwired.runtime.submit({
+      target: { kind: 'session', address: before.session.address },
+      idempotencyKey: 'revoked-unwired-host',
+      command: {
+        kind: 'control.rename',
+        input: {
+          title: 'must not be written by the revoked Host',
+          updatedAt: '2026-08-10T00:00:00.000Z',
+          source: 'dashboard',
+        },
+      },
+    })).resolves.toEqual({ kind: 'staleAddress' });
+    expect(sessionStore.getOwnedSession(session.sessionId)?.title).toBe('install');
+
+    const triggerOnly = currentSessionRuntimeHost(baseOptions);
+    const liveTurn = ordinaryTurn(session, 'om_install_live');
+    await expect(triggerOnly.runtime.submit({
+      target: { kind: 'session', address: after.session.address },
+      idempotencyKey: liveTurn.messageKey,
+      command: { kind: 'ordinary.ingress', input: { turn: liveTurn } },
+    })).resolves.toMatchObject({
+      kind: 'applied',
+      action: 'ordinary.inputCommitted',
+      durability: 'processLocal',
+    });
+    expect(ordinaryIngress.begin).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails closed when the same owner epoch is wired to a different ordinary ingress port', () => {
+    const registry = new Map<string, DaemonSession>();
+    const baseOptions = {
+      ownerLarkAppId: APP,
+      activeSessions: registry,
+      ownerBootId: 'boot-port-conflict',
+      runtimeEpoch: 'epoch-port-conflict',
+      keyedTriggerAdmissionBlocked: () => false,
+    };
+    const installed = currentSessionRuntimeHost({
+      ...baseOptions,
+      ordinaryIngress: committedOrdinaryIngress(),
+    });
+
+    expect(() => currentSessionRuntimeHost({
+      ...baseOptions,
+      ordinaryIngress: committedOrdinaryIngress(),
+    })).toThrow(/ordinary ingress port/i);
+    expect(currentSessionRuntimeHost(baseOptions)).toBe(installed);
   });
 
   it('rotates the actual Current Host on runtime epoch change and rejects the old address', async () => {

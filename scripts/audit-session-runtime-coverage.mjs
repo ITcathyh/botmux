@@ -105,6 +105,19 @@ const mandatorySessionLaneBinding = Object.freeze({
   resumeCallCount: 4,
 });
 
+const mandatoryOrdinaryUnwiredProductionProof = Object.freeze({
+  sourceFile: 'src/daemon.ts',
+  forbiddenImports: [
+    './core/current-session-runtime.js',
+    './core/current-ordinary-ingress.js',
+  ],
+  forbiddenCalls: [
+    'currentSessionRuntimeHost',
+    'createCurrentOrdinaryIngressPort',
+  ],
+  forbiddenOption: 'ordinaryIngress',
+});
+
 const mandatorySessionLaneDeferredPaths = new Map([
   ['keyed-route-admission-and-fail-close', {
     targetMilestone: 'C1',
@@ -529,12 +542,62 @@ function validateExecutorProductionBindingSchema(binding) {
   );
 }
 
+function validateOrdinaryUnwiredProductionProof(proof) {
+  assert(
+    isPlainObject(proof),
+    'per-session-command-lane.productionBinding.ordinaryUnwiredProductionProof must be an object',
+  );
+  const allowedKeys = new Set([
+    'sourceFile',
+    'forbiddenImports',
+    'forbiddenCalls',
+    'forbiddenOption',
+  ]);
+  for (const key of Object.keys(proof)) {
+    assert(
+      allowedKeys.has(key),
+      `ordinaryUnwiredProductionProof has unsupported field: ${key}`,
+    );
+  }
+  assert(
+    proof.sourceFile === mandatoryOrdinaryUnwiredProductionProof.sourceFile,
+    `ordinaryUnwiredProductionProof.sourceFile must be ${mandatoryOrdinaryUnwiredProductionProof.sourceFile}`,
+  );
+  validateStringArray(
+    proof.forbiddenImports,
+    'ordinaryUnwiredProductionProof.forbiddenImports',
+  );
+  assert(
+    sameStringSet(
+      proof.forbiddenImports,
+      mandatoryOrdinaryUnwiredProductionProof.forbiddenImports,
+    ),
+    'ordinaryUnwiredProductionProof.forbiddenImports must cover the exact production imports',
+  );
+  validateStringArray(
+    proof.forbiddenCalls,
+    'ordinaryUnwiredProductionProof.forbiddenCalls',
+  );
+  assert(
+    sameStringSet(
+      proof.forbiddenCalls,
+      mandatoryOrdinaryUnwiredProductionProof.forbiddenCalls,
+    ),
+    'ordinaryUnwiredProductionProof.forbiddenCalls must cover the exact production factories',
+  );
+  assert(
+    proof.forbiddenOption === mandatoryOrdinaryUnwiredProductionProof.forbiddenOption,
+    `ordinaryUnwiredProductionProof.forbiddenOption must be ${mandatoryOrdinaryUnwiredProductionProof.forbiddenOption}`,
+  );
+}
+
 function validateSessionLaneProductionBindingSchema(binding) {
   assert(isPlainObject(binding), 'per-session-command-lane.productionBinding must be an object');
   const allowedKeys = new Set([
     ...Object.keys(mandatorySessionLaneBinding),
     'observationKinds',
     'deferredPaths',
+    'ordinaryUnwiredProductionProof',
   ]);
   for (const key of Object.keys(binding)) {
     assert(allowedKeys.has(key), `per-session-command-lane.productionBinding has unsupported field: ${key}`);
@@ -562,6 +625,7 @@ function validateSessionLaneProductionBindingSchema(binding) {
       );
     }
   }
+  validateOrdinaryUnwiredProductionProof(binding.ordinaryUnwiredProductionProof);
   validateStringArray(
     binding.observationKinds,
     'per-session-command-lane.productionBinding.observationKinds',
@@ -885,6 +949,17 @@ function objectLiteralOwnPropertyNames(node) {
     }
     return [];
   }));
+}
+
+function objectLiteralOwnProperty(node, expected) {
+  objectLiteralOwnPropertyNames(node);
+  return node.properties.find(property => {
+    if (!property.name) return false;
+    if (ts.isIdentifier(property.name) || ts.isStringLiteralLike(property.name)) {
+      return property.name.text === expected;
+    }
+    return false;
+  });
 }
 
 function importedModules(parsed) {
@@ -1243,14 +1318,44 @@ function validateSessionLaneProductionBinding(binding) {
   const currentSessionCompositionProperties = objectLiteralOwnPropertyNames(
     currentSessionComposition[0].arguments[0],
   );
+  const ordinaryIngressPassThrough = objectLiteralOwnProperty(
+    currentSessionComposition[0].arguments[0],
+    'ordinaryIngress',
+  );
   assert(
-    !currentSessionCompositionProperties.has('ordinaryIngress')
+    currentSessionCompositionProperties.has('ordinaryIngress')
+      && ordinaryIngressPassThrough
+      && ts.isPropertyAssignment(ordinaryIngressPassThrough)
+      && ts.isPropertyAccessExpression(ordinaryIngressPassThrough.initializer)
+      && ts.isIdentifier(ordinaryIngressPassThrough.initializer.expression)
+      && ordinaryIngressPassThrough.initializer.expression.text === 'options'
+      && ordinaryIngressPassThrough.initializer.name.text === 'ordinaryIngress'
       && !importedModules(currentSessionRuntime).includes('./current-ordinary-ingress.js'),
-    'A3 fake ordinary Current port must remain unwired from production composition until C1',
+    'A3 Current SessionRuntime may only pass through an injected ordinary port; it must not create the Current Adapter',
   );
   findNamedFunction(
     sourceFile(binding.ordinaryFakeAdapterSource),
     binding.ordinaryFakeAdapterFactory,
+  );
+
+  const ordinaryUnwiredProof = binding.ordinaryUnwiredProductionProof;
+  const ordinaryProduction = sourceFile(ordinaryUnwiredProof.sourceFile);
+  const ordinaryProductionImports = importedModules(ordinaryProduction);
+  for (const forbidden of ordinaryUnwiredProof.forbiddenImports) {
+    assert(
+      !ordinaryProductionImports.includes(forbidden),
+      `ordinaryProductionWired=false forbids production import ${forbidden}`,
+    );
+  }
+  for (const forbidden of ordinaryUnwiredProof.forbiddenCalls) {
+    assert(
+      callExpressionsWithin(ordinaryProduction, forbidden).length === 0,
+      `ordinaryProductionWired=false forbids production create/call ${forbidden}`,
+    );
+  }
+  assert(
+    !containsIdentifier(ordinaryProduction, ordinaryUnwiredProof.forbiddenOption),
+    `ordinaryProductionWired=false forbids production injection option ${ordinaryUnwiredProof.forbiddenOption}`,
   );
 
   const executorRuntime = sourceFile(binding.executorRuntimeSource);
