@@ -128,7 +128,8 @@ describe('SessionRuntime ordinary ingress policy', () => {
     expect('receipt' in duplicate).toBe(false);
   });
 
-  it('reports a re-entrant same-Session duplicate as received before commitment', async () => {
+  it('queues a re-entrant same-Session duplicate until the first commitment finishes', async () => {
+    const order: string[] = [];
     let nested: ReturnType<ReturnType<typeof createSessionRuntimeHost>['runtime']['submit']> | undefined;
     let host!: ReturnType<typeof createSessionRuntimeHost>;
     let request!: {
@@ -137,7 +138,9 @@ describe('SessionRuntime ordinary ingress policy', () => {
       command: { kind: 'ordinary.ingress'; input: { semantic: SessionCommandValue } };
     };
     const commit = vi.fn(() => {
+      order.push('outer:commit:start');
       nested = host.runtime.submit(request);
+      order.push('outer:commit:end');
       return { kind: 'committed' as const };
     });
     host = createSessionRuntimeHost({
@@ -154,16 +157,42 @@ describe('SessionRuntime ordinary ingress policy', () => {
     };
 
     const first = await host.runtime.submit(request);
-    const received = await nested!;
+    const committed = await nested!;
 
     expect(first).toMatchObject({ kind: 'applied', action: 'ordinary.inputCommitted' });
-    expect(received).toMatchObject({
+    expect(committed).toMatchObject({
       kind: 'duplicate',
-      state: 'received',
+      state: 'inputCommitted',
       policy: 'ordinary-replayable',
       durability: 'processLocal',
     });
+    expect(order).toEqual(['outer:commit:start', 'outer:commit:end']);
     expect(commit).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails closed when a sync-only ordinary Adapter returns a Promise', async () => {
+    const asyncCommit = vi.fn(async () => ({ kind: 'committed' as const }));
+    const host = createSessionRuntimeHost({
+      directory: new OneSessionDirectory(),
+      keyedTriggers: unusedKeyedAuthority,
+      keyedTriggerTurns: unusedKeyedTurns,
+      ordinaryIngress: {
+        commit: asyncCommit as unknown as OrdinaryIngressPort['commit'],
+      },
+    });
+    const address = await addressFor(host);
+
+    const result = await host.runtime.submit({
+      target: { kind: 'session', address },
+      idempotencyKey: 'event-async-adapter',
+      command: { kind: 'ordinary.ingress', input: { semantic: { text: 'hello' } } },
+    });
+
+    expect(result).toEqual({
+      kind: 'quarantined',
+      message: 'OrdinaryIngressPort.commit must return synchronously',
+    });
+    expect(asyncCommit).toHaveBeenCalledTimes(1);
   });
 
   it('keeps an unknown input commitment sticky and never turns it into a blind replay', async () => {

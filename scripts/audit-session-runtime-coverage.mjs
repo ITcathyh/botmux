@@ -23,6 +23,7 @@ const expectedCoverage = new Map([
   ['ordinary-im', { targetMilestone: 'C1', disposition: 'remaining' }],
   ['control', { targetMilestone: 'C2', disposition: 'remaining' }],
   ['executor-generation', { targetMilestone: 'A2', disposition: 'migrated' }],
+  ['per-session-command-lane', { targetMilestone: 'A3', disposition: 'migrated' }],
   ['scheduler', { targetMilestone: 'C4', disposition: 'remaining' }],
   ['activation-restore', { targetMilestone: 'A4', disposition: 'remaining' }],
   ['path-specific-retained', { targetMilestone: 'Target-A', disposition: 'retained' }],
@@ -70,10 +71,44 @@ const mandatoryExecutorSelectors = new Map([
   ]],
   ['src/core/dispatch.ts', ['recordDispatchInputCommit']],
   ['src/core/worker-pool.ts', [
+    'reduceExit',
     'retireWorkerAfterUnknownGeneration',
     'setupWorkerHandlers',
   ]],
   ['src/core/trigger-session.ts', ['convergeIdempotentAsyncTurnOnWorkerExit']],
+]);
+
+const mandatorySessionLaneBinding = Object.freeze({
+  laneSource: 'src/core/session-command-lane.ts',
+  laneFactory: 'createSessionCommandLaneHost',
+  currentLaneSource: 'src/core/current-session-command-lane.ts',
+  sharedLaneExport: 'currentSessionCommandLane',
+  sessionRuntimeSource: 'src/core/session-runtime.ts',
+  sessionRuntimeFactory: 'createSessionRuntimeHost',
+  sessionSubmitFunction: 'submit',
+  currentSessionRuntimeSource: 'src/core/current-session-runtime.ts',
+  currentSessionRuntimeFactory: 'currentSessionRuntimeHost',
+  executorRuntimeSource: 'src/core/session-executor-runtime.ts',
+  executorRuntimeFactory: 'createSessionExecutorRuntime',
+  currentExecutorAdapterSource: 'src/core/current-session-executor-runtime.ts',
+  currentExecutorAdapterFactory: 'createCurrentSessionExecutorRuntime',
+  workerSource: 'src/core/worker-pool.ts',
+  handlerFunction: 'setupWorkerHandlers',
+  reportCallCount: 7,
+  resumeCallCount: 4,
+});
+
+const mandatorySessionLaneDeferredPaths = new Map([
+  ['keyed-route-admission-and-fail-close', {
+    targetMilestone: 'C1',
+    sourceFile: 'src/core/current-keyed-trigger-turn.ts',
+    enclosingFunction: 'failClose',
+  }],
+  ['activation-and-long-executor-lifecycle', {
+    targetMilestone: 'A4',
+    sourceFile: 'src/core/worker-pool.ts',
+    enclosingFunction: 'forkWorker',
+  }],
 ]);
 
 let cachedFacts;
@@ -192,28 +227,29 @@ function validateLedgerSchema(ledger) {
       `${entry.id}.disposition must be ${expected.disposition}`,
     );
     assert(typeof entry.description === 'string' && entry.description.length > 0, `${entry.id}.description is required`);
-    const rawPublisherOnly = entry.id === 'current-session-store-adapter';
+    const zeroSiteEntry = entry.id === 'current-session-store-adapter'
+      || entry.id === 'per-session-command-lane';
     assert(Array.isArray(entry.selectors), `${entry.id}.selectors must be an array`);
     assert(
-      rawPublisherOnly ? entry.selectors.length === 0 : entry.selectors.length > 0,
-      rawPublisherOnly
-        ? `${entry.id}.selectors must stay empty while the inventory exposes only its raw publisher`
+      zeroSiteEntry ? entry.selectors.length === 0 : entry.selectors.length > 0,
+      zeroSiteEntry
+        ? `${entry.id}.selectors must stay empty because this entry binds structural evidence only`
         : `${entry.id}.selectors must not be empty`,
     );
     assert(isPlainObject(entry.authoritySites), `${entry.id}.authoritySites must be an object`);
     assert(
       Number.isInteger(entry.authoritySites.recordCount)
-        && (rawPublisherOnly
+        && (zeroSiteEntry
           ? entry.authoritySites.recordCount === 0
           : entry.authoritySites.recordCount > 0),
-      `${entry.id}.authoritySites.recordCount must be ${rawPublisherOnly ? 'zero' : 'positive'}`,
+      `${entry.id}.authoritySites.recordCount must be ${zeroSiteEntry ? 'zero' : 'positive'}`,
     );
     assert(
       Number.isInteger(entry.authoritySites.mutationCount)
-        && (rawPublisherOnly
+        && (zeroSiteEntry
           ? entry.authoritySites.mutationCount === 0
           : entry.authoritySites.mutationCount > 0),
-      `${entry.id}.authoritySites.mutationCount must be ${rawPublisherOnly ? 'zero' : 'positive'}`,
+      `${entry.id}.authoritySites.mutationCount must be ${zeroSiteEntry ? 'zero' : 'positive'}`,
     );
     assert(
       typeof entry.authoritySites.digest === 'string'
@@ -261,8 +297,12 @@ function validateLedgerSchema(ledger) {
   const executor = ledger.coverage.find(entry => entry.id === 'executor-generation');
   validateExecutorSelectors(executor.selectors);
   validateExecutorProductionBindingSchema(executor.productionBinding);
+  const sessionLane = ledger.coverage.find(entry => entry.id === 'per-session-command-lane');
+  validateSessionLaneProductionBindingSchema(sessionLane.productionBinding);
   for (const entry of ledger.coverage) {
-    if (entry.id !== 'keyed-trigger-start' && entry.id !== 'executor-generation') {
+    if (entry.id !== 'keyed-trigger-start'
+      && entry.id !== 'executor-generation'
+      && entry.id !== 'per-session-command-lane') {
       assert(entry.productionBinding === undefined, `${entry.id} must not claim a migrated production binding`);
     }
   }
@@ -482,6 +522,85 @@ function validateExecutorProductionBindingSchema(binding) {
   );
 }
 
+function validateSessionLaneProductionBindingSchema(binding) {
+  assert(isPlainObject(binding), 'per-session-command-lane.productionBinding must be an object');
+  const allowedKeys = new Set([
+    ...Object.keys(mandatorySessionLaneBinding),
+    'observationKinds',
+    'deferredPaths',
+  ]);
+  for (const key of Object.keys(binding)) {
+    assert(allowedKeys.has(key), `per-session-command-lane.productionBinding has unsupported field: ${key}`);
+  }
+  for (const [field, expected] of Object.entries(mandatorySessionLaneBinding)) {
+    if (field === 'currentLaneSource') {
+      assert(
+        binding[field] === expected,
+        'per-session-command-lane.productionBinding.currentLaneSource must remain the shared Current lane module',
+      );
+    } else if (field === 'reportCallCount') {
+      assert(
+        binding[field] === expected,
+        'per-session-command-lane.productionBinding.reportCallCount must cover the exact report routes',
+      );
+    } else if (field === 'resumeCallCount') {
+      assert(
+        binding[field] === expected,
+        'per-session-command-lane.productionBinding.resumeCallCount must cover the exact continuation routes',
+      );
+    } else {
+      assert(
+        binding[field] === expected,
+        `per-session-command-lane.productionBinding.${field} must be ${expected}`,
+      );
+    }
+  }
+  validateStringArray(
+    binding.observationKinds,
+    'per-session-command-lane.productionBinding.observationKinds',
+  );
+  assert(
+    sameStringSet(binding.observationKinds, mandatoryExecutorObservationKinds),
+    'per-session-command-lane.productionBinding.observationKinds must cover every executor observation',
+  );
+  assert(
+    Array.isArray(binding.deferredPaths),
+    'per-session-command-lane.productionBinding.deferredPaths must be an array',
+  );
+  assert(
+    binding.deferredPaths.length === mandatorySessionLaneDeferredPaths.size,
+    'per-session-command-lane.productionBinding.deferredPaths must include keyed-route-admission-and-fail-close and activation-and-long-executor-lifecycle',
+  );
+  const seen = new Set();
+  for (const path of binding.deferredPaths) {
+    assert(isPlainObject(path), 'per-session-command-lane deferred path must be an object');
+    const allowedPathKeys = new Set(['id', 'targetMilestone', 'sourceFile', 'enclosingFunction']);
+    for (const key of Object.keys(path)) {
+      assert(allowedPathKeys.has(key), `per-session-command-lane deferred path has unsupported field: ${key}`);
+    }
+    assert(typeof path.id === 'string' && path.id.length > 0, 'per-session-command-lane deferred path id is required');
+    assert(!seen.has(path.id), `duplicate per-session-command-lane deferred path: ${path.id}`);
+    seen.add(path.id);
+    const expected = mandatorySessionLaneDeferredPaths.get(path.id);
+    assert(
+      expected,
+      `unknown per-session-command-lane deferred path: ${path.id}`,
+    );
+    for (const [field, value] of Object.entries(expected)) {
+      assert(
+        path[field] === value,
+        `per-session-command-lane deferred path ${path.id}.${field} must be ${value}`,
+      );
+    }
+  }
+  for (const id of mandatorySessionLaneDeferredPaths.keys()) {
+    assert(
+      seen.has(id),
+      `per-session-command-lane.productionBinding.deferredPaths must include ${id}`,
+    );
+  }
+}
+
 function selectAuthoritySites(selector, sites, assigned) {
   if (selector.inventoryRemainder === true) {
     return sites.filter(site => (
@@ -641,6 +760,35 @@ function containsStringLiteral(node, expected) {
   };
   visit(node);
   return found;
+}
+
+function containsIdentifier(node, expected) {
+  let found = false;
+  const visit = current => {
+    if (ts.isIdentifier(current) && current.text === expected) found = true;
+    if (!found) ts.forEachChild(current, visit);
+  };
+  visit(node);
+  return found;
+}
+
+function awaitExpressionsWithin(node) {
+  const awaits = [];
+  const visit = current => {
+    if (ts.isAwaitExpression(current)) awaits.push(current);
+    ts.forEachChild(current, visit);
+  };
+  visit(node);
+  return awaits;
+}
+
+function assertSynchronousCallback(node, label) {
+  assert(
+    !!node && (ts.isArrowFunction(node) || ts.isFunctionExpression(node)),
+    `${label} must be an inline synchronous transition callback`,
+  );
+  assert(!node.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.AsyncKeyword), `${label} must not be async`);
+  assert(awaitExpressionsWithin(node).length === 0, `${label} must not contain await`);
 }
 
 function calledName(call) {
@@ -815,6 +963,198 @@ function validateExecutorProductionBinding(binding, authoritySites, assigned) {
   }
 }
 
+function resolvedTransitionCallback(parsed, argument, label) {
+  if (argument && (ts.isArrowFunction(argument) || ts.isFunctionExpression(argument))) {
+    return argument;
+  }
+  if (argument && ts.isIdentifier(argument)) return findNamedFunction(parsed, argument.text);
+  throw new Error(`${label} must name an inline or local synchronous transition callback`);
+}
+
+function validateSessionLaneProductionBinding(binding) {
+  const lane = sourceFile(binding.laneSource);
+  const laneFactory = findNamedFunction(lane, binding.laneFactory);
+  assert(
+    importedModules(lane).length === 0,
+    `A3 lane core ${binding.laneSource} must not import Current or effect capabilities`,
+  );
+  assert(
+    awaitExpressionsWithin(lane).length === 0,
+    `A3 lane core ${binding.laneSource} must not contain await`,
+  );
+  assert(
+    callExpressionsWithin(laneFactory, 'assertShortTransition').length > 0,
+    `A3 lane ${binding.laneSource}#${binding.laneFactory} lost its thenable guard`,
+  );
+
+  const currentLane = sourceFile(binding.currentLaneSource);
+  assert(
+    importedModules(currentLane).includes('./session-command-lane.js'),
+    `A3 shared Current lane ${binding.currentLaneSource} must import the lane core`,
+  );
+  assert(
+    callExpressionsWithin(currentLane, binding.laneFactory).length === 1,
+    `A3 shared Current lane ${binding.currentLaneSource} must create exactly one process-local lane host`,
+  );
+  assert(
+    containsIdentifier(currentLane, binding.sharedLaneExport),
+    `A3 shared Current lane ${binding.currentLaneSource} must export ${binding.sharedLaneExport}`,
+  );
+  assert(
+    awaitExpressionsWithin(currentLane).length === 0,
+    `A3 shared Current lane ${binding.currentLaneSource} must not contain await`,
+  );
+
+  const sessionRuntime = sourceFile(binding.sessionRuntimeSource);
+  findNamedFunction(sessionRuntime, binding.sessionRuntimeFactory);
+  const sessionSubmit = findNamedFunction(sessionRuntime, binding.sessionSubmitFunction);
+  const sessionLaneCalls = callExpressionsWithin(sessionSubmit, 'commandLane.submit');
+  assert(
+    sessionLaneCalls.length === 1,
+    `A3 SessionRuntime ${binding.sessionRuntimeSource}#${binding.sessionSubmitFunction} must enter exactly one Session lane`,
+  );
+  const sessionReducer = resolvedTransitionCallback(
+    sessionRuntime,
+    sessionLaneCalls[0].arguments[1],
+    'A3 SessionRuntime lane reducer',
+  );
+  assertSynchronousCallback(sessionReducer, 'A3 SessionRuntime lane reducer');
+  assert(
+    containsIdentifier(sessionLaneCalls[0], 'sessionLaneAddress')
+      && containsStringLiteral(sessionSubmit, 'session'),
+    `A3 SessionRuntime ${binding.sessionSubmitFunction} must route resolved Session targets by logical Session address`,
+  );
+  assert(
+    callExpressionsWithin(sessionSubmit, 'keyedTriggerTurns.failClose').length === 1
+      && callExpressionsWithin(sessionLaneCalls[0], 'keyedTriggerTurns.failClose').length === 0,
+    'A3 must leave keyed route fail-close outside the resolved-Session lane as an explicit C1 remainder',
+  );
+
+  const currentSessionRuntime = sourceFile(binding.currentSessionRuntimeSource);
+  const currentSessionFactory = findNamedFunction(
+    currentSessionRuntime,
+    binding.currentSessionRuntimeFactory,
+  );
+  const currentSessionComposition = callExpressionsWithin(
+    currentSessionFactory,
+    binding.sessionRuntimeFactory,
+  );
+  assert(
+    currentSessionComposition.length === 1
+      && containsIdentifier(currentSessionComposition[0], binding.sharedLaneExport)
+      && containsIdentifier(currentSessionComposition[0], 'currentSessionLaneAddress'),
+    'A3 Current SessionRuntime must inject the shared owner/epoch Session lane and address resolver',
+  );
+
+  const executorRuntime = sourceFile(binding.executorRuntimeSource);
+  const executorFactory = findNamedFunction(executorRuntime, binding.executorRuntimeFactory);
+  assert(
+    awaitExpressionsWithin(executorRuntime).length === 0,
+    `A3 executor Runtime ${binding.executorRuntimeSource} must not contain await`,
+  );
+  const executorLaneCalls = callExpressionsWithin(executorFactory, 'commandLane.submit');
+  assert(
+    executorLaneCalls.length === 2,
+    `A3 executor Runtime ${binding.executorRuntimeSource} must lane both report and continuation resume`,
+  );
+  for (const method of ['report', 'resume']) {
+    const fn = findNamedFunction(executorRuntime, method);
+    const calls = callExpressionsWithin(fn, 'commandLane.submit');
+    assert(calls.length === 1, `A3 executor ${method} must enter exactly one Session lane`);
+    const reducer = resolvedTransitionCallback(
+      executorRuntime,
+      calls[0].arguments[1],
+      `A3 executor ${method} reducer`,
+    );
+    assertSynchronousCallback(reducer, `A3 executor ${method} reducer`);
+    assert(
+      containsIdentifier(reducer, 'transition'),
+      `A3 executor ${method} must run the caller's short authority transition inside the lane`,
+    );
+  }
+
+  const currentExecutor = sourceFile(binding.currentExecutorAdapterSource);
+  const currentExecutorFactory = findNamedFunction(
+    currentExecutor,
+    binding.currentExecutorAdapterFactory,
+  );
+  const currentExecutorComposition = callExpressionsWithin(
+    currentExecutorFactory,
+    binding.executorRuntimeFactory,
+  );
+  assert(
+    currentExecutorComposition.length === 1
+      && containsIdentifier(currentExecutorComposition[0], binding.sharedLaneExport)
+      && containsIdentifier(currentExecutorComposition[0], 'currentSessionLaneAddressForKey'),
+    'A3 Current executor Adapter must inject the same owner/epoch Session lane directory',
+  );
+
+  const worker = sourceFile(binding.workerSource);
+  const handler = findNamedFunction(worker, binding.handlerFunction);
+  const reportCalls = callExpressionsWithin(handler, 'sessionExecutorRuntime.report');
+  const resumeCalls = callExpressionsWithin(handler, 'sessionExecutorRuntime.resume');
+  assert(
+    reportCalls.length === binding.reportCallCount,
+    `A3 worker report route count drifted: expected ${binding.reportCallCount}, actual ${reportCalls.length}`,
+  );
+  assert(
+    resumeCalls.length === binding.resumeCallCount,
+    `A3 worker continuation route count drifted: expected ${binding.resumeCallCount}, actual ${resumeCalls.length}`,
+  );
+  for (const [index, call] of reportCalls.entries()) {
+    assert(
+      call.arguments.length === 3,
+      `A3 worker report route ${index + 1} must bind decision and authority mutation in one lane transition`,
+    );
+    const transition = resolvedTransitionCallback(
+      worker,
+      call.arguments[2],
+      `A3 worker report route ${index + 1}`,
+    );
+    assertSynchronousCallback(transition, `A3 worker report route ${index + 1}`);
+  }
+  for (const [index, call] of resumeCalls.entries()) {
+    assert(
+      call.arguments.length === 2,
+      `A3 worker continuation route ${index + 1} must re-enter the lane with one short transition`,
+    );
+    const transition = resolvedTransitionCallback(
+      worker,
+      call.arguments[1],
+      `A3 worker continuation route ${index + 1}`,
+    );
+    assertSynchronousCallback(transition, `A3 worker continuation route ${index + 1}`);
+  }
+  for (const kind of binding.observationKinds) {
+    assert(
+      reportCalls.some(call => containsStringLiteral(call, kind)),
+      `A3 worker report routes do not lane ${kind}`,
+    );
+  }
+  assert(
+    awaitExpressionsWithin(handler).length > 0,
+    'A3 worker handler must retain long executor/Lark/backend work outside its synchronous lane callbacks',
+  );
+
+  const keyedRemainder = binding.deferredPaths.find(
+    path => path.id === 'keyed-route-admission-and-fail-close',
+  );
+  const keyedSource = sourceFile(keyedRemainder.sourceFile);
+  const failClose = findNamedFunction(keyedSource, keyedRemainder.enclosingFunction);
+  assert(
+    awaitExpressionsWithin(failClose).length > 0
+      && callExpressionsWithin(failClose, 'closeWorkerSession').length > 0,
+    'A3 C1 remainder must continue to identify keyed fail-close long lifecycle work',
+  );
+  const lifecycleRemainder = binding.deferredPaths.find(
+    path => path.id === 'activation-and-long-executor-lifecycle',
+  );
+  findNamedFunction(
+    sourceFile(lifecycleRemainder.sourceFile),
+    lifecycleRemainder.enclosingFunction,
+  );
+}
+
 export function auditSessionRuntimeCoverage({ ledger } = {}) {
   const coverageLedger = ledger ?? JSON.parse(readFileSync(ledgerPath, 'utf8'));
   validateLedgerSchema(coverageLedger);
@@ -909,6 +1249,8 @@ export function auditSessionRuntimeCoverage({ ledger } = {}) {
   validateMigratedProductionBinding(keyedTrigger.productionBinding, facts.sites);
   const executor = coverageLedger.coverage.find(entry => entry.id === 'executor-generation');
   validateExecutorProductionBinding(executor.productionBinding, facts.sites, assigned);
+  const sessionLane = coverageLedger.coverage.find(entry => entry.id === 'per-session-command-lane');
+  validateSessionLaneProductionBinding(sessionLane.productionBinding);
   return { summary: entryCounts.join(', ') };
 }
 

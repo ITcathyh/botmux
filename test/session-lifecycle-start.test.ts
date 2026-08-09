@@ -364,6 +364,13 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     let businessSends = vi.mocked(worker.send).mock.calls
       .map(call => call[0])
       .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
+    // The lane only records/classifies the report. IPC retry is an effect and
+    // must not re-enter ChildProcess while the short reducer is still running.
+    expect(businessSends).toHaveLength(1);
+    await Promise.resolve();
+    businessSends = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
     expect(businessSends).toHaveLength(2);
 
     worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
@@ -1994,6 +2001,14 @@ describe('session.start lifecycle integration', () => {
     vi.mocked(sessionStore.updateSession).mockClear();
 
     worker.emit('message', { type: 'turn_input_committed', turnId: 'om_kickoff' });
+    // The report classification and receipt publication are one short lane
+    // transaction. They finish in EventEmitter's current call stack; an
+    // immediately following same-Session command cannot overtake the receipt.
+    expect(ds.session.dispatchInputReceipts?.om_kickoff).toEqual({
+      rootMessageId: 'om_dispatch_root',
+      committedAt: expect.any(String),
+      workerGeneration: 1,
+    });
     await Promise.resolve();
     expect(ds.session.dispatchInputReceipts?.om_kickoff).toEqual({
       rootMessageId: 'om_dispatch_root',
@@ -2207,6 +2222,10 @@ describe('session.start lifecycle integration', () => {
 
     vi.mocked(sessionStore.updateSession).mockClear();
     worker.emit('exit', 1, null);
+    // The durable fence and short dead-worker cleanup run in the lane before
+    // external lifecycle callbacks are scheduled.
+    expect(ds.worker).toBeNull();
+    expect(ds.session.workerGeneration).toBe(2);
     await Promise.resolve();
     expect(ds.worker).toBeNull();
     expect(ds.workerGeneration).toBe(2);
@@ -2322,6 +2341,33 @@ describe('session.start lifecycle integration', () => {
     }));
   });
 
+  it('continues worker-exit reconciliation when a deferred UI effect throws', async () => {
+    const onWorkerExit = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onWorkerExit,
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'first', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    ds.tuiPromptOptions = ['keep lifecycle independent'];
+    vi.mocked(dashboardEventBus.publish).mockImplementationOnce(() => {
+      throw new Error('dashboard publish failed');
+    });
+
+    worker.emit('exit', 1, null);
+    await Promise.resolve();
+
+    expect(ds.worker).toBeNull();
+    expect(onWorkerExit).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: ds.session.sessionId,
+      workerGeneration: 1,
+    }));
+  });
+
   it('suppresses a terminal continuation that loses its generation during await', async () => {
     let releaseTerminal!: () => void;
     const terminalBlocked = new Promise<void>(resolve => { releaseTerminal = resolve; });
@@ -2362,6 +2408,52 @@ describe('session.start lifecycle integration', () => {
       dispatchAttempt: 2,
     });
     expect(onDeferredScheduleTurnSettled).not.toHaveBeenCalled();
+  });
+
+  it('does not hold another Session lane while a terminal effect is awaiting', async () => {
+    let releaseFirstTerminal!: () => void;
+    const firstTerminalBlocked = new Promise<void>(resolve => {
+      releaseFirstTerminal = resolve;
+    });
+    const onTurnTerminal = vi.fn((terminal: { sessionId: string }) => (
+      terminal.sessionId === 'sid-lane-a' ? firstTerminalBlocked : undefined
+    ));
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 2,
+      closeSession: vi.fn(),
+      onTurnTerminal,
+    });
+    const first = makeDs();
+    first.session.sessionId = 'sid-lane-a';
+    const second = makeDs();
+    second.session.sessionId = 'sid-lane-b';
+    second.session.scope = 'chat';
+    second.session.replyTargets = {
+      turn_b: { rootMessageId: 'om_root_b', updatedAt: '2026-08-10T00:00:00.000Z' },
+    };
+    forkWorker(first, 'first', false);
+    const firstWorker = forkMock.mock.results.at(-1)!.value;
+    forkWorker(second, 'second', false);
+    const secondWorker = forkMock.mock.results.at(-1)!.value;
+
+    firstWorker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: first.session.sessionId,
+      turnId: 'turn-a',
+      status: 'completed',
+    });
+    await vi.waitFor(() => expect(onTurnTerminal).toHaveBeenCalledTimes(1));
+
+    secondWorker.emit('message', { type: 'turn_input_committed', turnId: 'turn_b' });
+    expect(second.session.dispatchInputReceipts?.turn_b).toMatchObject({
+      rootMessageId: 'om_root_b',
+      workerGeneration: 1,
+    });
+
+    releaseFirstTerminal();
+    await Promise.resolve();
   });
 
   it('suppresses a managed CLI-exit continuation that loses its generation during await', async () => {

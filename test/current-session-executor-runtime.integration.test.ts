@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createCurrentSessionExecutorRuntime } from '../src/core/current-session-executor-runtime.js';
-import type { DaemonSession } from '../src/core/types.js';
+import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 import {
   createSessionExact,
   getSessionForOwnerStrict,
@@ -29,7 +29,7 @@ describe('CurrentSessionExecutorRuntime owner-file integration', () => {
     rmSync(dataDir, { recursive: true, force: true });
   });
 
-  it('publishes replacement generation before activation and fences the old lease', () => {
+  it('publishes replacement generation before activation and fences the old lease', async () => {
     const session = createSessionExact({
       sessionId: 'sid-real-owner-file',
       createdAt: '2026-08-10T00:00:00.000Z',
@@ -50,21 +50,35 @@ describe('CurrentSessionExecutorRuntime owner-file integration', () => {
       scope: 'thread',
       workingDir: '/repo',
     } as DaemonSession;
-    const runtime = createCurrentSessionExecutorRuntime({ activeSessions: () => undefined });
+    const registry = new Map<string, DaemonSession>();
+    registry.set(activeSessionKey(ds), ds);
+    const runtime = createCurrentSessionExecutorRuntime({ activeSessions: () => registry });
 
     const firstCommit = runtime.commitGeneration(ds);
     const firstWorker = {};
     ds.worker = firstWorker as never;
     const firstLease = runtime.activate(firstCommit, firstWorker);
-    expect(runtime.report(firstLease, { kind: 'inputReceived', turnId: 'turn-1' }).kind).toBe('current');
+    expect((await runtime.report(
+      firstLease,
+      { kind: 'inputReceived', turnId: 'turn-1' },
+      decision => decision,
+    )).kind).toBe('current');
 
     const replacementCommit = runtime.commitGeneration(ds);
     expect(getSessionForOwnerStrict('app-owner', session.sessionId)?.workerGeneration).toBe(2);
-    expect(runtime.report(firstLease, { kind: 'inputCommitted', turnId: 'turn-1' }).kind).toBe('stale');
+    expect((await runtime.report(
+      firstLease,
+      { kind: 'inputCommitted', turnId: 'turn-1' },
+      decision => decision,
+    )).kind).toBe('stale');
 
     const replacementWorker = {};
     ds.worker = replacementWorker as never;
     const replacementLease = runtime.activate(replacementCommit, replacementWorker);
-    expect(runtime.report(replacementLease, { kind: 'inputCommitted', turnId: 'turn-1' }).kind).toBe('current');
+    expect((await runtime.report(
+      replacementLease,
+      { kind: 'inputCommitted', turnId: 'turn-1' },
+      decision => decision,
+    )).kind).toBe('current');
   });
 });

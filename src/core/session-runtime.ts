@@ -19,6 +19,11 @@ import type {
   DispatchInputCommitEvidencePort,
   DispatchInputCommitInspection,
 } from './dispatch-input-commit-evidence.js';
+import {
+  createSessionCommandLaneHost,
+  type SessionCommandLane,
+  type SessionLaneAddress,
+} from './session-command-lane.js';
 
 declare const sessionAddressBrand: unique symbol;
 declare const executorAddressBrand: unique symbol;
@@ -451,6 +456,19 @@ function opaque<T>(): T {
   return Object.freeze({}) as T;
 }
 
+class SynchronousPortContractError extends Error {}
+
+function invokeSynchronousPort<T>(label: string, invoke: () => T): T {
+  const value = invoke();
+  if (value !== null
+    && (typeof value === 'object' || typeof value === 'function')
+    && typeof (value as { then?: unknown }).then === 'function') {
+    void Promise.resolve(value).catch(() => undefined);
+    throw new SynchronousPortContractError(`${label} must return synchronously`);
+  }
+  return value;
+}
+
 function reflectsRename(state: StoredSessionState, input: ControlRenameInput): boolean {
   return state.title === input.title
     && state.titleUpdatedAt === input.updatedAt
@@ -598,7 +616,19 @@ export function createSessionRuntimeHost(options: {
   sessionStore?: SessionStore;
   executorObservations?: ExecutorObservationPort;
   dispatchInputCommits?: DispatchInputCommitEvidencePort;
+  /** Internal owner/epoch-scoped lane shared with Executor report routing. */
+  commandLane?: SessionCommandLane;
+  /** Maps a Host-local Session id to its opaque owner-scoped lane address. */
+  sessionLaneAddress?: (sessionId: string) => SessionLaneAddress;
 }): { runtime: SessionRuntime; projection: SessionProjection } {
+  if (!!options.commandLane !== !!options.sessionLaneAddress) {
+    throw new Error('SessionRuntime requires both command lane and lane address resolver');
+  }
+  const localLaneHost = options.commandLane && options.sessionLaneAddress
+    ? undefined
+    : createSessionCommandLaneHost();
+  const commandLane = options.commandLane ?? localLaneHost!.lane;
+  const sessionLaneAddress = options.sessionLaneAddress ?? localLaneHost!.addressFor;
   const addresses = new Map<string, SessionAddress>();
   const addressSlots = new WeakMap<object, AddressSlot>();
   const ordinaryInputs = new Map<string, {
@@ -670,7 +700,10 @@ export function createSessionRuntimeHost(options: {
   ): CriticalResult => {
     let settled: KeyedTriggerSettlementResult;
     try {
-      settled = options.keyedTriggers.settleDispatchUnknown(observation.token);
+      settled = invokeSynchronousPort(
+        'KeyedTriggerAuthority.settleDispatchUnknown',
+        () => options.keyedTriggers.settleDispatchUnknown(observation.token),
+      );
     } catch (error) {
       return outcome({
         kind: 'quarantined',
@@ -764,7 +797,10 @@ export function createSessionRuntimeHost(options: {
       }
       let binding: ExecutorBindingObservation;
       try {
-        binding = options.executorObservations.inspect(command.executor);
+        binding = invokeSynchronousPort(
+          'ExecutorObservationPort.inspect',
+          () => options.executorObservations!.inspect(command.executor),
+        );
       } catch (error) {
         return outcome({
           kind: 'quarantined',
@@ -791,7 +827,10 @@ export function createSessionRuntimeHost(options: {
 
       let loaded: ReturnType<SessionStore['load']>;
       try {
-        loaded = options.sessionStore.load(slot.sessionId);
+        loaded = invokeSynchronousPort(
+          'SessionStore.load',
+          () => options.sessionStore!.load(slot.sessionId),
+        );
       } catch (error) {
         return outcome({
           kind: 'quarantined',
@@ -816,10 +855,13 @@ export function createSessionRuntimeHost(options: {
       }
       let existingEvidence: DispatchInputCommitInspection;
       try {
-        existingEvidence = options.dispatchInputCommits.read({
-          sessionId: slot.sessionId,
-          turnId: command.turnId,
-        });
+        existingEvidence = invokeSynchronousPort(
+          'DispatchInputCommitEvidencePort.read',
+          () => options.dispatchInputCommits!.read({
+            sessionId: slot.sessionId,
+            turnId: command.turnId,
+          }),
+        );
       } catch (error) {
         return outcome({
           kind: 'quarantined',
@@ -855,12 +897,18 @@ export function createSessionRuntimeHost(options: {
 
       let reconciled: ExecutorInputCommitReconcileResult;
       try {
-        reconciled = options.executorObservations.reconcileInputCommit({
-          token: binding.token,
-          turnId: command.turnId,
-          executorGeneration,
-        });
+        reconciled = invokeSynchronousPort(
+          'ExecutorObservationPort.reconcileInputCommit',
+          () => options.executorObservations!.reconcileInputCommit({
+            token: binding.token,
+            turnId: command.turnId,
+            executorGeneration,
+          }),
+        );
       } catch (error) {
+        if (error instanceof SynchronousPortContractError) {
+          return outcome({ kind: 'quarantined', message: error.message });
+        }
         reconciled = {
           kind: 'unknown',
           message: error instanceof Error ? error.message : String(error),
@@ -890,7 +938,10 @@ export function createSessionRuntimeHost(options: {
       };
       let recorded: ReturnType<DispatchInputCommitEvidencePort['record']>;
       try {
-        recorded = options.dispatchInputCommits.record(evidence);
+        recorded = invokeSynchronousPort(
+          'DispatchInputCommitEvidencePort.record',
+          () => options.dispatchInputCommits!.record(evidence),
+        );
       } catch (error) {
         return outcome({
           kind: 'quarantined',
@@ -933,10 +984,13 @@ export function createSessionRuntimeHost(options: {
 
       let readback: DispatchInputCommitInspection;
       try {
-        readback = options.dispatchInputCommits.read({
-          sessionId: slot.sessionId,
-          turnId: command.turnId,
-        });
+        readback = invokeSynchronousPort(
+          'DispatchInputCommitEvidencePort.read',
+          () => options.dispatchInputCommits!.read({
+            sessionId: slot.sessionId,
+            turnId: command.turnId,
+          }),
+        );
       } catch (error) {
         return outcome({
           kind: 'ambiguous',
@@ -979,6 +1033,7 @@ export function createSessionRuntimeHost(options: {
         });
       }
       const slot = addressSlots.get(request.target.address)!;
+      const renameInput = request.command.input;
       if (!options.sessionStore) {
         return outcome({
           kind: 'notWired',
@@ -988,7 +1043,7 @@ export function createSessionRuntimeHost(options: {
       }
       let requestHash: string;
       try {
-        requestHash = computeInputHash(request.command.input);
+        requestHash = computeInputHash(renameInput);
       } catch (error) {
         return outcome({
           kind: 'rejected',
@@ -1046,7 +1101,10 @@ export function createSessionRuntimeHost(options: {
       }
       let loaded: ReturnType<SessionStore['load']>;
       try {
-        loaded = options.sessionStore.load(slot.sessionId);
+        loaded = invokeSynchronousPort(
+          'SessionStore.load',
+          () => options.sessionStore!.load(slot.sessionId),
+        );
       } catch (error) {
         if (priorCommand?.state === 'unknown') {
           return outcome({
@@ -1090,7 +1148,7 @@ export function createSessionRuntimeHost(options: {
         if (priorCommand?.state !== 'unknown') controlCommands.delete(controlKey);
         return outcome({ kind: 'quarantined', message: loaded.message });
       }
-      if (reflectsRename(loaded.state, request.command.input)) {
+      if (reflectsRename(loaded.state, renameInput)) {
         controlCommands.set(controlKey, {
           requestHash,
           sessionId: slot.sessionId,
@@ -1114,11 +1172,14 @@ export function createSessionRuntimeHost(options: {
       }
       let applied: ReturnType<SessionStore['apply']>;
       try {
-        applied = options.sessionStore.apply({
-          sessionId: slot.sessionId,
-          expected: loaded.version,
-          transition: { kind: 'rename', ...request.command.input },
-        });
+        applied = invokeSynchronousPort(
+          'SessionStore.apply',
+          () => options.sessionStore!.apply({
+            sessionId: slot.sessionId,
+            expected: loaded.version,
+            transition: { kind: 'rename', ...renameInput },
+          }),
+        );
       } catch (error) {
         controlCommands.set(controlKey, {
           requestHash,
@@ -1145,7 +1206,7 @@ export function createSessionRuntimeHost(options: {
         });
       }
       if (applied.kind === 'conflict') {
-        if (applied.current && reflectsRename(applied.current.state, request.command.input)) {
+        if (applied.current && reflectsRename(applied.current.state, renameInput)) {
           controlCommands.set(controlKey, {
             requestHash,
             sessionId: slot.sessionId,
@@ -1172,7 +1233,10 @@ export function createSessionRuntimeHost(options: {
       }
       let readback: ReturnType<SessionStore['load']>;
       try {
-        readback = options.sessionStore.load(slot.sessionId);
+        readback = invokeSynchronousPort(
+          'SessionStore.load',
+          () => options.sessionStore!.load(slot.sessionId),
+        );
       } catch (error) {
         controlCommands.set(controlKey, {
           requestHash,
@@ -1186,7 +1250,7 @@ export function createSessionRuntimeHost(options: {
           message: `${applied.message}; strict readback failed: ${error instanceof Error ? error.message : String(error)}`,
         });
       }
-      if (readback.kind === 'loaded' && reflectsRename(readback.state, request.command.input)) {
+      if (readback.kind === 'loaded' && reflectsRename(readback.state, renameInput)) {
         controlCommands.set(controlKey, {
           requestHash,
           sessionId: slot.sessionId,
@@ -1229,6 +1293,7 @@ export function createSessionRuntimeHost(options: {
         });
       }
       const slot = addressSlots.get(request.target.address)!;
+      const ordinaryInput = request.command.input;
       if (!options.ordinaryIngress) {
         return outcome({
           kind: 'notWired',
@@ -1238,7 +1303,7 @@ export function createSessionRuntimeHost(options: {
       }
       let requestHash: string;
       try {
-        requestHash = computeInputHash(request.command.input.semantic);
+        requestHash = computeInputHash(ordinaryInput.semantic);
       } catch (error) {
         return outcome({
           kind: 'rejected',
@@ -1297,12 +1362,22 @@ export function createSessionRuntimeHost(options: {
       });
       let committed: OrdinaryIngressCommitResult;
       try {
-        committed = options.ordinaryIngress.commit({
-          sessionId: slot.sessionId,
-          idempotencyKey: request.idempotencyKey,
-          semantic: request.command.input.semantic,
-        });
+        committed = invokeSynchronousPort(
+          'OrdinaryIngressPort.commit',
+          () => options.ordinaryIngress!.commit({
+            sessionId: slot.sessionId,
+            idempotencyKey: request.idempotencyKey,
+            semantic: ordinaryInput.semantic,
+          }),
+        );
       } catch (error) {
+        if (error instanceof SynchronousPortContractError) {
+          ordinaryInputs.set(ordinaryKey, {
+            requestHash,
+            state: 'commitUnknown',
+          });
+          return outcome({ kind: 'quarantined', message: error.message });
+        }
         committed = {
           kind: 'unknown',
           message: error instanceof Error ? error.message : String(error),
@@ -1365,7 +1440,10 @@ export function createSessionRuntimeHost(options: {
     }
     let observation: KeyedTriggerObservation;
     try {
-      observation = options.keyedTriggers.inspect(request.idempotencyKey);
+      observation = invokeSynchronousPort(
+        'KeyedTriggerAuthority.inspect',
+        () => options.keyedTriggers.inspect(request.idempotencyKey),
+      );
     } catch (error) {
       return outcome({ kind: 'quarantined', message: error instanceof Error ? error.message : String(error) });
     }
@@ -1377,7 +1455,10 @@ export function createSessionRuntimeHost(options: {
 
     let prepared: KeyedTriggerTurnPrepareResult;
     try {
-      prepared = options.keyedTriggerTurns.prepare(command.input);
+      prepared = invokeSynchronousPort(
+        'KeyedTriggerTurnPort.prepare',
+        () => options.keyedTriggerTurns.prepare(command.input),
+      );
     } catch (error) {
       return outcome({ kind: 'quarantined', message: error instanceof Error ? error.message : String(error) });
     }
@@ -1387,14 +1468,17 @@ export function createSessionRuntimeHost(options: {
 
     let reserved: KeyedTriggerReserveResult;
     try {
-      reserved = options.keyedTriggers.reserve({
-        key: request.idempotencyKey,
-        requestHash,
-        sessionId: candidate.sessionId,
-        triggerId: candidate.triggerId,
-        chatId: candidate.chatId,
-        candidate: admission.candidate,
-      });
+      reserved = invokeSynchronousPort(
+        'KeyedTriggerAuthority.reserve',
+        () => options.keyedTriggers.reserve({
+          key: request.idempotencyKey,
+          requestHash,
+          sessionId: candidate.sessionId,
+          triggerId: candidate.triggerId,
+          chatId: candidate.chatId,
+          candidate: admission.candidate,
+        }),
+      );
     } catch (error) {
       return outcome({ kind: 'quarantined', message: error instanceof Error ? error.message : String(error) });
     }
@@ -1415,7 +1499,10 @@ export function createSessionRuntimeHost(options: {
 
     let begun: KeyedTriggerBeginResult;
     try {
-      begun = options.keyedTriggers.begin(reserved.token);
+      begun = invokeSynchronousPort(
+        'KeyedTriggerAuthority.begin',
+        () => options.keyedTriggers.begin(reserved.token),
+      );
     } catch (error) {
       return outcome({ kind: 'quarantined', message: error instanceof Error ? error.message : String(error) });
     }
@@ -1426,15 +1513,21 @@ export function createSessionRuntimeHost(options: {
     }
 
     try {
-      const accepted = options.keyedTriggerTurns.acceptAtMostOnce(candidate.token, {
-        key: request.idempotencyKey,
-        pendingCreatedAt: begun.pendingCreatedAt,
-      });
+      const accepted = invokeSynchronousPort(
+        'KeyedTriggerTurnPort.acceptAtMostOnce',
+        () => options.keyedTriggerTurns.acceptAtMostOnce(candidate.token, {
+          key: request.idempotencyKey,
+          pendingCreatedAt: begun.pendingCreatedAt,
+        }),
+      );
       if (accepted.kind === 'refused') throw new Error(accepted.message);
     } catch (dispatchError) {
       let settled: KeyedTriggerSettlementResult;
       try {
-        settled = options.keyedTriggers.settleDispatchUnknown(begun.token);
+        settled = invokeSynchronousPort(
+          'KeyedTriggerAuthority.settleDispatchUnknown',
+          () => options.keyedTriggers.settleDispatchUnknown(begun.token),
+        );
       } catch (settlementError) {
         return {
           kind: 'failClose',
@@ -1478,9 +1571,21 @@ export function createSessionRuntimeHost(options: {
   const submit = async <C extends SessionCommand>(
     request: SessionCommandRequest<C>,
   ): Promise<CommandOutcomeFor<C>> => {
-    // run() finishes the dispatch-critical segment before the first await, so
-    // callers cannot interleave a freeze between the final fence and fork.
-    const result = run(request as SessionCommandRequest);
+    // A Session-targeted reducer enters the one owner-scoped FIFO lane. The
+    // drain is synchronous, so the reducer still finishes before this submit
+    // reaches its first await; re-entrant submissions queue behind it.
+    const addressSlot = request.target.kind === 'session'
+      ? addressSlots.get(request.target.address)
+      : undefined;
+    const result = addressSlot
+      ? await commandLane.submit(
+          sessionLaneAddress(addressSlot.sessionId),
+          () => run(request as SessionCommandRequest),
+        )
+      // Keyed route admission has no logical Session until it wins creation.
+      // Its dispatch-critical fence remains one synchronous run-to-completion
+      // segment; C1 moves route creation behind the lane once identity exists.
+      : run(request as SessionCommandRequest);
     if (result.kind === 'outcome') return result.outcome as CommandOutcomeFor<C>;
     let closed: KeyedTriggerTurnCloseResult;
     try {

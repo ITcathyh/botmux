@@ -407,12 +407,13 @@ describe('worker-pool lifecycle hook integration', () => {
     expect(emitHookEventMock).not.toHaveBeenCalled();
   });
 
-  it('emits session.exit from worker process exit', () => {
+  it('emits session.exit from worker process exit after the short exit transition', async () => {
     const worker = makeFakeWorker();
     const ds = makeDs({ worker });
     __testOnly_setupWorkerHandlers(ds, worker);
 
     worker.emit('exit', 1);
+    await flush();
 
     expect(emitHookEventMock).toHaveBeenCalledWith('session.exit', expect.objectContaining({
       sessionId: 'sid-lifecycle-test',

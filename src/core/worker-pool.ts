@@ -73,6 +73,7 @@ import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
 import {
   type ExecutorGenerationCommit,
   type ExecutorLease,
+  type ExecutorObservationDecision,
 } from './session-executor-runtime.js';
 import { createCurrentSessionExecutorRuntime } from './current-session-executor-runtime.js';
 
@@ -83,6 +84,7 @@ const DAEMON_BOOT_ID = randomUUID();
 const restartCoordinator = new RestartCoordinator();
 const createExecutorRuntime = () => createCurrentSessionExecutorRuntime({
   activeSessions: () => activeSessionsRegistry,
+  runtimeEpoch: DAEMON_BOOT_ID,
 });
 let sessionExecutorRuntime = createExecutorRuntime();
 let activeExecutorLeases = new WeakMap<DaemonSession, ExecutorLease>();
@@ -7061,18 +7063,30 @@ export function clearStuckWarningAuthority(ds: DaemonSession): void {
  * they patch the card themselves with a context-specific message and then call
  * clearStuckWarningAuthority() to drop the markers.
  */
-export function invalidateStuckWarning(ds: DaemonSession, reason: string): void {
+function revokeStuckWarningAuthority(
+  ds: DaemonSession,
+  reason: string,
+): (() => void) | undefined {
   if (!ds.stuckWarningCardId && !ds.stuckWarningTurnId && ds.stuckWarningNonce === undefined) return;
   const t = tag(ds);
-  if (ds.stuckWarningCardId) {
-    const locDs = localeForBot(ds.larkAppId);
-    const resolvedCard = buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, locDs), locDs);
-    updateMessage(ds.larkAppId, ds.stuckWarningCardId, resolvedCard).catch(err =>
-      logger.debug(`[${t}] Failed to resolve stuck-warning card (${reason}): ${err}`),
-    );
-  }
+  const appId = ds.larkAppId;
+  const cardId = ds.stuckWarningCardId;
+  const locDs = localeForBot(appId);
+  const resolvedCard = cardId
+    ? buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, locDs), locDs)
+    : undefined;
   logger.debug(`[${t}] invalidateStuckWarning (${reason}): turn=${ds.stuckWarningTurnId ?? 'none'} nonce=${ds.stuckWarningNonce ?? 'none'}`);
   clearStuckWarningAuthority(ds);
+  return () => {
+    if (!cardId || !resolvedCard) return;
+    updateMessage(appId, cardId, resolvedCard).catch(err =>
+      logger.debug(`[${t}] Failed to resolve stuck-warning card (${reason}): ${err}`),
+    );
+  };
+}
+
+export function invalidateStuckWarning(ds: DaemonSession, reason: string): void {
+  revokeStuckWarningAuthority(ds, reason)?.();
 }
 
 function hasTuiPromptAuthority(ds: DaemonSession): boolean {
@@ -7103,27 +7117,54 @@ function clearTuiPromptAuthority(ds: DaemonSession): void {
  * delivery; resolving the card and clearing all authority here prevents that
  * narrow window from permanently occupying the session's prompt slot.
  */
+function revokeTuiPromptAuthority(
+  ds: DaemonSession,
+  reason: string,
+  outcome: 'failed' | 'resolved' = 'failed',
+): (() => void) | undefined {
+  if (!hasTuiPromptAuthority(ds)) return;
+  const t = tag(ds);
+  const appId = ds.larkAppId;
+  const cardId = ds.tuiPromptCardId;
+  const locDs = localeForBot(appId);
+  const terminalCard = cardId
+    ? (outcome === 'resolved'
+        ? buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, locDs), locDs)
+        : buildTuiPromptFailedCard(tr('worker.tui_submit_failed', {
+          cliName: storedSessionCliDisplayName(ds),
+        }, locDs), locDs))
+    : undefined;
+  logger.debug(`[${t}] invalidateTuiPrompt (${reason}): card=${cardId ?? 'none'}`);
+  clearTuiPromptAuthority(ds);
+  return () => {
+    if (cardId && terminalCard) {
+      updateMessage(appId, cardId, terminalCard).catch(err =>
+        logger.debug(`[${t}] Failed to update terminal TUI prompt card (${reason}): ${err}`),
+      );
+    }
+    publishAttentionPatch(ds);
+  };
+}
+
 function invalidateTuiPrompt(
   ds: DaemonSession,
   reason: string,
   outcome: 'failed' | 'resolved' = 'failed',
 ): void {
-  if (!hasTuiPromptAuthority(ds)) return;
-  const t = tag(ds);
-  if (ds.tuiPromptCardId) {
-    const locDs = localeForBot(ds.larkAppId);
-    const terminalCard = outcome === 'resolved'
-      ? buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, locDs), locDs)
-      : buildTuiPromptFailedCard(tr('worker.tui_submit_failed', {
-        cliName: storedSessionCliDisplayName(ds),
-      }, locDs), locDs);
-    updateMessage(ds.larkAppId, ds.tuiPromptCardId, terminalCard).catch(err =>
-      logger.debug(`[${t}] Failed to update terminal TUI prompt card (${reason}): ${err}`),
-    );
+  revokeTuiPromptAuthority(ds, reason, outcome)?.();
+}
+
+function runWorkerUiEffects(effects: readonly (() => void)[], workerTag: string): void {
+  for (const effect of effects) {
+    try {
+      effect();
+    } catch (error) {
+      logger.warn(
+        `[${workerTag}] Worker lifecycle UI effect failed: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
-  logger.debug(`[${t}] invalidateTuiPrompt (${reason}): card=${ds.tuiPromptCardId ?? 'none'}`);
-  clearTuiPromptAuthority(ds);
-  publishAttentionPatch(ds);
 }
 
 function setupWorkerHandlers(
@@ -7314,58 +7355,72 @@ function setupWorkerHandlers(
         break;
       }
       case 'turn_input_received': {
-        const report = sessionExecutorRuntime.report(executorLease, {
+        const report = await sessionExecutorRuntime.report(executorLease, {
           kind: 'inputReceived',
           turnId: msg.turnId,
+        }, decision => {
+          if (decision.kind === 'current') {
+            acknowledgeOrdinaryImDeliveryReceipt(ds, msg.turnId, workerGeneration);
+          }
+          return decision;
         });
         if (report.kind !== 'current') {
           logger.warn(`[${t}] Ignored turn_input_received from stale worker generation`);
           break;
         }
-        acknowledgeOrdinaryImDeliveryReceipt(ds, msg.turnId, workerGeneration);
         break;
       }
       case 'turn_input_rejected': {
-        const report = sessionExecutorRuntime.report(executorLease, {
+        const report = await sessionExecutorRuntime.report(executorLease, {
           kind: 'inputRejected',
           turnId: msg.turnId,
+        }, decision => {
+          const rejectEffect = decision.kind === 'current'
+            ? () => rejectOrdinaryImDelivery(ds, msg.turnId, workerGeneration, msg.reason)
+            : undefined;
+          return { decision, rejectEffect };
         });
-        if (report.kind !== 'current') {
+        if (report.decision.kind !== 'current') {
           logger.warn(`[${t}] Ignored turn_input_rejected from stale worker generation`);
           break;
         }
-        rejectOrdinaryImDelivery(ds, msg.turnId, workerGeneration, msg.reason);
+        // Transport retry / user-visible failure are Adapter effects. They may
+        // synchronously invoke ChildProcess callbacks or launch Lark delivery,
+        // so they run only after the short Session lane has been released.
+        report.rejectEffect?.();
         break;
       }
       case 'turn_input_committed': {
         // Bind the receipt to the exact live worker generation. A late ACK
         // from a replaced worker cannot make the replacement appear to have
         // accepted this dispatch turn.
-        const report = sessionExecutorRuntime.report(executorLease, {
+        const report = await sessionExecutorRuntime.report(executorLease, {
           kind: 'inputCommitted',
           turnId: msg.turnId,
+        }, decision => {
+          if (decision.kind !== 'current') return { decision, recorded: undefined };
+          // Compatibility/fallback: a commit also proves receipt if the earlier
+          // receipt ACK was delayed or dropped on the reverse IPC channel.
+          completeOrdinaryImDelivery(ds, msg.turnId, workerGeneration);
+          const recorded = dispatchInputCommits.record({
+            sessionId: handlerSession.sessionId,
+            turnId: msg.turnId,
+            executorGeneration: workerGeneration,
+            committedAt: new Date().toISOString(),
+          });
+          if (recorded.kind === 'recorded' && msg.turnId.startsWith('mlrp_turn_')) {
+            markMessageListenerRunPreviewRunning(msg.turnId);
+          }
+          return { decision, recorded };
         });
-        if (report.kind !== 'current') {
+        if (report.decision.kind !== 'current') {
           logger.warn(`[${t}] Ignored turn_input_committed from stale worker generation`);
           break;
         }
-        // Compatibility/fallback: a commit also proves receipt if the earlier
-        // receipt ACK was delayed or dropped on the reverse IPC channel.
-        completeOrdinaryImDelivery(ds, msg.turnId, workerGeneration);
-        const recorded = dispatchInputCommits.record({
-          sessionId: handlerSession.sessionId,
-          turnId: msg.turnId,
-          executorGeneration: workerGeneration,
-          committedAt: new Date().toISOString(),
-        });
-        if (recorded.kind === 'recorded') {
-          if (msg.turnId.startsWith('mlrp_turn_')) {
-            markMessageListenerRunPreviewRunning(msg.turnId);
-          }
-        } else {
+        if (report.recorded?.kind !== 'recorded') {
           logger.warn(
             `[${t}] Input commit evidence was not recorded `
-            + `turn=${msg.turnId.slice(0, 16)} outcome=${recorded.kind}`,
+            + `turn=${msg.turnId.slice(0, 16)} outcome=${report.recorded?.kind ?? 'missing'}`,
           );
         }
         break;
@@ -8559,19 +8614,31 @@ function setupWorkerHandlers(
         // CLI-generation authority must not outlive the concrete worker/CLI
         // pair that issued it. A delayed message from a replaced Node worker
         // must neither clear nor restart the replacement generation.
-        const report = sessionExecutorRuntime.report(executorLease, { kind: 'cliExit' });
-        if (report.kind !== 'current' || !report.continuation) {
+        const report = await sessionExecutorRuntime.report(
+          executorLease,
+          { kind: 'cliExit' },
+          decision => {
+            const uiEffects: Array<() => void> = [];
+            if (decision.kind === 'current' && decision.continuation) {
+              ds.managedTurnOrigin = undefined;
+              // Disable exact old-generation card authorities before any
+              // external exit reconciliation can yield. Provider/card effects
+              // execute only after the short lane transition has returned.
+              const stuckEffect = revokeStuckWarningAuthority(ds, 'claude_exit');
+              const tuiEffect = revokeTuiPromptAuthority(ds, 'claude_exit');
+              if (stuckEffect) uiEffects.push(stuckEffect);
+              if (tuiEffect) uiEffects.push(tuiEffect);
+              ds.hasHistory = true;
+            }
+            return { decision, uiEffects };
+          },
+        );
+        if (report.decision.kind !== 'current' || !report.decision.continuation) {
           logger.warn(`[${t}] Ignored claude_exit from stale worker generation`);
           break;
         }
-        ds.managedTurnOrigin = undefined;
-        // The worker/CLI generation ended. Disable an outstanding stuck-warning
-        // card before any replacement worker can be attached; otherwise a late
-        // click could inject its keys into the replacement CLI.
-        invalidateStuckWarning(ds, 'claude_exit');
-        invalidateTuiPrompt(ds, 'claude_exit');
+        runWorkerUiEffects(report.uiEffects, t);
         logger.info(`[${t}] ${sessionCliDisplayName(ds, botCfg)} exited (code: ${msg.code}, signal: ${msg.signal})`);
-        ds.hasHistory = true;
         try {
           await cb.onCliExit?.({
             sessionId: ds.session.sessionId,
@@ -8586,8 +8653,16 @@ function setupWorkerHandlers(
         // A transfer, repo replacement, or worker replacement that won during
         // that await owns all later lifecycle decisions. Never restart/kill its
         // new worker from this stale CLI-exit continuation.
-        const continuation = sessionExecutorRuntime.resume(report.continuation);
-        if (continuation.kind !== 'current' || isSessionTransferring(ds)) {
+        const continuation = await sessionExecutorRuntime.resume(
+          report.decision.continuation,
+          decision => ({ decision, transferring: isSessionTransferring(ds) }),
+        );
+        if (continuation.decision.kind !== 'current'
+          || continuation.transferring
+          // Promise resolution happens after the lane synchronously drains any
+          // already-queued command. Re-check the dynamic lease before the
+          // lifecycle branch can touch a replacement committed in that drain.
+          || !sessionExecutorRuntime.isCurrent(executorLease)) {
           logger.warn(`[${t}] Suppressed stale claude_exit lifecycle continuation`);
           break;
         }
@@ -8942,21 +9017,20 @@ function setupWorkerHandlers(
           );
           break;
         }
-        const report = sessionExecutorRuntime.report(executorLease, {
+        const report = await sessionExecutorRuntime.report(executorLease, {
           kind: 'turnTerminal',
           turnId: msg.turnId,
+        }, decision => {
+          if (decision.kind === 'current' && decision.continuation
+            && ds.managedTurnOrigin?.turnId === msg.turnId
+            && ds.managedTurnOrigin.dispatchAttempt === msg.dispatchAttempt) {
+            ds.managedTurnOrigin = undefined;
+          }
+          return decision;
         });
         if (report.kind !== 'current' || !report.continuation) {
           logger.warn(`[${t}] Ignored turn_terminal from stale worker generation`);
           break;
-        }
-        // Defense in depth: the worker sends a token-matched revoke before the
-        // terminal IPC, but an older/mixed worker must still lose authority at
-        // this exact terminal edge. Tuple-match prevents a late turn N event
-        // from clearing a capability already rotated for turn N+1.
-        if (ds.managedTurnOrigin?.turnId === msg.turnId
-          && ds.managedTurnOrigin.dispatchAttempt === msg.dispatchAttempt) {
-          ds.managedTurnOrigin = undefined;
         }
         try {
           await cb.onTurnTerminal?.(msg, {
@@ -9010,16 +9084,23 @@ function setupWorkerHandlers(
             logger.info(`[${t}] Settled async HTTP turn ${msg.turnId.substring(0, 8)} completed (empty output; nothing-to-send)`);
           }
         }
-        const continuation = sessionExecutorRuntime.resume(report.continuation);
+        const continuation = await sessionExecutorRuntime.resume(
+          report.continuation,
+          decision => {
+            if (decision.kind === 'current'
+              && msg.turnId.startsWith('mlrp_turn_')
+              && msg.status !== 'completed') {
+              markMessageListenerRunPreviewFailed(msg.turnId, {
+                sessionId: msg.sessionId,
+                error: msg.errorCode ?? msg.status,
+              });
+            }
+            return decision;
+          },
+        );
         if (continuation.kind !== 'current') {
           logger.warn(`[${t}] Suppressed stale turn_terminal lifecycle continuation`);
           break;
-        }
-        if (msg.turnId.startsWith('mlrp_turn_') && msg.status !== 'completed') {
-          markMessageListenerRunPreviewFailed(msg.turnId, {
-            sessionId: msg.sessionId,
-            error: msg.errorCode ?? msg.status,
-          });
         }
         try {
           await cb.onDeferredScheduleTurnSettled?.({
@@ -9355,10 +9436,10 @@ function setupWorkerHandlers(
                   });
               if (!owned) return false;
 
-              const terminalReport = sessionExecutorRuntime.report(executorLease, {
+              const terminalReport = await sessionExecutorRuntime.report(executorLease, {
                 kind: 'turnTerminal',
                 turnId: msg.turnId,
-              });
+              }, decision => decision);
               if (terminalReport.kind !== 'current' || !terminalReport.continuation) {
                 logger.warn(`[${t}] Suppressed stale Codex App final settlement`);
                 return false;
@@ -9374,7 +9455,7 @@ function setupWorkerHandlers(
               )) {
                 // Consume the continuation token, but durable prior commitment
                 // remains success even if a replacement won meanwhile.
-                sessionExecutorRuntime.resume(terminalReport.continuation);
+                await sessionExecutorRuntime.resume(terminalReport.continuation, () => true);
                 return true;
               }
               const committed = settleCodexAppDispatch(
@@ -9406,26 +9487,44 @@ function setupWorkerHandlers(
                   return false;
                 }
               }
-              if (sessionExecutorRuntime.resume(terminalReport.continuation).kind !== 'current') {
+              const persisted = await sessionExecutorRuntime.resume(
+                terminalReport.continuation,
+                continuation => {
+                  if (committedCodexAppSequence(
+                    ds.session.codexAppGenerationCommits ?? [],
+                    settlement.generation,
+                    settlement.seq,
+                  )) return true;
+                  if (continuation.kind !== 'current') return false;
+                  const latest = settleCodexAppDispatch(
+                    ds.session.codexAppDispatchLedger ?? [],
+                    ds.session.codexAppGenerationCommits ?? [],
+                    identity,
+                    settlement.generation,
+                    settlement.seq,
+                  );
+                  if (!latest.ok) return false;
+                  const priorLedger = ds.session.codexAppDispatchLedger;
+                  const priorCommits = ds.session.codexAppGenerationCommits;
+                  ds.session.codexAppDispatchLedger = latest.ledger;
+                  ds.session.codexAppGenerationCommits = latest.commits;
+                  try {
+                    // One atomic sessions-file replacement owns both the exact
+                    // FIFO pop and cumulative runner ACK boundary.
+                    sessionStore.updateSession(ds.session);
+                    return true;
+                  } catch (err) {
+                    ds.session.codexAppDispatchLedger = priorLedger;
+                    ds.session.codexAppGenerationCommits = priorCommits;
+                    logger.error(`[${t}] Failed to persist Codex App final settlement: ${err instanceof Error ? err.message : String(err)}`);
+                    return false;
+                  }
+                },
+              );
+              if (!persisted) {
                 logger.warn(`[${t}] Suppressed stale Codex App settlement continuation`);
-                return false;
               }
-              const priorLedger = ds.session.codexAppDispatchLedger;
-              const priorCommits = ds.session.codexAppGenerationCommits;
-              ds.session.codexAppDispatchLedger = committed.ledger;
-              ds.session.codexAppGenerationCommits = committed.commits;
-              try {
-                // One atomic sessions-file replacement owns both the exact FIFO
-                // pop and cumulative runner ACK boundary. Only after this write
-                // may the worker acknowledge final-end to the runner.
-                sessionStore.updateSession(ds.session);
-                return true;
-              } catch (err) {
-                ds.session.codexAppDispatchLedger = priorLedger;
-                ds.session.codexAppGenerationCommits = priorCommits;
-                logger.error(`[${t}] Failed to persist Codex App final settlement: ${err instanceof Error ? err.message : String(err)}`);
-                return false;
-              }
+              return persisted;
             })().finally(() => codexAppFinalSettlementInFlight.delete(key));
             codexAppFinalSettlementInFlight.set(key, inFlight);
           }
@@ -9521,113 +9620,131 @@ function setupWorkerHandlers(
   });
 
   worker.on('exit', (code, signal) => {
-    const exitReport = sessionExecutorRuntime.report(executorLease, { kind: 'workerExit' });
-    const currentExit = exitReport.kind === 'currentExit';
-    const currentExitUnfenced = exitReport.kind === 'unreadable' && exitReport.current;
-    const retiringExit = exitReport.kind === 'retiringExit';
-    if (activeExecutorLeases.get(ds) === executorLease) {
-      activeExecutorLeases.delete(ds);
-    }
-    if (exitReport.kind === 'unreadable') {
-      logger.error(`[${t}] ${exitReport.message}`);
-    }
-    abandonOrdinaryImDeliveriesForWorker(worker);
-    const transferRetirement = transferRetiringWorkers.has(worker);
-    transferRetiringWorkers.delete(worker);
-    clearLifecycleRetirement(ds, worker);
-    logger.info(`[${t}] Worker process exited (code: ${code})`);
-    // Last-resort startup guard: syntax/import crashes and abrupt exits can
-    // happen before the worker sends either ready or a structured error.  Do
-    // not leave the originating Lark message unanswered. Intentional close /
-    // replacement kills are excluded to avoid noisy false alarms.
-    if (currentExit && !transferRetirement && !startupState.ready && !startupState.failureNotified && !worker.killed && ds.session.status !== 'closed') {
-      const reason = tr('worker.start_exited_early', { code: code ?? 'null' }, loc);
-      // Carry the frozen init attribution so an abrupt pre-ready exit of a
-      // durable VC delivery is fenced to the receipt/lease chain, not replied
-      // out-of-band (which could post on a silent delivery).
-      void notifyStartupFailure(reason, startupState.initTurnId, startupState.initDispatchAttempt);
-    }
-    // Clear the current child before notifying durable consumers. A callback
-    // may schedule a retry; it must not observe/send to this dead IPC channel.
-    // A stale takeover worker never clears the replacement — during takeover the
-    // old worker's exit fires AFTER the new worker has been assigned.
-    if (currentExit || currentExitUnfenced) {
-      restartCoordinator.failSession(ds.session.sessionId);
-      if (ds.session.queuedActivationPending) {
-        // Journal ownership is backend-independent. The next worker replays
-        // this exact head with queuedActivationResume before durable tail N+1.
-        ds.initialStartPending = false;
-        ds.initialStartClaimToken = undefined;
-      } else {
-        reparkQueuedActivationFollowUpTail(ds, 'worker exit during activation follow-up handoff');
-      }
-      ds.worker = null;
-      ds.workerReady = false;
-      ds.workerPort = null;
-      // Dead worker generation — stop the periodic usage refresh immediately
-      // instead of waiting a tick for it to self-clear on !workerHasInitialized.
-      clearUsageRefreshTimer(ds);
-      ds.workerToken = null;
-      ds.workerViewToken = null;
-      ds.managedTurnOrigin = undefined;
-      if (ds.riffCloseState) {
-        ds.riffCloseState = { ...ds.riffCloseState, phase: 'uncertain' };
-      }
-      // Do not clear riffShutdownState here. Only the shutdown coordinator can
-      // release a generation after lineage persistence or admission restore.
-      // This worker generation is gone. Invalidate any stuck-warning card it
-      // posted so a late click cannot inject keys into a replacement worker.
-      invalidateStuckWarning(ds, 'worker_exit');
-      invalidateTuiPrompt(ds, 'worker_exit');
-    }
-    if (!transferRetirement && currentExit) {
-      try {
-        const notified = cb.onWorkerExit?.({
-          sessionId: exitReport.sessionId,
-          workerGeneration: exitReport.executorGeneration,
-          code,
-          signal,
+    const reduceExit = (exitReport: ExecutorObservationDecision) => {
+        const currentExit = exitReport.kind === 'currentExit';
+        const currentExitUnfenced = exitReport.kind === 'unreadable' && exitReport.current;
+        const retiringExit = exitReport.kind === 'retiringExit';
+        if (activeExecutorLeases.get(ds) === executorLease) {
+          activeExecutorLeases.delete(ds);
+        }
+        abandonOrdinaryImDeliveriesForWorker(worker);
+        const transferRetirement = transferRetiringWorkers.has(worker);
+        transferRetiringWorkers.delete(worker);
+        clearLifecycleRetirement(ds, worker);
+        const notifyStartup = currentExit
+          && !transferRetirement
+          && !startupState.ready
+          && !startupState.failureNotified
+          && !worker.killed
+          && ds.session.status !== 'closed';
+        const uiEffects: Array<() => void> = [];
+
+        // Clear the current child before any external callback can observe or
+        // retry this dead IPC channel.
+        if (currentExit || currentExitUnfenced) {
+          restartCoordinator.failSession(ds.session.sessionId);
+          if (ds.session.queuedActivationPending) {
+            ds.initialStartPending = false;
+            ds.initialStartClaimToken = undefined;
+          } else {
+            reparkQueuedActivationFollowUpTail(ds, 'worker exit during activation follow-up handoff');
+          }
+          ds.worker = null;
+          ds.workerReady = false;
+          ds.workerPort = null;
+          clearUsageRefreshTimer(ds);
+          ds.workerToken = null;
+          ds.workerViewToken = null;
+          ds.managedTurnOrigin = undefined;
+          if (ds.riffCloseState) {
+            ds.riffCloseState = { ...ds.riffCloseState, phase: 'uncertain' };
+          }
+          const stuckEffect = revokeStuckWarningAuthority(ds, 'worker_exit');
+          const tuiEffect = revokeTuiPromptAuthority(ds, 'worker_exit');
+          if (stuckEffect) uiEffects.push(stuckEffect);
+          if (tuiEffect) uiEffects.push(tuiEffect);
+        }
+
+        const publishExit = currentExit && !transferRetirement && !ds.exitEventEmitted;
+        if (publishExit) ds.exitEventEmitted = true;
+        return Object.freeze({
+          exitReport,
+          currentExit,
+          retiringExit,
+          transferRetirement,
+          notifyStartup,
+          publishExit,
+          uiEffects,
         });
-        void Promise.resolve(notified).catch((err: any) => {
+      };
+
+    const applyExitPlan = (plan: ReturnType<typeof reduceExit>): void => {
+      const { exitReport } = plan;
+      runWorkerUiEffects(plan.uiEffects, t);
+      if (exitReport.kind === 'unreadable') logger.error(`[${t}] ${exitReport.message}`);
+      logger.info(`[${t}] Worker process exited (code: ${code})`);
+      if (plan.notifyStartup) {
+        const reason = tr('worker.start_exited_early', { code: code ?? 'null' }, loc);
+        void notifyStartupFailure(reason, startupState.initTurnId, startupState.initDispatchAttempt);
+      }
+      if (!plan.transferRetirement && plan.currentExit) {
+        try {
+          const notified = cb.onWorkerExit?.({
+            sessionId: exitReport.sessionId,
+            workerGeneration: exitReport.executorGeneration,
+            code,
+            signal,
+          });
+          void Promise.resolve(notified).catch((err: any) => {
+            logger.error(`[${t}] Failed to reconcile worker exit generation ${exitReport.executorGeneration}: ${err.message}`);
+          });
+        } catch (err: any) {
           logger.error(`[${t}] Failed to reconcile worker exit generation ${exitReport.executorGeneration}: ${err.message}`);
-        });
-      } catch (err: any) {
-        logger.error(`[${t}] Failed to reconcile worker exit generation ${exitReport.executorGeneration}: ${err.message}`);
-      }
-    } else if (!transferRetirement && retiringExit) {
-      try {
-        const notified = cb.onRetiringWorkerExit?.({
-          sessionId: exitReport.sessionId,
-          workerGeneration: exitReport.executorGeneration,
-          code,
-          signal,
-        });
-        void Promise.resolve(notified).catch((err: any) => {
+        }
+      } else if (!plan.transferRetirement && plan.retiringExit) {
+        try {
+          const notified = cb.onRetiringWorkerExit?.({
+            sessionId: exitReport.sessionId,
+            workerGeneration: exitReport.executorGeneration,
+            code,
+            signal,
+          });
+          void Promise.resolve(notified).catch((err: any) => {
+            logger.error(`[${t}] Failed to reconcile retiring worker generation ${exitReport.executorGeneration}: ${err.message}`);
+          });
+        } catch (err: any) {
           logger.error(`[${t}] Failed to reconcile retiring worker generation ${exitReport.executorGeneration}: ${err.message}`);
-        });
-      } catch (err: any) {
-        logger.error(`[${t}] Failed to reconcile retiring worker generation ${exitReport.executorGeneration}: ${err.message}`);
+        }
+      } else {
+        logger.info(`[${t}] Suppressed external worker-exit effects for routing transfer`);
       }
-    } else {
-      logger.info(`[${t}] Suppressed external worker-exit effects for routing transfer`);
-    }
-    // Notify dashboard, but only once per session lifecycle. The
-    // dashboard-driven `closeSession()` path also publishes; whichever
-    // fires first wins, the other's emit is suppressed.
-    if (currentExit && !transferRetirement && !ds.exitEventEmitted) {
-      ds.exitEventEmitted = true;
-      dashboardEventBus.publish({
-        type: 'session.exited',
-        body: {
-          sessionId: ds.session.sessionId,
-          reason: code === 0 ? 'graceful' : `exit_code_${code}`,
-        },
+      if (plan.publishExit) {
+        const reason = code === 0 ? 'graceful' : `exit_code_${code}`;
+        dashboardEventBus.publish({
+          type: 'session.exited',
+          body: { sessionId: ds.session.sessionId, reason },
+        });
+        emitSessionLifecycleHook(ds, 'session.exit', { reason, code });
+      }
+    };
+
+    const submitExit = () => sessionExecutorRuntime.report(
+      executorLease,
+      { kind: 'workerExit' },
+      reduceExit,
+    );
+    void submitExit().then(applyExitPlan, (error) => {
+      logger.error(
+        `[${t}] Failed to reduce worker-exit transition; retrying once: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+      void submitExit().then(applyExitPlan, (retryError) => {
+        logger.error(
+          `[${t}] Worker-exit transition retry failed closed: `
+          + `${retryError instanceof Error ? retryError.message : String(retryError)}`,
+        );
       });
-      emitSessionLifecycleHook(ds, 'session.exit', {
-        reason: code === 0 ? 'graceful' : `exit_code_${code}`,
-        code,
-      });
-    }
+    });
   });
 }
 

@@ -2,6 +2,10 @@ import { isDeepStrictEqual } from 'node:util';
 import * as sessionStore from '../services/session-store.js';
 import type { Session } from '../types.js';
 import {
+  currentSessionCommandLane,
+  currentSessionLaneAddressForKey,
+} from './current-session-command-lane.js';
+import {
   createSessionExecutorRuntime,
   type ExecutorContinuation,
   type ExecutorContinuationDecision,
@@ -21,8 +25,15 @@ import {
 export interface CurrentSessionExecutorRuntime {
   commitGeneration(session: DaemonSession): ExecutorGenerationCommit;
   activate(commit: ExecutorGenerationCommit, identity: object): ExecutorLease;
-  report(lease: ExecutorLease, observation: ExecutorObservation): ExecutorObservationDecision;
-  resume(continuation: ExecutorContinuation): ExecutorContinuationDecision;
+  report<T>(
+    lease: ExecutorLease,
+    observation: ExecutorObservation,
+    transition: (decision: ExecutorObservationDecision) => T,
+  ): Promise<T>;
+  resume<T>(
+    continuation: ExecutorContinuation,
+    transition: (decision: ExecutorContinuationDecision) => T,
+  ): Promise<T>;
   isCurrent(lease: ExecutorLease): boolean;
   /** Process-local fail-closed gate for an unproved generation publication. */
   isQuarantined(session: DaemonSession): boolean;
@@ -37,8 +48,16 @@ export interface CurrentSessionExecutorRuntime {
  */
 export function createCurrentSessionExecutorRuntime(input: {
   activeSessions: () => Map<string, DaemonSession> | undefined;
+  runtimeEpoch?: string;
 }): CurrentSessionExecutorRuntime {
-  const runtime = createSessionExecutorRuntime();
+  const runtimeEpoch = input.runtimeEpoch ?? 'current-session-executor-runtime';
+  const runtime = createSessionExecutorRuntime({
+    commandLane: currentSessionCommandLane,
+    laneAddressForSessionKey: sessionKey => currentSessionLaneAddressForKey(
+      runtimeEpoch,
+      sessionKey,
+    ),
+  });
   type PendingGenerationWrite = {
     session: Session;
     ownerLarkAppId: string;
@@ -159,6 +178,8 @@ export function createCurrentSessionExecutorRuntime(input: {
       const key = logicalSessionKey(handlerLarkAppId, handlerSession.sessionId);
       let exactToken: object | undefined;
       const authority: ExecutorGenerationAuthority = {
+        sessionKey: key,
+        sessionId: handlerSession.sessionId,
         commitNext() {
           const previousDaemonGeneration = ds.workerGeneration;
           const previousSessionGeneration = ds.session.workerGeneration;
@@ -230,8 +251,6 @@ export function createCurrentSessionExecutorRuntime(input: {
           pendingExitFences.delete(key);
           return {
             token,
-            sessionKey: key,
-            sessionId: ds.session.sessionId,
             generation: workerGeneration,
           };
         },

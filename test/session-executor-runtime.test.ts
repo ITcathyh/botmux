@@ -5,15 +5,19 @@ import {
 } from '../src/core/session-executor-runtime.js';
 
 function authority() {
+  const sessionKey = 'app-owner\0sid-runtime';
+  const sessionId = 'sid-runtime';
   let generation = 0;
   let currentIdentity: object | undefined;
   const committed = new Set<object>();
   const port: ExecutorGenerationAuthority = {
+    sessionKey,
+    sessionId,
     commitNext() {
       generation += 1;
       const token = Object.freeze({ generation });
       committed.add(token);
-      return { token, sessionKey: 'app-owner\0sid-runtime', sessionId: 'sid-runtime', generation };
+      return { token, generation };
     },
     owns(token, identity) {
       return committed.has(token)
@@ -43,12 +47,14 @@ function fixedAuthority(input: {
   generation: number;
   fencedGeneration?: number;
 }): ExecutorGenerationAuthority {
+  const sessionKey = input.sessionKey ?? 'app-owner\0sid-runtime';
+  const sessionId = input.sessionId ?? 'sid-runtime';
   const token = Object.freeze({ generation: input.generation });
   return {
+    sessionKey,
+    sessionId,
     commitNext: () => ({
       token,
-      sessionKey: input.sessionKey ?? 'app-owner\0sid-runtime',
-      sessionId: input.sessionId ?? 'sid-runtime',
       generation: input.generation,
     }),
     owns: () => true,
@@ -60,7 +66,7 @@ function fixedAuthority(input: {
 }
 
 describe('SessionExecutorRuntime generation authority', () => {
-  it('revokes an old lease as soon as a newer generation is committed', () => {
+  it('revokes an old lease as soon as a newer generation is committed', async () => {
     const runtime = createSessionExecutorRuntime();
     const first = runtime.commitGeneration(fixedAuthority({ generation: 1 }));
     const firstLease = runtime.activate(first, {});
@@ -68,7 +74,11 @@ describe('SessionExecutorRuntime generation authority', () => {
 
     const second = runtime.commitGeneration(fixedAuthority({ generation: 2 }));
     expect(runtime.isCurrent(firstLease)).toBe(false);
-    expect(runtime.report(firstLease, { kind: 'inputReceived', turnId: 'turn-1' }).kind).toBe('stale');
+    expect((await runtime.report(
+      firstLease,
+      { kind: 'inputReceived', turnId: 'turn-1' },
+      decision => decision,
+    )).kind).toBe('stale');
 
     const secondLease = runtime.activate(second, {});
     expect(runtime.isCurrent(secondLease)).toBe(true);
@@ -83,7 +93,7 @@ describe('SessionExecutorRuntime generation authority', () => {
     expect(runtime.isCurrent(runtime.activate(second, {}))).toBe(true);
   });
 
-  it('keeps one current lease even when distinct authorities both claim ownership', () => {
+  it('keeps one current lease even when distinct authorities both claim ownership', async () => {
     const runtime = createSessionExecutorRuntime();
     const firstLease = runtime.activate(
       runtime.commitGeneration(fixedAuthority({ generation: 1 })),
@@ -94,8 +104,16 @@ describe('SessionExecutorRuntime generation authority', () => {
       {},
     );
 
-    expect(runtime.report(firstLease, { kind: 'inputCommitted', turnId: 'turn-1' }).kind).toBe('stale');
-    expect(runtime.report(secondLease, { kind: 'inputCommitted', turnId: 'turn-1' }).kind).toBe('current');
+    expect((await runtime.report(
+      firstLease,
+      { kind: 'inputCommitted', turnId: 'turn-1' },
+      decision => decision,
+    )).kind).toBe('stale');
+    expect((await runtime.report(
+      secondLease,
+      { kind: 'inputCommitted', turnId: 'turn-1' },
+      decision => decision,
+    )).kind).toBe('current');
   });
 
   it('poisons the prior lease when an Adapter publishes a non-monotonic generation', () => {
@@ -127,13 +145,14 @@ describe('SessionExecutorRuntime generation authority', () => {
     expect(runtime.isCurrent(second)).toBe(true);
   });
 
-  it('keeps the exit fence as the generation floor', () => {
+  it('keeps the exit fence as the generation floor', async () => {
     const runtime = createSessionExecutorRuntime();
     const lease = runtime.activate(
       runtime.commitGeneration(fixedAuthority({ generation: 1, fencedGeneration: 2 })),
       {},
     );
-    expect(runtime.report(lease, { kind: 'workerExit' }).kind).toBe('currentExit');
+    expect((await runtime.report(lease, { kind: 'workerExit' }, decision => decision)).kind)
+      .toBe('currentExit');
 
     expect(() => runtime.commitGeneration(fixedAuthority({ generation: 2 })))
       .toThrow('non-monotonic commitment');
@@ -143,21 +162,21 @@ describe('SessionExecutorRuntime generation authority', () => {
     )).not.toThrow();
   });
 
-  it.each([1, Number.NaN])('fails closed on invalid exit fence generation %s', (fencedGeneration) => {
+  it.each([1, Number.NaN])('fails closed on invalid exit fence generation %s', async (fencedGeneration) => {
     const runtime = createSessionExecutorRuntime();
     const lease = runtime.activate(runtime.commitGeneration(fixedAuthority({
       generation: 1,
       fencedGeneration,
     })), {});
 
-    expect(runtime.report(lease, { kind: 'workerExit' })).toMatchObject({
+    expect(await runtime.report(lease, { kind: 'workerExit' }, decision => decision)).toMatchObject({
       kind: 'unreadable',
       current: true,
       message: expect.stringContaining('invalid exit fence'),
     });
   });
 
-  it('commits a generation before minting one opaque activation lease', () => {
+  it('commits a generation before minting one opaque activation lease', async () => {
     const runtime = createSessionExecutorRuntime();
     const current = authority();
     const worker = {};
@@ -167,7 +186,11 @@ describe('SessionExecutorRuntime generation authority', () => {
     const lease = runtime.activate(commit, worker);
 
     expect(commit.generation).toBe(1);
-    expect(runtime.report(lease, { kind: 'inputReceived', turnId: 'turn-1' })).toEqual({
+    expect(await runtime.report(
+      lease,
+      { kind: 'inputReceived', turnId: 'turn-1' },
+      decision => decision,
+    )).toEqual({
       kind: 'current',
       sessionId: 'sid-runtime',
       executorGeneration: 1,
@@ -175,7 +198,7 @@ describe('SessionExecutorRuntime generation authority', () => {
     expect(() => runtime.activate(commit, {})).toThrow('already activated');
   });
 
-  it('rejects received, committed, and terminal reports after replacement', () => {
+  it('rejects received, committed, and terminal reports after replacement', async () => {
     const runtime = createSessionExecutorRuntime();
     const current = authority();
     const oldWorker = {};
@@ -191,7 +214,7 @@ describe('SessionExecutorRuntime generation authority', () => {
       { kind: 'inputCommitted' as const, turnId: 'turn-1' },
       { kind: 'turnTerminal' as const, turnId: 'turn-1' },
     ]) {
-      expect(runtime.report(lease, observation)).toEqual({
+      expect(await runtime.report(lease, observation, decision => decision)).toEqual({
         kind: 'stale',
         sessionId: 'sid-runtime',
         executorGeneration: 1,
@@ -199,7 +222,7 @@ describe('SessionExecutorRuntime generation authority', () => {
     }
   });
 
-  it('rechecks an async terminal continuation after generation replacement', () => {
+  it('rechecks an async terminal continuation after generation replacement', async () => {
     const runtime = createSessionExecutorRuntime();
     const current = authority();
     const worker = {};
@@ -207,19 +230,26 @@ describe('SessionExecutorRuntime generation authority', () => {
     current.activate(worker);
     const lease = runtime.activate(commit, worker);
 
-    const accepted = runtime.report(lease, { kind: 'turnTerminal', turnId: 'turn-1' });
+    const accepted = await runtime.report(
+      lease,
+      { kind: 'turnTerminal', turnId: 'turn-1' },
+      decision => decision,
+    );
     expect(accepted.kind).toBe('current');
     expect(accepted.kind === 'current' ? accepted.continuation : undefined).toBeDefined();
 
     current.replace({});
-    expect(runtime.resume(accepted.kind === 'current' ? accepted.continuation! : undefined as never)).toEqual({
+    expect(await runtime.resume(
+      accepted.kind === 'current' ? accepted.continuation! : undefined as never,
+      decision => decision,
+    )).toEqual({
       kind: 'stale',
       sessionId: 'sid-runtime',
       executorGeneration: 1,
     });
   });
 
-  it('fences a current worker exit before returning authority for external effects', () => {
+  it('fences a current worker exit before returning authority for external effects', async () => {
     const runtime = createSessionExecutorRuntime();
     const current = authority();
     const worker = {};
@@ -228,7 +258,7 @@ describe('SessionExecutorRuntime generation authority', () => {
     const lease = runtime.activate(commit, worker);
     const fence = vi.spyOn(current.port, 'fenceExit');
 
-    expect(runtime.report(lease, { kind: 'workerExit' })).toEqual({
+    expect(await runtime.report(lease, { kind: 'workerExit' }, decision => decision)).toEqual({
       kind: 'currentExit',
       sessionId: 'sid-runtime',
       executorGeneration: 1,
@@ -236,14 +266,14 @@ describe('SessionExecutorRuntime generation authority', () => {
     });
     expect(fence).toHaveBeenCalledTimes(1);
     expect(current.generation()).toBe(2);
-    expect(runtime.report(lease, { kind: 'workerExit' })).toEqual({
+    expect(await runtime.report(lease, { kind: 'workerExit' }, decision => decision)).toEqual({
       kind: 'stale',
       sessionId: 'sid-runtime',
       executorGeneration: 1,
     });
   });
 
-  it('allows one authentic retiring exit reconciliation without current effects', () => {
+  it('allows one authentic retiring exit reconciliation without current effects', async () => {
     const runtime = createSessionExecutorRuntime();
     const current = authority();
     const oldWorker = {};
@@ -253,16 +283,17 @@ describe('SessionExecutorRuntime generation authority', () => {
     current.replace({});
     const fence = vi.spyOn(current.port, 'fenceExit');
 
-    expect(runtime.report(lease, { kind: 'workerExit' })).toEqual({
+    expect(await runtime.report(lease, { kind: 'workerExit' }, decision => decision)).toEqual({
       kind: 'retiringExit',
       sessionId: 'sid-runtime',
       executorGeneration: 1,
     });
     expect(fence).not.toHaveBeenCalled();
-    expect(runtime.report(lease, { kind: 'workerExit' }).kind).toBe('stale');
+    expect((await runtime.report(lease, { kind: 'workerExit' }, decision => decision)).kind)
+      .toBe('stale');
   });
 
-  it('fails closed when the current exit fence is unreadable', () => {
+  it('fails closed when the current exit fence is unreadable', async () => {
     const runtime = createSessionExecutorRuntime();
     const current = authority();
     const worker = {};
@@ -274,13 +305,156 @@ describe('SessionExecutorRuntime generation authority', () => {
       message: 'disk unavailable',
     });
 
-    expect(runtime.report(lease, { kind: 'workerExit' })).toEqual({
+    expect(await runtime.report(lease, { kind: 'workerExit' }, decision => decision)).toEqual({
       kind: 'unreadable',
       sessionId: 'sid-runtime',
       executorGeneration: 1,
       current: true,
       message: 'disk unavailable',
     });
-    expect(runtime.report(lease, { kind: 'inputCommitted', turnId: 'turn-1' }).kind).toBe('stale');
+    expect((await runtime.report(
+      lease,
+      { kind: 'inputCommitted', turnId: 'turn-1' },
+      decision => decision,
+    )).kind).toBe('stale');
+  });
+
+  it('consumes one continuation only once when two resumes queue in the same Session lane', async () => {
+    const runtime = createSessionExecutorRuntime();
+    const current = authority();
+    const worker = {};
+    const commit = runtime.commitGeneration(current.port);
+    current.activate(worker);
+    const lease = runtime.activate(commit, worker);
+    const accepted = await runtime.report(
+      lease,
+      { kind: 'turnTerminal', turnId: 'turn-once' },
+      decision => decision,
+    );
+    if (accepted.kind !== 'current' || !accepted.continuation) {
+      throw new Error('expected a current terminal continuation');
+    }
+
+    let firstResume!: ReturnType<typeof runtime.resume>;
+    let secondResume!: ReturnType<typeof runtime.resume>;
+    await runtime.report(
+      lease,
+      { kind: 'inputReceived', turnId: 'turn-queue-owner' },
+      decision => {
+        firstResume = runtime.resume(accepted.continuation!, resumed => resumed);
+        secondResume = runtime.resume(accepted.continuation!, resumed => resumed);
+        void secondResume.catch(() => undefined);
+        return decision;
+      },
+    );
+
+    await expect(firstResume).resolves.toMatchObject({ kind: 'current' });
+    await expect(secondResume).rejects.toThrow('already consumed');
+  });
+
+  it('rejects an async authority ownership proof and never treats it as current', async () => {
+    const runtime = createSessionExecutorRuntime();
+    const current = authority();
+    const worker = {};
+    const commit = runtime.commitGeneration(current.port);
+    current.activate(worker);
+    const lease = runtime.activate(commit, worker);
+    vi.spyOn(current.port, 'owns').mockImplementation((async () => true) as never);
+    const transition = vi.fn((decision) => decision);
+
+    expect(runtime.isCurrent(lease)).toBe(false);
+    await expect(runtime.report(
+      lease,
+      { kind: 'inputReceived', turnId: 'turn-async-owner' },
+      transition,
+    )).rejects.toThrow('ExecutorGenerationAuthority.owns must return synchronously');
+    expect(transition).not.toHaveBeenCalled();
+  });
+
+  it('invalidates a terminal continuation when its short transition fails', async () => {
+    const runtime = createSessionExecutorRuntime();
+    const current = authority();
+    const worker = {};
+    const commit = runtime.commitGeneration(current.port);
+    current.activate(worker);
+    const lease = runtime.activate(commit, worker);
+    let leakedContinuation: Parameters<typeof runtime.resume>[0] | undefined;
+
+    await expect(runtime.report(
+      lease,
+      { kind: 'turnTerminal', turnId: 'turn-failed-transition' },
+      decision => {
+        leakedContinuation = decision.kind === 'current' ? decision.continuation : undefined;
+        throw new Error('terminal transition failed');
+      },
+    )).rejects.toThrow('terminal transition failed');
+    expect(leakedContinuation).toBeDefined();
+    await expect(runtime.resume(leakedContinuation!, decision => decision))
+      .rejects.toThrow('belongs to another Runtime epoch');
+  });
+
+  it('retries one continuation when its first short transition fails', async () => {
+    const runtime = createSessionExecutorRuntime();
+    const current = authority();
+    const worker = {};
+    const commit = runtime.commitGeneration(current.port);
+    current.activate(worker);
+    const lease = runtime.activate(commit, worker);
+    const accepted = await runtime.report(
+      lease,
+      { kind: 'cliExit' },
+      decision => decision,
+    );
+    if (accepted.kind !== 'current' || !accepted.continuation) {
+      throw new Error('expected current CLI-exit continuation');
+    }
+
+    await expect(runtime.resume(accepted.continuation, () => {
+      throw new Error('continuation transition failed');
+    })).rejects.toThrow('continuation transition failed');
+    await expect(runtime.resume(accepted.continuation, decision => decision))
+      .resolves.toMatchObject({ kind: 'current' });
+  });
+
+  it('retries worker-exit cleanup without fencing the generation twice', async () => {
+    const runtime = createSessionExecutorRuntime();
+    const current = authority();
+    const worker = {};
+    const commit = runtime.commitGeneration(current.port);
+    current.activate(worker);
+    const lease = runtime.activate(commit, worker);
+    const fence = vi.spyOn(current.port, 'fenceExit');
+
+    await expect(runtime.report(lease, { kind: 'workerExit' }, () => {
+      throw new Error('exit cleanup failed');
+    })).rejects.toThrow('exit cleanup failed');
+    await expect(runtime.report(lease, { kind: 'workerExit' }, decision => decision))
+      .resolves.toMatchObject({ kind: 'currentExit', fencedGeneration: 2 });
+    expect(fence).toHaveBeenCalledTimes(1);
+    await expect(runtime.report(lease, { kind: 'workerExit' }, decision => decision))
+      .resolves.toMatchObject({ kind: 'stale' });
+  });
+
+  it('downgrades a failed current-exit cleanup retry after replacement commits', async () => {
+    const runtime = createSessionExecutorRuntime();
+    const first = authority();
+    const firstWorker = {};
+    const firstCommit = runtime.commitGeneration(first.port);
+    first.activate(firstWorker);
+    const firstLease = runtime.activate(firstCommit, firstWorker);
+    const fence = vi.spyOn(first.port, 'fenceExit');
+
+    await expect(runtime.report(firstLease, { kind: 'workerExit' }, () => {
+      throw new Error('current cleanup interrupted');
+    })).rejects.toThrow('current cleanup interrupted');
+
+    const replacementLease = runtime.activate(
+      runtime.commitGeneration(fixedAuthority({ generation: 3 })),
+      {},
+    );
+    await expect(runtime.report(firstLease, { kind: 'workerExit' }, decision => decision))
+      .resolves.toMatchObject({ kind: 'retiringExit', executorGeneration: 1 });
+    expect(runtime.isCurrent(replacementLease)).toBe(true);
+    expect(fence).toHaveBeenCalledTimes(1);
   });
 });

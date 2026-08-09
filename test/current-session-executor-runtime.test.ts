@@ -42,15 +42,28 @@ function makeDs(generation = 0): DaemonSession {
   } as DaemonSession;
 }
 
+function runtimeHarness() {
+  const registry = new Map<string, DaemonSession>();
+  return {
+    registry,
+    runtime: createCurrentSessionExecutorRuntime({ activeSessions: () => registry }),
+  };
+}
+
+function registerCurrent(registry: Map<string, DaemonSession>, ds: DaemonSession): void {
+  registry.set(activeSessionKey(ds), ds);
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   updateSession.mockImplementation(() => undefined);
 });
 
 describe('CurrentSessionExecutorRuntime generation publication', () => {
-  it('never revives an old lease when response loss reveals a future winner', () => {
-    const runtime = createCurrentSessionExecutorRuntime({ activeSessions: () => undefined });
+  it('never revives an old lease when response loss reveals a future winner', async () => {
+    const { registry, runtime } = runtimeHarness();
     const ds = makeDs(1);
+    registerCurrent(registry, ds);
     const worker = {};
     ds.worker = worker as never;
     const oldLease = runtime.activate(runtime.commitGeneration(ds), worker);
@@ -63,11 +76,15 @@ describe('CurrentSessionExecutorRuntime generation publication', () => {
     expect(() => runtime.commitGeneration(ds)).toThrow('response lost');
     expect(ds.workerGeneration).toBe(4);
     expect(ds.session.workerGeneration).toBe(4);
-    expect(runtime.report(oldLease, { kind: 'inputReceived', turnId: 'turn-1' }).kind).toBe('stale');
+    expect((await runtime.report(
+      oldLease,
+      { kind: 'inputReceived', turnId: 'turn-1' },
+      decision => decision,
+    )).kind).toBe('stale');
   });
 
   it('accepts a reservation response loss only for the exact owner-bound generation', () => {
-    const runtime = createCurrentSessionExecutorRuntime({ activeSessions: () => undefined });
+    const { runtime } = runtimeHarness();
     const ds = makeDs(1);
     updateSession.mockImplementationOnce(() => { throw new Error('response lost'); });
     getSessionForOwnerStrict.mockImplementationOnce(() => structuredClone(ds.session));
@@ -76,7 +93,7 @@ describe('CurrentSessionExecutorRuntime generation publication', () => {
   });
 
   it('accepts exact response-loss readback for a deferred chat-scoped route', () => {
-    const runtime = createCurrentSessionExecutorRuntime({ activeSessions: () => undefined });
+    const { runtime } = runtimeHarness();
     const ds = makeDs(1);
     ds.scope = 'chat';
     ds.session.scope = 'chat';
@@ -93,9 +110,8 @@ describe('CurrentSessionExecutorRuntime generation publication', () => {
     expect(runtime.isQuarantined(ds)).toBe(false);
   });
 
-  it('uses the canonical VC receiver registry key for current ownership', () => {
-    const registry = new Map<string, DaemonSession>();
-    const runtime = createCurrentSessionExecutorRuntime({ activeSessions: () => registry });
+  it('uses the canonical VC receiver registry key for current ownership', async () => {
+    const { registry, runtime } = runtimeHarness();
     const ds = makeDs();
     ds.scope = 'chat';
     ds.session.scope = 'chat';
@@ -105,20 +121,24 @@ describe('CurrentSessionExecutorRuntime generation publication', () => {
       memberId: 'member-1',
       memberEpoch: 1,
     };
-    registry.set(activeSessionKey(ds), ds);
+    registerCurrent(registry, ds);
     const worker = {};
     const commit = runtime.commitGeneration(ds);
     ds.worker = worker as never;
     const lease = runtime.activate(commit, worker);
 
-    expect(runtime.report(lease, { kind: 'inputReceived', turnId: 'turn-1' })).toMatchObject({
+    expect(await runtime.report(
+      lease,
+      { kind: 'inputReceived', turnId: 'turn-1' },
+      decision => decision,
+    )).toMatchObject({
       kind: 'current',
       executorGeneration: 1,
     });
   });
 
   it('does not claim a same-generation response from a rebound route', () => {
-    const runtime = createCurrentSessionExecutorRuntime({ activeSessions: () => undefined });
+    const { runtime } = runtimeHarness();
     const ds = makeDs(1);
     updateSession.mockImplementationOnce(() => { throw new Error('response lost'); });
     const rebound = makeSession(2);
@@ -129,7 +149,7 @@ describe('CurrentSessionExecutorRuntime generation publication', () => {
   });
 
   it('quarantines a same-generation response that is not the exact intended row', () => {
-    const runtime = createCurrentSessionExecutorRuntime({ activeSessions: () => undefined });
+    const { runtime } = runtimeHarness();
     const ds = makeDs(1);
     updateSession.mockImplementationOnce(() => { throw new Error('response lost'); });
     const divergent = makeSession(2);
@@ -144,7 +164,7 @@ describe('CurrentSessionExecutorRuntime generation publication', () => {
   });
 
   it('blocks another reservation while the prior publication outcome is unreadable', () => {
-    const runtime = createCurrentSessionExecutorRuntime({ activeSessions: () => undefined });
+    const { runtime } = runtimeHarness();
     const ds = makeDs(1);
     updateSession.mockImplementationOnce(() => { throw new Error('response lost'); });
     getSessionForOwnerStrict.mockImplementationOnce(() => { throw new Error('disk unreadable'); });
@@ -156,9 +176,10 @@ describe('CurrentSessionExecutorRuntime generation publication', () => {
     expect(updateSession).toHaveBeenCalledTimes(1);
   });
 
-  it('blocks a new generation while an unknown exit fence cannot be reconciled', () => {
-    const runtime = createCurrentSessionExecutorRuntime({ activeSessions: () => undefined });
+  it('blocks a new generation while an unknown exit fence cannot be reconciled', async () => {
+    const { registry, runtime } = runtimeHarness();
     const ds = makeDs();
+    registerCurrent(registry, ds);
     const worker = {};
     const commit = runtime.commitGeneration(ds);
     ds.worker = worker as never;
@@ -166,7 +187,8 @@ describe('CurrentSessionExecutorRuntime generation publication', () => {
 
     updateSession.mockImplementationOnce(() => { throw new Error('fence response unknown'); });
     getSessionForOwnerStrict.mockImplementationOnce(() => { throw new Error('disk unreadable'); });
-    expect(runtime.report(lease, { kind: 'workerExit' })).toMatchObject({ kind: 'unreadable' });
+    expect(await runtime.report(lease, { kind: 'workerExit' }, decision => decision))
+      .toMatchObject({ kind: 'unreadable' });
     expect(ds.session.workerGeneration).toBe(2);
 
     getSessionForOwnerStrict.mockImplementationOnce(() => { throw new Error('still unreadable'); });
@@ -174,9 +196,10 @@ describe('CurrentSessionExecutorRuntime generation publication', () => {
     expect(updateSession).toHaveBeenCalledTimes(2);
   });
 
-  it('unblocks after strict readback proves the intended dead-generation fence', () => {
-    const runtime = createCurrentSessionExecutorRuntime({ activeSessions: () => undefined });
+  it('unblocks after strict readback proves the intended dead-generation fence', async () => {
+    const { registry, runtime } = runtimeHarness();
     const ds = makeDs();
+    registerCurrent(registry, ds);
     const worker = {};
     const commit = runtime.commitGeneration(ds);
     ds.worker = worker as never;
@@ -184,7 +207,8 @@ describe('CurrentSessionExecutorRuntime generation publication', () => {
 
     updateSession.mockImplementationOnce(() => { throw new Error('fence response unknown'); });
     getSessionForOwnerStrict.mockImplementationOnce(() => { throw new Error('disk unreadable'); });
-    expect(runtime.report(lease, { kind: 'workerExit' }).kind).toBe('unreadable');
+    expect((await runtime.report(lease, { kind: 'workerExit' }, decision => decision)).kind)
+      .toBe('unreadable');
 
     const fenced = makeSession(2);
     delete fenced.pid;
@@ -192,9 +216,10 @@ describe('CurrentSessionExecutorRuntime generation publication', () => {
     expect(runtime.commitGeneration(ds).generation).toBe(3);
   });
 
-  it('repairs a proven pre-publish exit fence with one higher reservation', () => {
-    const runtime = createCurrentSessionExecutorRuntime({ activeSessions: () => undefined });
+  it('repairs a proven pre-publish exit fence with one higher reservation', async () => {
+    const { registry, runtime } = runtimeHarness();
     const ds = makeDs();
+    registerCurrent(registry, ds);
     const worker = {};
     const commit = runtime.commitGeneration(ds);
     ds.worker = worker as never;
@@ -202,16 +227,18 @@ describe('CurrentSessionExecutorRuntime generation publication', () => {
 
     updateSession.mockImplementationOnce(() => { throw new Error('before publish'); });
     getSessionForOwnerStrict.mockReturnValueOnce(makeSession(1));
-    expect(runtime.report(lease, { kind: 'workerExit' }).kind).toBe('unreadable');
+    expect((await runtime.report(lease, { kind: 'workerExit' }, decision => decision)).kind)
+      .toBe('unreadable');
 
     getSessionForOwnerStrict.mockReturnValueOnce(makeSession(1));
     expect(runtime.commitGeneration(ds).generation).toBe(3);
     expect(ds.session.workerGeneration).toBe(3);
   });
 
-  it('keeps quarantine when readback reveals an unexpected future fence', () => {
-    const runtime = createCurrentSessionExecutorRuntime({ activeSessions: () => undefined });
+  it('keeps quarantine when readback reveals an unexpected future fence', async () => {
+    const { registry, runtime } = runtimeHarness();
     const ds = makeDs();
+    registerCurrent(registry, ds);
     const worker = {};
     const commit = runtime.commitGeneration(ds);
     ds.worker = worker as never;
@@ -219,7 +246,8 @@ describe('CurrentSessionExecutorRuntime generation publication', () => {
 
     updateSession.mockImplementationOnce(() => { throw new Error('fence response unknown'); });
     getSessionForOwnerStrict.mockImplementationOnce(() => { throw new Error('disk unreadable'); });
-    expect(runtime.report(lease, { kind: 'workerExit' }).kind).toBe('unreadable');
+    expect((await runtime.report(lease, { kind: 'workerExit' }, decision => decision)).kind)
+      .toBe('unreadable');
 
     getSessionForOwnerStrict.mockReturnValueOnce(makeSession(4));
     expect(() => runtime.commitGeneration(ds)).toThrow('unexpected durable generation');

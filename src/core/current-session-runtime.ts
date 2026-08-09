@@ -3,6 +3,10 @@ import * as idempotencyStore from '../services/idempotency-store.js';
 import * as sessionStore from '../services/session-store.js';
 import type { Session } from '../types.js';
 import type { DaemonSession } from './types.js';
+import {
+  currentSessionCommandLane,
+  currentSessionLaneAddress,
+} from './current-session-command-lane.js';
 import { createCurrentKeyedTriggerTurnPort } from './current-keyed-trigger-turn.js';
 import {
   createSessionRuntimeHost,
@@ -460,6 +464,12 @@ export function currentSessionRuntimeHost(options: {
       ownerLarkAppId: options.ownerLarkAppId,
       runtimeEpoch,
     }),
+    commandLane: currentSessionCommandLane,
+    sessionLaneAddress: sessionId => currentSessionLaneAddress(
+      runtimeEpoch,
+      options.ownerLarkAppId,
+      sessionId,
+    ),
   });
   if (cacheable) byOwner.set(options.ownerLarkAppId, { runtimeEpoch, host });
   return host;

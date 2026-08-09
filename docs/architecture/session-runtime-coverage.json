@@ -3,7 +3,7 @@
   "purpose": "Target-A 可执行覆盖台账：由源码和 A0 authority inventory 证明已迁移边界与 remaining bypass，不声明 Target-B durability。",
   "authorityInventory": {
     "path": "docs/architecture/session-authority-inventory.json",
-    "sha256": "777c507bbcf4c0853eea9e6afd8b8e01eeb4ed32cfd74279235081fd4c4437e9"
+    "sha256": "ecbb8a846e60111f994e4b28e27fd55b440b444f2d59f2c8f4a39b7cd7022905"
   },
   "coverage": [
     {
@@ -79,7 +79,7 @@
       "id": "ordinary-im",
       "targetMilestone": "C1",
       "disposition": "remaining",
-      "description": "ordinary new/follow-up、queued/parked、pending-repo 与 worker-replacement caller 尚未统一经 submit。",
+      "description": "ordinary new/follow-up、queued/parked、pending-repo、worker-replacement caller 与 keyed route admission/fail-close 尚未统一经 submit；A3 不将长路由失败收口伪装为已迁移。",
       "selectors": [
         {
           "sourceFile": "src/daemon.ts",
@@ -216,6 +216,7 @@
         {
           "sourceFile": "src/core/worker-pool.ts",
           "enclosingFunctions": [
+            "reduceExit",
             "retireWorkerAfterUnknownGeneration",
             "setupWorkerHandlers"
           ],
@@ -234,9 +235,9 @@
         }
       ],
       "authoritySites": {
-        "recordCount": 58,
-        "mutationCount": 58,
-        "digest": "52595f580ad9fa024d32ea8983353484a0a0fdb0df368b6580a6d9fee27f46b8"
+        "recordCount": 59,
+        "mutationCount": 59,
+        "digest": "f41b6d861205742b185097f320facb6313cad38b8303f0950aed99027c8d726b"
       },
       "productionBinding": {
         "workerSource": "src/core/worker-pool.ts",
@@ -252,6 +253,59 @@
           "turnTerminal",
           "cliExit",
           "workerExit"
+        ]
+      }
+    },
+    {
+      "id": "per-session-command-lane",
+      "targetMilestone": "A3",
+      "disposition": "migrated",
+      "description": "SessionRuntime command 与 executor report/continuation 共用 owner/epoch-bound per-Session FIFO lane；lane 内只执行同步权威 transition，长 I/O 保持在 lane 外。该项仅以结构 binding 证明排序边界，不重复认领 A1/A2 authority sites。",
+      "selectors": [],
+      "authoritySites": {
+        "recordCount": 0,
+        "mutationCount": 0,
+        "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "productionBinding": {
+        "laneSource": "src/core/session-command-lane.ts",
+        "laneFactory": "createSessionCommandLaneHost",
+        "currentLaneSource": "src/core/current-session-command-lane.ts",
+        "sharedLaneExport": "currentSessionCommandLane",
+        "sessionRuntimeSource": "src/core/session-runtime.ts",
+        "sessionRuntimeFactory": "createSessionRuntimeHost",
+        "sessionSubmitFunction": "submit",
+        "currentSessionRuntimeSource": "src/core/current-session-runtime.ts",
+        "currentSessionRuntimeFactory": "currentSessionRuntimeHost",
+        "executorRuntimeSource": "src/core/session-executor-runtime.ts",
+        "executorRuntimeFactory": "createSessionExecutorRuntime",
+        "currentExecutorAdapterSource": "src/core/current-session-executor-runtime.ts",
+        "currentExecutorAdapterFactory": "createCurrentSessionExecutorRuntime",
+        "workerSource": "src/core/worker-pool.ts",
+        "handlerFunction": "setupWorkerHandlers",
+        "reportCallCount": 7,
+        "resumeCallCount": 4,
+        "observationKinds": [
+          "inputReceived",
+          "inputRejected",
+          "inputCommitted",
+          "turnTerminal",
+          "cliExit",
+          "workerExit"
+        ],
+        "deferredPaths": [
+          {
+            "id": "keyed-route-admission-and-fail-close",
+            "targetMilestone": "C1",
+            "sourceFile": "src/core/current-keyed-trigger-turn.ts",
+            "enclosingFunction": "failClose"
+          },
+          {
+            "id": "activation-and-long-executor-lifecycle",
+            "targetMilestone": "A4",
+            "sourceFile": "src/core/worker-pool.ts",
+            "enclosingFunction": "forkWorker"
+          }
         ]
       }
     },
@@ -287,7 +341,7 @@
       "id": "activation-restore",
       "targetMilestone": "A4",
       "disposition": "remaining",
-      "description": "activation、restore、reattach、cold-resume 与 generic executor lifetime 尚未由 Runtime singleflight/lifecycle policy 收口。",
+      "description": "activation、restore、reattach、cold-resume 与 generic executor lifetime 尚未由 Runtime singleflight/lifecycle policy 收口；A3 显式保留 forkWorker 长生命周期/I/O 为 A4 remainder。",
       "selectors": [
         {
           "sourceFile": "src/core/session-manager.ts",
@@ -394,9 +448,9 @@
         }
       ],
       "authoritySites": {
-        "recordCount": 11,
-        "mutationCount": 11,
-        "digest": "c1e8cb18e954dbf86be016620939513342131a7c5a3346b16883b7fc485e638e"
+        "recordCount": 12,
+        "mutationCount": 12,
+        "digest": "898cc541394dd2f4b0d0c8ca03566913f5a735a9a28070525a3c0fa8d76fbccb"
       }
     },
     {
@@ -410,9 +464,9 @@
         }
       ],
       "authoritySites": {
-        "recordCount": 524,
-        "mutationCount": 527,
-        "digest": "90d480e1a7bef110c9d0812b0a6e178392f31e95d0746133553420cafdca1eb9"
+        "recordCount": 522,
+        "mutationCount": 525,
+        "digest": "13b73b5954619a4d2edadd74c7a421d7b24e83355adf6014c1dfb24ac3a5a995"
       },
       "rawPublisherSelectors": [
         {

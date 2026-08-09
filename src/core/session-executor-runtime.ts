@@ -8,17 +8,23 @@
  * outside this short synchronous boundary.
  */
 
+import {
+  createSessionCommandLaneHost,
+  type SessionCommandLane,
+  type SessionLaneAddress,
+} from './session-command-lane.js';
+
 declare const executorGenerationCommitBrand: unique symbol;
 declare const executorLeaseBrand: unique symbol;
 declare const executorContinuationBrand: unique symbol;
 
 export interface ExecutorGenerationAuthority {
+  /** Stable owner-scoped identity, available before any durable publication. */
+  readonly sessionKey: string;
+  readonly sessionId: string;
   /** Persist the next generation before a replacement process may be spawned. */
   commitNext(): {
     token: unknown;
-    /** Owner-scoped logical Session identity; never exposed to report callers. */
-    sessionKey: string;
-    sessionId: string;
     generation: number;
   };
   /** Exact Current binding check: owner, Session, process identity, generation. */
@@ -94,12 +100,15 @@ interface CommitSlot {
   sessionKey: string;
   sessionId: string;
   generation: number;
+  laneAddress: SessionLaneAddress;
   activated: boolean;
 }
 
 interface LeaseSlot extends CommitSlot {
   identity: object;
   ended: boolean;
+  /** Durable exit classification awaiting one successful short transition. */
+  pendingExitDecision?: ExecutorObservationDecision;
 }
 
 interface ContinuationSlot {
@@ -110,16 +119,43 @@ function opaque<T>(): T {
   return Object.freeze({}) as T;
 }
 
+function invokeSynchronousAuthority<T>(label: string, invoke: () => T): T {
+  const value = invoke();
+  if (value !== null
+    && (typeof value === 'object' || typeof value === 'function')
+    && typeof (value as { then?: unknown }).then === 'function') {
+    void Promise.resolve(value).catch(() => undefined);
+    throw new Error(`${label} must return synchronously`);
+  }
+  return value;
+}
+
 export interface SessionExecutorRuntime {
   commitGeneration(authority: ExecutorGenerationAuthority): ExecutorGenerationCommit;
   activate(commit: ExecutorGenerationCommit, identity: object): ExecutorLease;
-  report(lease: ExecutorLease, observation: ExecutorObservation): ExecutorObservationDecision;
-  resume(continuation: ExecutorContinuation): ExecutorContinuationDecision;
+  report<T>(
+    lease: ExecutorLease,
+    observation: ExecutorObservation,
+    transition: (decision: ExecutorObservationDecision) => T,
+  ): Promise<T>;
+  resume<T>(
+    continuation: ExecutorContinuation,
+    transition: (decision: ExecutorContinuationDecision) => T,
+  ): Promise<T>;
   /** Long-lived effect guard for delayed named Adapters; carries no generation bytes. */
   isCurrent(lease: ExecutorLease): boolean;
 }
 
-export function createSessionExecutorRuntime(): SessionExecutorRuntime {
+export function createSessionExecutorRuntime(options: {
+  commandLane?: SessionCommandLane;
+  laneAddressForSessionKey?: (sessionKey: string) => SessionLaneAddress;
+} = {}): SessionExecutorRuntime {
+  if (!!options.commandLane !== !!options.laneAddressForSessionKey) {
+    throw new Error('Executor Runtime requires both command lane and lane address resolver');
+  }
+  const localLaneHost = options.commandLane ? undefined : createSessionCommandLaneHost();
+  const commandLane = options.commandLane ?? localLaneHost!.lane;
+  const laneAddressForSessionKey = options.laneAddressForSessionKey ?? localLaneHost!.addressFor;
   const commits = new WeakMap<object, CommitSlot>();
   const leases = new WeakMap<object, LeaseSlot>();
   const continuations = new WeakMap<object, ContinuationSlot>();
@@ -132,21 +168,155 @@ export function createSessionExecutorRuntime(): SessionExecutorRuntime {
     executorGeneration: slot.generation,
   });
 
+  const decideReport = (
+    slot: LeaseSlot,
+    lease: ExecutorLease,
+    observation: ExecutorObservation,
+  ): ExecutorObservationDecision => {
+    if (slot.ended) {
+      if (observation.kind === 'workerExit' && slot.pendingExitDecision) {
+        const replacement = currentCommitBySessionKey.get(slot.sessionKey);
+        if (replacement && replacement !== slot
+          && (slot.pendingExitDecision.kind === 'currentExit'
+            || slot.pendingExitDecision.kind === 'unreadable')) {
+          // The durable exit/fence fact belongs to this old generation, but a
+          // newly committed generation now owns every mutable lifecycle slot.
+          // A cleanup retry may reconcile only old-generation named evidence.
+          slot.pendingExitDecision = {
+            kind: 'retiringExit',
+            sessionId: slot.sessionId,
+            executorGeneration: slot.generation,
+          };
+        }
+        return slot.pendingExitDecision;
+      }
+      return stale(slot);
+    }
+
+    if (observation.kind === 'workerExit') {
+      // Every authentic process identity gets one exit classification. A
+      // replaced generation may reconcile its own named receipts, but can
+      // never fence or publish lifecycle state for the replacement.
+      if (currentCommitBySessionKey.get(slot.sessionKey) !== slot
+        || !invokeSynchronousAuthority(
+          'ExecutorGenerationAuthority.owns',
+          () => slot.authority.owns(slot.token, slot.identity),
+        )) {
+        const decision: ExecutorObservationDecision = {
+          kind: 'retiringExit',
+          sessionId: slot.sessionId,
+          executorGeneration: slot.generation,
+        };
+        slot.ended = true;
+        slot.pendingExitDecision = decision;
+        return decision;
+      }
+      const fenced = invokeSynchronousAuthority(
+        'ExecutorGenerationAuthority.fenceExit',
+        () => slot.authority.fenceExit(slot.token, slot.identity),
+      );
+      if (fenced.kind === 'stale') {
+        if (currentCommitBySessionKey.get(slot.sessionKey) === slot) {
+          currentCommitBySessionKey.delete(slot.sessionKey);
+        }
+        const decision = stale(slot);
+        slot.ended = true;
+        slot.pendingExitDecision = decision;
+        return decision;
+      }
+      if (fenced.kind === 'unreadable') {
+        const decision: ExecutorObservationDecision = {
+          kind: 'unreadable',
+          sessionId: slot.sessionId,
+          executorGeneration: slot.generation,
+          current: true,
+          message: fenced.message,
+        };
+        slot.ended = true;
+        slot.pendingExitDecision = decision;
+        return decision;
+      }
+      const generationFloor = generationFloorBySessionKey.get(slot.sessionKey) ?? slot.generation;
+      if (!Number.isSafeInteger(fenced.generation)
+        || fenced.generation <= slot.generation
+        || fenced.generation <= generationFloor) {
+        const decision: ExecutorObservationDecision = {
+          kind: 'unreadable',
+          sessionId: slot.sessionId,
+          executorGeneration: slot.generation,
+          current: true,
+          message: 'Executor generation authority returned an invalid exit fence',
+        };
+        slot.ended = true;
+        slot.pendingExitDecision = decision;
+        return decision;
+      }
+      generationFloorBySessionKey.set(
+        slot.sessionKey,
+        Math.max(generationFloorBySessionKey.get(slot.sessionKey) ?? 0, fenced.generation),
+      );
+      if (currentCommitBySessionKey.get(slot.sessionKey) === slot) {
+        currentCommitBySessionKey.delete(slot.sessionKey);
+      }
+      const decision: ExecutorObservationDecision = {
+        kind: 'currentExit',
+        sessionId: slot.sessionId,
+        executorGeneration: slot.generation,
+        fencedGeneration: fenced.generation,
+      };
+      slot.ended = true;
+      slot.pendingExitDecision = decision;
+      return decision;
+    }
+
+    if (currentCommitBySessionKey.get(slot.sessionKey) !== slot
+      || !invokeSynchronousAuthority(
+        'ExecutorGenerationAuthority.owns',
+        () => slot.authority.owns(slot.token, slot.identity),
+      )) return stale(slot);
+
+    if (observation.kind === 'turnTerminal' || observation.kind === 'cliExit') {
+      const continuation = opaque<ExecutorContinuation>();
+      continuations.set(continuation, { lease });
+      return {
+        kind: 'current',
+        sessionId: slot.sessionId,
+        executorGeneration: slot.generation,
+        continuation,
+      };
+    }
+    return {
+      kind: 'current',
+      sessionId: slot.sessionId,
+      executorGeneration: slot.generation,
+    };
+  };
+
   return {
     commitGeneration(authority) {
-      const committed = authority.commitNext();
-      if (!committed.sessionKey
-        || !committed.sessionId
-        || !Number.isSafeInteger(committed.generation)
+      const authoritySessionKey = authority.sessionKey;
+      const authoritySessionId = authority.sessionId;
+      if (!authoritySessionKey || !authoritySessionId) {
+        throw new Error('Executor generation authority has an invalid Session identity');
+      }
+      // Resolve the infallible ordering capability before the Adapter is
+      // allowed to publish a new generation. A post-publication lookup failure
+      // would otherwise strand a durable generation without a returned lease.
+      const laneAddress = laneAddressForSessionKey(authoritySessionKey);
+      const committed = invokeSynchronousAuthority(
+        'ExecutorGenerationAuthority.commitNext',
+        () => authority.commitNext(),
+      );
+      if (!Number.isSafeInteger(committed.generation)
         || committed.generation <= 0) {
         throw new Error('Executor generation authority returned an invalid commitment');
       }
-      const generationFloor = generationFloorBySessionKey.get(committed.sessionKey) ?? 0;
+      const generationFloor = generationFloorBySessionKey.get(authoritySessionKey) ?? 0;
       if (committed.generation <= generationFloor) {
         // The Adapter has already attempted publication. Preserve safety by
         // revoking the old in-process lease instead of pretending its lower
         // generation is still current.
-        currentCommitBySessionKey.delete(committed.sessionKey);
+        currentCommitBySessionKey.delete(authoritySessionKey);
         throw new Error('Executor generation authority returned a non-monotonic commitment');
       }
       const commit = Object.freeze({
@@ -155,16 +325,17 @@ export function createSessionExecutorRuntime(): SessionExecutorRuntime {
       const slot: CommitSlot = {
         authority,
         token: committed.token,
-        sessionKey: committed.sessionKey,
-        sessionId: committed.sessionId,
+        sessionKey: authoritySessionKey,
+        sessionId: authoritySessionId,
         generation: committed.generation,
+        laneAddress,
         activated: false,
       };
       commits.set(commit, slot);
-      generationFloorBySessionKey.set(committed.sessionKey, committed.generation);
+      generationFloorBySessionKey.set(authoritySessionKey, committed.generation);
       // Publication of a newer generation is itself the revocation boundary;
       // the replacement process need not already be spawned/activated.
-      currentCommitBySessionKey.set(committed.sessionKey, slot);
+      currentCommitBySessionKey.set(authoritySessionKey, slot);
       return commit;
     },
 
@@ -183,116 +354,86 @@ export function createSessionExecutorRuntime(): SessionExecutorRuntime {
       return lease;
     },
 
-    report(lease, observation) {
+    report(lease, observation, transition) {
       const slot = leases.get(lease);
-      if (!slot) throw new Error('Executor lease belongs to another Runtime epoch');
-      if (slot.ended) return stale(slot);
-
-      if (observation.kind === 'workerExit') {
-        // Every authentic process identity gets one exit classification. A
-        // replaced generation may reconcile its own named receipts, but can
-        // never fence or publish lifecycle state for the replacement.
-        slot.ended = true;
-        if (currentCommitBySessionKey.get(slot.sessionKey) !== slot
-          || !slot.authority.owns(slot.token, slot.identity)) {
-          return {
-            kind: 'retiringExit',
-            sessionId: slot.sessionId,
-            executorGeneration: slot.generation,
-          };
-        }
-        const fenced = slot.authority.fenceExit(slot.token, slot.identity);
-        if (fenced.kind === 'stale') {
-          if (currentCommitBySessionKey.get(slot.sessionKey) === slot) {
-            currentCommitBySessionKey.delete(slot.sessionKey);
+      if (!slot) return Promise.reject(new Error('Executor lease belongs to another Runtime epoch'));
+      return commandLane.submit(
+        slot.laneAddress,
+        () => {
+          const decision = decideReport(slot, lease, observation);
+          try {
+            const result = invokeSynchronousAuthority(
+              'Executor report transition',
+              () => transition(decision),
+            );
+            if (observation.kind === 'workerExit'
+              && slot.pendingExitDecision === decision) {
+              slot.pendingExitDecision = undefined;
+            }
+            return result;
+          } catch (error) {
+            if (decision.kind === 'current' && decision.continuation) {
+              continuations.delete(decision.continuation);
+            }
+            throw error;
           }
-          return stale(slot);
-        }
-        if (fenced.kind === 'unreadable') {
-          return {
-            kind: 'unreadable',
-            sessionId: slot.sessionId,
-            executorGeneration: slot.generation,
-            current: true,
-            message: fenced.message,
-          };
-        }
-        const generationFloor = generationFloorBySessionKey.get(slot.sessionKey) ?? slot.generation;
-        if (!Number.isSafeInteger(fenced.generation)
-          || fenced.generation <= slot.generation
-          || fenced.generation <= generationFloor) {
-          return {
-            kind: 'unreadable',
-            sessionId: slot.sessionId,
-            executorGeneration: slot.generation,
-            current: true,
-            message: 'Executor generation authority returned an invalid exit fence',
-          };
-        }
-        generationFloorBySessionKey.set(
-          slot.sessionKey,
-          Math.max(generationFloorBySessionKey.get(slot.sessionKey) ?? 0, fenced.generation),
-        );
-        if (currentCommitBySessionKey.get(slot.sessionKey) === slot) {
-          currentCommitBySessionKey.delete(slot.sessionKey);
-        }
-        return {
-          kind: 'currentExit',
-          sessionId: slot.sessionId,
-          executorGeneration: slot.generation,
-          fencedGeneration: fenced.generation,
-        };
-      }
-
-      if (currentCommitBySessionKey.get(slot.sessionKey) !== slot
-        || !slot.authority.owns(slot.token, slot.identity)) return stale(slot);
-
-      if (observation.kind === 'turnTerminal' || observation.kind === 'cliExit') {
-        const continuation = opaque<ExecutorContinuation>();
-        continuations.set(continuation, { lease });
-        return {
-          kind: 'current',
-          sessionId: slot.sessionId,
-          executorGeneration: slot.generation,
-          continuation,
-        };
-      }
-      return {
-        kind: 'current',
-        sessionId: slot.sessionId,
-        executorGeneration: slot.generation,
-      };
+        },
+      );
     },
 
-    resume(continuation) {
+    resume(continuation, transition) {
       const continuationSlot = continuations.get(continuation);
-      if (!continuationSlot) throw new Error('Executor continuation belongs to another Runtime epoch');
-      // A continuation is a one-shot authority proof. Async consumers must
-      // acquire a fresh observation if they need another external effect.
-      continuations.delete(continuation);
-      const slot = leases.get(continuationSlot.lease)!;
-      if (slot.ended
-        || currentCommitBySessionKey.get(slot.sessionKey) !== slot
-        || !slot.authority.owns(slot.token, slot.identity)) {
-        return {
-          kind: 'stale',
-          sessionId: slot.sessionId,
-          executorGeneration: slot.generation,
-        };
+      if (!continuationSlot) {
+        return Promise.reject(new Error('Executor continuation belongs to another Runtime epoch'));
       }
-      return {
-        kind: 'current',
-        sessionId: slot.sessionId,
-        executorGeneration: slot.generation,
-      };
+      const slot = leases.get(continuationSlot.lease)!;
+      return commandLane.submit(slot.laneAddress, () => {
+        if (continuations.get(continuation) !== continuationSlot) {
+          throw new Error('Executor continuation was already consumed');
+        }
+        let decision: ExecutorContinuationDecision;
+        if (slot.ended
+          || currentCommitBySessionKey.get(slot.sessionKey) !== slot
+          || !invokeSynchronousAuthority(
+            'ExecutorGenerationAuthority.owns',
+            () => slot.authority.owns(slot.token, slot.identity),
+          )) {
+          decision = {
+            kind: 'stale',
+            sessionId: slot.sessionId,
+            executorGeneration: slot.generation,
+          };
+        } else {
+          decision = {
+            kind: 'current',
+            sessionId: slot.sessionId,
+            executorGeneration: slot.generation,
+          };
+        }
+        const result = invokeSynchronousAuthority(
+          'Executor continuation transition',
+          () => transition(decision),
+        );
+        // Consume only after the short transition succeeds. A reducer failure
+        // can be retried without re-running the external effect that minted it.
+        continuations.delete(continuation);
+        return result;
+      });
     },
 
     isCurrent(lease) {
       const slot = leases.get(lease);
-      return !!slot
-        && !slot.ended
-        && currentCommitBySessionKey.get(slot.sessionKey) === slot
-        && slot.authority.owns(slot.token, slot.identity);
+      if (!slot
+        || slot.ended
+        || currentCommitBySessionKey.get(slot.sessionKey) !== slot) return false;
+      try {
+        return invokeSynchronousAuthority(
+          'ExecutorGenerationAuthority.owns',
+          () => slot.authority.owns(slot.token, slot.identity),
+        );
+      } catch {
+        return false;
+      }
     },
   };
 }

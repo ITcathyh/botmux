@@ -168,4 +168,46 @@ describe('SessionRuntime coverage ledger', () => {
     expect(() => auditSessionRuntimeCoverage({ ledger }))
       .toThrow(/observationKinds.*every executor observation/i);
   });
+
+  it('binds A3 ordering structurally without stealing A1/A2 authority sites', () => {
+    const ledger = cloneLedger();
+    const lane = ledger.coverage.find((entry: any) => entry.id === 'per-session-command-lane');
+
+    expect(lane).toBeDefined();
+    expect(lane.selectors).toEqual([]);
+    expect(lane.authoritySites).toEqual({
+      recordCount: 0,
+      mutationCount: 0,
+      digest: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+    });
+    expect(() => auditSessionRuntimeCoverage({ ledger })).not.toThrow();
+  });
+
+  it('rejects deleting the shared Current lane composition seam', () => {
+    const ledger = cloneLedger();
+    const lane = ledger.coverage.find((entry: any) => entry.id === 'per-session-command-lane');
+    lane.productionBinding.currentLaneSource = 'src/core/session-command-lane.ts';
+
+    expect(() => auditSessionRuntimeCoverage({ ledger }))
+      .toThrow(/currentLaneSource.*shared Current lane/i);
+  });
+
+  it('rejects a report route that loses its synchronous lane transition', () => {
+    const ledger = cloneLedger();
+    const lane = ledger.coverage.find((entry: any) => entry.id === 'per-session-command-lane');
+    lane.productionBinding.reportCallCount -= 1;
+
+    expect(() => auditSessionRuntimeCoverage({ ledger }))
+      .toThrow(/reportCallCount.*exact report routes/i);
+  });
+
+  it('keeps keyed route fail-close and long lifecycle work as named remainders', () => {
+    const ledger = cloneLedger();
+    const lane = ledger.coverage.find((entry: any) => entry.id === 'per-session-command-lane');
+    lane.productionBinding.deferredPaths = lane.productionBinding.deferredPaths
+      .filter((path: any) => path.id !== 'keyed-route-admission-and-fail-close');
+
+    expect(() => auditSessionRuntimeCoverage({ ledger }))
+      .toThrow(/deferredPaths.*keyed-route-admission-and-fail-close/i);
+  });
 });
