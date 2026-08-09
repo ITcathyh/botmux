@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { currentSessionRuntimeHost } from '../src/core/current-session-runtime.js';
@@ -20,25 +20,20 @@ const target = (key: string) => ({
 
 function startInput(key: string): KeyedTriggerStartInput {
   return {
-    semantic: {
+    business: {
       instruction: key,
-      envelope: { format: 'text' },
+      envelope: { format: 'text', sourceName: 'test', trusted: false },
       source: { type: 'webhook' },
       presentation: null,
       options: { asyncReturnSessionId: true },
     },
-    triggerId: `trigger-${key}`,
-    title: '[External] test',
-    prompt: key,
-    codexAppText: key,
-    codexAppApplicationContext: '',
-    codexAppMessageContext: key,
     persistInputHistory: true,
   };
 }
 
 function requestHash(key: string): string {
-  return computeInputHash(startInput(key).semantic);
+  const input = startInput(key);
+  return computeInputHash({ business: input.business, persistInputHistory: true });
 }
 
 function startCommand(key: string) {
@@ -48,13 +43,13 @@ function startCommand(key: string) {
 class TestTurns implements KeyedTriggerTurnPort {
   accepts = vi.fn();
   prepare(input: KeyedTriggerStartInput) {
-    const key = input.triggerId.replace(/^trigger-/, '');
+    const key = input.business.instruction ?? 'unknown';
     return {
       kind: 'prepared' as const,
       turn: {
         token: Object.freeze({ key }),
         sessionId: `candidate-${key}`,
-        triggerId: input.triggerId,
+        triggerId: `trigger-${key}`,
         chatId: `http_async_${key}`,
       },
     };
@@ -165,6 +160,45 @@ describe('Current SessionRuntime projection adapter', () => {
     })).resolves.toMatchObject({ kind: 'notReady' });
   });
 
+  it('rejects a base-valid row whose normalized owner projection fields are malformed', async () => {
+    const session = sessionStore.createSession('oc_chat', 'om_shape', 'valid first', 'group');
+    session.larkAppId = APP;
+    sessionStore.updateSession(session);
+    const file = join(dataDir, `sessions-${APP}.json`);
+    const rows = JSON.parse(readFileSync(file, 'utf8')) as Record<string, Record<string, unknown>>;
+    rows[session.sessionId]!.scope = 'bogus';
+    rows[session.sessionId]!.title = 42;
+    writeFileSync(file, JSON.stringify(rows, null, 2), 'utf8');
+    const host = currentSessionRuntimeHost({
+      ownerLarkAppId: APP,
+      activeSessions: new Map(),
+      ownerBootId: 'boot-malformed-normalized',
+      keyedTriggerAdmissionBlocked: () => false,
+    });
+
+    await expect(host.projection.read({
+      kind: 'byExternalSession',
+      sessionId: session.sessionId,
+    })).resolves.toMatchObject({ kind: 'notReady' });
+  });
+
+  it('never projects an ownerless row from another owner file through the bound Host', async () => {
+    sessionStore.init('cli_OTHER_OWNER');
+    const foreign = sessionStore.createSession('oc_foreign', 'om_foreign', 'foreign', 'group');
+    sessionStore.updateSession(foreign);
+    const host = currentSessionRuntimeHost({
+      ownerLarkAppId: APP,
+      activeSessions: new Map(),
+      ownerBootId: 'boot-owner-bound',
+      keyedTriggerAdmissionBlocked: () => false,
+    });
+
+    await expect(host.projection.read({
+      kind: 'byExternalSession',
+      sessionId: foreign.sessionId,
+    })).resolves.toEqual({ kind: 'notFound' });
+  });
+
   it('resolves a stable route to its unique active binding even when closed history shares it', async () => {
     const closedOne = sessionStore.createSession('oc_reopen', 'om_reopen', 'closed one', 'group');
     closedOne.larkAppId = APP;
@@ -253,6 +287,25 @@ describe('Current SessionRuntime projection adapter', () => {
       command,
     })).resolves.toEqual({ kind: 'staleAddress' });
     expect(idempotencyStore.lookup(APP, 'stale-epoch')).toBeUndefined();
+
+    const rebound = await second.projection.read({
+      kind: 'byExternalSession',
+      sessionId: session.sessionId,
+    });
+    if (rebound.kind !== 'one') throw new Error('expected rebound session');
+    await expect(second.runtime.submit({
+      target: { kind: 'session', address: rebound.session.address },
+      idempotencyKey: 'rename-after-rebind',
+      command: {
+        kind: 'control.rename',
+        input: {
+          title: 'Rebound title',
+          updatedAt: '2026-08-10T00:00:00.000Z',
+          source: 'dashboard',
+        },
+      },
+    })).resolves.toMatchObject({ kind: 'applied', action: 'control.renamed' });
+    expect(sessionStore.getOwnedSession(session.sessionId)?.title).toBe('Rebound title');
   });
 
   it('does not borrow liveness or chat identity from a foreign owner with the same sessionId', async () => {
@@ -300,6 +353,53 @@ describe('Current SessionRuntime projection adapter', () => {
     expect(result).toMatchObject({ kind: 'ambiguous', sessionId: sharedSessionId });
     if (result.kind !== 'ambiguous') throw new Error('expected ambiguous');
     expect(result.chatId).not.toBe('foreign-chat');
+    expect(turns.accepts).not.toHaveBeenCalled();
+  });
+
+  it('does not borrow chat identity from an ownerless row in another owner file', async () => {
+    const sharedSessionId = 'shared-persisted-session-id';
+    sessionStore.init('cli_OTHER_OWNER');
+    sessionStore.createSessionExact({
+      sessionId: sharedSessionId,
+      createdAt: '2026-08-10T00:00:00.000Z',
+      chatId: 'foreign-persisted-chat',
+      rootMessageId: 'foreign-persisted-root',
+      title: 'foreign ownerless row',
+      chatType: 'group',
+      scope: 'thread',
+    });
+    const claim = idempotencyStore.claim({
+      ownerLarkAppId: APP,
+      key: 'foreign-persisted-collision',
+      sessionId: sharedSessionId,
+      triggerId: 'old-trigger',
+      requestHash: requestHash('foreign-persisted-collision'),
+      ownerBootId: 'boot-old',
+      now: 1,
+    });
+    if (claim.kind !== 'won') throw new Error('expected claim');
+    idempotencyStore.transition(APP, 'foreign-persisted-collision', claim.record, {
+      state: 'attempting',
+      now: 2,
+    });
+    const turns = new TestTurns();
+    const host = currentSessionRuntimeHost({
+      ownerLarkAppId: APP,
+      activeSessions: new Map(),
+      ownerBootId: 'boot-current',
+      keyedTriggerAdmissionBlocked: () => false,
+      keyedTriggerTurns: turns,
+    });
+
+    const result = await host.runtime.submit({
+      target: target('foreign-persisted-collision'),
+      idempotencyKey: 'foreign-persisted-collision',
+      command: startCommand('foreign-persisted-collision'),
+    });
+
+    expect(result).toMatchObject({ kind: 'ambiguous', sessionId: sharedSessionId });
+    if (result.kind !== 'ambiguous') throw new Error('expected ambiguous');
+    expect(result.chatId).not.toBe('foreign-persisted-chat');
     expect(turns.accepts).not.toHaveBeenCalled();
   });
 

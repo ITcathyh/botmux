@@ -34,8 +34,9 @@ import { withBotTurnAdmission } from './bot-turn-mutation-gate.js';
 import { stagePendingRepoSetup } from './pending-repo-journal.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { currentSessionRuntimeHost } from './current-session-runtime.js';
+import { externalTriggerBusinessInput } from './external-trigger-envelope.js';
 import type {
-  CommandOutcome,
+  KeyedTriggerCommandOutcome,
   SessionRuntime,
 } from './session-runtime.js';
 
@@ -663,7 +664,7 @@ function buildAsyncQueuedResponse(
 }
 
 function keyedTriggerOutcomeResponse(
-  outcome: CommandOutcome,
+  outcome: KeyedTriggerCommandOutcome,
   idempotencyKey: string,
 ): TriggerResponse | undefined {
   if (outcome.kind === 'applied') return undefined;
@@ -902,16 +903,6 @@ async function triggerSessionTurnAdmitted(
   // "session exists → reuse" map: a turn that crashed before/mid dispatch must
   // resolve to a terminal state, never silently re-run or hang `running`.
   const idempotencyKey = req.options?.idempotencyKey?.trim();
-  // SessionRuntime binds the key to its full business payload — a same-key retry
-  // with a DIFFERENT payload is a caller bug (409), not a silent join. It must
-  // cover everything that renders into the prompt / drives execution:
-  // instruction, envelope, source, presentation, and the WHOLE options object
-  // EXCEPT the idempotencyKey itself (that's the lookup key, not payload). Hashing
-  // only a hand-picked subset (model/effort/suppress) silently reused a turn when
-  // e.g. options.status firing→resolved changed the prompt but not the hash
-  // (codex #776 round-4). No daemon-generated ids (session/chat/triggerId) are in
-  // these inputs, so the hash is stable across retries.
-  const { idempotencyKey: _omitKey, ...optionsForHash } = (req.options ?? {}) as Record<string, unknown>;
   if (idempotencyKey) {
     if (!req.options?.asyncReturnSessionId
       || req.options.waitForFinalOutput
@@ -947,21 +938,10 @@ async function triggerSessionTurnAdmitted(
       command: {
         kind: 'keyedTrigger.start',
         input: {
-          semantic: {
-            instruction: req.instruction ?? null,
-            envelope: req.envelope,
-            source: req.source,
-            presentation: req.presentation ?? null,
-            options: optionsForHash,
-          },
-          triggerId,
-          title: triggerTitle(req),
-          prompt,
-          codexAppText,
-          codexAppApplicationContext,
-          codexAppMessageContext,
-          ...(typeof req.options.model === 'string' ? { model: req.options.model } : {}),
-          ...(req.options.reasoningEffort ? { reasoningEffort: req.options.reasoningEffort } : {}),
+          // Hashing and rendering consume this exact normalized object inside
+          // SessionRuntime/Current Adapter; the ingress cannot supply divergent
+          // rendered bytes for an otherwise identical idempotency key.
+          business: externalTriggerBusinessInput(req),
           persistInputHistory: internal?.persistInputHistory !== false,
         },
       },

@@ -41,6 +41,7 @@ class TestKeyedTriggerAuthority implements KeyedTriggerAuthority {
   blocked = false;
   unreadable = false;
   blockAfterReserve = false;
+  settlement: 'failed' | 'completed' = 'failed';
   observations = new Map<string, KeyedTriggerObservation>();
   inspections = 0;
   reserves = 0;
@@ -97,7 +98,9 @@ class TestKeyedTriggerAuthority implements KeyedTriggerAuthority {
 
   settleDispatchUnknown(token: unknown) {
     this.failures.push(token as AuthorityToken);
-    return { kind: 'recorded' as const };
+    return this.settlement === 'completed'
+      ? { kind: 'completed' as const }
+      : { kind: 'failed' as const };
   }
 }
 
@@ -118,7 +121,7 @@ class TestKeyedTriggerTurns implements KeyedTriggerTurnPort {
       turn: {
         token,
         sessionId: 'session-new',
-        triggerId: input.triggerId,
+        triggerId: 'trigger-new',
         chatId: 'http_async_new',
       },
     };
@@ -170,19 +173,13 @@ const target = (key: string) => ({
 
 function input(overrides: Partial<KeyedTriggerStartInput> = {}): KeyedTriggerStartInput {
   return {
-    semantic: {
+    business: {
       instruction: 'do the thing',
-      envelope: { format: 'text' },
+      envelope: { format: 'text', sourceName: 'test', trusted: false },
       source: { type: 'webhook' },
       presentation: null,
       options: { asyncReturnSessionId: true },
     },
-    triggerId: 'trigger-new',
-    title: '[External] test',
-    prompt: 'prompt',
-    codexAppText: 'visible',
-    codexAppApplicationContext: '',
-    codexAppMessageContext: 'message context',
     persistInputHistory: true,
     ...overrides,
   };
@@ -193,7 +190,11 @@ function startCommand(overrides: Partial<KeyedTriggerStartInput> = {}) {
 }
 
 function hash(overrides: Partial<KeyedTriggerStartInput> = {}): string {
-  return computeInputHash(input(overrides).semantic);
+  const value = input(overrides);
+  return computeInputHash({
+    business: value.business,
+    persistInputHistory: value.persistInputHistory,
+  });
 }
 
 describe('SessionRuntime address and projection boundary', () => {
@@ -313,6 +314,31 @@ describe('SessionRuntime keyed-trigger policy', () => {
     expect(current.authority.reserves).toBe(0);
   });
 
+  it('returns the stronger completed result when completion wins the interrupted-attempt settlement race', async () => {
+    const current = host();
+    current.authority.settlement = 'completed';
+    current.authority.observations.set('completed-race', {
+      kind: 'present', token: { key: 'completed-race', revision: 2 }, requestHash: hash(),
+      sessionId: 'completed-session', triggerId: 'completed-trigger', chatId: 'http_async_completed',
+      leaseState: 'attempting', ownerBoot: 'other', terminal: 'pending', executorLive: false,
+    });
+
+    const result = await current.runtime.submit({
+      target: target('completed-race'),
+      idempotencyKey: 'completed-race',
+      command: startCommand(),
+    });
+
+    expect(result).toMatchObject({
+      kind: 'duplicate',
+      state: 'completed',
+      sessionId: 'completed-session',
+    });
+    expect(current.authority.failures).toHaveLength(1);
+    expect(current.turns.prepares).toBe(0);
+    expect(current.turns.closes).toBe(0);
+  });
+
   it('takes over an older reserved lease without exposing the execution port', async () => {
     const current = host();
     current.authority.observations.set('takeover', {
@@ -346,6 +372,22 @@ describe('SessionRuntime keyed-trigger policy', () => {
     expect('receipt' in failed).toBe(false);
   });
 
+  it('does not fail-close a candidate when completion wins dispatch-failure settlement', async () => {
+    const current = host();
+    current.turns.refuse = true;
+    current.authority.settlement = 'completed';
+
+    const result = await current.runtime.submit({
+      target: target('key-completed'),
+      idempotencyKey: 'key-completed',
+      command: startCommand(),
+    });
+
+    expect(result).toMatchObject({ kind: 'duplicate', state: 'completed', sessionId: 'session-new' });
+    expect(current.authority.failures).toHaveLength(1);
+    expect(current.turns.closes).toBe(0);
+  });
+
   it('quarantines a candidate when fail-close cannot converge', async () => {
     const current = host();
     current.turns.refuse = true;
@@ -370,6 +412,20 @@ describe('SessionRuntime keyed-trigger policy', () => {
     expect(current.turns.prepares).toBe(0);
   });
 
+  it('rejects a blank idempotency key before any authority or turn side effect', async () => {
+    const current = host();
+    const result = await current.runtime.submit({
+      target: target('blank-key'),
+      idempotencyKey: '   ',
+      command: startCommand(),
+    });
+
+    expect(result).toMatchObject({ kind: 'rejected', reason: 'invalidCommand' });
+    expect(current.authority.inspections).toBe(0);
+    expect(current.authority.reserves).toBe(0);
+    expect(current.turns.prepares).toBe(0);
+  });
+
   it('rejects a non-canonicalizable semantic input before touching authority', async () => {
     const current = host();
     const cyclic: Record<string, unknown> = {};
@@ -379,8 +435,8 @@ describe('SessionRuntime keyed-trigger policy', () => {
       target: target('cyclic'),
       idempotencyKey: 'cyclic',
       command: startCommand({
-        semantic: {
-          ...input().semantic,
+        business: {
+          ...input().business,
           source: cyclic,
         },
       }),

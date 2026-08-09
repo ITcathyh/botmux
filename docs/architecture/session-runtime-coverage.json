@@ -1,0 +1,379 @@
+{
+  "schemaVersion": 1,
+  "purpose": "A1 可执行覆盖台账：由源码和 A0 authority inventory 证明已迁移命令与 remaining bypass，不声明 Target-B durability。",
+  "authorityInventory": {
+    "path": "docs/architecture/session-authority-inventory.json",
+    "sha256": "ce540b557d1046bcb575be6a32f07694d0d030c65ee8a79ae51d754552db25dd"
+  },
+  "coverage": [
+    {
+      "id": "keyed-trigger-start",
+      "targetMilestone": "A1",
+      "disposition": "migrated",
+      "description": "keyedTrigger.start 已由 production trigger caller 提交给 SessionRuntime；Current JSON/worker 细节仅留在 runtime Adapter 后。",
+      "selectors": [
+        {
+          "sourceFile": "src/core/current-keyed-trigger-turn.ts"
+        }
+      ],
+      "authoritySites": {
+        "recordCount": 20,
+        "mutationCount": 20,
+        "digest": "d22d09b3c0a1389d80844f94982b1421ae67f1f1c8dfab12184acb53cc6aae2e"
+      },
+      "productionBinding": {
+        "sourceFile": "src/core/trigger-session.ts",
+        "enclosingFunction": "triggerSessionTurnAdmitted",
+        "runtimeMethod": "submit",
+        "commandKind": "keyedTrigger.start",
+        "scope": "nearestIf",
+        "forbiddenCalls": [
+          "sessionStore.createSession",
+          "sessionStore.createSessionExact",
+          "sessionStore.updateSession",
+          "sessionStore.closeSession",
+          "activeSessions.set",
+          "activeSessions.delete",
+          "forkWorker",
+          "forkSession",
+          "closeSession"
+        ],
+        "pureRuntimeSources": [
+          "src/core/session-runtime.ts"
+        ],
+        "forbiddenImports": [
+          "../services/session-store.js",
+          "./worker-pool.js"
+        ]
+      }
+    },
+    {
+      "id": "current-session-store-adapter",
+      "targetMilestone": "A1",
+      "disposition": "migrated",
+      "description": "CurrentSessionStore load/apply Adapter 已位于 Runtime seam 后；A1 binding 由 apply raw publisher 证明，legacy cache bridge 不冒充独立 semantic authority site。",
+      "selectors": [],
+      "authoritySites": {
+        "recordCount": 0,
+        "mutationCount": 0,
+        "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "rawPublisherSelectors": [
+        {
+          "sourceFile": "src/services/session-store.ts",
+          "enclosingFunctions": [
+            "apply"
+          ],
+          "authorityIds": [
+            "current-session-row"
+          ]
+        }
+      ],
+      "authorityRawPublishers": {
+        "recordCount": 1,
+        "publishSiteCount": 2,
+        "digest": "9bf07240bcb367d12910145054fe1b5753af50b57172378ec3fd3449c409b3d0"
+      }
+    },
+    {
+      "id": "ordinary-im",
+      "targetMilestone": "C1",
+      "disposition": "remaining",
+      "description": "ordinary new/follow-up、queued/parked、pending-repo 与 worker-replacement caller 尚未统一经 submit。",
+      "selectors": [
+        {
+          "sourceFile": "src/daemon.ts",
+          "enclosingFunctions": [
+            "armSharedReplyTarget",
+            "beginNewTurn",
+            "claimNewDaemonSession",
+            "cleanupFailedDelivery",
+            "clearInitialStartBuffers",
+            "clearInitialStartClaim",
+            "deliverPassthroughToExistingSession",
+            "dispatchTurn",
+            "forkReservedInitialRawSession",
+            "forkReservedInitialSession",
+            "handleNewTopicAdmitted",
+            "handleThreadReplyAdmitted",
+            "noteTurnReceived",
+            "reconcileDeferredTopicBinding",
+            "releaseQueuedActivationReservation",
+            "replyInvalidWorkingDirs",
+            "reserveAsyncQueuedActivationTailAdmission",
+            "rollbackRegisteredJoinSession",
+            "scheduleQueuedActivationTailReleaseRetry",
+            "setDirectChatDisplayNameFromSender",
+            "settleAsyncQueuedActivationTailAdmission",
+            "stageClaimedPendingRepoSetup",
+            "stageCurrentBehindQueuedActivation",
+            "startInitialPassthroughSession",
+            "tryAcquireInitialStartClaim"
+          ]
+        },
+        {
+          "sourceFile": "src/core/initial-user-turn.ts"
+        },
+        {
+          "sourceFile": "src/core/reply-target.ts"
+        },
+        {
+          "sourceFile": "src/core/pending-repo-journal.ts"
+        },
+        {
+          "sourceFile": "src/core/command-handler.ts",
+          "enclosingFunctions": [
+            "commitRepoSelection",
+            "forkPendingCli"
+          ]
+        },
+        {
+          "sourceFile": "src/im/lark/card-handler.ts",
+          "enclosingFunctions": [
+            "commitRepoSelection",
+            "runAutoWorktreeCommit"
+          ]
+        }
+      ],
+      "authoritySites": {
+        "recordCount": 337,
+        "mutationCount": 337,
+        "digest": "0c8d82b67cab1098fa8b021edd1a50ed7b040ab063992626f57f6e3ff6dc4525"
+      }
+    },
+    {
+      "id": "control",
+      "targetMilestone": "C2",
+      "disposition": "remaining",
+      "description": "Dashboard/card/command close、cancel、activate、rename 仍直接使用 Current mutation surface。",
+      "selectors": [
+        {
+          "sourceFile": "src/core/dashboard-ipc-server.ts"
+        },
+        {
+          "sourceFile": "src/core/command-handler.ts",
+          "enclosingFunctions": [
+            "handleCardCommand",
+            "handleCommand"
+          ]
+        },
+        {
+          "sourceFile": "src/im/lark/card-handler.ts",
+          "enclosingFunctions": [
+            "handleCardAction"
+          ]
+        },
+        {
+          "sourceFile": "src/core/session-cwd.ts"
+        },
+        {
+          "sourceFile": "src/core/session-title.ts"
+        }
+      ],
+      "authoritySites": {
+        "recordCount": 66,
+        "mutationCount": 67,
+        "digest": "4c0cee46447b7e3880b58585eed0955a48ca7909df339de664f15f14a34a755d"
+      }
+    },
+    {
+      "id": "executor-generation",
+      "targetMilestone": "A2",
+      "disposition": "remaining",
+      "description": "executor received/committed/terminal/exit 与 generation fence 尚未收进 SessionRuntime internal Module。",
+      "selectors": [
+        {
+          "sourceFile": "src/core/dispatch.ts"
+        },
+        {
+          "sourceFile": "src/core/worker-pool.ts",
+          "enclosingFunctions": [
+            "setupWorkerHandlers"
+          ]
+        },
+        {
+          "sourceFile": "src/core/trigger-session.ts",
+          "enclosingFunctions": [
+            "convergeIdempotentAsyncTurnOnWorkerExit"
+          ]
+        }
+      ],
+      "authoritySites": {
+        "recordCount": 128,
+        "mutationCount": 130,
+        "digest": "4b5f0c1df5ef8556cb922de92e0acee95944bf20048ccdc15f2731fe1211d8bc"
+      }
+    },
+    {
+      "id": "scheduler",
+      "targetMilestone": "C4",
+      "disposition": "remaining",
+      "description": "scheduler producer 与 scheduled Session creation 尚未只提交 stable logical run ID。",
+      "selectors": [
+        {
+          "sourceFile": "src/core/scheduler.ts"
+        },
+        {
+          "sourceFile": "src/services/schedule-store.ts"
+        },
+        {
+          "sourceFile": "src/core/silent-schedule-turns.ts"
+        },
+        {
+          "sourceFile": "src/core/session-manager.ts",
+          "enclosingFunctions": [
+            "executeScheduledTask"
+          ]
+        }
+      ],
+      "authoritySites": {
+        "recordCount": 33,
+        "mutationCount": 33,
+        "digest": "e033a6d1e0a2412f55338653706fabd3ef134f8308fffd9268122a977fdd4a86"
+      }
+    },
+    {
+      "id": "activation-restore",
+      "targetMilestone": "A4",
+      "disposition": "remaining",
+      "description": "activation、restore、reattach、cold-resume 与 generic executor lifetime 尚未由 Runtime singleflight/lifecycle policy 收口。",
+      "selectors": [
+        {
+          "sourceFile": "src/core/session-manager.ts",
+          "enclosingFunctions": [
+            "activate",
+            "activateQueuedSession",
+            "quarantineUnregisteredRestoreSession",
+            "restoreActiveSessions",
+            "resumeRestoredPendingRepoSetup",
+            "resumeSession"
+          ]
+        },
+        {
+          "sourceFile": "src/core/worker-pool.ts",
+          "enclosingFunctions": [
+            "admitQueuedActivationTail",
+            "clearQueuedActivationJournal",
+            "closeSession",
+            "closeUnregisteredCollisionLoser",
+            "forkAdoptWorker",
+            "forkSession",
+            "forkWorker",
+            "killWorker",
+            "persistActivationAck",
+            "promoteQueuedActivationTail",
+            "reparkQueuedActivationFollowUpTail",
+            "reparkUnsubmittedQueuedActivation",
+            "releaseReservation",
+            "removeInactiveRegistration",
+            "requestSessionRestart",
+            "reserveQueuedActivationTailAdmission",
+            "reserveWorkerGeneration",
+            "resolveQuarantinedForkPlan",
+            "restoreQueuedActivationJournal",
+            "rollbackWorkerForkPreInit",
+            "setActiveSessionIfActive",
+            "setActiveSessionSafe",
+            "suspendWorker",
+            "transferSession"
+          ]
+        },
+        {
+          "sourceFile": "src/core/command-handler.ts",
+          "enclosingFunctions": [
+            "startAdoptSession",
+            "startCodexAppThreadSession",
+            "startForkSubtopicSession",
+            "startResumeImportSession"
+          ]
+        }
+      ],
+      "authoritySites": {
+        "recordCount": 344,
+        "mutationCount": 345,
+        "digest": "c04edcf2df31e4261fb2a489faa0bc29480c7da10671903a479975787a9b11b3"
+      }
+    },
+    {
+      "id": "path-specific-retained",
+      "targetMilestone": "Target-A",
+      "disposition": "retained",
+      "description": "仅保留 A0 已命名的 path-specific authority Adapter 内部协议；direct caller 与 legacy SessionStore API 即使触碰同一字段也仍是 bypass。",
+      "selectors": [
+        {
+          "inventoryRemainder": true,
+          "classifications": [
+            "path_specific_authority"
+          ],
+          "excludedAccessLanes": [
+            "direct-caller-mutation",
+            "session-store-api"
+          ]
+        }
+      ],
+      "authoritySites": {
+        "recordCount": 24,
+        "mutationCount": 24,
+        "digest": "ea2a396d75d9992121a034e380849093ee10d42aff0887d82abf418a004cd0da"
+      },
+      "rawPublisherSelectors": [
+        {
+          "inventoryRemainder": true,
+          "authorityClassifications": [
+            "path_specific_authority"
+          ]
+        }
+      ],
+      "authorityRawPublishers": {
+        "recordCount": 2,
+        "publishSiteCount": 4,
+        "digest": "086308ca4cbce97fb98f6a0b48ffa9d3a503b6bb147a2c783c2725dba03911c8"
+      }
+    },
+    {
+      "id": "projection",
+      "targetMilestone": "C3",
+      "disposition": "remaining",
+      "description": "尚未被具体 caller milestone 覆盖的 Dashboard event projection 写点独立列入 C3；它们不是 Session authority。",
+      "selectors": [
+        {
+          "inventoryRemainder": true,
+          "classifications": [
+            "projection"
+          ]
+        }
+      ],
+      "authoritySites": {
+        "recordCount": 8,
+        "mutationCount": 8,
+        "digest": "7f7dc70142516e071a52c6cee7ce652c98bc8423de7b9d1603c4a2bd1b36af9a"
+      }
+    },
+    {
+      "id": "remaining-bypass",
+      "targetMilestone": "Target-A",
+      "disposition": "remaining",
+      "description": "未被具体 milestone 覆盖的 Session-owned、Actor Host 与 direct legacy writer 仍是 Target-A roll-up bypass；不得以 retained 名义隐藏。",
+      "selectors": [
+        {
+          "inventoryRemainder": true
+        }
+      ],
+      "authoritySites": {
+        "recordCount": 426,
+        "mutationCount": 427,
+        "digest": "ad1aff9d0788d43495675735abd22d5d30226979377124176da212425ec43534"
+      },
+      "rawPublisherSelectors": [
+        {
+          "inventoryRemainder": true
+        }
+      ],
+      "authorityRawPublishers": {
+        "recordCount": 5,
+        "publishSiteCount": 13,
+        "digest": "f25842a671a2370ddfd6b2fb8cb62504fe97841a281111daebc8588e136641d4"
+      }
+    }
+  ]
+}

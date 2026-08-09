@@ -184,7 +184,8 @@ describe('robustness', () => {
 
 describe('recordFailedStrict (authoritative dispatch_unknown terminal)', () => {
   it('writes a durable failed(dispatch_unknown) that lookup surfaces', () => {
-    recordFailedStrict('sessF', 'trg_f', 7000, 'cli_test', 'dispatch_unknown');
+    expect(recordFailedStrict('sessF', 'trg_f', 7000, 'cli_test', 'dispatch_unknown'))
+      .toBe('failed');
     const r = lookup('sessF', 'trg_f')?.result;
     expect(r?.status).toBe('failed');
     expect(r?.errorCode).toBe('no_output');
@@ -193,7 +194,7 @@ describe('recordFailedStrict (authoritative dispatch_unknown terminal)', () => {
 
   it('COMPLETED WINS: does not overwrite an existing completed result', () => {
     recordCompleted('sessC', 'trg_c', 'the answer', 5000, 'cli_test');
-    recordFailedStrict('sessC', 'trg_c', 6000, 'cli_test'); // must be a no-op
+    expect(recordFailedStrict('sessC', 'trg_c', 6000, 'cli_test')).toBe('completed');
     expect(lookup('sessC', 'trg_c')?.result.status).toBe('completed');
     expect(lookup('sessC', 'trg_c')?.result.content).toBe('the answer');
   });

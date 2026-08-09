@@ -6,6 +6,10 @@ import * as oncallStore from '../services/oncall-store.js';
 import * as sessionStore from '../services/session-store.js';
 import type { CliTurnPayload } from '../types.js';
 import {
+  compileExternalTrigger,
+  type CompiledExternalTrigger,
+} from './external-trigger-envelope.js';
+import {
   ensureSessionWhiteboard,
   buildNewTopicCliInput,
   rememberLastCliInput,
@@ -30,6 +34,7 @@ type PreparedPhase = 'prepared' | 'materializing' | 'accepted' | 'failed' | 'clo
 
 interface CurrentPreparedKeyedTriggerTurn {
   input: KeyedTriggerStartInput;
+  compiled: CompiledExternalTrigger;
   sessionId: string;
   triggerId: string;
   chatId: string;
@@ -65,11 +70,13 @@ export function createCurrentKeyedTriggerTurnPort(options: {
     const validated = validateWorkingDir(candidate, localeForBot(options.ownerLarkAppId));
     if (!validated.ok) return { kind: 'retryable', message: validated.error };
 
+    const triggerId = `trg_${randomUUID()}`;
     const preparedToken = token();
     const prepared: CurrentPreparedKeyedTriggerTurn = {
       input,
+      compiled: compileExternalTrigger(input.business, triggerId, options.ownerLarkAppId),
       sessionId: randomUUID(),
-      triggerId: input.triggerId,
+      triggerId,
       chatId,
       createdAt: new Date().toISOString(),
       workingDir: validated.resolvedPath,
@@ -112,7 +119,7 @@ export function createCurrentKeyedTriggerTurnPort(options: {
         createdAt: prepared.createdAt,
         chatId: prepared.chatId,
         rootMessageId: prepared.chatId,
-        title: prepared.input.title,
+        title: prepared.compiled.title,
         chatType: 'group',
         scope: 'chat',
       });
@@ -123,8 +130,15 @@ export function createCurrentKeyedTriggerTurnPort(options: {
       session.cliId = bot.config.cliId;
       const isCodexFamily = bot.config.cliId === 'codex' || bot.config.cliId === 'codex-app';
       if (isCodexFamily) {
-        if (prepared.input.model?.trim()) session.model = prepared.input.model.trim();
-        if (prepared.input.reasoningEffort) session.reasoningEffort = prepared.input.reasoningEffort;
+        const model = prepared.input.business.options.model;
+        if (typeof model === 'string' && model.trim()) session.model = model.trim();
+        const reasoningEffort = prepared.input.business.options.reasoningEffort;
+        if (reasoningEffort === 'low'
+            || reasoningEffort === 'medium'
+            || reasoningEffort === 'high'
+            || reasoningEffort === 'xhigh') {
+          session.reasoningEffort = reasoningEffort;
+        }
       }
       sessionStore.updateSession(session);
       messageQueue.ensureQueue(prepared.chatId);
@@ -144,18 +158,18 @@ export function createCurrentKeyedTriggerTurnPort(options: {
         hasHistory: false,
         workingDir: prepared.workingDir,
         initialStartPending: true,
-        pendingPrompt: prepared.input.prompt,
-        pendingCodexAppText: prepared.input.codexAppText,
+        pendingPrompt: prepared.compiled.prompt,
+        pendingCodexAppText: prepared.compiled.visibleText,
         pendingCodexAppApplicationContext:
-          prepared.input.codexAppApplicationContext || undefined,
-        pendingCodexAppMessageContext: prepared.input.codexAppMessageContext,
+          prepared.compiled.applicationContext || undefined,
+        pendingCodexAppMessageContext: prepared.compiled.messageContext,
       };
       prepared.ds = ds;
       options.activeSessions.set(key, ds);
       ensureSessionWhiteboard(ds);
 
       const promptInput = buildNewTopicCliInput(
-        prepared.input.prompt,
+        prepared.compiled.prompt,
         session.sessionId,
         bot.config.cliId,
         bot.config.cliPathOverride,
@@ -170,14 +184,14 @@ export function createCurrentKeyedTriggerTurnPort(options: {
           larkAppId: options.ownerLarkAppId,
           chatId: prepared.chatId,
           whiteboardId: session.whiteboardId,
-          codexAppText: prepared.input.codexAppText,
-          codexAppApplicationContext: prepared.input.codexAppApplicationContext,
-          codexAppMessageContext: prepared.input.codexAppMessageContext,
+          codexAppText: prepared.compiled.visibleText,
+          codexAppApplicationContext: prepared.compiled.applicationContext,
+          codexAppMessageContext: prepared.compiled.messageContext,
         },
       );
       prepared.promptInput = promptInput;
       if (prepared.input.persistInputHistory) {
-        rememberLastCliInput(ds, prepared.input.prompt, promptInput);
+        rememberLastCliInput(ds, prepared.compiled.prompt, promptInput);
       }
 
       ds.asyncTriggerResults ??= new Map();

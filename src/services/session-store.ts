@@ -1,16 +1,283 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 import { cleanupMaterializedDashboardImages } from '../core/dashboard-images.js';
+import { normalizeSessionTitle } from '../core/session-board.js';
 import { deleteFrozenCards } from './frozen-card-store.js';
 import type { Session } from '../types.js';
+import type {
+  SessionStore,
+  SessionStoreVersion,
+  StoredSessionState,
+} from '../core/session-store.js';
 
 let sessions: Map<string, Session> = new Map();
 let loaded = false;
 let currentAppId: string | undefined;
+
+class FutureCurrentSessionSourceError extends Error {
+  override readonly name = 'FutureCurrentSessionSourceError';
+}
+
+class CorruptCurrentSessionSourceError extends Error {
+  override readonly name = 'CorruptCurrentSessionSourceError';
+}
+
+/** Injectable fault points for the Adapter contract suite. Production omits it. */
+export interface CurrentSessionStoreFaults {
+  beforeLoad?(): void;
+  beforePublish?(): void;
+  afterPublishBeforeReturn?(): void;
+  beforeRecoveryRead?(): void;
+}
+
+/**
+ * Owner-bound Target-A Adapter. The complete transition/readback contract is
+ * implemented below; this factory never consults the mutable global init()
+ * owner when resolving its source path.
+ */
+export function createCurrentSessionStore(input: {
+  ownerLarkAppId: string;
+  runtimeEpoch: string;
+  faults?: CurrentSessionStoreFaults;
+}): SessionStore {
+  const fp = join(config.session.dataDir, `sessions-${input.ownerLarkAppId}.json`);
+  const versions = new WeakMap<object, {
+    runtimeEpoch: string;
+    sessionId: string;
+    sourceDigest: string;
+  }>();
+  const digestRow = (row: Session): string => createHash('sha256')
+    .update(JSON.stringify(row))
+    .digest('hex');
+  const mintVersion = (sessionId: string, sourceDigest: string): SessionStoreVersion => {
+    const token = Object.freeze({}) as SessionStoreVersion;
+    versions.set(token, { runtimeEpoch: input.runtimeEpoch, sessionId, sourceDigest });
+    return token;
+  };
+  const loadedResult = (sessionId: string, row: Session) => ({
+    state: normalizeCurrentSessionStoreState(row, input.ownerLarkAppId),
+    version: mintVersion(sessionId, digestRow(row)),
+  });
+  const appliedResult = (sessionId: string, row: Session) => {
+    const next = loadedResult(sessionId, row);
+    return { kind: 'applied' as const, state: next.state, nextVersion: next.version };
+  };
+  const synchronizeLegacyCache = (sessionId: string, next: Session): void => {
+    if (!loaded || currentAppId !== input.ownerLarkAppId) return;
+    const cached = sessions.get(sessionId);
+    if (!cached) return;
+    // Legacy callers retain the original Session object by reference. Rotate
+    // that object in place to the exact fresh row only after apply/readback is
+    // classified as applied. A field-by-field update would leave newly learned
+    // persisted fields out of the cache, and the next legacy save() would then
+    // erase them from disk. This bridge assumes the semantic apply is
+    // serialized against legacy mutation of this same Session object; Target-A
+    // does not wire control/executor production callers until the per-Session
+    // lane owns that exclusion. It must not be used as a merge algorithm for
+    // an unsaved legacy mutation spanning an await.
+    const cachedRecord = cached as unknown as Record<string, unknown>;
+    const nextRecord = next as unknown as Record<string, unknown>;
+    for (const key of Object.keys(cachedRecord)) {
+      if (!Object.prototype.hasOwnProperty.call(nextRecord, key)) delete cachedRecord[key];
+    }
+    Object.assign(cachedRecord, nextRecord);
+  };
+  return {
+    load: (sessionId) => {
+      try {
+        input.faults?.beforeLoad?.();
+        return withFileLockSync(fp, () => {
+          const row = readCurrentSessionStoreSourceStrict(fp, input.ownerLarkAppId).parsed[sessionId];
+          if (!row) return { kind: 'notFound' as const };
+          return {
+            kind: 'loaded' as const,
+            ...loadedResult(sessionId, row),
+          };
+        });
+      } catch (error) {
+        if (error instanceof FutureCurrentSessionSourceError) {
+          return { kind: 'futureVersion', message: error.message };
+        }
+        if (error instanceof CorruptCurrentSessionSourceError) {
+          return { kind: 'corrupt', message: error.message };
+        }
+        return {
+          kind: 'unavailable',
+          message: `Current Session source unavailable: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+    },
+    apply: (request) => {
+      try {
+        return withFileLockSync(fp, () => {
+          const source = readCurrentSessionStoreSourceStrict(fp, input.ownerLarkAppId);
+          const row = source.parsed[request.sessionId];
+          const expected = versions.get(request.expected);
+          if (!row || !expected
+              || expected.runtimeEpoch !== input.runtimeEpoch
+              || expected.sessionId !== request.sessionId
+              || expected.sourceDigest !== digestRow(row)) {
+            return row
+              ? { kind: 'conflict' as const, current: loadedResult(request.sessionId, row) }
+              : { kind: 'conflict' as const };
+          }
+          const title = normalizeSessionTitle(request.transition.title);
+          if (!title
+              || title !== request.transition.title
+              || !Number.isFinite(Date.parse(request.transition.updatedAt))) {
+            return {
+              kind: 'rejected' as const,
+              reason: 'invalidTransition' as const,
+              message: 'invalid rename transition',
+            };
+          }
+          const next: Session = {
+            ...row,
+            title,
+            nativeSessionTitle: title,
+            nativeSessionTitleUserDefined: true,
+            nativeSessionTitleAwaitingContent: undefined,
+            titleUpdatedAt: request.transition.updatedAt,
+            titleSource: request.transition.source,
+          };
+          source.parsed[request.sessionId] = next;
+          const json = JSON.stringify(source.parsed, null, 2);
+          try {
+            if (json !== source.raw) {
+              const tmpFp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
+              try {
+                input.faults?.beforePublish?.();
+                writeFileSync(tmpFp, json, 'utf-8');
+                renameSync(tmpFp, fp);
+                input.faults?.afterPublishBeforeReturn?.();
+              } finally {
+                try { unlinkSync(tmpFp); } catch { /* rename or cleanup already removed it */ }
+              }
+            }
+          } catch (writeError) {
+            try {
+              input.faults?.beforeRecoveryRead?.();
+              const readback = readCurrentSessionStoreSourceStrict(fp, input.ownerLarkAppId).parsed[request.sessionId];
+              if (!readback) return { kind: 'conflict' as const };
+              const readbackDigest = digestRow(readback);
+              if (readbackDigest === digestRow(next)) {
+                synchronizeLegacyCache(request.sessionId, readback);
+                return appliedResult(request.sessionId, readback);
+              }
+              if (readbackDigest === expected.sourceDigest) {
+                return {
+                  kind: 'notApplied' as const,
+                  message: `Current Session transition was proven not applied: ${writeError instanceof Error ? writeError.message : String(writeError)}`,
+                };
+              }
+              return {
+                kind: 'conflict' as const,
+                current: loadedResult(request.sessionId, readback),
+              };
+            } catch (readbackError) {
+              return {
+                kind: 'unknown' as const,
+                message: `Current Session publication is unprovable after failure: ${readbackError instanceof Error ? readbackError.message : String(readbackError)}`,
+              };
+            }
+          }
+          synchronizeLegacyCache(request.sessionId, next);
+          return appliedResult(request.sessionId, next);
+        });
+      } catch (error) {
+        return {
+          kind: 'unknown',
+          message: `Current Session transition failed: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+    },
+  };
+}
+
+function corruptCurrentSessionSource(message: string): never {
+  throw new CorruptCurrentSessionSourceError(message);
+}
+
+function normalizeCurrentSessionStoreState(
+  row: Session,
+  ownerLarkAppId: string,
+): StoredSessionState {
+  const raw = row as unknown as Record<string, unknown>;
+  if (typeof raw.title !== 'string' || !raw.title.trim()) {
+    corruptCurrentSessionSource(`Session ${row.sessionId} has an invalid title`);
+  }
+  if (raw.scope !== undefined && raw.scope !== 'thread' && raw.scope !== 'chat') {
+    corruptCurrentSessionSource(`Session ${row.sessionId} has an invalid route scope`);
+  }
+  if (raw.larkAppId !== undefined
+      && (typeof raw.larkAppId !== 'string' || raw.larkAppId !== ownerLarkAppId)) {
+    corruptCurrentSessionSource(`Session ${row.sessionId} does not belong to owner ${ownerLarkAppId}`);
+  }
+  if (raw.workerGeneration !== undefined
+      && (!Number.isSafeInteger(raw.workerGeneration) || (raw.workerGeneration as number) < 0)) {
+    corruptCurrentSessionSource(`Session ${row.sessionId} has an invalid executor generation`);
+  }
+  if (raw.titleUpdatedAt !== undefined
+      && (typeof raw.titleUpdatedAt !== 'string' || !Number.isFinite(Date.parse(raw.titleUpdatedAt)))) {
+    corruptCurrentSessionSource(`Session ${row.sessionId} has an invalid title timestamp`);
+  }
+  const titleSources = new Set(['initial', 'user', 'agent', 'cli', 'dashboard', 'system']);
+  if (raw.titleSource !== undefined
+      && (typeof raw.titleSource !== 'string' || !titleSources.has(raw.titleSource))) {
+    corruptCurrentSessionSource(`Session ${row.sessionId} has an invalid title source`);
+  }
+  return {
+    sessionId: row.sessionId,
+    route: row.scope === 'chat'
+      ? { kind: 'chat', chatId: row.chatId }
+      : { kind: 'thread', anchorId: row.rootMessageId },
+    recordStatus: row.status,
+    title: row.title,
+    titleUpdatedAt: row.titleUpdatedAt,
+    titleSource: row.titleSource,
+    executorGeneration: row.workerGeneration ?? 0,
+  };
+}
+
+function readCurrentSessionStoreSourceStrict(
+  fp: string,
+  ownerLarkAppId: string,
+): { raw: string; parsed: Record<string, Session> } {
+  const source = readSessionsProjectionStrict(fp);
+  for (const row of Object.values(source.parsed)) {
+    normalizeCurrentSessionStoreState(row, ownerLarkAppId);
+  }
+  return source;
+}
+
+/**
+ * Owner-file-bound strict projection used by SessionRuntime. Unlike the
+ * ambient legacy cache, this never follows `init()` state from another daemon
+ * owner and validates the same normalized fields as CurrentSessionStore.
+ */
+export function listSessionsForOwnerStrict(ownerLarkAppId: string): Session[] {
+  const fp = join(config.session.dataDir, `sessions-${ownerLarkAppId}.json`);
+  mkdirSync(dirname(fp), { recursive: true });
+  return withFileLockSync(fp, () => (
+    Object.values(readCurrentSessionStoreSourceStrict(fp, ownerLarkAppId).parsed)
+  ));
+}
+
+/** Exact owner-file-bound lookup for owner-scoped Runtime authority checks. */
+export function getSessionForOwnerStrict(
+  ownerLarkAppId: string,
+  sessionId: string,
+): Session | undefined {
+  const fp = join(config.session.dataDir, `sessions-${ownerLarkAppId}.json`);
+  mkdirSync(dirname(fp), { recursive: true });
+  return withFileLockSync(fp, () => (
+    readCurrentSessionStoreSourceStrict(fp, ownerLarkAppId).parsed[sessionId]
+  ));
+}
 
 // Legacy fields from the removed「处理中」placeholder-card PATCH delivery. They
 // no longer exist on Session and nothing reads them, but sessions persisted
@@ -203,16 +470,36 @@ function readExistingSessionsFromDisk(fp: string): { raw: string; parsed: Record
 }
 
 function readSessionsProjectionStrict(fp: string): { raw: string; parsed: Record<string, Session> } {
-  if (!existsSync(fp)) return { raw: '', parsed: {} };
-  const raw = readFileSync(fp, 'utf-8');
-  const value = JSON.parse(raw) as unknown;
+  let raw: string;
+  try {
+    raw = readFileSync(fp, 'utf-8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { raw: '', parsed: {} };
+    throw error;
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(raw) as unknown;
+  } catch (error) {
+    throw new CorruptCurrentSessionSourceError(
+      `invalid JSON in sessions projection at ${fp}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const schemaVersion = (value as Record<string, unknown>).schemaVersion;
+    if (typeof schemaVersion === 'number' && Number.isInteger(schemaVersion) && schemaVersion > 1) {
+      throw new FutureCurrentSessionSourceError(
+        `future sessions projection schemaVersion ${schemaVersion} at ${fp}`,
+      );
+    }
+  }
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error(`invalid sessions projection at ${fp}`);
+    throw new CorruptCurrentSessionSourceError(`invalid sessions projection at ${fp}`);
   }
   const parsed = value as Record<string, unknown>;
   for (const [key, candidate] of Object.entries(parsed)) {
     if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
-      throw new Error(`invalid Session row ${key} at ${fp}`);
+      throw new CorruptCurrentSessionSourceError(`invalid Session row ${key} at ${fp}`);
     }
     const row = candidate as Record<string, unknown>;
     if (typeof row.sessionId !== 'string'
@@ -225,7 +512,7 @@ function readSessionsProjectionStrict(fp: string): { raw: string; parsed: Record
       || (row.status !== 'active' && row.status !== 'closed')
       || typeof row.createdAt !== 'string'
       || row.createdAt.length === 0) {
-      throw new Error(`malformed Session row ${key} at ${fp}`);
+      throw new CorruptCurrentSessionSourceError(`malformed Session row ${key} at ${fp}`);
     }
   }
   return { raw, parsed: parsed as Record<string, Session> };

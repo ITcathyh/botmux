@@ -47,6 +47,10 @@ const createdSessions: any[] = [];
 let createExactShouldThrow = false;
 let updateShouldThrow = false;
 vi.mock('../src/services/session-store.js', () => ({
+  createCurrentSessionStore: vi.fn(() => ({
+    load: vi.fn(() => ({ kind: 'notFound' })),
+    apply: vi.fn(() => ({ kind: 'unknown', message: 'unused mocked Current Store' })),
+  })),
   createSession: vi.fn((chatId: string, anchor: string, title: string) => {
     const s = { sessionId: `sess-${++sessionSeq}`, chatId, rootMessageId: anchor, title, scope: 'chat', status: 'active', createdAt: '2026-06-01T00:00:00.000Z' };
     createdSessions.push(s);
@@ -71,11 +75,13 @@ vi.mock('../src/services/session-store.js', () => ({
   }),
   getSession: vi.fn((id: string) => createdSessions.find(s => s.sessionId === id)),
   getOwnedSession: vi.fn((id: string) => createdSessions.find(s => s.sessionId === id)),
+  getSessionForOwnerStrict: vi.fn((_owner: string, id: string) => createdSessions.find(s => s.sessionId === id)),
   closeSession: vi.fn((id: string) => {
     const session = createdSessions.find(s => s.sessionId === id);
     if (session) session.status = 'closed';
   }),
   listSessionsStrict: vi.fn(() => createdSessions),
+  listSessionsForOwnerStrict: vi.fn(() => createdSessions),
   registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
   cleanupSessionBridgeSendMarkers: vi.fn(),
   cleanupSessionBridgeSendMarkersNow: vi.fn(),
@@ -473,7 +479,7 @@ describe('triggerSessionTurn — idempotency dispatch (real stores)', () => {
     expect(mockForkWorker).not.toHaveBeenCalled(); // no dispatch on the orphan
   });
 
-  it('post-rename barrier plus terminal-write failure has no Session and no phantom failed response', async () => {
+  it('post-rename barrier plus terminal-write failure is non-terminal first, then retry persists dispatch_unknown', async () => {
     const realTransition = idempotencyStore.transition;
     const transitionSpy = vi.spyOn(idempotencyStore, 'transition').mockImplementationOnce((...args: any[]) => {
       realTransition(...args as Parameters<typeof realTransition>);
@@ -492,7 +498,8 @@ describe('triggerSessionTurn — idempotency dispatch (real stores)', () => {
     expect(first.ok).toBe(false);
     expect(first.errorCode).toBe('trigger_failed');
     expect(first.state).not.toBe('failed');
-    expect(idempotencyStore.lookup(APP, 'k-bpost-double')?.state).toBe('attempting');
+    const stranded = idempotencyStore.lookup(APP, 'k-bpost-double');
+    expect(stranded?.state).toBe('attempting');
     expect(createdSessions).toHaveLength(0);
     expect(mockForkWorker).not.toHaveBeenCalled();
 
@@ -500,8 +507,13 @@ describe('triggerSessionTurn — idempotency dispatch (real stores)', () => {
       larkAppId: APP,
       activeSessions: new Map(),
     });
-    expect(retry.errorCode).toBe('trigger_failed');
-    expect(retry.state).not.toBe('failed');
+    expect(retry.errorCode).toBe('no_output');
+    expect(retry.state).toBe('failed');
+    expect(retry.idempotent).toBe(true);
+    expect(asyncTriggerStore.lookup(stranded!.sessionId, stranded!.triggerId)?.result).toMatchObject({
+      status: 'failed',
+      reason: 'dispatch_unknown',
+    });
     expect(mockForkWorker).not.toHaveBeenCalled();
   });
 
@@ -600,6 +612,25 @@ describe('triggerSessionTurn — idempotency dispatch (real stores)', () => {
     expect(prompt).not.toContain('spaced-key');   // raw key never rendered
     expect(prompt).not.toContain('idempotencyKey'); // field itself stripped
     expect(prompt).toContain('"status": "firing"'); // other options still rendered
+  });
+
+  it('passes the canonical key-free business envelope to the actual keyed fork', async () => {
+    const request = {
+      ...freshAsyncReq('  actual-spaced-key  '),
+      options: {
+        asyncReturnSessionId: true,
+        idempotencyKey: '  actual-spaced-key  ',
+        status: 'firing',
+      },
+    } as any;
+
+    await triggerSessionTurn(request, { larkAppId: APP, activeSessions: new Map() });
+
+    expect(mockForkWorker).toHaveBeenCalledTimes(1);
+    const actualPromptInput = mockForkWorker.mock.calls[0][1] as { content: string };
+    expect(actualPromptInput.content).not.toContain('actual-spaced-key');
+    expect(actualPromptInput.content).not.toContain('idempotencyKey');
+    expect(actualPromptInput.content).toContain('"status": "firing"');
   });
 
   it('trim-equivalent keys reuse the SAME lease and do NOT 409 (prompt is identical after strip)', async () => {

@@ -83,11 +83,10 @@ class CurrentKeyedTriggerAuthority implements KeyedTriggerAuthority {
   private observeRecord(record: idempotencyStore.IdempotencyRecord): Extract<KeyedTriggerObservation, { kind: 'present' }> {
     const live = activeBySessionId(this.activeSessions, this.ownerLarkAppId, record.sessionId);
     const executorLive = !!live?.worker && !live.worker.killed;
-    const persisted = sessionStore.getOwnedSession(record.sessionId);
-    const persistedOwned = persisted
-      && (!persisted.larkAppId || persisted.larkAppId === this.ownerLarkAppId)
-      ? persisted
-      : undefined;
+    const persistedOwned = sessionStore.getSessionForOwnerStrict(
+      this.ownerLarkAppId,
+      record.sessionId,
+    );
     const chatId = live?.chatId ?? persistedOwned?.chatId ?? '';
     const asyncRecord = asyncTriggerStore.lookup(record.sessionId, record.triggerId);
     const terminal = asyncRecord?.ownerLarkAppId === record.ownerLarkAppId
@@ -323,14 +322,14 @@ class CurrentKeyedTriggerAuthority implements KeyedTriggerAuthority {
       return { kind: 'unreadable', message: 'invalid current keyed-trigger lease token' };
     }
     try {
-      asyncTriggerStore.recordFailedStrict(
+      const terminal = asyncTriggerStore.recordFailedStrict(
         current.record.sessionId,
         current.record.triggerId,
         Date.now(),
         this.ownerLarkAppId,
         'dispatch_unknown',
       );
-      return { kind: 'recorded' };
+      return { kind: terminal };
     } catch (error) {
       return {
         kind: 'unreadable',
@@ -370,8 +369,7 @@ class CurrentSessionDirectory implements SessionDirectory {
         executorStatus: executorStatusFor(ds),
       });
     }
-    for (const session of sessionStore.listSessionsStrict()) {
-      if (session.larkAppId && session.larkAppId !== this.ownerLarkAppId) continue;
+    for (const session of sessionStore.listSessionsForOwnerStrict(this.ownerLarkAppId)) {
       if (rows.has(session.sessionId)) continue;
       rows.set(session.sessionId, {
         key: session.sessionId,
@@ -457,6 +455,10 @@ export function currentSessionRuntimeHost(options: {
     keyedTriggerTurns: options.keyedTriggerTurns ?? createCurrentKeyedTriggerTurnPort({
       ownerLarkAppId: options.ownerLarkAppId,
       activeSessions: options.activeSessions,
+    }),
+    sessionStore: sessionStore.createCurrentSessionStore({
+      ownerLarkAppId: options.ownerLarkAppId,
+      runtimeEpoch,
     }),
   });
   if (cacheable) byOwner.set(options.ownerLarkAppId, { runtimeEpoch, host });
