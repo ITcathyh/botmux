@@ -22,7 +22,7 @@ const expectedCoverage = new Map([
   ['current-session-store-adapter', { targetMilestone: 'A1', disposition: 'migrated' }],
   ['ordinary-im', { targetMilestone: 'C1', disposition: 'remaining' }],
   ['control', { targetMilestone: 'C2', disposition: 'remaining' }],
-  ['executor-generation', { targetMilestone: 'A2', disposition: 'remaining' }],
+  ['executor-generation', { targetMilestone: 'A2', disposition: 'migrated' }],
   ['scheduler', { targetMilestone: 'C4', disposition: 'remaining' }],
   ['activation-restore', { targetMilestone: 'A4', disposition: 'remaining' }],
   ['path-specific-retained', { targetMilestone: 'Target-A', disposition: 'retained' }],
@@ -48,6 +48,33 @@ const mandatoryForbiddenCalls = [
 ];
 const mandatoryPureRuntimeSources = ['src/core/session-runtime.ts'];
 const mandatoryForbiddenImports = ['../services/session-store.js', './worker-pool.js'];
+const executorRuntimeAccessLane = 'session-executor-runtime-adapter';
+const mandatoryExecutorObservationKinds = [
+  'inputReceived',
+  'inputRejected',
+  'inputCommitted',
+  'turnTerminal',
+  'cliExit',
+  'workerExit',
+];
+const mandatoryExecutorSelectors = new Map([
+  ['src/core/current-session-executor-runtime.ts', [
+    'commitNext',
+    'fenceExit',
+    'reconcilePendingExitFence',
+    'reconcilePendingReservation',
+  ]],
+  ['src/core/current-dispatch-input-commit-evidence.ts', [
+    'record',
+    'synchronizeReceipts',
+  ]],
+  ['src/core/dispatch.ts', ['recordDispatchInputCommit']],
+  ['src/core/worker-pool.ts', [
+    'retireWorkerAfterUnknownGeneration',
+    'setupWorkerHandlers',
+  ]],
+  ['src/core/trigger-session.ts', ['convergeIdempotentAsyncTurnOnWorkerExit']],
+]);
 
 let cachedFacts;
 const parsedSources = new Map();
@@ -229,10 +256,13 @@ function validateLedgerSchema(ledger) {
   }
   for (const id of expectedCoverage.keys()) assert(ids.has(id), `missing coverage entry: ${id}`);
 
-  const migrated = ledger.coverage.find(entry => entry.id === 'keyed-trigger-start');
-  validateProductionBindingSchema(migrated.productionBinding);
+  const keyedTrigger = ledger.coverage.find(entry => entry.id === 'keyed-trigger-start');
+  validateKeyedProductionBindingSchema(keyedTrigger.productionBinding);
+  const executor = ledger.coverage.find(entry => entry.id === 'executor-generation');
+  validateExecutorSelectors(executor.selectors);
+  validateExecutorProductionBindingSchema(executor.productionBinding);
   for (const entry of ledger.coverage) {
-    if (entry.id !== 'keyed-trigger-start') {
+    if (entry.id !== 'keyed-trigger-start' && entry.id !== 'executor-generation') {
       assert(entry.productionBinding === undefined, `${entry.id} must not claim a migrated production binding`);
     }
   }
@@ -344,7 +374,7 @@ function validateSelectorSchema(selector, entryId) {
   }
 }
 
-function validateProductionBindingSchema(binding) {
+function validateKeyedProductionBindingSchema(binding) {
   assert(isPlainObject(binding), 'keyed-trigger-start.productionBinding must be an object');
   assert(typeof binding.sourceFile === 'string' && binding.sourceFile.startsWith('src/'), 'productionBinding.sourceFile must name src/');
   assert(typeof binding.enclosingFunction === 'string' && binding.enclosingFunction.length > 0, 'productionBinding.enclosingFunction is required');
@@ -363,6 +393,93 @@ function validateProductionBindingSchema(binding) {
   for (const path of mandatoryForbiddenImports) {
     assert(binding.forbiddenImports.includes(path), `productionBinding.forbiddenImports must include ${path}`);
   }
+}
+
+function sameStringSet(actual, expected) {
+  return actual.length === expected.length
+    && actual.every(value => expected.includes(value));
+}
+
+function validateExecutorSelectors(selectors) {
+  assert(
+    selectors.length === mandatoryExecutorSelectors.size,
+    'executor-generation selectors must remain an exact production partition',
+  );
+  const seen = new Set();
+  for (const selector of selectors) {
+    const expectedFunctions = mandatoryExecutorSelectors.get(selector.sourceFile);
+    assert(
+      expectedFunctions,
+      `executor-generation selector is not an exact reviewed source: ${selector.sourceFile}`,
+    );
+    assert(!seen.has(selector.sourceFile), `duplicate executor-generation selector: ${selector.sourceFile}`);
+    seen.add(selector.sourceFile);
+    assert(
+      sameStringSet(selector.accessLanes ?? [], [executorRuntimeAccessLane]),
+      `executor-generation selector ${selector.sourceFile} must use only the exact ${executorRuntimeAccessLane} access lane`,
+    );
+    assert(
+      sameStringSet(selector.enclosingFunctions ?? [], expectedFunctions),
+      `executor-generation selector ${selector.sourceFile} must name only its exact reviewed functions`,
+    );
+    assert(
+      selector.authorityIds === undefined,
+      `executor-generation selector ${selector.sourceFile} must not widen through authority IDs`,
+    );
+  }
+}
+
+function validateExecutorProductionBindingSchema(binding) {
+  assert(isPlainObject(binding), 'executor-generation.productionBinding must be an object');
+  for (const field of [
+    'workerSource',
+    'runtimeSource',
+    'currentAdapterSource',
+    'evidenceAdapterSource',
+  ]) {
+    assert(
+      typeof binding[field] === 'string' && binding[field].startsWith('src/'),
+      `executor-generation.productionBinding.${field} must name src/`,
+    );
+  }
+  for (const field of ['handlerFunction', 'reservationFunction']) {
+    assert(
+      typeof binding[field] === 'string' && binding[field].length > 0,
+      `executor-generation.productionBinding.${field} is required`,
+    );
+  }
+  assert(
+    binding.workerSource === 'src/core/worker-pool.ts',
+    'executor-generation.productionBinding.workerSource must remain worker-pool',
+  );
+  assert(
+    binding.handlerFunction === 'setupWorkerHandlers',
+    'executor-generation.productionBinding.handlerFunction must remain setupWorkerHandlers',
+  );
+  assert(
+    binding.reservationFunction === 'reserveWorkerGeneration',
+    'executor-generation.productionBinding.reservationFunction must remain reserveWorkerGeneration',
+  );
+  assert(
+    binding.runtimeSource === 'src/core/session-executor-runtime.ts',
+    'executor-generation.productionBinding.runtimeSource must remain the pure internal Runtime',
+  );
+  assert(
+    binding.currentAdapterSource === 'src/core/current-session-executor-runtime.ts',
+    'executor-generation.productionBinding.currentAdapterSource must remain the Current generation Adapter',
+  );
+  assert(
+    binding.evidenceAdapterSource === 'src/core/current-dispatch-input-commit-evidence.ts',
+    'executor-generation.productionBinding.evidenceAdapterSource must remain the named evidence Adapter',
+  );
+  validateStringArray(
+    binding.observationKinds,
+    'executor-generation.productionBinding.observationKinds',
+  );
+  assert(
+    sameStringSet(binding.observationKinds, mandatoryExecutorObservationKinds),
+    'executor-generation.productionBinding.observationKinds must cover every executor observation',
+  );
 }
 
 function selectAuthoritySites(selector, sites, assigned) {
@@ -555,6 +672,27 @@ function callsWithin(node) {
   return calls;
 }
 
+function callExpressionsWithin(node, expected) {
+  const calls = [];
+  const visit = current => {
+    if (ts.isCallExpression(current)) {
+      const name = calledName(current);
+      if (name && matchesForbiddenCall(name, expected)) calls.push(current);
+    }
+    ts.forEachChild(current, visit);
+  };
+  visit(node);
+  return calls;
+}
+
+function importedModules(parsed) {
+  return parsed.statements
+    .filter(ts.isImportDeclaration)
+    .map(statement => statement.moduleSpecifier)
+    .filter(ts.isStringLiteralLike)
+    .map(specifier => specifier.text);
+}
+
 function verifyNoForbiddenCalls(node, forbiddenCalls, label) {
   for (const actual of callsWithin(node)) {
     const forbidden = forbiddenCalls.find(candidate => matchesForbiddenCall(actual, candidate));
@@ -592,14 +730,88 @@ function validateMigratedProductionBinding(binding, authoritySites) {
     const directSites = authoritySites.filter(site => site.sourceFile === path);
     assert(directSites.length === 0, `migrated runtime core ${path} gained direct Session authority sites`);
     verifyNoForbiddenCalls(runtimeSource, binding.forbiddenCalls, `migrated runtime core ${path}`);
-    const imports = runtimeSource.statements
-      .filter(ts.isImportDeclaration)
-      .map(statement => statement.moduleSpecifier)
-      .filter(ts.isStringLiteralLike)
-      .map(specifier => specifier.text);
+    const imports = importedModules(runtimeSource);
     for (const forbidden of binding.forbiddenImports) {
       assert(!imports.includes(forbidden), `migrated runtime core ${path} imports forbidden direct-write capability ${forbidden}`);
     }
+  }
+}
+
+function validateExecutorProductionBinding(binding, authoritySites, assigned) {
+  const worker = sourceFile(binding.workerSource);
+  const handler = findNamedFunction(worker, binding.handlerFunction);
+  const reservation = findNamedFunction(worker, binding.reservationFunction);
+  assert(
+    callExpressionsWithin(reservation, 'sessionExecutorRuntime.commitGeneration').length === 1,
+    `executor reservation ${binding.workerSource}#${binding.reservationFunction} must delegate exactly once to commitGeneration`,
+  );
+  assert(
+    authoritySites.every(site => !(
+      site.sourceFile === binding.workerSource
+      && site.enclosingFunction === binding.reservationFunction
+    )),
+    `executor reservation ${binding.workerSource}#${binding.reservationFunction} regained direct Session authority`,
+  );
+  assert(
+    callExpressionsWithin(handler, 'sessionExecutorRuntime.activate').length === 1,
+    `executor handler ${binding.workerSource}#${binding.handlerFunction} must activate exactly one opaque lease`,
+  );
+  assert(
+    callExpressionsWithin(handler, 'sessionExecutorRuntime.isCurrent').length > 0,
+    `executor handler ${binding.workerSource}#${binding.handlerFunction} must gate long-lived effects through isCurrent`,
+  );
+  assert(
+    callExpressionsWithin(handler, 'sessionExecutorRuntime.resume').length > 0,
+    `executor handler ${binding.workerSource}#${binding.handlerFunction} must revalidate async continuations`,
+  );
+  const reportCalls = callExpressionsWithin(handler, 'sessionExecutorRuntime.report');
+  for (const kind of binding.observationKinds) {
+    assert(
+      reportCalls.some(call => containsStringLiteral(call, kind)),
+      `executor handler ${binding.workerSource}#${binding.handlerFunction} does not report ${kind}`,
+    );
+  }
+  assert(
+    callExpressionsWithin(handler, 'createCurrentDispatchInputCommitEvidencePort').length === 1,
+    `executor handler ${binding.workerSource}#${binding.handlerFunction} must bind one named input-commit evidence Adapter`,
+  );
+  assert(
+    callExpressionsWithin(handler, 'recordDispatchInputCommit').length === 0,
+    `executor handler ${binding.workerSource}#${binding.handlerFunction} bypasses the named input-commit evidence Adapter`,
+  );
+
+  const runtime = sourceFile(binding.runtimeSource);
+  const runtimeSites = authoritySites.filter(site => site.sourceFile === binding.runtimeSource);
+  assert(runtimeSites.length === 0, `executor Runtime core ${binding.runtimeSource} gained direct Session authority sites`);
+  const forbiddenRuntimeImports = ['../services/session-store.js', './worker-pool.js'];
+  const runtimeImports = importedModules(runtime);
+  for (const forbidden of forbiddenRuntimeImports) {
+    assert(
+      !runtimeImports.includes(forbidden),
+      `executor Runtime core ${binding.runtimeSource} imports forbidden Current capability ${forbidden}`,
+    );
+  }
+
+  for (const adapterSource of [binding.currentAdapterSource, binding.evidenceAdapterSource]) {
+    sourceFile(adapterSource);
+    const adapterSites = authoritySites.filter(site => site.sourceFile === adapterSource);
+    assert(adapterSites.length > 0, `executor Current Adapter ${adapterSource} has no reviewed authority evidence`);
+    for (const site of adapterSites) {
+      assert(
+        site.accessLane === executorRuntimeAccessLane,
+        `executor Current Adapter ${siteIdentity(site)} escaped the named access lane`,
+      );
+      assert(
+        assigned.get(siteIdentity(site)) === 'executor-generation',
+        `executor Current Adapter ${siteIdentity(site)} is not covered by the migrated A2 partition`,
+      );
+    }
+  }
+  for (const site of authoritySites.filter(site => site.accessLane === executorRuntimeAccessLane)) {
+    assert(
+      assigned.get(siteIdentity(site)) === 'executor-generation',
+      `executor access-lane site ${siteIdentity(site)} is not covered by the migrated A2 partition`,
+    );
   }
 }
 
@@ -693,8 +905,10 @@ export function auditSessionRuntimeCoverage({ ledger } = {}) {
       `${entry.id} raw publisher binding drifted: expected ${JSON.stringify(entry.authorityRawPublishers)}, actual ${JSON.stringify(actual)}`,
     );
   }
-  const migrated = coverageLedger.coverage.find(entry => entry.id === 'keyed-trigger-start');
-  validateMigratedProductionBinding(migrated.productionBinding, facts.sites);
+  const keyedTrigger = coverageLedger.coverage.find(entry => entry.id === 'keyed-trigger-start');
+  validateMigratedProductionBinding(keyedTrigger.productionBinding, facts.sites);
+  const executor = coverageLedger.coverage.find(entry => entry.id === 'executor-generation');
+  validateExecutorProductionBinding(executor.productionBinding, facts.sites, assigned);
   return { summary: entryCounts.join(', ') };
 }
 

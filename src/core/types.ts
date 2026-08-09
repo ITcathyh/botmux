@@ -282,6 +282,8 @@ export interface DaemonSession {
     phase: 'preparing' | 'prepared' | 'uncertain';
     requestId: string;
     taskId?: string;
+    /** Exact worker that owns this close transaction across replacement. */
+    worker: ChildProcess;
   };
   /** Graceful-shutdown transaction for the exact Riff worker generation. */
   riffShutdownState?: {

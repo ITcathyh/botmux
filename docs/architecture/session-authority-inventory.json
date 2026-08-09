@@ -244,9 +244,9 @@
     {
       "id": "dispatch-card-and-turn-evidence",
       "classification": "path_specific_authority",
-      "owner": "Reply-target helpers, DispatchRegistry, FrozenCardStore, and turn-send marker writers",
+      "owner": "CurrentDispatchInputCommitEvidence, reply-target helpers, DispatchRegistry, FrozenCardStore, and turn-send marker writers",
       "location": "Session.replyTargets/replyTargetsPrunedThrough/turnReplyContexts/dispatchInputReceipts, dispatch registry roots, <dataDir>/frozen-cards/<session>.json, and <dataDir>/turn-sends/<session>.jsonl",
-      "semantics": "Per-turn delivery/routing evidence and user-visible history; not Session lifecycle truth."
+      "semantics": "Per-turn delivery/routing evidence and user-visible history; the Current input-commit Adapter preserves exact root/generation proof and strict readback without promoting this state to Session lifecycle truth."
     },
     {
       "id": "codex-notifier-outbox",
@@ -1586,6 +1586,66 @@
       "accessLane": "session-store-api"
     },
     {
+      "sourceFile": "src/core/current-dispatch-input-commit-evidence.ts",
+      "enclosingFunction": "record",
+      "receiverKind": "Session",
+      "fieldPath": "dispatchInputReceipts",
+      "operation": "assign",
+      "normalizedAstHash": "5b6bb0a2e14b70fd",
+      "count": 1,
+      "classification": "path_specific_authority",
+      "authorityId": "dispatch-card-and-turn-evidence",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/current-dispatch-input-commit-evidence.ts",
+      "enclosingFunction": "record",
+      "receiverKind": "Session",
+      "fieldPath": "dispatchInputReceipts",
+      "operation": "assign",
+      "normalizedAstHash": "5bd802b9ee992b05",
+      "count": 1,
+      "classification": "path_specific_authority",
+      "authorityId": "dispatch-card-and-turn-evidence",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/current-dispatch-input-commit-evidence.ts",
+      "enclosingFunction": "record",
+      "receiverKind": "SessionStore",
+      "fieldPath": "*",
+      "operation": "call:updateSession",
+      "normalizedAstHash": "d44a675b7d95fc19",
+      "count": 1,
+      "classification": "session_owned_persisted",
+      "authorityId": "current-session-row",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/current-dispatch-input-commit-evidence.ts",
+      "enclosingFunction": "synchronizeReceipts",
+      "receiverKind": "Session",
+      "fieldPath": "dispatchInputReceipts",
+      "operation": "assign",
+      "normalizedAstHash": "803a938af4c8ff42",
+      "count": 1,
+      "classification": "path_specific_authority",
+      "authorityId": "dispatch-card-and-turn-evidence",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/current-dispatch-input-commit-evidence.ts",
+      "enclosingFunction": "synchronizeReceipts",
+      "receiverKind": "Session",
+      "fieldPath": "dispatchInputReceipts",
+      "operation": "delete",
+      "normalizedAstHash": "116793d429549b29",
+      "count": 1,
+      "classification": "path_specific_authority",
+      "authorityId": "dispatch-card-and-turn-evidence",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
       "sourceFile": "src/core/current-keyed-trigger-turn.ts",
       "enclosingFunction": "acceptAtMostOnce",
       "receiverKind": "DaemonSession",
@@ -1826,6 +1886,294 @@
       "accessLane": "session-runtime-current-adapter"
     },
     {
+      "sourceFile": "src/core/current-session-executor-runtime.ts",
+      "enclosingFunction": "commitNext",
+      "receiverKind": "DaemonSession",
+      "fieldPath": "workerGeneration",
+      "operation": "assign",
+      "normalizedAstHash": "33419d4da2e45c3c",
+      "count": 1,
+      "classification": "ephemeral_runtime",
+      "authorityId": "actor-host-runtime",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/current-session-executor-runtime.ts",
+      "enclosingFunction": "commitNext",
+      "receiverKind": "DaemonSession",
+      "fieldPath": "workerGeneration",
+      "operation": "assign",
+      "normalizedAstHash": "c74df767d2000fef",
+      "count": 1,
+      "classification": "ephemeral_runtime",
+      "authorityId": "actor-host-runtime",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/current-session-executor-runtime.ts",
+      "enclosingFunction": "commitNext",
+      "receiverKind": "DaemonSession",
+      "fieldPath": "workerGeneration",
+      "operation": "assign",
+      "normalizedAstHash": "d55366bb2647b4c8",
+      "count": 1,
+      "classification": "ephemeral_runtime",
+      "authorityId": "actor-host-runtime",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/current-session-executor-runtime.ts",
+      "enclosingFunction": "commitNext",
+      "receiverKind": "DaemonSession",
+      "fieldPath": "workerGeneration",
+      "operation": "delete",
+      "normalizedAstHash": "94504756ea8800fe",
+      "count": 1,
+      "classification": "ephemeral_runtime",
+      "authorityId": "actor-host-runtime",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/current-session-executor-runtime.ts",
+      "enclosingFunction": "commitNext",
+      "receiverKind": "Session",
+      "fieldPath": "workerGeneration",
+      "operation": "assign",
+      "normalizedAstHash": "5498c60fec5e29d4",
+      "count": 1,
+      "classification": "session_owned_persisted",
+      "authorityId": "current-session-row",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/current-session-executor-runtime.ts",
+      "enclosingFunction": "commitNext",
+      "receiverKind": "Session",
+      "fieldPath": "workerGeneration",
+      "operation": "assign",
+      "normalizedAstHash": "817c6b7a5b17cf43",
+      "count": 1,
+      "classification": "session_owned_persisted",
+      "authorityId": "current-session-row",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/current-session-executor-runtime.ts",
+      "enclosingFunction": "commitNext",
+      "receiverKind": "Session",
+      "fieldPath": "workerGeneration",
+      "operation": "assign",
+      "normalizedAstHash": "b49671a9315c996a",
+      "count": 1,
+      "classification": "session_owned_persisted",
+      "authorityId": "current-session-row",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/current-session-executor-runtime.ts",
+      "enclosingFunction": "commitNext",
+      "receiverKind": "Session",
+      "fieldPath": "workerGeneration",
+      "operation": "delete",
+      "normalizedAstHash": "5b76564b2a08f90c",
+      "count": 1,
+      "classification": "session_owned_persisted",
+      "authorityId": "current-session-row",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/current-session-executor-runtime.ts",
+      "enclosingFunction": "commitNext",
+      "receiverKind": "SessionStore",
+      "fieldPath": "*",
+      "operation": "call:updateSession",
+      "normalizedAstHash": "92b2e1c092983eaa",
+      "count": 1,
+      "classification": "session_owned_persisted",
+      "authorityId": "current-session-row",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/current-session-executor-runtime.ts",
+      "enclosingFunction": "fenceExit",
+      "receiverKind": "DaemonSession",
+      "fieldPath": "workerGeneration",
+      "operation": "assign",
+      "normalizedAstHash": "b484cfffbd3abf84",
+      "count": 1,
+      "classification": "ephemeral_runtime",
+      "authorityId": "actor-host-runtime",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/current-session-executor-runtime.ts",
+      "enclosingFunction": "fenceExit",
+      "receiverKind": "Session",
+      "fieldPath": "pid",
+      "operation": "assign",
+      "normalizedAstHash": "376b56315c81e589",
+      "count": 1,
+      "classification": "session_owned_persisted",
+      "authorityId": "current-session-row",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/current-session-executor-runtime.ts",
+      "enclosingFunction": "fenceExit",
+      "receiverKind": "Session",
+      "fieldPath": "workerGeneration",
+      "operation": "assign",
+      "normalizedAstHash": "b7e577f4021a3b00",
+      "count": 1,
+      "classification": "session_owned_persisted",
+      "authorityId": "current-session-row",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/current-session-executor-runtime.ts",
+      "enclosingFunction": "fenceExit",
+      "receiverKind": "SessionStore",
+      "fieldPath": "*",
+      "operation": "call:updateSession",
+      "normalizedAstHash": "92b2e1c092983eaa",
+      "count": 1,
+      "classification": "session_owned_persisted",
+      "authorityId": "current-session-row",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/current-session-executor-runtime.ts",
+      "enclosingFunction": "reconcilePendingExitFence",
+      "receiverKind": "DaemonSession",
+      "fieldPath": "workerGeneration",
+      "operation": "assign",
+      "normalizedAstHash": "7475db3a68f5ac09",
+      "count": 1,
+      "classification": "ephemeral_runtime",
+      "authorityId": "actor-host-runtime",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/current-session-executor-runtime.ts",
+      "enclosingFunction": "reconcilePendingExitFence",
+      "receiverKind": "DaemonSession",
+      "fieldPath": "workerGeneration",
+      "operation": "assign",
+      "normalizedAstHash": "cfc4da7bede36340",
+      "count": 1,
+      "classification": "ephemeral_runtime",
+      "authorityId": "actor-host-runtime",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/current-session-executor-runtime.ts",
+      "enclosingFunction": "reconcilePendingExitFence",
+      "receiverKind": "Session",
+      "fieldPath": "pid",
+      "operation": "assign",
+      "normalizedAstHash": "a1d091558baed70e",
+      "count": 1,
+      "classification": "session_owned_persisted",
+      "authorityId": "current-session-row",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/current-session-executor-runtime.ts",
+      "enclosingFunction": "reconcilePendingExitFence",
+      "receiverKind": "Session",
+      "fieldPath": "workerGeneration",
+      "operation": "assign",
+      "normalizedAstHash": "300e74eb2def8c27",
+      "count": 1,
+      "classification": "session_owned_persisted",
+      "authorityId": "current-session-row",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/current-session-executor-runtime.ts",
+      "enclosingFunction": "reconcilePendingExitFence",
+      "receiverKind": "Session",
+      "fieldPath": "workerGeneration",
+      "operation": "assign",
+      "normalizedAstHash": "d941e8596edb984f",
+      "count": 1,
+      "classification": "session_owned_persisted",
+      "authorityId": "current-session-row",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/current-session-executor-runtime.ts",
+      "enclosingFunction": "reconcilePendingReservation",
+      "receiverKind": "DaemonSession",
+      "fieldPath": "workerGeneration",
+      "operation": "assign",
+      "normalizedAstHash": "03b824fabe16063d",
+      "count": 1,
+      "classification": "ephemeral_runtime",
+      "authorityId": "actor-host-runtime",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/current-session-executor-runtime.ts",
+      "enclosingFunction": "reconcilePendingReservation",
+      "receiverKind": "DaemonSession",
+      "fieldPath": "workerGeneration",
+      "operation": "assign",
+      "normalizedAstHash": "7475db3a68f5ac09",
+      "count": 1,
+      "classification": "ephemeral_runtime",
+      "authorityId": "actor-host-runtime",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/current-session-executor-runtime.ts",
+      "enclosingFunction": "reconcilePendingReservation",
+      "receiverKind": "DaemonSession",
+      "fieldPath": "workerGeneration",
+      "operation": "assign",
+      "normalizedAstHash": "cfc4da7bede36340",
+      "count": 1,
+      "classification": "ephemeral_runtime",
+      "authorityId": "actor-host-runtime",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/current-session-executor-runtime.ts",
+      "enclosingFunction": "reconcilePendingReservation",
+      "receiverKind": "Session",
+      "fieldPath": "workerGeneration",
+      "operation": "assign",
+      "normalizedAstHash": "300e74eb2def8c27",
+      "count": 1,
+      "classification": "session_owned_persisted",
+      "authorityId": "current-session-row",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/current-session-executor-runtime.ts",
+      "enclosingFunction": "reconcilePendingReservation",
+      "receiverKind": "Session",
+      "fieldPath": "workerGeneration",
+      "operation": "assign",
+      "normalizedAstHash": "d941e8596edb984f",
+      "count": 1,
+      "classification": "session_owned_persisted",
+      "authorityId": "current-session-row",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/current-session-executor-runtime.ts",
+      "enclosingFunction": "reconcilePendingReservation",
+      "receiverKind": "Session",
+      "fieldPath": "workerGeneration",
+      "operation": "assign",
+      "normalizedAstHash": "f3708277f3281de6",
+      "count": 1,
+      "classification": "session_owned_persisted",
+      "authorityId": "current-session-row",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
       "sourceFile": "src/core/dashboard-ipc-server.ts",
       "enclosingFunction": "<module>",
       "receiverKind": "DaemonSession",
@@ -2063,7 +2411,7 @@
       "count": 1,
       "classification": "path_specific_authority",
       "authorityId": "dispatch-card-and-turn-evidence",
-      "accessLane": "dispatch-receipt-helper"
+      "accessLane": "session-executor-runtime-adapter"
     },
     {
       "sourceFile": "src/core/initial-user-turn.ts",
@@ -5231,7 +5579,7 @@
       "count": 1,
       "classification": "ephemeral_runtime",
       "authorityId": "actor-host-runtime",
-      "accessLane": "actor-host-direct"
+      "accessLane": "session-executor-runtime-adapter"
     },
     {
       "sourceFile": "src/core/trigger-session.ts",
@@ -5243,7 +5591,7 @@
       "count": 1,
       "classification": "ephemeral_runtime",
       "authorityId": "actor-host-runtime",
-      "accessLane": "actor-host-direct"
+      "accessLane": "session-executor-runtime-adapter"
     },
     {
       "sourceFile": "src/core/trigger-session.ts",
@@ -6643,7 +6991,7 @@
       "receiverKind": "DaemonSession",
       "fieldPath": "lastBridgeEmittedUuid",
       "operation": "assign",
-      "normalizedAstHash": "62a8cd89c8c8ebf9",
+      "normalizedAstHash": "85638f8e3ef1c224",
       "count": 1,
       "classification": "ephemeral_runtime",
       "authorityId": "actor-host-runtime",
@@ -6655,7 +7003,7 @@
       "receiverKind": "DaemonSession",
       "fieldPath": "lastBridgeEmittedUuid",
       "operation": "assign",
-      "normalizedAstHash": "85638f8e3ef1c224",
+      "normalizedAstHash": "a609087cc5a6662e",
       "count": 1,
       "classification": "ephemeral_runtime",
       "authorityId": "actor-host-runtime",
@@ -8671,7 +9019,7 @@
       "receiverKind": "DaemonSession",
       "fieldPath": "riffCloseState",
       "operation": "assign",
-      "normalizedAstHash": "4537baf92fa3161a",
+      "normalizedAstHash": "71427a988e340977",
       "count": 1,
       "classification": "ephemeral_runtime",
       "authorityId": "actor-host-runtime",
@@ -8683,7 +9031,7 @@
       "receiverKind": "DaemonSession",
       "fieldPath": "riffCloseState",
       "operation": "assign",
-      "normalizedAstHash": "50c91ed54619db24",
+      "normalizedAstHash": "db75b577a62b6340",
       "count": 1,
       "classification": "ephemeral_runtime",
       "authorityId": "actor-host-runtime",
@@ -9255,90 +9603,6 @@
     },
     {
       "sourceFile": "src/core/worker-pool.ts",
-      "enclosingFunction": "reserveWorkerGeneration",
-      "receiverKind": "DaemonSession",
-      "fieldPath": "workerGeneration",
-      "operation": "assign",
-      "normalizedAstHash": "33419d4da2e45c3c",
-      "count": 1,
-      "classification": "ephemeral_runtime",
-      "authorityId": "actor-host-runtime",
-      "accessLane": "actor-host-direct"
-    },
-    {
-      "sourceFile": "src/core/worker-pool.ts",
-      "enclosingFunction": "reserveWorkerGeneration",
-      "receiverKind": "DaemonSession",
-      "fieldPath": "workerGeneration",
-      "operation": "assign",
-      "normalizedAstHash": "58f6165d720e8764",
-      "count": 1,
-      "classification": "ephemeral_runtime",
-      "authorityId": "actor-host-runtime",
-      "accessLane": "actor-host-direct"
-    },
-    {
-      "sourceFile": "src/core/worker-pool.ts",
-      "enclosingFunction": "reserveWorkerGeneration",
-      "receiverKind": "DaemonSession",
-      "fieldPath": "workerGeneration",
-      "operation": "delete",
-      "normalizedAstHash": "d3d8b3071ec25c47",
-      "count": 1,
-      "classification": "ephemeral_runtime",
-      "authorityId": "actor-host-runtime",
-      "accessLane": "actor-host-direct"
-    },
-    {
-      "sourceFile": "src/core/worker-pool.ts",
-      "enclosingFunction": "reserveWorkerGeneration",
-      "receiverKind": "Session",
-      "fieldPath": "workerGeneration",
-      "operation": "assign",
-      "normalizedAstHash": "817c6b7a5b17cf43",
-      "count": 1,
-      "classification": "session_owned_persisted",
-      "authorityId": "current-session-row",
-      "accessLane": "direct-caller-mutation"
-    },
-    {
-      "sourceFile": "src/core/worker-pool.ts",
-      "enclosingFunction": "reserveWorkerGeneration",
-      "receiverKind": "Session",
-      "fieldPath": "workerGeneration",
-      "operation": "assign",
-      "normalizedAstHash": "f89746140f4c0a87",
-      "count": 1,
-      "classification": "session_owned_persisted",
-      "authorityId": "current-session-row",
-      "accessLane": "direct-caller-mutation"
-    },
-    {
-      "sourceFile": "src/core/worker-pool.ts",
-      "enclosingFunction": "reserveWorkerGeneration",
-      "receiverKind": "Session",
-      "fieldPath": "workerGeneration",
-      "operation": "delete",
-      "normalizedAstHash": "d48063c34d331601",
-      "count": 1,
-      "classification": "session_owned_persisted",
-      "authorityId": "current-session-row",
-      "accessLane": "direct-caller-mutation"
-    },
-    {
-      "sourceFile": "src/core/worker-pool.ts",
-      "enclosingFunction": "reserveWorkerGeneration",
-      "receiverKind": "SessionStore",
-      "fieldPath": "*",
-      "operation": "call:updateSession",
-      "normalizedAstHash": "92b2e1c092983eaa",
-      "count": 1,
-      "classification": "session_owned_persisted",
-      "authorityId": "current-session-row",
-      "accessLane": "session-store-api"
-    },
-    {
-      "sourceFile": "src/core/worker-pool.ts",
       "enclosingFunction": "resolveQuarantinedForkPlan",
       "receiverKind": "DaemonSession",
       "fieldPath": "quarantinedActivationTailPromotion",
@@ -9372,6 +9636,90 @@
       "classification": "ephemeral_runtime",
       "authorityId": "actor-host-runtime",
       "accessLane": "actor-host-direct"
+    },
+    {
+      "sourceFile": "src/core/worker-pool.ts",
+      "enclosingFunction": "retireWorkerAfterUnknownGeneration",
+      "receiverKind": "DaemonSession",
+      "fieldPath": "localProcessAttestation",
+      "operation": "assign",
+      "normalizedAstHash": "c526938e100f0669",
+      "count": 1,
+      "classification": "ephemeral_runtime",
+      "authorityId": "actor-host-runtime",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/worker-pool.ts",
+      "enclosingFunction": "retireWorkerAfterUnknownGeneration",
+      "receiverKind": "DaemonSession",
+      "fieldPath": "managedTurnOrigin",
+      "operation": "assign",
+      "normalizedAstHash": "094e43bab1d32648",
+      "count": 1,
+      "classification": "ephemeral_runtime",
+      "authorityId": "actor-host-runtime",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/worker-pool.ts",
+      "enclosingFunction": "retireWorkerAfterUnknownGeneration",
+      "receiverKind": "DaemonSession",
+      "fieldPath": "worker",
+      "operation": "assign",
+      "normalizedAstHash": "72d4363a99b051f7",
+      "count": 1,
+      "classification": "ephemeral_runtime",
+      "authorityId": "actor-host-runtime",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/worker-pool.ts",
+      "enclosingFunction": "retireWorkerAfterUnknownGeneration",
+      "receiverKind": "DaemonSession",
+      "fieldPath": "workerPort",
+      "operation": "assign",
+      "normalizedAstHash": "4b8a8c7743e82eae",
+      "count": 1,
+      "classification": "ephemeral_runtime",
+      "authorityId": "actor-host-runtime",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/worker-pool.ts",
+      "enclosingFunction": "retireWorkerAfterUnknownGeneration",
+      "receiverKind": "DaemonSession",
+      "fieldPath": "workerReady",
+      "operation": "assign",
+      "normalizedAstHash": "c574d0e451505f89",
+      "count": 1,
+      "classification": "ephemeral_runtime",
+      "authorityId": "actor-host-runtime",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/worker-pool.ts",
+      "enclosingFunction": "retireWorkerAfterUnknownGeneration",
+      "receiverKind": "DaemonSession",
+      "fieldPath": "workerToken",
+      "operation": "assign",
+      "normalizedAstHash": "06ac57ef2fe588b4",
+      "count": 1,
+      "classification": "ephemeral_runtime",
+      "authorityId": "actor-host-runtime",
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/worker-pool.ts",
+      "enclosingFunction": "retireWorkerAfterUnknownGeneration",
+      "receiverKind": "DaemonSession",
+      "fieldPath": "workerViewToken",
+      "operation": "assign",
+      "normalizedAstHash": "96d30fa43c16b56b",
+      "count": 1,
+      "classification": "ephemeral_runtime",
+      "authorityId": "actor-host-runtime",
+      "accessLane": "session-executor-runtime-adapter"
     },
     {
       "sourceFile": "src/core/worker-pool.ts",
@@ -10087,11 +10435,11 @@
       "receiverKind": "DaemonSession",
       "fieldPath": "exitEventEmitted",
       "operation": "assign",
-      "normalizedAstHash": "b00ebd5430221799",
+      "normalizedAstHash": "97534bf66dd3d032",
       "count": 1,
       "classification": "ephemeral_runtime",
       "authorityId": "actor-host-runtime",
-      "accessLane": "actor-host-direct"
+      "accessLane": "session-executor-runtime-adapter"
     },
     {
       "sourceFile": "src/core/worker-pool.ts",
@@ -10103,7 +10451,7 @@
       "count": 1,
       "classification": "ephemeral_runtime",
       "authorityId": "actor-host-runtime",
-      "accessLane": "actor-host-direct"
+      "accessLane": "session-executor-runtime-adapter"
     },
     {
       "sourceFile": "src/core/worker-pool.ts",
@@ -10183,11 +10531,11 @@
       "receiverKind": "DaemonSession",
       "fieldPath": "initialStartClaimToken",
       "operation": "assign",
-      "normalizedAstHash": "53c01c7c74139f13",
+      "normalizedAstHash": "199752bec8c2476a",
       "count": 1,
       "classification": "ephemeral_runtime",
       "authorityId": "actor-host-runtime",
-      "accessLane": "actor-host-direct"
+      "accessLane": "session-executor-runtime-adapter"
     },
     {
       "sourceFile": "src/core/worker-pool.ts",
@@ -10195,11 +10543,11 @@
       "receiverKind": "DaemonSession",
       "fieldPath": "initialStartPending",
       "operation": "assign",
-      "normalizedAstHash": "5eed1b4230f39783",
+      "normalizedAstHash": "e907c3c042d5de9e",
       "count": 1,
       "classification": "ephemeral_runtime",
       "authorityId": "actor-host-runtime",
-      "accessLane": "actor-host-direct"
+      "accessLane": "session-executor-runtime-adapter"
     },
     {
       "sourceFile": "src/core/worker-pool.ts",
@@ -10271,7 +10619,7 @@
       "count": 1,
       "classification": "ephemeral_runtime",
       "authorityId": "actor-host-runtime",
-      "accessLane": "actor-host-direct"
+      "accessLane": "session-executor-runtime-adapter"
     },
     {
       "sourceFile": "src/core/worker-pool.ts",
@@ -10307,7 +10655,7 @@
       "count": 1,
       "classification": "ephemeral_runtime",
       "authorityId": "actor-host-runtime",
-      "accessLane": "actor-host-direct"
+      "accessLane": "session-executor-runtime-adapter"
     },
     {
       "sourceFile": "src/core/worker-pool.ts",
@@ -10316,18 +10664,6 @@
       "fieldPath": "managedTurnOrigin",
       "operation": "assign",
       "normalizedAstHash": "3b2e2671da0bd830",
-      "count": 1,
-      "classification": "ephemeral_runtime",
-      "authorityId": "actor-host-runtime",
-      "accessLane": "actor-host-direct"
-    },
-    {
-      "sourceFile": "src/core/worker-pool.ts",
-      "enclosingFunction": "setupWorkerHandlers",
-      "receiverKind": "DaemonSession",
-      "fieldPath": "managedTurnOrigin",
-      "operation": "assign",
-      "normalizedAstHash": "3fc8fa716cba93ae",
       "count": 1,
       "classification": "ephemeral_runtime",
       "authorityId": "actor-host-runtime",
@@ -10355,7 +10691,7 @@
       "count": 1,
       "classification": "ephemeral_runtime",
       "authorityId": "actor-host-runtime",
-      "accessLane": "actor-host-direct"
+      "accessLane": "session-executor-runtime-adapter"
     },
     {
       "sourceFile": "src/core/worker-pool.ts",
@@ -10380,6 +10716,18 @@
       "classification": "ephemeral_runtime",
       "authorityId": "actor-host-runtime",
       "accessLane": "actor-host-direct"
+    },
+    {
+      "sourceFile": "src/core/worker-pool.ts",
+      "enclosingFunction": "setupWorkerHandlers",
+      "receiverKind": "DaemonSession",
+      "fieldPath": "managedTurnOrigin",
+      "operation": "assign",
+      "normalizedAstHash": "cc3c521c520a1a82",
+      "count": 1,
+      "classification": "ephemeral_runtime",
+      "authorityId": "actor-host-runtime",
+      "accessLane": "session-executor-runtime-adapter"
     },
     {
       "sourceFile": "src/core/worker-pool.ts",
@@ -10519,11 +10867,11 @@
       "receiverKind": "DaemonSession",
       "fieldPath": "riffCloseState",
       "operation": "assign",
-      "normalizedAstHash": "0458a073c8b33d95",
+      "normalizedAstHash": "8bcaf4f6fe13a437",
       "count": 1,
       "classification": "ephemeral_runtime",
       "authorityId": "actor-host-runtime",
-      "accessLane": "actor-host-direct"
+      "accessLane": "session-executor-runtime-adapter"
     },
     {
       "sourceFile": "src/core/worker-pool.ts",
@@ -10831,23 +11179,23 @@
       "receiverKind": "DaemonSession",
       "fieldPath": "worker",
       "operation": "assign",
-      "normalizedAstHash": "c7f843bd0e2f0cb4",
+      "normalizedAstHash": "38770088b7f81cbd",
       "count": 1,
       "classification": "ephemeral_runtime",
       "authorityId": "actor-host-runtime",
-      "accessLane": "actor-host-direct"
+      "accessLane": "session-executor-runtime-adapter"
     },
     {
       "sourceFile": "src/core/worker-pool.ts",
       "enclosingFunction": "setupWorkerHandlers",
       "receiverKind": "DaemonSession",
-      "fieldPath": "workerGeneration",
+      "fieldPath": "workerPort",
       "operation": "assign",
-      "normalizedAstHash": "b07f5c57035126e5",
+      "normalizedAstHash": "5e2f4a3456a83504",
       "count": 1,
       "classification": "ephemeral_runtime",
       "authorityId": "actor-host-runtime",
-      "accessLane": "actor-host-direct"
+      "accessLane": "session-executor-runtime-adapter"
     },
     {
       "sourceFile": "src/core/worker-pool.ts",
@@ -10856,18 +11204,6 @@
       "fieldPath": "workerPort",
       "operation": "assign",
       "normalizedAstHash": "a8365c2d55c04075",
-      "count": 1,
-      "classification": "ephemeral_runtime",
-      "authorityId": "actor-host-runtime",
-      "accessLane": "actor-host-direct"
-    },
-    {
-      "sourceFile": "src/core/worker-pool.ts",
-      "enclosingFunction": "setupWorkerHandlers",
-      "receiverKind": "DaemonSession",
-      "fieldPath": "workerPort",
-      "operation": "assign",
-      "normalizedAstHash": "b2ff2cd8bac6d8fc",
       "count": 1,
       "classification": "ephemeral_runtime",
       "authorityId": "actor-host-runtime",
@@ -10891,11 +11227,11 @@
       "receiverKind": "DaemonSession",
       "fieldPath": "workerReady",
       "operation": "assign",
-      "normalizedAstHash": "6431fb2999cc1bcb",
+      "normalizedAstHash": "4ed913cb102af268",
       "count": 1,
       "classification": "ephemeral_runtime",
       "authorityId": "actor-host-runtime",
-      "accessLane": "actor-host-direct"
+      "accessLane": "session-executor-runtime-adapter"
     },
     {
       "sourceFile": "src/core/worker-pool.ts",
@@ -10903,11 +11239,11 @@
       "receiverKind": "DaemonSession",
       "fieldPath": "workerReady",
       "operation": "assign",
-      "normalizedAstHash": "b29785ac7ead9a0e",
+      "normalizedAstHash": "6431fb2999cc1bcb",
       "count": 1,
       "classification": "ephemeral_runtime",
       "authorityId": "actor-host-runtime",
-      "accessLane": "actor-host-direct"
+      "accessLane": "session-executor-runtime-adapter"
     },
     {
       "sourceFile": "src/core/worker-pool.ts",
@@ -10919,7 +11255,7 @@
       "count": 1,
       "classification": "ephemeral_runtime",
       "authorityId": "actor-host-runtime",
-      "accessLane": "actor-host-direct"
+      "accessLane": "session-executor-runtime-adapter"
     },
     {
       "sourceFile": "src/core/worker-pool.ts",
@@ -10939,11 +11275,23 @@
       "receiverKind": "DaemonSession",
       "fieldPath": "workerToken",
       "operation": "assign",
-      "normalizedAstHash": "7016442fefa0eac0",
+      "normalizedAstHash": "48eeacff80be6e03",
       "count": 1,
       "classification": "ephemeral_runtime",
       "authorityId": "actor-host-runtime",
-      "accessLane": "actor-host-direct"
+      "accessLane": "session-executor-runtime-adapter"
+    },
+    {
+      "sourceFile": "src/core/worker-pool.ts",
+      "enclosingFunction": "setupWorkerHandlers",
+      "receiverKind": "DaemonSession",
+      "fieldPath": "workerViewToken",
+      "operation": "assign",
+      "normalizedAstHash": "a2ac84e3ec1185a5",
+      "count": 1,
+      "classification": "ephemeral_runtime",
+      "authorityId": "actor-host-runtime",
+      "accessLane": "session-executor-runtime-adapter"
     },
     {
       "sourceFile": "src/core/worker-pool.ts",
@@ -10960,26 +11308,14 @@
     {
       "sourceFile": "src/core/worker-pool.ts",
       "enclosingFunction": "setupWorkerHandlers",
-      "receiverKind": "DaemonSession",
-      "fieldPath": "workerViewToken",
-      "operation": "assign",
-      "normalizedAstHash": "c41c6baff5486344",
-      "count": 1,
-      "classification": "ephemeral_runtime",
-      "authorityId": "actor-host-runtime",
-      "accessLane": "actor-host-direct"
-    },
-    {
-      "sourceFile": "src/core/worker-pool.ts",
-      "enclosingFunction": "setupWorkerHandlers",
       "receiverKind": "DashboardProjection",
       "fieldPath": "session.exited",
       "operation": "publish",
-      "normalizedAstHash": "295b61e46aba3ece",
+      "normalizedAstHash": "900dc8d82d5c87b4",
       "count": 1,
       "classification": "projection",
       "authorityId": "dashboard-projection",
-      "accessLane": "dashboard-event-publish"
+      "accessLane": "session-executor-runtime-adapter"
     },
     {
       "sourceFile": "src/core/worker-pool.ts",
@@ -11189,18 +11525,6 @@
       "sourceFile": "src/core/worker-pool.ts",
       "enclosingFunction": "setupWorkerHandlers",
       "receiverKind": "Session",
-      "fieldPath": "pid",
-      "operation": "assign",
-      "normalizedAstHash": "9daaddc03eba6a67",
-      "count": 1,
-      "classification": "session_owned_persisted",
-      "authorityId": "current-session-row",
-      "accessLane": "direct-caller-mutation"
-    },
-    {
-      "sourceFile": "src/core/worker-pool.ts",
-      "enclosingFunction": "setupWorkerHandlers",
-      "receiverKind": "Session",
       "fieldPath": "riffParentTaskId",
       "operation": "assign",
       "normalizedAstHash": "64dc6a50c54772bd",
@@ -11267,7 +11591,7 @@
       "count": 1,
       "classification": "session_owned_persisted",
       "authorityId": "current-session-row",
-      "accessLane": "direct-caller-mutation"
+      "accessLane": "session-executor-runtime-adapter"
     },
     {
       "sourceFile": "src/core/worker-pool.ts",
@@ -11276,18 +11600,6 @@
       "fieldPath": "webPort",
       "operation": "assign",
       "normalizedAstHash": "d0a6f578cc75c990",
-      "count": 1,
-      "classification": "session_owned_persisted",
-      "authorityId": "current-session-row",
-      "accessLane": "direct-caller-mutation"
-    },
-    {
-      "sourceFile": "src/core/worker-pool.ts",
-      "enclosingFunction": "setupWorkerHandlers",
-      "receiverKind": "Session",
-      "fieldPath": "workerGeneration",
-      "operation": "assign",
-      "normalizedAstHash": "183bacb42705f1c2",
       "count": 1,
       "classification": "session_owned_persisted",
       "authorityId": "current-session-row",
@@ -11407,30 +11719,6 @@
       "receiverKind": "SessionStore",
       "fieldPath": "*",
       "operation": "call:updateSession",
-      "normalizedAstHash": "d17b5c9d87852494",
-      "count": 1,
-      "classification": "session_owned_persisted",
-      "authorityId": "current-session-row",
-      "accessLane": "session-store-api"
-    },
-    {
-      "sourceFile": "src/core/worker-pool.ts",
-      "enclosingFunction": "setupWorkerHandlers",
-      "receiverKind": "SessionStore",
-      "fieldPath": "*",
-      "operation": "call:updateSession",
-      "normalizedAstHash": "e15c7ed5518691ee",
-      "count": 1,
-      "classification": "session_owned_persisted",
-      "authorityId": "current-session-row",
-      "accessLane": "session-store-api"
-    },
-    {
-      "sourceFile": "src/core/worker-pool.ts",
-      "enclosingFunction": "setupWorkerHandlers",
-      "receiverKind": "SessionStore",
-      "fieldPath": "*",
-      "operation": "call:updateSession",
       "normalizedAstHash": "e3aa3fe187fa30a1",
       "count": 1,
       "classification": "session_owned_persisted",
@@ -11447,7 +11735,7 @@
       "count": 1,
       "classification": "session_owned_persisted",
       "authorityId": "current-session-row",
-      "accessLane": "session-store-api"
+      "accessLane": "session-executor-runtime-adapter"
     },
     {
       "sourceFile": "src/core/worker-pool.ts",

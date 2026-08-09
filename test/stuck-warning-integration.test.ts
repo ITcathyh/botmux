@@ -22,6 +22,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 import {
   initWorkerPool,
+  __testOnly_resetSessionExecutorRuntime,
   __testOnly_reserveWorkerGeneration,
   __testOnly_setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
@@ -166,6 +167,7 @@ describe('stuck-warning state machine (integration)', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    __testOnly_resetSessionExecutorRuntime();
     updateMessageMock.mockClear();
     // Deferred sessionReply: tests control when the card POST resolves,
     // simulating in-flight async POSTs.
@@ -393,6 +395,39 @@ describe('stuck-warning state machine (integration)', () => {
     );
     expect(ds.tuiPromptCardId).toBeUndefined();
     expect(ds.tuiPromptProcessing).toBe(false);
+  });
+
+  it('does not clear replacement TUI authority when an old submit-failure reply resolves late', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({ worker: fakeWorker });
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    ds.tuiPromptCardId = 'om_old_tui_card';
+    ds.tuiPromptProcessing = true;
+    ds.tuiPromptOptions = [
+      { text: 'Old', selected: false, type: 'select', keys: ['Enter'] },
+    ];
+
+    fakeWorker.emit('message', {
+      type: 'tui_prompt_submit_failed',
+      cardMessageId: 'om_old_tui_card',
+    });
+    await flush();
+    expect(sessionReplyMock).toHaveBeenCalledOnce();
+
+    __testOnly_reserveWorkerGeneration(ds);
+    ds.tuiPromptCardId = 'om_replacement_tui_card';
+    ds.tuiPromptProcessing = true;
+    ds.tuiPromptOptions = [
+      { text: 'Replacement', selected: false, type: 'select', keys: ['Enter'] },
+    ];
+    sessionReplyDeferred.resolve('om_failure_notice');
+    await flush();
+
+    expect(ds.tuiPromptCardId).toBe('om_replacement_tui_card');
+    expect(ds.tuiPromptOptions).toEqual([
+      { text: 'Replacement', selected: false, type: 'select', keys: ['Enter'] },
+    ]);
+    expect(ds.tuiPromptProcessing).toBe(true);
   });
 
   it('stale worker generation cannot resolve the replacement TUI card', async () => {

@@ -13,7 +13,12 @@ export async function settleDeferredScheduleRun(
   context: { turnId: string; source: 'terminal' | 'idle' },
   deps: {
     reconcile: (ds: DaemonSession) => string | undefined;
-    closeSession: (sessionId: string) => Promise<unknown>;
+    closeSession: (
+      sessionId: string,
+      options?: { isCurrent?: () => boolean },
+    ) => Promise<boolean | void>;
+    /** Dynamic executor-generation proof for timer-delayed settlement. */
+    isCurrent?: () => boolean;
   },
 ): Promise<DeferredScheduleSettlementResult> {
   const run = ds.session.deferredScheduleRun;
@@ -23,8 +28,13 @@ export async function settleDeferredScheduleRun(
   if (context.source === 'idle' && ds.lastScreenStatus !== 'idle') {
     return { action: 'ignored' };
   }
+  if (deps.isCurrent && !deps.isCurrent()) return { action: 'ignored' };
   const rootMessageId = deps.reconcile(ds);
   if (rootMessageId) return { action: 'materialized', rootMessageId };
-  await deps.closeSession(ds.session.sessionId);
+  if (deps.isCurrent && !deps.isCurrent()) return { action: 'ignored' };
+  const closed = deps.isCurrent
+    ? await deps.closeSession(ds.session.sessionId, { isCurrent: deps.isCurrent })
+    : await deps.closeSession(ds.session.sessionId);
+  if (closed === false) return { action: 'ignored' };
   return { action: 'closed' };
 }

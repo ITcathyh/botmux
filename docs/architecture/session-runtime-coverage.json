@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
-  "purpose": "A1 可执行覆盖台账：由源码和 A0 authority inventory 证明已迁移命令与 remaining bypass，不声明 Target-B durability。",
+  "purpose": "Target-A 可执行覆盖台账：由源码和 A0 authority inventory 证明已迁移边界与 remaining bypass，不声明 Target-B durability。",
   "authorityInventory": {
     "path": "docs/architecture/session-authority-inventory.json",
-    "sha256": "ce540b557d1046bcb575be6a32f07694d0d030c65ee8a79ae51d754552db25dd"
+    "sha256": "777c507bbcf4c0853eea9e6afd8b8e01eeb4ed32cfd74279235081fd4c4437e9"
   },
   "coverage": [
     {
@@ -179,29 +179,80 @@
     {
       "id": "executor-generation",
       "targetMilestone": "A2",
-      "disposition": "remaining",
-      "description": "executor received/committed/terminal/exit 与 generation fence 尚未收进 SessionRuntime internal Module。",
+      "disposition": "migrated",
+      "description": "executor received/rejected/committed/terminal/CLI-exit/worker-exit 已经 opaque lease 进入 SessionExecutorRuntime；generation publish/fence 与 named input-commit evidence 仅留在 owner-bound Current Adapter 后。",
       "selectors": [
         {
-          "sourceFile": "src/core/dispatch.ts"
+          "sourceFile": "src/core/current-session-executor-runtime.ts",
+          "enclosingFunctions": [
+            "commitNext",
+            "fenceExit",
+            "reconcilePendingExitFence",
+            "reconcilePendingReservation"
+          ],
+          "accessLanes": [
+            "session-executor-runtime-adapter"
+          ]
+        },
+        {
+          "sourceFile": "src/core/current-dispatch-input-commit-evidence.ts",
+          "enclosingFunctions": [
+            "record",
+            "synchronizeReceipts"
+          ],
+          "accessLanes": [
+            "session-executor-runtime-adapter"
+          ]
+        },
+        {
+          "sourceFile": "src/core/dispatch.ts",
+          "enclosingFunctions": [
+            "recordDispatchInputCommit"
+          ],
+          "accessLanes": [
+            "session-executor-runtime-adapter"
+          ]
         },
         {
           "sourceFile": "src/core/worker-pool.ts",
           "enclosingFunctions": [
+            "retireWorkerAfterUnknownGeneration",
             "setupWorkerHandlers"
+          ],
+          "accessLanes": [
+            "session-executor-runtime-adapter"
           ]
         },
         {
           "sourceFile": "src/core/trigger-session.ts",
           "enclosingFunctions": [
             "convergeIdempotentAsyncTurnOnWorkerExit"
+          ],
+          "accessLanes": [
+            "session-executor-runtime-adapter"
           ]
         }
       ],
       "authoritySites": {
-        "recordCount": 128,
-        "mutationCount": 130,
-        "digest": "4b5f0c1df5ef8556cb922de92e0acee95944bf20048ccdc15f2731fe1211d8bc"
+        "recordCount": 58,
+        "mutationCount": 58,
+        "digest": "52595f580ad9fa024d32ea8983353484a0a0fdb0df368b6580a6d9fee27f46b8"
+      },
+      "productionBinding": {
+        "workerSource": "src/core/worker-pool.ts",
+        "handlerFunction": "setupWorkerHandlers",
+        "reservationFunction": "reserveWorkerGeneration",
+        "runtimeSource": "src/core/session-executor-runtime.ts",
+        "currentAdapterSource": "src/core/current-session-executor-runtime.ts",
+        "evidenceAdapterSource": "src/core/current-dispatch-input-commit-evidence.ts",
+        "observationKinds": [
+          "inputReceived",
+          "inputRejected",
+          "inputCommitted",
+          "turnTerminal",
+          "cliExit",
+          "workerExit"
+        ]
       }
     },
     {
@@ -268,7 +319,6 @@
             "removeInactiveRegistration",
             "requestSessionRestart",
             "reserveQueuedActivationTailAdmission",
-            "reserveWorkerGeneration",
             "resolveQuarantinedForkPlan",
             "restoreQueuedActivationJournal",
             "rollbackWorkerForkPreInit",
@@ -289,9 +339,9 @@
         }
       ],
       "authoritySites": {
-        "recordCount": 344,
-        "mutationCount": 345,
-        "digest": "c04edcf2df31e4261fb2a489faa0bc29480c7da10671903a479975787a9b11b3"
+        "recordCount": 337,
+        "mutationCount": 338,
+        "digest": "4064bdccea18bbdf6856cd2bb4d531f4e28a790453cde42f407b0ad1129fb084"
       }
     },
     {
@@ -344,9 +394,9 @@
         }
       ],
       "authoritySites": {
-        "recordCount": 8,
-        "mutationCount": 8,
-        "digest": "7f7dc70142516e071a52c6cee7ce652c98bc8423de7b9d1603c4a2bd1b36af9a"
+        "recordCount": 11,
+        "mutationCount": 11,
+        "digest": "c1e8cb18e954dbf86be016620939513342131a7c5a3346b16883b7fc485e638e"
       }
     },
     {
@@ -360,9 +410,9 @@
         }
       ],
       "authoritySites": {
-        "recordCount": 426,
-        "mutationCount": 427,
-        "digest": "ad1aff9d0788d43495675735abd22d5d30226979377124176da212425ec43534"
+        "recordCount": 524,
+        "mutationCount": 527,
+        "digest": "90d480e1a7bef110c9d0812b0a6e178392f31e95d0746133553420cafdca1eb9"
       },
       "rawPublisherSelectors": [
         {

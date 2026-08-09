@@ -62,4 +62,29 @@ describe('deferred schedule turn settlement', () => {
     expect(deps.reconcile).not.toHaveBeenCalled();
     expect(closeSession).not.toHaveBeenCalled();
   });
+
+  it('does not settle after the originating executor generation loses authority', async () => {
+    const closeSession = vi.fn(async () => undefined);
+    const reconcile = vi.fn(() => undefined);
+
+    expect(await settleDeferredScheduleRun(makeSession(), {
+      turnId: 'schedule:task-1:run-1', source: 'terminal',
+    }, { reconcile, closeSession, isCurrent: () => false })).toEqual({ action: 'ignored' });
+    expect(reconcile).not.toHaveBeenCalled();
+    expect(closeSession).not.toHaveBeenCalled();
+  });
+
+  it('rechecks generation authority between reconcile and close', async () => {
+    const closeSession = vi.fn(async () => undefined);
+    let checks = 0;
+
+    expect(await settleDeferredScheduleRun(makeSession(), {
+      turnId: 'schedule:task-1:run-1', source: 'terminal',
+    }, {
+      reconcile: () => undefined,
+      closeSession,
+      isCurrent: () => ++checks === 1,
+    })).toEqual({ action: 'ignored' });
+    expect(closeSession).not.toHaveBeenCalled();
+  });
 });

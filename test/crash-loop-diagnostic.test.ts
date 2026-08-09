@@ -205,6 +205,7 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
       phase: 'preparing',
       requestId: 'close-riff',
       taskId: 'task-riff',
+      worker,
     };
     __testOnly_setupWorkerHandlers(ds, worker);
 

@@ -202,6 +202,57 @@ describe('Riff explicit close', () => {
     expect(sessionStore.getSession(fixture.session.sessionId)?.riffParentTaskId).toBeUndefined();
   });
 
+  it('aborts a prepared close when its executor guard becomes stale before durable close', async () => {
+    const fixture = createFixture({ liveWorker: true, resultTaskId: 'task-riff-child' });
+    let current = true;
+    let closeRequestId: string | undefined;
+    vi.mocked(fixture.worker.send).mockImplementation((message: any) => {
+      if (message.type === 'close' && message.requestId) {
+        closeRequestId = message.requestId;
+        return;
+      }
+      if (message.type === 'close_abort' && message.requestId) {
+        queueMicrotask(() => fixture.worker.emit('message', {
+          type: 'close_abort_result',
+          requestId: message.requestId,
+          ok: true,
+        }));
+      }
+    });
+
+    const closing = closeSession(fixture.session.sessionId, {
+      isCurrent: () => current,
+    });
+    await vi.waitFor(() => expect(closeRequestId).toBeDefined());
+    current = false;
+    fixture.worker.emit('message', {
+      type: 'close_result',
+      requestId: closeRequestId,
+      ok: true,
+      taskId: 'task-riff-child',
+    });
+
+    expect(await closing).toEqual({
+      ok: false,
+      alreadyClosed: false,
+      error: 'executor_generation_stale',
+      retryable: false,
+    });
+    expect(fixture.worker.send).toHaveBeenCalledWith({
+      type: 'close_abort',
+      requestId: closeRequestId,
+    });
+    expect(fixture.worker.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'close_commit',
+    }));
+    expect(sessionStore.getSession(fixture.session.sessionId)).toMatchObject({
+      status: 'active',
+      riffParentTaskId: 'task-riff-child',
+    });
+    expect(fixture.registry.get(activeSessionKey(fixture.ds))).toBe(fixture.ds);
+    expect(fixture.ds.riffCloseState).toBeUndefined();
+  });
+
   it('aborts a failed live prepare and keeps the session retryable', async () => {
     const fixture = createFixture({ liveWorker: true, closeOk: false });
 
@@ -264,6 +315,7 @@ describe('Riff explicit close', () => {
       phase: 'preparing',
       requestId: 'close-riff',
       taskId: 'task-riff-123',
+      worker: fixture.worker,
     };
 
     expect(sendWorkerInput(fixture.ds, 'late turn', 'om_late_turn')).toBe(false);

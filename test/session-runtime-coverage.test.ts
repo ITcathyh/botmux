@@ -148,4 +148,24 @@ describe('SessionRuntime coverage ledger', () => {
     expect(() => auditSessionRuntimeCoverage({ ledger }))
       .toThrow(/forbidden.*currentSessionRuntimeHost/i);
   });
+
+  it('does not let migrated executor coverage swallow the rest of setupWorkerHandlers', () => {
+    const ledger = cloneLedger();
+    const executor = ledger.coverage.find((entry: any) => entry.id === 'executor-generation');
+    const workerSelector = executor.selectors.find(
+      (selector: any) => selector.sourceFile === 'src/core/worker-pool.ts',
+    );
+    delete workerSelector.accessLanes;
+    expect(() => auditSessionRuntimeCoverage({ ledger }))
+      .toThrow(/executor-generation.*exact.*session-executor-runtime-adapter.*access lane/i);
+  });
+
+  it('requires every executor observation at the migrated production boundary', () => {
+    const ledger = cloneLedger();
+    const executor = ledger.coverage.find((entry: any) => entry.id === 'executor-generation');
+    executor.productionBinding.observationKinds = executor.productionBinding.observationKinds
+      .filter((kind: string) => kind !== 'workerExit');
+    expect(() => auditSessionRuntimeCoverage({ ledger }))
+      .toThrow(/observationKinds.*every executor observation/i);
+  });
 });

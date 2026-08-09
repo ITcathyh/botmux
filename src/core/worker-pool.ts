@@ -70,12 +70,22 @@ import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigP
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
+import {
+  type ExecutorGenerationCommit,
+  type ExecutorLease,
+} from './session-executor-runtime.js';
+import { createCurrentSessionExecutorRuntime } from './current-session-executor-runtime.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
  *  isolated persistent panes so a suspend→resume reattach (same id) is
  *  distinguishable from a pane surviving a daemon restart (different id). */
 const DAEMON_BOOT_ID = randomUUID();
 const restartCoordinator = new RestartCoordinator();
+const createExecutorRuntime = () => createCurrentSessionExecutorRuntime({
+  activeSessions: () => activeSessionsRegistry,
+});
+let sessionExecutorRuntime = createExecutorRuntime();
+let activeExecutorLeases = new WeakMap<DaemonSession, ExecutorLease>();
 const lifecycleRetiringWorkers = new WeakMap<DaemonSession, Set<ChildProcess>>();
 const transferRetiringWorkers = new WeakSet<ChildProcess>();
 
@@ -105,6 +115,47 @@ function clearLifecycleRetirement(ds: DaemonSession, worker: ChildProcess): void
   const workers = lifecycleRetiringWorkers.get(ds);
   workers?.delete(worker);
   if (workers?.size === 0) lifecycleRetiringWorkers.delete(ds);
+}
+
+function hasCurrentExecutorAuthority(ds: DaemonSession): boolean {
+  if (sessionExecutorRuntime.isQuarantined(ds)) return false;
+  const lease = activeExecutorLeases.get(ds);
+  return !lease || sessionExecutorRuntime.isCurrent(lease);
+}
+
+/**
+ * A generation publication whose durable outcome cannot be proven revokes the
+ * old process immediately. Keeping its ChildProcess pointer routable would let
+ * the CLI execute turns whose received/committed reports the new fence rejects.
+ */
+function retireWorkerAfterUnknownGeneration(ds: DaemonSession): void {
+  const worker = ds.worker;
+  restartCoordinator.cancelSession(ds.session.sessionId);
+  clearUsageRefreshTimer(ds);
+  ds.localProcessAttestation = undefined;
+  invalidateStuckWarning(ds, 'unknown_executor_generation');
+  invalidateTuiPrompt(ds, 'unknown_executor_generation');
+  if (worker && !worker.killed) {
+    logger.error(
+      `[${tag(ds)}] Retiring worker after an unproved executor-generation publication`,
+    );
+    trackLifecycleRetirement(ds, worker);
+    try { worker.send({ type: 'close' } as DaemonToWorker); } catch { /* IPC already closed */ }
+    armWorkerKillBackstop(
+      worker,
+      tag(ds),
+      (ds.initConfig?.backendType ?? ds.session.backendType) === 'riff'
+        ? 24_000
+        : WORKER_SIGTERM_BACKSTOP_MS,
+    );
+  }
+  ds.worker = null;
+  ds.workerReady = false;
+  ds.workerPort = null;
+  ds.workerToken = null;
+  ds.workerViewToken = null;
+  ds.managedTurnOrigin = undefined;
+  activeExecutorLeases.delete(ds);
 }
 
 /** Symmetric lifecycle fence: relay must not start while another operation is
@@ -328,7 +379,7 @@ import {
   extractBotmuxLarkNativeSessionTitlePrompt,
 } from './session-title.js';
 import { acknowledgeSessionReady } from './session-ready-handshake.js';
-import { recordDispatchInputCommit } from './dispatch.js';
+import { createCurrentDispatchInputCommitEvidencePort } from './current-dispatch-input-commit-evidence.js';
 import { sendWorkerIpc } from './worker-ipc.js';
 import { cleanupExplicitSessionBacking } from './explicit-session-backing-cleanup.js';
 import { RIFF_ADMISSION_RESTORE_TIMEOUT_MS } from './shutdown-budgets.js';
@@ -444,35 +495,45 @@ export interface WorkerPoolCallbacks {
    * authoritative close failed and the active owner must remain retryable.
    * `void` is retained for older embedders/tests that implement a synchronous
    * best-effort close; the production daemon always returns an exact boolean. */
-  closeSession: (ds: DaemonSession) => boolean | void | Promise<boolean | void>;
+  closeSession: (
+    ds: DaemonSession,
+    options?: { isExecutorCurrent?: () => boolean },
+  ) => boolean | void | Promise<boolean | void>;
   /** Re-check the per-bot resident-session cap after a process starts or an
    * over-cap busy session becomes idle. Optional for unit-test callers. */
   enforceLiveSessionCap?: () => void;
   /** Durable consumers subscribe to transcript-backed turn completion here.
    *  Optional so ordinary sessions and tests keep their existing behavior. */
   onTurnTerminal?: (
-    ds: DaemonSession,
     terminal: Extract<WorkerToDaemon, { type: 'turn_terminal' }>,
-    context: { workerGeneration: number },
+    context: { sessionId: string; workerGeneration: number },
   ) => void | Promise<void>;
   /** A hidden fresh-topic schedule can be reclaimed once its exact turn is
    * settled. Transcript-backed CLIs report `terminal`; screen-only/remote
    * adapters use the existing debounced idle edge as a compatibility fallback. */
   onDeferredScheduleTurnSettled?: (
-    ds: DaemonSession,
-    context: { turnId: string; source: 'terminal' | 'idle' },
+    context: {
+      sessionId: string;
+      turnId: string;
+      source: 'terminal' | 'idle';
+      /** Dynamic opaque generation guard; delayed effects must check at fire. */
+      isExecutorCurrent: () => boolean;
+    },
   ) => void | Promise<void>;
   /** A process exit makes every unresolved receipt dispatched to this exact
    *  worker generation ambiguous; the receiver decides retry policy. */
   onWorkerExit?: (
-    ds: DaemonSession,
+    context: { sessionId: string; workerGeneration: number; code: number | null; signal: NodeJS.Signals | null },
+  ) => void | Promise<void>;
+  /** A superseded process may reconcile only its exact named receipts. It no
+   * longer carries a mutable Session/lifecycle capability. */
+  onRetiringWorkerExit?: (
     context: { sessionId: string; workerGeneration: number; code: number | null; signal: NodeJS.Signals | null },
   ) => void | Promise<void>;
   /** The managed CLI can crash and auto-restart inside a still-live Node
    *  worker. Durable receipts dispatched to this generation become ambiguous
    *  even though `onWorkerExit` will not fire. */
   onCliExit?: (
-    ds: DaemonSession,
     context: { sessionId: string; workerGeneration: number; code: number | null; signal: string | null },
   ) => void | Promise<void>;
   /** Boot recovery worker confirms its old persistent CLI was fenced before
@@ -1979,6 +2040,7 @@ function flushCardPatch(ds: DaemonSession): void {
 async function closeWithdrawnSessionIfLedgerEmpty(
   ds: DaemonSession,
   context: string,
+  isExecutorCurrent?: () => boolean,
 ): Promise<boolean> {
   if (hasProtectedSessionMutationOwnership(ds)) {
     logger.warn(`[${tag(ds)}] ${context}; preserving session because Codex App dispatch is unsettled`);
@@ -1988,7 +2050,9 @@ async function closeWithdrawnSessionIfLedgerEmpty(
   // The callback routes through the authoritative async closeSession helper;
   // never pre-kill a worker before that helper settles its backend boundary.
   try {
-    const closed = await requireCallbacks().closeSession(ds);
+    const closed = await requireCallbacks().closeSession(ds, {
+      ...(isExecutorCurrent ? { isExecutorCurrent } : {}),
+    });
     if (closed === false) {
       logger.warn(`[${tag(ds)}] ${context}; authoritative close failed, session retained for retry`);
       return false;
@@ -2576,7 +2640,7 @@ async function abortLiveRiffWorkerClose(
   opts: { allowAbsentAfterProvenRestore?: boolean } = {},
 ): Promise<boolean> {
   if (ds.riffCloseState?.requestId !== requestId) return false;
-  const worker = ds.worker;
+  const worker = ds.riffCloseState.worker;
   if (!worker || worker.killed) {
     if (opts.allowAbsentAfterProvenRestore) {
       ds.riffCloseState = undefined;
@@ -2599,7 +2663,8 @@ async function abortLiveRiffWorkerClose(
     const onMessage = (raw: unknown): void => {
       const msg = raw as WorkerToDaemon;
       if (msg?.type !== 'close_abort_result' || msg.requestId !== requestId) return;
-      if (ds.worker !== worker) {
+      if (ds.riffCloseState?.requestId !== requestId
+          || ds.riffCloseState.worker !== worker) {
         finish({ ok: false, error: 'stale_worker_generation' });
         return;
       }
@@ -2661,6 +2726,7 @@ async function prepareLiveRiffWorkerClose(ds: DaemonSession): Promise<RiffCloseP
   ds.riffCloseState = {
     phase: 'preparing',
     requestId,
+    worker,
     ...(ds.session.riffParentTaskId ? { taskId: ds.session.riffParentTaskId } : {}),
   };
   let matchedCloseResult = false;
@@ -2738,6 +2804,7 @@ async function prepareLiveRiffWorkerClose(ds: DaemonSession): Promise<RiffCloseP
   ds.riffCloseState = {
     phase: 'prepared',
     requestId,
+    worker,
     ...(taskId ? { taskId } : {}),
   };
   logger.info(`[${tag(ds)}] Riff worker close prepared and remote task cancellation confirmed`);
@@ -3179,6 +3246,12 @@ export function teardownAuthoritativePersistentBackingBeforeClose(
  */
 export type CloseSessionResult =
   | { ok: true; alreadyClosed: boolean; known: boolean }
+  | {
+      ok: false;
+      alreadyClosed: false;
+      error: 'executor_generation_stale';
+      retryable: false;
+    }
   | ({
       ok: false;
       alreadyClosed: false;
@@ -3186,7 +3259,16 @@ export type CloseSessionResult =
 
 export async function closeSession(
   sessionId: string,
+  options: { isCurrent?: () => boolean } = {},
 ): Promise<CloseSessionResult> {
+  if (options.isCurrent && !options.isCurrent()) {
+    return {
+      ok: false,
+      alreadyClosed: false,
+      error: 'executor_generation_stale',
+      retryable: false,
+    };
+  }
   const ds = findActiveBySessionId(sessionId);
   const stored = sessionStore.getOwnedSession(sessionId);
   // Prove fail-closed ZMX teardown before any registry/store mutation. Repo
@@ -3227,6 +3309,17 @@ export async function closeSession(
   const preparedRiffRequestId = ds?.riffCloseState?.phase === 'prepared'
     ? ds.riffCloseState.requestId
     : undefined;
+  if (options.isCurrent && !options.isCurrent()) {
+    if (ds && preparedRiffRequestId) {
+      await abortLiveRiffWorkerClose(ds, preparedRiffRequestId);
+    }
+    return {
+      ok: false,
+      alreadyClosed: false,
+      error: 'executor_generation_stale',
+      retryable: false,
+    };
+  }
 
   // 会话关闭即可回收其崩溃重启计数；否则每个曾崩溃过的 session 会在 daemon
   // 生命周期内永久占位（restartCounts 此前无任何 delete）。
@@ -3244,6 +3337,17 @@ export async function closeSession(
   // Mutations are bot-owner scoped. getSession() has a read-only cross-file
   // fallback for agent CLI discovery, so it must not authorize close.
   if (wasOpen) {
+    if (options.isCurrent && !options.isCurrent()) {
+      if (ds && preparedRiffRequestId) {
+        await abortLiveRiffWorkerClose(ds, preparedRiffRequestId);
+      }
+      return {
+        ok: false,
+        alreadyClosed: false,
+        error: 'executor_generation_stale',
+        retryable: false,
+      };
+    }
     if (!ds && stored && !isOwnedRiffClose) destroyUnregisteredPersistentBacking(stored);
     try {
       sessionStore.closeSession(sessionId, {
@@ -4120,6 +4224,7 @@ export function sendWorkerSessionInput(
   message: TransferBufferedInput,
 ): boolean {
   if (bufferTransferInput(ds, message)) return true;
+  if (!hasCurrentExecutorAuthority(ds)) return false;
   if (!ds.worker || ds.worker.killed) return false;
   ds.worker.send(message);
   return true;
@@ -5592,6 +5697,7 @@ export function sendWorkerInput(
     return false;
   }
   const transferGate = transferInputGates.get(ds);
+  if (!transferGate && !hasCurrentExecutorAuthority(ds)) return false;
   if ((!ds.worker || ds.worker.killed) && !transferGate) return false;
   const normalized = typeof payload === 'string' ? { content: payload } : payload;
   const effectiveCliId = ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
@@ -7024,12 +7130,13 @@ function setupWorkerHandlers(
   ds: DaemonSession,
   worker: ChildProcess,
   startupState: WorkerStartupState = { ready: false, failureNotified: false },
-  reservedWorkerGeneration?: number,
+  reservedGenerationCommit?: ExecutorGenerationCommit,
 ): void {
   const cb = requireCallbacks();
   const t = tag(ds);
-  const workerGeneration = reservedWorkerGeneration
+  const generationCommit = reservedGenerationCommit
     ?? reserveWorkerGeneration(ds);
+  const workerGeneration = generationCommit.generation;
   if (
     ds.workerGeneration !== workerGeneration
     || ds.session.workerGeneration !== workerGeneration
@@ -7051,20 +7158,16 @@ function setupWorkerHandlers(
   const handlerSession = ds.session;
   const handlerAnchor = sessionAnchorId(ds);
   const handlerLarkAppId = ds.larkAppId;
+  const executorLease: ExecutorLease = sessionExecutorRuntime.activate(generationCommit, worker);
+  activeExecutorLeases.set(ds, executorLease);
   const ownsWorkerSession = (): boolean =>
-    ds.worker === worker
-    && ds.workerGeneration === workerGeneration
-    && ds.session.workerGeneration === workerGeneration
-    && ds.session === handlerSession
-    && ds.session.status === 'active'
-    && ds.larkAppId === handlerLarkAppId
-    && sessionAnchorId(ds) === handlerAnchor
-    && (
-      !activeSessionsRegistry
-      || activeSessionsRegistry.get(sessionKey(handlerAnchor, handlerLarkAppId)) === ds
-    );
+    sessionExecutorRuntime.isCurrent(executorLease);
   const ownsLifecycleMutation = (): boolean =>
     ownsWorkerSession() && !isSessionTransferring(ds);
+  const dispatchInputCommits = createCurrentDispatchInputCommitEvidencePort({
+    ownerLarkAppId: handlerLarkAppId,
+    session: handlerSession,
+  });
   // A new worker generation is starting. As a backstop, invalidate any
   // stuck-warning card posted by the previous generation — explicit kill/suspend/
   // exit paths should already have done this, but fork/refork/takeover paths
@@ -7194,7 +7297,12 @@ function setupWorkerHandlers(
     // A replaced worker can drain queued messages after the new child has been
     // installed; never let those stale events mutate the replacement's cards,
     // tokens, readiness, transcript metadata, or durable turn state.
-    if (ds.worker !== worker) {
+    const executorObservation = msg.type === 'turn_input_received'
+      || msg.type === 'turn_input_rejected'
+      || msg.type === 'turn_input_committed'
+      || msg.type === 'turn_terminal'
+      || msg.type === 'claude_exit';
+    if (!ownsWorkerSession() && !executorObservation) {
       logger.debug(`[${t}] Ignored stale worker message: ${msg.type}`);
       return;
     }
@@ -7206,11 +7314,11 @@ function setupWorkerHandlers(
         break;
       }
       case 'turn_input_received': {
-        if (
-          ds.worker !== worker
-          || ds.workerGeneration !== workerGeneration
-          || ds.session.workerGeneration !== workerGeneration
-        ) {
+        const report = sessionExecutorRuntime.report(executorLease, {
+          kind: 'inputReceived',
+          turnId: msg.turnId,
+        });
+        if (report.kind !== 'current') {
           logger.warn(`[${t}] Ignored turn_input_received from stale worker generation`);
           break;
         }
@@ -7218,11 +7326,11 @@ function setupWorkerHandlers(
         break;
       }
       case 'turn_input_rejected': {
-        if (
-          ds.worker !== worker
-          || ds.workerGeneration !== workerGeneration
-          || ds.session.workerGeneration !== workerGeneration
-        ) {
+        const report = sessionExecutorRuntime.report(executorLease, {
+          kind: 'inputRejected',
+          turnId: msg.turnId,
+        });
+        if (report.kind !== 'current') {
           logger.warn(`[${t}] Ignored turn_input_rejected from stale worker generation`);
           break;
         }
@@ -7233,24 +7341,32 @@ function setupWorkerHandlers(
         // Bind the receipt to the exact live worker generation. A late ACK
         // from a replaced worker cannot make the replacement appear to have
         // accepted this dispatch turn.
-        if (
-          ds.worker !== worker
-          || ds.workerGeneration !== workerGeneration
-          || ds.session.workerGeneration !== workerGeneration
-        ) {
+        const report = sessionExecutorRuntime.report(executorLease, {
+          kind: 'inputCommitted',
+          turnId: msg.turnId,
+        });
+        if (report.kind !== 'current') {
           logger.warn(`[${t}] Ignored turn_input_committed from stale worker generation`);
           break;
         }
         // Compatibility/fallback: a commit also proves receipt if the earlier
         // receipt ACK was delayed or dropped on the reverse IPC channel.
         completeOrdinaryImDelivery(ds, msg.turnId, workerGeneration);
-        if (recordDispatchInputCommit(ds.session, msg.turnId, workerGeneration)) {
-          sessionStore.updateSession(ds.session);
+        const recorded = dispatchInputCommits.record({
+          sessionId: handlerSession.sessionId,
+          turnId: msg.turnId,
+          executorGeneration: workerGeneration,
+          committedAt: new Date().toISOString(),
+        });
+        if (recorded.kind === 'recorded') {
           if (msg.turnId.startsWith('mlrp_turn_')) {
             markMessageListenerRunPreviewRunning(msg.turnId);
           }
         } else {
-          logger.warn(`[${t}] Ignored unbound input commit turn=${msg.turnId.slice(0, 16)}`);
+          logger.warn(
+            `[${t}] Input commit evidence was not recorded `
+            + `turn=${msg.turnId.slice(0, 16)} outcome=${recorded.kind}`,
+          );
         }
         break;
       }
@@ -7601,7 +7717,11 @@ function setupWorkerHandlers(
         } catch (err) {
           if (!ownsLifecycleMutation()) break;
           if (err instanceof MessageWithdrawnError) {
-            await closeWithdrawnSessionIfLedgerEmpty(ds, 'Root message withdrawn while creating worker-ready card');
+            await closeWithdrawnSessionIfLedgerEmpty(
+              ds,
+              'Root message withdrawn while creating worker-ready card',
+              ownsLifecycleMutation,
+            );
             break;
           }
           logger.warn(`[${t}] Failed to send streaming card, falling back to static card: ${err}`);
@@ -7653,7 +7773,11 @@ function setupWorkerHandlers(
           } catch (fallbackErr) {
             if (!ownsLifecycleMutation()) break;
             if (fallbackErr instanceof MessageWithdrawnError) {
-              await closeWithdrawnSessionIfLedgerEmpty(ds, 'Root message withdrawn while creating fallback worker-ready card');
+              await closeWithdrawnSessionIfLedgerEmpty(
+                ds,
+                'Root message withdrawn while creating fallback worker-ready card',
+                ownsLifecycleMutation,
+              );
               break;
             }
             throw fallbackErr;
@@ -7900,7 +8024,12 @@ function setupWorkerHandlers(
             && msg.turnId
             && ds.session.deferredScheduleRun?.turnId === msg.turnId
           ) {
-            void cb.onDeferredScheduleTurnSettled?.(ds, { turnId: msg.turnId, source: 'idle' });
+            void cb.onDeferredScheduleTurnSettled?.({
+              sessionId: handlerSession.sessionId,
+              turnId: msg.turnId,
+              source: 'idle',
+              isExecutorCurrent: ownsLifecycleMutation,
+            });
           }
           // If every over-cap process was busy, the earlier check deliberately
           // left them alone. Re-check on the first idle edge so capacity is
@@ -7999,7 +8128,11 @@ function setupWorkerHandlers(
             .catch(async err => {
               if (!ownsLifecycleMutation()) return;
               if (err instanceof MessageWithdrawnError) {
-                await closeWithdrawnSessionIfLedgerEmpty(ds, 'Root message withdrawn while creating streaming card');
+                await closeWithdrawnSessionIfLedgerEmpty(
+                  ds,
+                  'Root message withdrawn while creating streaming card',
+                  ownsLifecycleMutation,
+                );
                 return;
               }
               logger.debug(`[${t}] Failed to create streaming card: ${err}`);
@@ -8238,6 +8371,9 @@ function setupWorkerHandlers(
           );
           break;
         }
+        const matchedTuiCardId = matchesTuiCard ? ds.tuiPromptCardId : undefined;
+        const matchedStuckCardId = matchesStuckCard ? ds.stuckWarningCardId : undefined;
+        const matchedStuckNonce = matchesStuckCard ? ds.stuckWarningNonce : undefined;
 
         const failureText = tr('worker.tui_submit_failed', {
           cliName: sessionCliDisplayName(ds, botCfg),
@@ -8259,11 +8395,20 @@ function setupWorkerHandlers(
           }
         }
 
-        if (matchesTuiCard) {
+        if (!ownsLifecycleMutation()) {
+          logger.info(`[${t}] Suppressed stale TUI submit-failure continuation`);
+          break;
+        }
+        const stillMatchesTuiCard = !!matchedTuiCardId
+          && ds.tuiPromptCardId === matchedTuiCardId;
+        const stillMatchesStuckCard = matchedStuckNonce !== undefined
+          && ds.stuckWarningNonce === matchedStuckNonce
+          && ds.stuckWarningCardId === matchedStuckCardId;
+        if (stillMatchesTuiCard) {
           clearTuiPromptAuthority(ds);
         }
-        if (matchesStuckCard) clearStuckWarningAuthority(ds);
-        publishAttentionPatch(ds);
+        if (stillMatchesStuckCard) clearStuckWarningAuthority(ds);
+        if (stillMatchesTuiCard || stillMatchesStuckCard) publishAttentionPatch(ds);
         break;
       }
 
@@ -8414,8 +8559,8 @@ function setupWorkerHandlers(
         // CLI-generation authority must not outlive the concrete worker/CLI
         // pair that issued it. A delayed message from a replaced Node worker
         // must neither clear nor restart the replacement generation.
-        const workerSession = ds.session;
-        if (ds.worker !== worker || ds.workerGeneration !== workerGeneration) {
+        const report = sessionExecutorRuntime.report(executorLease, { kind: 'cliExit' });
+        if (report.kind !== 'current' || !report.continuation) {
           logger.warn(`[${t}] Ignored claude_exit from stale worker generation`);
           break;
         }
@@ -8428,7 +8573,7 @@ function setupWorkerHandlers(
         logger.info(`[${t}] ${sessionCliDisplayName(ds, botCfg)} exited (code: ${msg.code}, signal: ${msg.signal})`);
         ds.hasHistory = true;
         try {
-          await cb.onCliExit?.(ds, {
+          await cb.onCliExit?.({
             sessionId: ds.session.sessionId,
             workerGeneration,
             code: msg.code,
@@ -8441,12 +8586,8 @@ function setupWorkerHandlers(
         // A transfer, repo replacement, or worker replacement that won during
         // that await owns all later lifecycle decisions. Never restart/kill its
         // new worker from this stale CLI-exit continuation.
-        if (
-          ds.worker !== worker
-          || ds.workerGeneration !== workerGeneration
-          || ds.session !== workerSession
-          || isSessionTransferring(ds)
-        ) {
+        const continuation = sessionExecutorRuntime.resume(report.continuation);
+        if (continuation.kind !== 'current' || isSessionTransferring(ds)) {
           logger.warn(`[${t}] Suppressed stale claude_exit lifecycle continuation`);
           break;
         }
@@ -8502,9 +8643,9 @@ function setupWorkerHandlers(
             try {
               await scopedReply(tr('cmd.restart.riff_unsupported', undefined, loc), 'text', undefined);
             } catch (replyErr) {
-              if (replyErr instanceof MessageWithdrawnError) {
+              if (replyErr instanceof MessageWithdrawnError && ownsLifecycleMutation()) {
                 logger.warn(`[${t}] Root message withdrawn, closing stale session`);
-                cb.closeSession(ds);
+                cb.closeSession(ds, { isExecutorCurrent: ownsLifecycleMutation });
               }
             }
           }
@@ -8582,7 +8723,11 @@ function setupWorkerHandlers(
               await scopedReply(parts.join('\n\n'), 'text', undefined);
             } catch (replyErr) {
               if (replyErr instanceof MessageWithdrawnError && ownsLifecycleMutation()) {
-                await closeWithdrawnSessionIfLedgerEmpty(ds, 'Root message withdrawn while sending crash diagnostic');
+                await closeWithdrawnSessionIfLedgerEmpty(
+                  ds,
+                  'Root message withdrawn while sending crash diagnostic',
+                  ownsLifecycleMutation,
+                );
               }
             }
           }
@@ -8704,6 +8849,10 @@ function setupWorkerHandlers(
         // message actually exists in this run's target chat before persisting
         // the host-side binding. This fences fabricated/cross-chat message ids.
         const claimedChatId = await getMessageChatId(ds.larkAppId, msg.rootMessageId);
+        if (!ownsLifecycleMutation()) {
+          logger.warn(`[${t}] Dropped deferred topic binding after executor generation changed`);
+          break;
+        }
         if (claimedChatId !== ds.chatId) {
           logger.warn(`[${t}] Dropped deferred topic binding outside target chat`);
           break;
@@ -8786,15 +8935,19 @@ function setupWorkerHandlers(
       }
 
       case 'turn_terminal': {
-        if (ds.worker !== worker) {
-          logger.warn(`[${t}] Ignored turn_terminal from stale worker generation`);
-          break;
-        }
         if (msg.sessionId !== ds.session.sessionId) {
           logger.warn(
             `[${t}] Dropped turn_terminal with mismatched sessionId ` +
             `(worker=${msg.sessionId}, daemon=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`,
           );
+          break;
+        }
+        const report = sessionExecutorRuntime.report(executorLease, {
+          kind: 'turnTerminal',
+          turnId: msg.turnId,
+        });
+        if (report.kind !== 'current' || !report.continuation) {
+          logger.warn(`[${t}] Ignored turn_terminal from stale worker generation`);
           break;
         }
         // Defense in depth: the worker sends a token-matched revoke before the
@@ -8806,7 +8959,10 @@ function setupWorkerHandlers(
           ds.managedTurnOrigin = undefined;
         }
         try {
-          await cb.onTurnTerminal?.(ds, msg, { workerGeneration });
+          await cb.onTurnTerminal?.(msg, {
+            sessionId: handlerSession.sessionId,
+            workerGeneration,
+          });
         } catch (err: any) {
           // The durable receipt remains non-terminal and can be reconciled;
           // never let a projection/store failure crash the worker IPC loop.
@@ -8830,6 +8986,9 @@ function setupWorkerHandlers(
         // turn (pending-only), never touches a managed VC-meeting receiver, and
         // only affects this bot's own pending async result. Feishu turns have no
         // asyncTriggerResults entry, so their silent-turn behavior is unchanged.
+        // Turn-exact receipt: like the durable receipt persist above, it settles
+        // this exact turnId regardless of the generation fence below, which
+        // gates only lifecycle continuation.
         if (msg.status === 'completed'
           && msg.outputDisposition === 'nothing_to_send'
           && !ds.session.vcMeetingReceiver) {
@@ -8851,6 +9010,11 @@ function setupWorkerHandlers(
             logger.info(`[${t}] Settled async HTTP turn ${msg.turnId.substring(0, 8)} completed (empty output; nothing-to-send)`);
           }
         }
+        const continuation = sessionExecutorRuntime.resume(report.continuation);
+        if (continuation.kind !== 'current') {
+          logger.warn(`[${t}] Suppressed stale turn_terminal lifecycle continuation`);
+          break;
+        }
         if (msg.turnId.startsWith('mlrp_turn_') && msg.status !== 'completed') {
           markMessageListenerRunPreviewFailed(msg.turnId, {
             sessionId: msg.sessionId,
@@ -8858,7 +9022,12 @@ function setupWorkerHandlers(
           });
         }
         try {
-          await cb.onDeferredScheduleTurnSettled?.(ds, { turnId: msg.turnId, source: 'terminal' });
+          await cb.onDeferredScheduleTurnSettled?.({
+            sessionId: handlerSession.sessionId,
+            turnId: msg.turnId,
+            source: 'terminal',
+            isExecutorCurrent: ownsLifecycleMutation,
+          });
         } catch (err: any) {
           logger.error(`[${t}] Failed to settle deferred schedule turn ${msg.turnId.substring(0, 8)}: ${err.message}`);
         }
@@ -9082,7 +9251,7 @@ function setupWorkerHandlers(
               } as DaemonToWorker);
             } catch { /* runner keeps the final unacknowledged for replacement */ }
           };
-          if (ds.worker !== worker) {
+          if (!ownsLifecycleMutation()) {
             acknowledge(false, 'stale_worker_generation');
             break;
           }
@@ -9180,12 +9349,20 @@ function setupWorkerHandlers(
                       t,
                       0,
                       resolve,
-                      () => ds.worker === worker
-                        && ds.session.sessionId === msg.sessionId,
+                      ownsLifecycleMutation,
                       preview.settledEntry.replyTarget,
                     );
                   });
               if (!owned) return false;
+
+              const terminalReport = sessionExecutorRuntime.report(executorLease, {
+                kind: 'turnTerminal',
+                turnId: msg.turnId,
+              });
+              if (terminalReport.kind !== 'current' || !terminalReport.continuation) {
+                logger.warn(`[${t}] Suppressed stale Codex App final settlement`);
+                return false;
+              }
 
               // Re-read after the asynchronous external delivery. A concurrent
               // replacement may already have committed this signed sequence;
@@ -9194,7 +9371,12 @@ function setupWorkerHandlers(
                 ds.session.codexAppGenerationCommits ?? [],
                 settlement.generation,
                 settlement.seq,
-              )) return true;
+              )) {
+                // Consume the continuation token, but durable prior commitment
+                // remains success even if a replacement won meanwhile.
+                sessionExecutorRuntime.resume(terminalReport.continuation);
+                return true;
+              }
               const committed = settleCodexAppDispatch(
                 ds.session.codexAppDispatchLedger ?? [],
                 ds.session.codexAppGenerationCommits ?? [],
@@ -9209,17 +9391,24 @@ function setupWorkerHandlers(
                   // the daemon ACK long enough to emit a later terminal IPC.
                   // Persist the exact completed attempt first; the worker's
                   // ordered duplicate terminal remains idempotent.
-                  await cb.onTurnTerminal?.(ds, {
+                  await cb.onTurnTerminal?.({
                     type: 'turn_terminal',
                     sessionId: ds.session.sessionId,
                     turnId: msg.turnId,
                     dispatchAttempt: msg.dispatchAttempt,
                     status: 'completed',
-                  }, { workerGeneration });
+                  }, {
+                    sessionId: handlerSession.sessionId,
+                    workerGeneration,
+                  });
                 } catch (err) {
                   logger.error(`[${t}] Failed to persist Codex App settlement terminal: ${err instanceof Error ? err.message : String(err)}`);
                   return false;
                 }
+              }
+              if (sessionExecutorRuntime.resume(terminalReport.continuation).kind !== 'current') {
+                logger.warn(`[${t}] Suppressed stale Codex App settlement continuation`);
+                return false;
               }
               const priorLedger = ds.session.codexAppDispatchLedger;
               const priorCommits = ds.session.codexAppGenerationCommits;
@@ -9253,6 +9442,7 @@ function setupWorkerHandlers(
         // transcript JSONL and forwarded it to us. Dedup with a session-scoped
         // key so a re-drain can't re-send the same answer or cross-suppress
         // another session.
+        if (!ownsLifecycleMutation()) break;
         if (!msg.content || !msg.content.trim()) break;
         if (shouldDropMismatchedFinalOutput(ds, msg, t)) break;
         if (shouldDropMismatchedHermesFinalOutput(ds, msg, t)) break;
@@ -9331,6 +9521,16 @@ function setupWorkerHandlers(
   });
 
   worker.on('exit', (code, signal) => {
+    const exitReport = sessionExecutorRuntime.report(executorLease, { kind: 'workerExit' });
+    const currentExit = exitReport.kind === 'currentExit';
+    const currentExitUnfenced = exitReport.kind === 'unreadable' && exitReport.current;
+    const retiringExit = exitReport.kind === 'retiringExit';
+    if (activeExecutorLeases.get(ds) === executorLease) {
+      activeExecutorLeases.delete(ds);
+    }
+    if (exitReport.kind === 'unreadable') {
+      logger.error(`[${t}] ${exitReport.message}`);
+    }
     abandonOrdinaryImDeliveriesForWorker(worker);
     const transferRetirement = transferRetiringWorkers.has(worker);
     transferRetiringWorkers.delete(worker);
@@ -9340,7 +9540,7 @@ function setupWorkerHandlers(
     // happen before the worker sends either ready or a structured error.  Do
     // not leave the originating Lark message unanswered. Intentional close /
     // replacement kills are excluded to avoid noisy false alarms.
-    if (!transferRetirement && !startupState.ready && !startupState.failureNotified && !worker.killed && ds.session.status !== 'closed') {
+    if (currentExit && !transferRetirement && !startupState.ready && !startupState.failureNotified && !worker.killed && ds.session.status !== 'closed') {
       const reason = tr('worker.start_exited_early', { code: code ?? 'null' }, loc);
       // Carry the frozen init attribution so an abrupt pre-ready exit of a
       // durable VC delivery is fenced to the receipt/lease chain, not replied
@@ -9351,7 +9551,7 @@ function setupWorkerHandlers(
     // may schedule a retry; it must not observe/send to this dead IPC channel.
     // A stale takeover worker never clears the replacement — during takeover the
     // old worker's exit fires AFTER the new worker has been assigned.
-    if (ds.worker === worker) {
+    if (currentExit || currentExitUnfenced) {
       restartCoordinator.failSession(ds.session.sessionId);
       if (ds.session.queuedActivationPending) {
         // Journal ownership is backend-independent. The next worker replays
@@ -9379,34 +9579,34 @@ function setupWorkerHandlers(
       // posted so a late click cannot inject keys into a replacement worker.
       invalidateStuckWarning(ds, 'worker_exit');
       invalidateTuiPrompt(ds, 'worker_exit');
-      // Fence this lifetime before a polling dispatcher can observe its last
-      // ACK. Keeping the old receipt is useful audit evidence, but the
-      // persisted current generation advances immediately so it cannot count
-      // as acceptance after the worker has died. A stale takeover worker never
-      // enters this branch and therefore cannot fence the replacement.
-      const fencedGeneration = Math.max(
-        workerGeneration,
-        ds.workerGeneration ?? 0,
-        ds.session.workerGeneration ?? 0,
-      ) + 1;
-      ds.workerGeneration = fencedGeneration;
-      ds.session.workerGeneration = fencedGeneration;
-      ds.session.pid = undefined;
-      sessionStore.updateSession(ds.session);
     }
-    if (!transferRetirement) {
+    if (!transferRetirement && currentExit) {
       try {
-        const notified = cb.onWorkerExit?.(ds, {
-          sessionId: ds.session.sessionId,
-          workerGeneration,
+        const notified = cb.onWorkerExit?.({
+          sessionId: exitReport.sessionId,
+          workerGeneration: exitReport.executorGeneration,
           code,
           signal,
         });
         void Promise.resolve(notified).catch((err: any) => {
-          logger.error(`[${t}] Failed to reconcile worker exit generation ${workerGeneration}: ${err.message}`);
+          logger.error(`[${t}] Failed to reconcile worker exit generation ${exitReport.executorGeneration}: ${err.message}`);
         });
       } catch (err: any) {
-        logger.error(`[${t}] Failed to reconcile worker exit generation ${workerGeneration}: ${err.message}`);
+        logger.error(`[${t}] Failed to reconcile worker exit generation ${exitReport.executorGeneration}: ${err.message}`);
+      }
+    } else if (!transferRetirement && retiringExit) {
+      try {
+        const notified = cb.onRetiringWorkerExit?.({
+          sessionId: exitReport.sessionId,
+          workerGeneration: exitReport.executorGeneration,
+          code,
+          signal,
+        });
+        void Promise.resolve(notified).catch((err: any) => {
+          logger.error(`[${t}] Failed to reconcile retiring worker generation ${exitReport.executorGeneration}: ${err.message}`);
+        });
+      } catch (err: any) {
+        logger.error(`[${t}] Failed to reconcile retiring worker generation ${exitReport.executorGeneration}: ${err.message}`);
       }
     } else {
       logger.info(`[${t}] Suppressed external worker-exit effects for routing transfer`);
@@ -9414,7 +9614,7 @@ function setupWorkerHandlers(
     // Notify dashboard, but only once per session lifecycle. The
     // dashboard-driven `closeSession()` path also publishes; whichever
     // fires first wins, the other's emit is suppressed.
-    if (!transferRetirement && !ds.exitEventEmitted) {
+    if (currentExit && !transferRetirement && !ds.exitEventEmitted) {
       ds.exitEventEmitted = true;
       dashboardEventBus.publish({
         type: 'session.exited',
@@ -9943,6 +10143,7 @@ function deliverFinalOutput(
         if (await closeWithdrawnSessionIfLedgerEmpty(
           ds,
           'Root message withdrawn while forwarding final_output',
+          isStillOwned,
         )) {
           ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
           onComplete?.(true);
@@ -9977,35 +10178,33 @@ function deliverFinalOutput(
 export const __testOnly_deliverFinalOutput = deliverFinalOutput;
 export const __testOnly_setupWorkerHandlers = setupWorkerHandlers;
 export const __testOnly_reserveWorkerGeneration = reserveWorkerGeneration;
+export const __testOnly_resetSessionExecutorRuntime = (): void => {
+  sessionExecutorRuntime = createExecutorRuntime();
+  activeExecutorLeases = new WeakMap();
+};
 export const __testOnly_finishTurnReactions = finishTurnReactions;
 export const __testOnly_finalOutputDedupeKey = finalOutputDedupeKey;
 export const __testOnly_retireTerminalizedCodexAppLedgerEntriesForRecovery = retireTerminalizedCodexAppLedgerEntriesForRecovery;
 
 // ─── Fork adopt worker ──────────────────────────────────────────────────────
 
-function reserveWorkerGeneration(ds: DaemonSession): number {
-  const previousDaemonGeneration = ds.workerGeneration;
-  const previousSessionGeneration = ds.session.workerGeneration;
-  const workerGeneration = Math.max(
-    previousDaemonGeneration ?? 0,
-    previousSessionGeneration ?? 0,
-  ) + 1;
-  ds.workerGeneration = workerGeneration;
-  ds.session.workerGeneration = workerGeneration;
+function reserveWorkerGeneration(ds: DaemonSession): ExecutorGenerationCommit {
+  let commitment: ExecutorGenerationCommit;
   try {
-    sessionStore.updateSession(ds.session);
+    commitment = sessionExecutorRuntime.commitGeneration(ds);
   } catch (error) {
-    if (previousDaemonGeneration === undefined) delete ds.workerGeneration;
-    else ds.workerGeneration = previousDaemonGeneration;
-    if (previousSessionGeneration === undefined) delete ds.session.workerGeneration;
-    else ds.session.workerGeneration = previousSessionGeneration;
+    const priorLease = activeExecutorLeases.get(ds);
+    if (sessionExecutorRuntime.isQuarantined(ds)
+        || (priorLease && !sessionExecutorRuntime.isCurrent(priorLease))) {
+      retireWorkerAfterUnknownGeneration(ds);
+    }
     throw error;
   }
   // Reservation is the first durable proof that the previous generation has
   // lost authority. Clear its TUI slot before any environment check, adapter
   // creation, or fork can throw and strand a clicked card in "processing".
   invalidateTuiPrompt(ds, 'reserve_worker_generation');
-  return workerGeneration;
+  return commitment;
 }
 
 /**

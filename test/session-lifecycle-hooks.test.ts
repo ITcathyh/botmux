@@ -109,6 +109,7 @@ import {
 import {
   detachWorkerForTransfer,
   initWorkerPool,
+  __testOnly_resetSessionExecutorRuntime,
   __testOnly_setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
@@ -167,6 +168,7 @@ async function flush(): Promise<void> {
 beforeEach(() => {
   vi.useRealTimers();
   vi.clearAllMocks();
+  __testOnly_resetSessionExecutorRuntime();
   __testOnly_resetSessionLifecycleHooks();
 });
 

@@ -2,10 +2,18 @@ import { EventEmitter } from 'node:events';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { applyQueuedCodexAppLegacyFallback } from '../src/core/session-create.js';
 
-const { emitHookEventMock, forkMock, execSyncMock } = vi.hoisted(() => ({
+const {
+  emitHookEventMock,
+  forkMock,
+  execSyncMock,
+  getMessageChatIdMock,
+  writeDeferredTopicBindingMock,
+} = vi.hoisted(() => ({
   emitHookEventMock: vi.fn(),
   forkMock: vi.fn(),
   execSyncMock: vi.fn(),
+  getMessageChatIdMock: vi.fn(),
+  writeDeferredTopicBindingMock: vi.fn(),
 }));
 
 vi.mock('node:child_process', async (importOriginal) => {
@@ -28,9 +36,14 @@ vi.mock('../src/im/lark/client.js', () => {
   return {
     updateMessage: vi.fn(async () => {}),
     deleteMessage: vi.fn(async () => {}),
+    getMessageChatId: (...args: unknown[]) => getMessageChatIdMock(...args),
     MessageWithdrawnError,
   };
 });
+
+vi.mock('../src/core/deferred-topic-binding.js', () => ({
+  writeDeferredTopicBinding: (...args: unknown[]) => writeDeferredTopicBindingMock(...args),
+}));
 
 vi.mock('../src/im/lark/card-builder.js', () => ({
   buildStreamingCard: vi.fn(() => '{"type":"streaming"}'),
@@ -87,6 +100,7 @@ vi.mock('../src/services/session-store.js', () => ({
   closeSession: vi.fn(),
   updateSession: vi.fn(),
   updateSessionPid: vi.fn(),
+  getSessionForOwnerStrict: vi.fn(),
 }));
 
 vi.mock('../src/services/frozen-card-store.js', () => ({
@@ -142,11 +156,15 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 import { __testOnly_resetSessionLifecycleHooks } from '../src/services/session-lifecycle-hooks.js';
 import {
   __testOnly_resetOrdinaryImDeliveries,
+  __testOnly_resetSessionExecutorRuntime,
+  __testOnly_reserveWorkerGeneration,
+  __testOnly_setupWorkerHandlers,
   forkAdoptWorker,
   forkWorker,
   initWorkerPool,
   promoteQueuedActivationTail,
   sendWorkerInput,
+  sendWorkerSessionInput,
 } from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 import * as sessionStore from '../src/services/session-store.js';
@@ -219,6 +237,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(sessionStore.updateSession).mockImplementation(() => undefined);
   __testOnly_resetOrdinaryImDeliveries();
+  __testOnly_resetSessionExecutorRuntime();
   vi.mocked(getBot).mockImplementation(() => defaultBot());
   __testOnly_resetSessionLifecycleHooks();
   forkMock.mockImplementation(() => makeFakeWorker());
@@ -511,6 +530,7 @@ describe('CLI runtime session freeze', () => {
     for (const source of ['configured', 'legacy-path'] as const) {
       const executable = `/opt/frozen-${source}`;
       const ds = makeDs();
+      ds.session.sessionId = `sid-start-test-${source}`;
       ds.session.cliId = 'codex';
       ds.session.agentFrozen = true;
       ds.session.cliRuntime = {
@@ -1758,7 +1778,9 @@ describe('Codex App clean-input feature gate', () => {
       content: '<user_message>QUEUED_OLD\n\nCURRENT_OLD</user_message>',
       codexAppInput: { text: 'CURRENT_OLD' },
     }, { queued: true, queuedText: undefined });
-    forkWorker(makeDs(), oldPayload, { turnId: 'om_old_queued' });
+    const oldDs = makeDs();
+    oldDs.session.sessionId = 'sid-start-test-old-queued';
+    forkWorker(oldDs, oldPayload, { turnId: 'om_old_queued' });
     const oldWorker = forkMock.mock.results.at(-1)!.value;
     const oldInit = vi.mocked(oldWorker.send).mock.calls[0][0];
     expect(oldInit.prompt.match(/QUEUED_OLD/g)).toHaveLength(1);
@@ -1769,7 +1791,9 @@ describe('Codex App clean-input feature gate', () => {
       content: '<user_message>QUEUED_NEW\n\nCURRENT_NEW</user_message>',
       codexAppInput: { text: 'QUEUED_NEW\n\nCURRENT_NEW' },
     }, { queued: true, queuedText: 'QUEUED_NEW' });
-    forkWorker(makeDs(), modernPayload, { turnId: 'om_new_queued' });
+    const modernDs = makeDs();
+    modernDs.session.sessionId = 'sid-start-test-modern-queued';
+    forkWorker(modernDs, modernPayload, { turnId: 'om_new_queued' });
     const modernWorker = forkMock.mock.results.at(-1)!.value;
     const modernInit = vi.mocked(modernWorker.send).mock.calls[0][0];
     expect(modernInit.promptCodexAppInput.text.match(/QUEUED_NEW/g)).toHaveLength(1);
@@ -2000,9 +2024,11 @@ describe('session.start lifecycle integration', () => {
     ds.session.sandboxHidePaths = [];
     ds.session.sandboxReadonlyPaths = [];
     ds.session.sandboxNetwork = true;
+    const persistedBeforeReservation = structuredClone(ds.session);
     vi.mocked(sessionStore.updateSession).mockImplementationOnce(() => {
       throw new Error('generation persistence failed');
     });
+    vi.mocked(sessionStore.getSessionForOwnerStrict).mockReturnValueOnce(persistedBeforeReservation);
 
     expect(() => forkWorker(ds, 'hello', false)).toThrow(
       'generation persistence failed',
@@ -2014,6 +2040,82 @@ describe('session.start lifecycle integration', () => {
     expect(ds.workerGeneration).toBe(4);
     expect(ds.session.workerGeneration).toBe(4);
   });
+
+  it('continues a replacement when strict readback proves a lost reservation response', () => {
+    const ds = makeDs();
+    forkWorker(ds, 'first', false);
+    const firstWorker = forkMock.mock.results.at(-1)!.value;
+    vi.mocked(sessionStore.updateSession).mockImplementationOnce(() => {
+      throw new Error('response lost after generation publish');
+    });
+    vi.mocked(sessionStore.getSessionForOwnerStrict).mockImplementation(() => (
+      structuredClone(ds.session)
+    ));
+
+    expect(() => forkWorker(ds, 'replacement', { resume: true })).not.toThrow();
+
+    const replacement = forkMock.mock.results.at(-1)!.value;
+    expect(firstWorker.kill).toHaveBeenCalled();
+    expect(ds.worker).toBe(replacement);
+    expect(ds.workerGeneration).toBe(2);
+    expect(ds.session.workerGeneration).toBe(2);
+  });
+
+  it.each(['unreadable', 'future'] as const)(
+    'retires the old worker when replacement generation publication is %s',
+    async (failure) => {
+      vi.useFakeTimers();
+      const sessionReply = vi.fn(async () => 'om_reply');
+      initWorkerPool({
+        sessionReply,
+        getSessionWorkingDir: () => '/repo',
+        getActiveCount: () => 1,
+        closeSession: vi.fn(),
+      });
+      const ds = makeDs();
+      forkWorker(ds, 'first', false);
+      const firstWorker = forkMock.mock.results.at(-1)!.value;
+      sessionReply.mockClear();
+      vi.mocked(firstWorker.send).mockClear();
+
+      vi.mocked(sessionStore.updateSession).mockImplementationOnce(() => {
+        throw new Error('replacement generation response lost');
+      });
+      if (failure === 'unreadable') {
+        vi.mocked(sessionStore.getSessionForOwnerStrict).mockImplementationOnce(() => {
+          throw new Error('owner file unreadable');
+        });
+      } else {
+        vi.mocked(sessionStore.getSessionForOwnerStrict).mockImplementationOnce(() => ({
+          ...structuredClone(ds.session),
+          workerGeneration: 7,
+        }));
+      }
+
+      expect(() => forkWorker(ds, 'replacement', { resume: true })).toThrow();
+      expect(ds.worker).toBeNull();
+      expect(firstWorker.send).toHaveBeenCalledWith({ type: 'close' });
+      vi.mocked(firstWorker.send).mockClear();
+
+      expect(sendWorkerInput(ds, 'must not execute', 'turn-after-unknown')).toBe(false);
+      expect(firstWorker.send).not.toHaveBeenCalledWith(expect.objectContaining({
+        type: 'message',
+        turnId: 'turn-after-unknown',
+      }));
+      expect(sendWorkerSessionInput(ds, { type: 'refresh_screen' })).toBe(false);
+      expect(firstWorker.send).not.toHaveBeenCalledWith({ type: 'refresh_screen' });
+
+      firstWorker.emit('message', {
+        type: 'final_output',
+        sessionId: ds.session.sessionId,
+        turnId: 'turn-stale-output',
+        content: 'must not be delivered',
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sessionReply).not.toHaveBeenCalled();
+      expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+    },
+  );
 
   it('rotates the persisted generation before replacement IPC and rejects the old worker receipt', async () => {
     const ds = makeDs();
@@ -2055,6 +2157,40 @@ describe('session.start lifecycle integration', () => {
     expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
   });
 
+  it('drops a deferred topic binding when the executor generation changes during provider verification', async () => {
+    let resolveMessageChat!: (chatId: string) => void;
+    getMessageChatIdMock.mockReturnValueOnce(new Promise<string>((resolve) => {
+      resolveMessageChat = resolve;
+    }));
+    const ds = makeDs();
+    ds.session.backendType = 'riff';
+    ds.session.deferredScheduleRun = {
+      taskId: 'schedule-task',
+      turnId: 'schedule-turn',
+      routingAnchor: 'schedule:task:run',
+      createdAt: '2026-08-10T00:00:00.000Z',
+    };
+    const worker = makeFakeWorker();
+    ds.worker = worker;
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'deferred_topic_materialized',
+      sessionId: ds.session.sessionId,
+      turnId: 'schedule-turn',
+      rootMessageId: 'om_materialized',
+    });
+    await Promise.resolve();
+    expect(getMessageChatIdMock).toHaveBeenCalledWith(ds.larkAppId, 'om_materialized');
+
+    __testOnly_reserveWorkerGeneration(ds);
+    resolveMessageChat(ds.chatId);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(writeDeferredTopicBindingMock).not.toHaveBeenCalled();
+  });
+
   it('fences the persisted generation when the ACKing worker exits before dispatch polling', async () => {
     const ds = makeDs();
     ds.session.scope = 'chat';
@@ -2078,6 +2214,270 @@ describe('session.start lifecycle integration', () => {
     expect(ds.session.pid).toBeUndefined();
     expect(ds.session.dispatchInputReceipts?.om_kickoff?.workerGeneration).toBe(1);
     expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+  });
+
+  it('does not publish current lifecycle state when a replaced worker exits', async () => {
+    const onWorkerExit = vi.fn();
+    const onRetiringWorkerExit = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onWorkerExit,
+      onRetiringWorkerExit,
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'first', false);
+    const firstWorker = forkMock.mock.results.at(-1)!.value;
+    firstWorker.emit('message', { type: 'ready', port: 3456, token: 'first' });
+    forkWorker(ds, 'replacement', { resume: true });
+    const replacementWorker = forkMock.mock.results.at(-1)!.value;
+    vi.mocked(dashboardEventBus.publish).mockClear();
+    emitHookEventMock.mockClear();
+
+    firstWorker.emit('exit', 0, null);
+    await Promise.resolve();
+
+    // The authentic retiring generation may reconcile its own named receipts,
+    // but it cannot claim the replacement's current lifecycle/projection slot.
+    expect(onRetiringWorkerExit).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: ds.session.sessionId,
+      workerGeneration: 1,
+    }));
+    expect(onWorkerExit).not.toHaveBeenCalled();
+    expect(ds.worker).toBe(replacementWorker);
+    expect(ds.workerGeneration).toBe(2);
+    expect(ds.session.workerGeneration).toBe(2);
+    expect(ds.exitEventEmitted).not.toBe(true);
+    expect(dashboardEventBus.publish).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.exited',
+    }));
+    expect(emitHookEventMock).not.toHaveBeenCalledWith('session.exit', expect.anything());
+  });
+
+  it('quarantines current exit effects when the generation fence is proven unpublished', async () => {
+    const onWorkerExit = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onWorkerExit,
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'first', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const persistedBeforeExit = structuredClone(ds.session);
+    vi.mocked(sessionStore.updateSession).mockImplementationOnce(() => {
+      throw new Error('publish failed before rename');
+    });
+    vi.mocked(sessionStore.getSessionForOwnerStrict).mockReturnValue(persistedBeforeExit);
+    vi.mocked(dashboardEventBus.publish).mockClear();
+
+    worker.emit('exit', 1, null);
+    await Promise.resolve();
+
+    expect(ds.worker).toBeNull();
+    expect(ds.session.workerGeneration).toBe(2);
+    expect(onWorkerExit).not.toHaveBeenCalled();
+    expect(ds.exitEventEmitted).not.toBe(true);
+    expect(dashboardEventBus.publish).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.exited',
+    }));
+  });
+
+  it('accepts a lost exit-fence response when strict owner readback proves publication', async () => {
+    const onWorkerExit = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onWorkerExit,
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'first', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    vi.mocked(sessionStore.updateSession).mockImplementationOnce(() => {
+      throw new Error('response lost after rename');
+    });
+    vi.mocked(sessionStore.getSessionForOwnerStrict).mockImplementation(() => (
+      structuredClone(ds.session)
+    ));
+    vi.mocked(dashboardEventBus.publish).mockClear();
+
+    worker.emit('exit', 1, null);
+    await Promise.resolve();
+
+    expect(ds.worker).toBeNull();
+    expect(ds.session.workerGeneration).toBe(2);
+    expect(onWorkerExit).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: ds.session.sessionId,
+      workerGeneration: 1,
+    }));
+    expect(ds.exitEventEmitted).toBe(true);
+    expect(dashboardEventBus.publish).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.exited',
+    }));
+  });
+
+  it('suppresses a terminal continuation that loses its generation during await', async () => {
+    let releaseTerminal!: () => void;
+    const terminalBlocked = new Promise<void>(resolve => { releaseTerminal = resolve; });
+    const onTurnTerminal = vi.fn(() => terminalBlocked);
+    const onDeferredScheduleTurnSettled = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onTurnTerminal,
+      onDeferredScheduleTurnSettled,
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'first', false);
+    const firstWorker = forkMock.mock.results.at(-1)!.value;
+    firstWorker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'turn-old',
+      status: 'completed',
+    });
+    await vi.waitFor(() => expect(onTurnTerminal).toHaveBeenCalledTimes(1));
+
+    forkWorker(ds, 'replacement', { resume: true });
+    ds.managedTurnOrigin = {
+      capability: 'replacement-capability',
+      turnId: 'turn-new',
+      dispatchAttempt: 2,
+    };
+    releaseTerminal();
+    await vi.waitFor(() => expect(onTurnTerminal).toHaveReturned());
+    await Promise.resolve();
+
+    expect(ds.managedTurnOrigin).toEqual({
+      capability: 'replacement-capability',
+      turnId: 'turn-new',
+      dispatchAttempt: 2,
+    });
+    expect(onDeferredScheduleTurnSettled).not.toHaveBeenCalled();
+  });
+
+  it('suppresses a managed CLI-exit continuation that loses its generation during await', async () => {
+    let releaseCliExit!: () => void;
+    const cliExitBlocked = new Promise<void>(resolve => { releaseCliExit = resolve; });
+    const onCliExit = vi.fn(() => cliExitBlocked);
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onCliExit,
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'first', false);
+    const firstWorker = forkMock.mock.results.at(-1)!.value;
+    firstWorker.emit('message', { type: 'claude_exit', code: 1, signal: null });
+    await vi.waitFor(() => expect(onCliExit).toHaveBeenCalledTimes(1));
+
+    forkWorker(ds, 'replacement', { resume: true });
+    const replacement = forkMock.mock.results.at(-1)!.value;
+    releaseCliExit();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(ds.worker).toBe(replacement);
+    expect(replacement.kill).not.toHaveBeenCalled();
+    expect(forkMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects stale reports when only the generation rotates on the same child pointer', async () => {
+    const onTurnTerminal = vi.fn();
+    const onCliExit = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onTurnTerminal,
+      onCliExit,
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'first', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    __testOnly_reserveWorkerGeneration(ds);
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'turn-old',
+      status: 'completed',
+    });
+    worker.emit('message', {
+      type: 'claude_exit',
+      code: 1,
+      signal: null,
+    });
+    await Promise.resolve();
+
+    expect(ds.worker).toBe(worker);
+    expect(ds.workerGeneration).toBe(2);
+    expect(ds.session.workerGeneration).toBe(2);
+    expect(onTurnTerminal).not.toHaveBeenCalled();
+    expect(onCliExit).not.toHaveBeenCalled();
+  });
+
+  it('keeps the shared non-Codex path current while all replaced reports stay fenced', async () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    const onTurnTerminal = vi.fn();
+    const onCliExit = vi.fn();
+    const onWorkerExit = vi.fn();
+    const onRetiringWorkerExit = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onTurnTerminal,
+      onCliExit,
+      onWorkerExit,
+      onRetiringWorkerExit,
+    });
+    const ds = makeDs();
+    ds.session.cliId = 'claude-code';
+    ds.session.scope = 'chat';
+    ds.session.replyTargets = {
+      shared_turn: { rootMessageId: 'om_dispatch_root', updatedAt: '2026-08-10T00:00:00.000Z' },
+    };
+    forkWorker(ds, 'first', false);
+    const firstWorker = forkMock.mock.results.at(-1)!.value;
+    forkWorker(ds, 'replacement', { resume: true });
+    const replacement = forkMock.mock.results.at(-1)!.value;
+
+    firstWorker.emit('message', { type: 'turn_input_received', turnId: 'shared_turn' });
+    firstWorker.emit('message', { type: 'turn_input_committed', turnId: 'shared_turn' });
+    firstWorker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'shared_turn',
+      status: 'completed',
+    });
+    firstWorker.emit('message', { type: 'claude_exit', code: 1, signal: null });
+    firstWorker.emit('exit', 1, null);
+    await Promise.resolve();
+
+    expect(ds.worker).toBe(replacement);
+    expect(ds.session.dispatchInputReceipts?.shared_turn).toBeUndefined();
+    expect(onTurnTerminal).not.toHaveBeenCalled();
+    expect(onCliExit).not.toHaveBeenCalled();
+    expect(onRetiringWorkerExit).toHaveBeenCalledWith(expect.objectContaining({ workerGeneration: 1 }));
+    expect(onWorkerExit).not.toHaveBeenCalled();
+
+    replacement.emit('message', { type: 'turn_input_received', turnId: 'shared_turn' });
+    replacement.emit('message', { type: 'turn_input_committed', turnId: 'shared_turn' });
+    await Promise.resolve();
+    expect(ds.session.dispatchInputReceipts?.shared_turn?.workerGeneration).toBe(2);
   });
 
   it('emits session.start after forkAdoptWorker spawns an adopt worker', () => {

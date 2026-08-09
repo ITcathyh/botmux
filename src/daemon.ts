@@ -2901,7 +2901,11 @@ const deferredScheduleSettleTimers = new Map<string, ReturnType<typeof setTimeou
 
 function scheduleDeferredScheduleSettlement(
   ds: DaemonSession,
-  context: { turnId: string; source: 'terminal' | 'idle' },
+  context: {
+    turnId: string;
+    source: 'terminal' | 'idle';
+    isExecutorCurrent: () => boolean;
+  },
 ): void {
   const run = ds.session.deferredScheduleRun;
   if (!run || run.turnId !== context.turnId) return;
@@ -2916,9 +2920,13 @@ function scheduleDeferredScheduleSettlement(
     : 1_500;
   const timer = setTimeout(() => {
     deferredScheduleSettleTimers.delete(sessionId);
+    if (!context.isExecutorCurrent()) return;
     void settleDeferredScheduleRun(ds, context, {
       reconcile: reconcileDeferredTopicBinding,
-      closeSession: closeSessionHelper,
+      closeSession: async (sessionId, options) => (
+        (await closeSessionHelper(sessionId, options)).ok
+      ),
+      isCurrent: context.isExecutorCurrent,
     }).then((result) => {
       if (result.action === 'materialized') {
         logger.info(
@@ -20681,7 +20689,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // trigger-result's closed-branch then resolves `failed` instead of stranding the
   // poller on `running` while the same Node worker auto-restarts to a healthy idle
   // CLI (codex #776 round-8 finding #2). Never throws into the exit handler.
-  const failCloseIdempotentTurnIfConvergenceWriteFailed = (ds: DaemonSession, exitingWorkerGeneration: number): void => {
+  const failCloseIdempotentTurnIfConvergenceWriteFailed = (
+    ds: DaemonSession,
+    exitingWorkerGeneration: number,
+    options: { closeCurrentOnFailure?: boolean } = {},
+  ): void => {
     let outcome: ReturnType<typeof convergeIdempotentAsyncTurnOnWorkerExit>;
     try {
       outcome = convergeIdempotentAsyncTurnOnWorkerExit(ds, exitingWorkerGeneration);
@@ -20690,6 +20702,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       outcome = 'write_failed';
     }
     if (outcome === 'write_failed') {
+      if (options.closeCurrentOnFailure === false) {
+        logger.error(
+          `[idempotency] retiring generation ${exitingWorkerGeneration} convergence remains quarantined `
+          + `for ${ds.session.sessionId.slice(0, 8)}; current Session retained`,
+        );
+        return;
+      }
       // Durable terminal could not be written. Close the session so its persisted
       // status becomes `closed` → trigger-result resolves `failed` (soft terminal),
       // and resolveIdempotencyHit sees a not-live session on retry. This is the
@@ -20703,19 +20722,28 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     sessionReply,
     getSessionWorkingDir,
     getActiveCount,
-    closeSession(ds: DaemonSession): Promise<boolean> {
+    closeSession(
+      ds: DaemonSession,
+      options: { isExecutorCurrent?: () => boolean } = {},
+    ): Promise<boolean> {
       // Route through the dashboard-aware helper so session.exited / session.update
       // events fire for withdrawn-message / crash / adopt-exit teardown paths too,
       // matching the dashboard-driven close.
       const sessionId = ds.session.sessionId;
       return runDetachedBotTurnMutation(ds.larkAppId, async () => {
+        if (options.isExecutorCurrent && !options.isExecutorCurrent()) return false;
         const current = findActiveBySessionId(sessionId);
         if (current !== ds) return false;
         if (hasProtectedSessionMutationOwnership(current)) {
           logger.info(`[${sessionId.substring(0, 8)}] Withdraw auto-close deferred: Codex App FIFO became unsettled`);
           return false;
         }
-        await closeSessionHelper(sessionId);
+        const closed = await closeSessionHelper(sessionId, {
+          ...(options.isExecutorCurrent
+            ? { isCurrent: options.isExecutorCurrent }
+            : {}),
+        });
+        if (!closed.ok) return false;
         logger.info(`[${sessionId.substring(0, 8)}] Session auto-closed (message withdrawn)`);
         return true;
       }).catch((err) => {
@@ -20728,19 +20756,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     enforceLiveSessionCap: () => enforceLiveSessionCap('session_change'),
     onQueuedActivationSubmitted,
-    onTurnTerminal(ds, terminal, context) {
+    onTurnTerminal(terminal, context) {
       const enqueued = vcMeetingTerminalReconciler?.enqueue(terminal, context);
       if (terminal.dispatchAttempt !== undefined && enqueued?.accepted) {
         logger.info(
           `[vc-delivery] terminal queued ${terminal.status} turn=${terminal.turnId.slice(0, 12)} `
-          + `session=${ds.session.sessionId.slice(0, 8)} attempt=${terminal.dispatchAttempt}`,
+          + `session=${context.sessionId.slice(0, 8)} attempt=${terminal.dispatchAttempt}`,
         );
       }
     },
-    onDeferredScheduleTurnSettled(ds, context) {
+    onDeferredScheduleTurnSettled(context) {
+      const ds = findActiveBySessionId(context.sessionId);
+      if (!ds || ds.larkAppId !== cfg.larkAppId) return;
       scheduleDeferredScheduleSettlement(ds, context);
     },
-    onCliExit(ds, context) {
+    onCliExit(context) {
+      const ds = findActiveBySessionId(context.sessionId);
+      if (!ds || ds.larkAppId !== cfg.larkAppId) return;
       // Same idempotent-async convergence as onWorkerExit: the MANAGED CLI can
       // exit inside a still-live Node worker (persistent-pane / codex-app
       // auto-restart), in which case onWorkerExit never fires. An incomplete
@@ -20762,7 +20794,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         );
       }
     },
-    onWorkerExit(ds, context) {
+    onWorkerExit(context) {
+      const ds = findActiveBySessionId(context.sessionId);
+      if (!ds || ds.larkAppId !== cfg.larkAppId) return;
       // Converge an incomplete idempotent async turn (options.idempotencyKey):
       // a worker that died with no final_output would otherwise poll `running`
       // and let a same-key retry `reuse` the dead session forever, until the next
@@ -20785,6 +20819,31 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       if (result.ambiguousDeliveryKeys.length > 0) {
         logger.warn(
           `[vc-delivery] worker exit marked ${result.ambiguousDeliveryKeys.length} receipt(s) ambiguous `
+          + `session=${context.sessionId.slice(0, 8)} generation=${context.workerGeneration}`,
+        );
+      }
+    },
+    onRetiringWorkerExit(context) {
+      const current = findActiveBySessionId(context.sessionId);
+      if (!current || current.larkAppId !== cfg.larkAppId) return;
+      // A superseded generation may settle only its exact path-specific
+      // receipts. It cannot close/kill or publish lifecycle for the current
+      // Session even when that old receipt's convergence write fails.
+      failCloseIdempotentTurnIfConvergenceWriteFailed(
+        current,
+        context.workerGeneration,
+        { closeCurrentOnFailure: false },
+      );
+      const result = handleVcMeetingWorkerGenerationExit(context, {
+        dataDir: config.session.dataDir,
+        selfAppId: cfg.larkAppId,
+      });
+      for (const ref of result.recoveryRefs) {
+        vcMeetingRuntimeLeaseRecovery.arm(ref, cfg.larkAppId);
+      }
+      if (result.ambiguousDeliveryKeys.length > 0) {
+        logger.warn(
+          `[vc-delivery] retiring worker marked ${result.ambiguousDeliveryKeys.length} receipt(s) ambiguous `
           + `session=${context.sessionId.slice(0, 8)} generation=${context.workerGeneration}`,
         );
       }

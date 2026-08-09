@@ -101,6 +101,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 import {
   getDaemonReplyCardUsageSnapshot,
   initWorkerPool,
+  __testOnly_resetSessionExecutorRuntime,
   __testOnly_setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
@@ -128,6 +129,10 @@ import {
   getMessageListenerRunPreview,
   markMessageListenerRunPreviewTriggered,
 } from '../src/services/message-listener-run-preview-store.js';
+
+beforeEach(() => {
+  __testOnly_resetSessionExecutorRuntime();
+});
 
 // Build a fake worker child process whose IPC `message` event we can fire
 // manually, then wire it through setupWorkerHandlers via forkAdoptWorker.
@@ -2072,7 +2077,9 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     // Single attempt, no further retries
     expect(sessionReply).toHaveBeenCalledTimes(1);
     expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
-    expect(closeSession).toHaveBeenCalledWith(ds);
+    expect(closeSession).toHaveBeenCalledWith(ds, {
+      isExecutorCurrent: expect.any(Function),
+    });
     expect(worker.send).not.toHaveBeenCalledWith({ type: 'close' });
     expect(worker.kill).not.toHaveBeenCalled();
   });
@@ -2164,7 +2171,10 @@ describe('Worker turn_terminal routing', () => {
     await Promise.resolve();
 
     expect(onTurnTerminal).toHaveBeenCalledTimes(1);
-    expect(onTurnTerminal).toHaveBeenCalledWith(ds, terminal, { workerGeneration: 1 });
+    expect(onTurnTerminal).toHaveBeenCalledWith(terminal, {
+      sessionId: ds.session.sessionId,
+      workerGeneration: 1,
+    });
   });
 
   it('captures silent fallback output and keeps the bounded legacy marker after terminal', async () => {
@@ -2375,7 +2385,7 @@ describe('Worker turn_terminal routing', () => {
       getSessionWorkingDir: () => '/tmp',
       getActiveCount: () => 1,
       closeSession: vi.fn(),
-      onTurnTerminal: (_ds, terminal) => {
+      onTurnTerminal: (terminal) => {
         completeVcMeetingDelivery('/tmp/test-sessions', {
           listenerAppId: 'listener-app', meetingId: 'meeting-1', memberId: 'member-1', memberEpoch: 1,
           deliveryKey: terminal.turnId,
@@ -2462,7 +2472,7 @@ describe('Worker turn_terminal routing', () => {
     (ds.worker as any).emit('exit', 17, 'SIGTERM');
     await Promise.resolve();
 
-    expect(onWorkerExit).toHaveBeenCalledWith(ds, {
+    expect(onWorkerExit).toHaveBeenCalledWith({
       sessionId: ds.session.sessionId,
       workerGeneration: 1,
       code: 17,
@@ -2498,7 +2508,7 @@ describe('Worker turn_terminal routing', () => {
     } satisfies Extract<WorkerToDaemon, { type: 'claude_exit' }>);
     await Promise.resolve();
 
-    expect(onCliExit).toHaveBeenCalledWith(ds, {
+    expect(onCliExit).toHaveBeenCalledWith({
       sessionId: ds.session.sessionId,
       workerGeneration: 1,
       code: 9,

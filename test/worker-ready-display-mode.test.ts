@@ -133,7 +133,13 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 
 // ─── Imports under test ────────────────────────────────────────────────────
 
-import { CARD_POSTING_SENTINEL, initWorkerPool, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
+import {
+  CARD_POSTING_SENTINEL,
+  initWorkerPool,
+  __testOnly_reserveWorkerGeneration,
+  __testOnly_resetSessionExecutorRuntime,
+  __testOnly_setupWorkerHandlers,
+} from '../src/core/worker-pool.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { getBot } from '../src/bot-registry.js';
@@ -196,6 +202,7 @@ describe('Worker ready: set_display_mode re-sync', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    __testOnly_resetSessionExecutorRuntime();
     sessionReplyMock = vi.fn(async () => 'om_new_card');
     closeSessionMock = vi.fn();
     initWorkerPool({
@@ -535,6 +542,32 @@ describe('Worker ready: set_display_mode re-sync', () => {
     expect(closeSessionMock).not.toHaveBeenCalled();
     expect(fakeWorker.kill).not.toHaveBeenCalled();
     expect(ds.session.codexAppDispatchLedger).toHaveLength(1);
+  });
+
+  it('passes a dynamic executor guard into withdrawn ready-card close', async () => {
+    sessionReplyMock.mockRejectedValueOnce(new MessageWithdrawnError('om_root'));
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      streamCardPending: true,
+      streamCardId: undefined,
+      worker: fakeWorker,
+    });
+    closeSessionMock.mockImplementationOnce((_: DaemonSession, options?: {
+      isExecutorCurrent?: () => boolean;
+    }) => {
+      expect(options?.isExecutorCurrent?.()).toBe(true);
+      __testOnly_reserveWorkerGeneration(ds);
+      expect(options?.isExecutorCurrent?.()).toBe(false);
+      return false;
+    });
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_abc' });
+    await flush();
+    await flush();
+
+    expect(closeSessionMock).toHaveBeenCalledOnce();
+    expect(ds.session.status).toBe('active');
   });
 
   it('PATCH path sends set_display_mode when displayMode is screenshot', async () => {

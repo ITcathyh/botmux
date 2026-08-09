@@ -13,6 +13,8 @@ export interface DispatchInputCommitEvidence {
   turnId: string;
   executorGeneration: number;
   committedAt: string;
+  /** Current Adapter proof; callers need not supply it when the Adapter derives it. */
+  rootMessageId?: string;
 }
 
 export type DispatchInputCommitInspection =
