@@ -30,6 +30,7 @@ const targetInterfaces = [
 
 const sessionStoreMutators = new Set([
   'createSession',
+  'createSessionExact',
   'closeSession',
   'reactivateClosedSession',
   'updateSessionPid',

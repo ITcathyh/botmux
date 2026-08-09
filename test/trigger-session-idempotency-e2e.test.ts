@@ -11,7 +11,7 @@
  * Run:  pnpm vitest run test/trigger-session-idempotency-e2e.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { TriggerRequest } from '../src/services/trigger-types.js';
@@ -32,7 +32,8 @@ vi.mock('../src/im/lark/client.js', () => ({
   listChatBotMembers: vi.fn(async () => []),
 }));
 
-const mockGetBot = vi.fn(() => ({ config: { cliId: 'codex-app', apiOnly: true } }));
+const defaultGetBot = () => ({ config: { cliId: 'codex-app', apiOnly: true } });
+const mockGetBot = vi.fn(defaultGetBot);
 vi.mock('../src/bot-registry.js', () => ({
   getBot: (...a: any[]) => mockGetBot(...a),
   effectiveDefaultWorkingDir: vi.fn(() => '/tmp'),
@@ -43,26 +44,53 @@ vi.mock('../src/services/oncall-store.js', () => ({ getOncallStatus: vi.fn(() =>
 
 let sessionSeq = 0;
 const createdSessions: any[] = [];
+let createExactShouldThrow = false;
+let updateShouldThrow = false;
 vi.mock('../src/services/session-store.js', () => ({
   createSession: vi.fn((chatId: string, anchor: string, title: string) => {
     const s = { sessionId: `sess-${++sessionSeq}`, chatId, rootMessageId: anchor, title, scope: 'chat', status: 'active', createdAt: '2026-06-01T00:00:00.000Z' };
     createdSessions.push(s);
     return s;
   }),
-  updateSession: vi.fn(),
+  createSessionExact: vi.fn((input: any) => {
+    if (createExactShouldThrow) throw new Error('injected createSessionExact failure');
+    const s = {
+      sessionId: input.sessionId,
+      chatId: input.chatId,
+      rootMessageId: input.rootMessageId,
+      title: input.title,
+      scope: input.scope,
+      status: 'active',
+      createdAt: input.createdAt,
+    };
+    createdSessions.push(s);
+    return s;
+  }),
+  updateSession: vi.fn(() => {
+    if (updateShouldThrow) throw new Error('injected updateSession failure');
+  }),
   getSession: vi.fn((id: string) => createdSessions.find(s => s.sessionId === id)),
   getOwnedSession: vi.fn((id: string) => createdSessions.find(s => s.sessionId === id)),
+  closeSession: vi.fn((id: string) => {
+    const session = createdSessions.find(s => s.sessionId === id);
+    if (session) session.status = 'closed';
+  }),
+  listSessionsStrict: vi.fn(() => createdSessions),
   registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
   cleanupSessionBridgeSendMarkers: vi.fn(),
   cleanupSessionBridgeSendMarkersNow: vi.fn(),
 }));
 
 vi.mock('../src/services/message-queue.js', () => ({ ensureQueue: vi.fn() }));
+let buildInputShouldThrow = false;
 vi.mock('../src/core/session-manager.js', () => ({
   buildFollowUpContent: vi.fn((p: string) => p),
   buildFollowUpCliInput: vi.fn((p: string) => ({ content: p })),
   buildNewTopicPrompt: vi.fn((p: string) => p),
-  buildNewTopicCliInput: vi.fn((p: string) => ({ content: p })),
+  buildNewTopicCliInput: vi.fn((p: string) => {
+    if (buildInputShouldThrow) throw new Error('injected buildNewTopicCliInput failure');
+    return { content: p };
+  }),
   ensureSessionWhiteboard: vi.fn(),
   getAvailableBots: vi.fn(async () => []),
   rememberLastCliInput: vi.fn(),
@@ -72,8 +100,22 @@ vi.mock('../src/im/lark/card-handler.js', () => ({ runAutoWorktreeCommit: vi.fn(
 
 // worker-pool: forkWorker is the dispatch side effect we make throw on demand.
 let forkShouldThrow = false;
-const mockForkWorker = vi.fn(() => { if (forkShouldThrow) throw new Error('injected fork failure'); });
-const mockCloseSession = vi.fn(async () => ({ ok: true, alreadyClosed: false, known: true }));
+let forkShouldRefuse = false;
+let closeShouldThrow = false;
+let closeShouldRefuse = false;
+let onFork: ((ds: any, forkArg: any) => void) | undefined;
+const mockForkWorker = vi.fn((ds: any, _prompt: any, forkArg: any) => {
+  if (forkShouldThrow) throw new Error('injected fork failure');
+  if (forkShouldRefuse) return false;
+  onFork?.(ds, forkArg);
+  ds.worker = { killed: false };
+  return true;
+});
+const mockCloseSession = vi.fn(async () => {
+  if (closeShouldThrow) throw new Error('injected close failure');
+  if (closeShouldRefuse) return { ok: false, error: 'injected close refusal' };
+  return { ok: true, alreadyClosed: false, known: true };
+});
 vi.mock('../src/core/worker-pool.js', () => ({
   forkWorker: (...a: any[]) => mockForkWorker(...a),
   sendWorkerInput: vi.fn(() => true),
@@ -109,7 +151,15 @@ beforeEach(() => {
   prevDataDir = process.env.SESSION_DATA_DIR;
   process.env.SESSION_DATA_DIR = tempDir;
   sessionSeq = 0; createdSessions.length = 0;
+  createExactShouldThrow = false;
+  updateShouldThrow = false;
+  buildInputShouldThrow = false;
   forkShouldThrow = false;
+  forkShouldRefuse = false;
+  closeShouldThrow = false;
+  closeShouldRefuse = false;
+  onFork = undefined;
+  mockGetBot.mockImplementation(defaultGetBot);
   mockForkWorker.mockClear(); mockCloseSession.mockClear();
 });
 afterEach(() => {
@@ -123,27 +173,69 @@ describe('triggerSessionTurn — idempotency dispatch (real stores)', () => {
     const res = await triggerSessionTurn(freshAsyncReq('k-1'), { larkAppId: APP, activeSessions: new Map() });
     expect(res.ok).toBe(true);
     expect(res.idempotent).toBe(false);
+    expect(createdSessions).toHaveLength(1);
     expect(mockForkWorker).toHaveBeenCalledTimes(1);
     const lease = idempotencyStore.lookup(APP, 'k-1');
     expect(lease?.state).toBe('attempting'); // barrier crossed before fork
     expect(lease?.sessionId).toBe(res.target?.sessionId);
   });
 
-  it('same key + same payload retry: reuses, does NOT fork again', async () => {
-    const first = await triggerSessionTurn(freshAsyncReq('k-2'), { larkAppId: APP, activeSessions: new Map() });
+  it('keeps the keyed at-most-once policy CLI-neutral on a non-Codex adapter', async () => {
+    mockGetBot.mockImplementation(() => ({ config: { cliId: 'claude-code', apiOnly: true } }));
+    const shared = new Map();
+    const first = await triggerSessionTurn(freshAsyncReq('k-claude'), {
+      larkAppId: APP,
+      activeSessions: shared,
+    });
+    const retry = await triggerSessionTurn(freshAsyncReq('k-claude'), {
+      larkAppId: APP,
+      activeSessions: shared,
+    });
+
+    expect(first.ok).toBe(true);
+    expect(retry.ok).toBe(true);
+    expect(retry.action).toBe('queued');
+    expect(retry.idempotent).toBe(true);
     expect(mockForkWorker).toHaveBeenCalledTimes(1);
-    const second = await triggerSessionTurn(freshAsyncReq('k-2'), { larkAppId: APP, activeSessions: new Map() });
+    expect(mockForkWorker.mock.calls[0][2]).toMatchObject({ atMostOnce: true });
+  });
+
+  it('same key + same payload retry: reuses, does NOT fork again', async () => {
+    const shared = new Map();
+    const first = await triggerSessionTurn(freshAsyncReq('k-2'), { larkAppId: APP, activeSessions: shared });
+    expect(mockForkWorker).toHaveBeenCalledTimes(1);
+    const second = await triggerSessionTurn(freshAsyncReq('k-2'), { larkAppId: APP, activeSessions: shared });
+    expect(second.ok).toBe(true);
     expect(second.idempotent).toBe(true);
     expect(second.target?.sessionId).toBe(first.target?.sessionId);
     expect(mockForkWorker).toHaveBeenCalledTimes(1); // still ONE fork
+    expect(createdSessions).toHaveLength(1);
+  });
+
+  it('concurrent same-key admission has one winner and never double-forks', async () => {
+    const shared = new Map();
+    const [first, second] = await Promise.all([
+      triggerSessionTurn(freshAsyncReq('k-concurrent'), { larkAppId: APP, activeSessions: shared }),
+      triggerSessionTurn(freshAsyncReq('k-concurrent'), { larkAppId: APP, activeSessions: shared }),
+    ]);
+
+    expect(mockForkWorker).toHaveBeenCalledTimes(1);
+    expect([first, second].filter(result => result.ok)).toHaveLength(2);
+    expect([first, second].filter(result => result.idempotent === false)).toHaveLength(1);
+    expect([first, second].filter(result => result.idempotent === true)).toHaveLength(1);
+    expect(first.target?.sessionId).toBe(second.target?.sessionId);
+    expect(createdSessions).toHaveLength(1);
+    expect(idempotencyStore.lookup(APP, 'k-concurrent')?.state).toBe('attempting');
   });
 
   it('same key + DIFFERENT payload → 409 idempotency_conflict, no second fork', async () => {
-    await triggerSessionTurn(freshAsyncReq('k-3', 'payload A'), { larkAppId: APP, activeSessions: new Map() });
-    const conflict = await triggerSessionTurn(freshAsyncReq('k-3', 'payload B'), { larkAppId: APP, activeSessions: new Map() });
+    const shared = new Map();
+    await triggerSessionTurn(freshAsyncReq('k-3', 'payload A'), { larkAppId: APP, activeSessions: shared });
+    const conflict = await triggerSessionTurn(freshAsyncReq('k-3', 'payload B'), { larkAppId: APP, activeSessions: shared });
     expect(conflict.ok).toBe(false);
     expect(conflict.errorCode).toBe('idempotency_conflict');
     expect(mockForkWorker).toHaveBeenCalledTimes(1);
+    expect(createdSessions).toHaveLength(1);
   });
 
   it('same key, same instruction, but DIFFERENT options.status → 409 (requestHash covers full options)', async () => {
@@ -160,7 +252,8 @@ describe('triggerSessionTurn — idempotency dispatch (real stores)', () => {
 
   it('fork throw AFTER the barrier → durable async failed(dispatch_unknown) + close, retry does NOT re-run', async () => {
     forkShouldThrow = true;
-    const res = await triggerSessionTurn(freshAsyncReq('k-4'), { larkAppId: APP, activeSessions: new Map() });
+    const shared = new Map();
+    const res = await triggerSessionTurn(freshAsyncReq('k-4'), { larkAppId: APP, activeSessions: shared });
     // The HTTP result reports a terminal failed (at-most-once), not queued.
     expect(res.state).toBe('failed');
     expect(res.errorCode).toBe('no_output');
@@ -169,6 +262,8 @@ describe('triggerSessionTurn — idempotency dispatch (real stores)', () => {
     expect(asyncTriggerStore.lookup(sid, res.triggerId!)?.result.status).toBe('failed');
     expect(asyncTriggerStore.lookup(sid, res.triggerId!)?.result.reason).toBe('dispatch_unknown');
     expect(mockCloseSession).toHaveBeenCalledWith(sid);
+    expect(shared.size).toBe(0);
+    expect(createdSessions.find(session => session.sessionId === sid)?.status).toBe('closed');
     // Retry with the same key must NOT dispatch again — it resolves terminal.
     forkShouldThrow = false;
     const forkBefore = mockForkWorker.mock.calls.length;
@@ -177,18 +272,125 @@ describe('triggerSessionTurn — idempotency dispatch (real stores)', () => {
     expect(mockForkWorker.mock.calls.length).toBe(forkBefore); // no new fork
   });
 
+  it('fork refusal AFTER the barrier never reports queued and converges dispatch_unknown', async () => {
+    forkShouldRefuse = true;
+    const shared = new Map();
+    const res = await triggerSessionTurn(freshAsyncReq('k-refused'), {
+      larkAppId: APP,
+      activeSessions: shared,
+    });
+
+    expect(res.ok).toBe(false);
+    expect(res.state).toBe('failed');
+    expect(res.errorCode).toBe('no_output');
+    expect(idempotencyStore.lookup(APP, 'k-refused')?.state).toBe('attempting');
+    expect(asyncTriggerStore.lookup(res.target!.sessionId!, res.triggerId!)?.result).toMatchObject({
+      status: 'failed',
+      reason: 'dispatch_unknown',
+    });
+    expect(mockCloseSession).toHaveBeenCalledWith(res.target!.sessionId!);
+    expect(shared.size).toBe(0);
+    expect(createdSessions.find(session => session.sessionId === res.target!.sessionId)?.status).toBe('closed');
+  });
+
+  it('arms lease, durable pending, and in-memory pending before worker acceptance', async () => {
+    onFork = (ds, forkArg) => {
+      expect(idempotencyStore.lookup(APP, 'k-order')?.state).toBe('attempting');
+      expect(asyncTriggerStore.lookup(ds.session.sessionId, forkArg.turnId)?.result.status).toBe('pending');
+      expect(ds.asyncTriggerResults?.get(forkArg.turnId)?.status).toBe('pending');
+      expect(ds.idempotentAsyncTurn).toMatchObject({ key: 'k-order', triggerId: forkArg.turnId });
+    };
+
+    const result = await triggerSessionTurn(freshAsyncReq('k-order'), {
+      larkAppId: APP,
+      activeSessions: new Map(),
+    });
+
+    expect(result.ok).toBe(true);
+    expect(mockForkWorker).toHaveBeenCalledTimes(1);
+  });
+
   it('DOUBLE failure (fork throw + terminal write throw) → 5xx trigger_failed, NOT a phantom state:failed', async () => {
     forkShouldThrow = true;
-    // Make recordFailedStrict's durable write fail: pre-create the async-triggers
-    // target path for the next session (sess-1) as a DIRECTORY, so the atomic
-    // rename onto it fails. The dispatch throws AND the terminal write throws →
-    // we must NOT claim state:failed (the caller could never observe it).
-    const asyncDir = join(tempDir, 'async-triggers');
-    mkdirSync(join(asyncDir, 'sess-1.json'), { recursive: true }); // path is a dir → write fails
-    const res = await triggerSessionTurn(freshAsyncReq('k-dbl'), { larkAppId: APP, activeSessions: new Map() });
+    const shared = new Map();
+    const terminalSpy = vi.spyOn(asyncTriggerStore, 'recordFailedStrict')
+      .mockImplementationOnce(() => { throw new Error('injected terminal write failure'); });
+    const res = await triggerSessionTurn(freshAsyncReq('k-dbl'), { larkAppId: APP, activeSessions: shared });
+    terminalSpy.mockRestore();
     expect(res.ok).toBe(false);
     expect(res.state).not.toBe('failed');       // no phantom terminal
     expect(res.errorCode).toBe('trigger_failed'); // honest 5xx-class hard error
+    expect(mockCloseSession).toHaveBeenCalledTimes(1);
+    expect(shared.size).toBe(0);
+    expect(createdSessions[0]?.status).toBe('closed');
+  });
+
+  it.each(['pre-write', 'post-write response loss'])('%s pending failure after the attempt fence never materializes a Session or forks', async (mode) => {
+    const realRecordPending = asyncTriggerStore.recordPending;
+    const pendingSpy = vi.spyOn(asyncTriggerStore, 'recordPending')
+      .mockImplementationOnce((...args) => {
+        if (mode === 'post-write response loss') realRecordPending(...args);
+        throw new Error(`injected ${mode} pending failure`);
+      });
+    const shared = new Map();
+    const key = mode === 'pre-write' ? 'k-pending-pre' : 'k-pending-post';
+
+    const result = await triggerSessionTurn(freshAsyncReq(key), {
+      larkAppId: APP,
+      activeSessions: shared,
+    });
+    pendingSpy.mockRestore();
+
+    expect(result).toMatchObject({ ok: false, state: 'failed', errorCode: 'no_output' });
+    expect(idempotencyStore.lookup(APP, key)?.state).toBe('attempting');
+    expect(asyncTriggerStore.lookup(result.target!.sessionId!, result.triggerId!)?.result).toMatchObject({
+      status: 'failed',
+      reason: 'dispatch_unknown',
+    });
+    expect(mockForkWorker).not.toHaveBeenCalled();
+    expect(createdSessions).toHaveLength(0);
+    expect(shared.size).toBe(0);
+  });
+
+  it.each([
+    ['createSessionExact', () => { createExactShouldThrow = true; }],
+    ['updateSession', () => { updateShouldThrow = true; }],
+    ['buildNewTopicCliInput', () => { buildInputShouldThrow = true; }],
+  ])('materialization fault in %s converges dispatch_unknown and removes every published owner', async (_label, inject) => {
+    inject();
+    const shared = new Map();
+
+    const result = await triggerSessionTurn(freshAsyncReq(`k-materialize-${_label}`), {
+      larkAppId: APP,
+      activeSessions: shared,
+    });
+
+    expect(result).toMatchObject({ ok: false, state: 'failed', errorCode: 'no_output' });
+    expect(idempotencyStore.lookup(APP, `k-materialize-${_label}`)?.state).toBe('attempting');
+    expect(asyncTriggerStore.lookup(result.target!.sessionId!, result.triggerId!)?.result).toMatchObject({
+      status: 'failed',
+      reason: 'dispatch_unknown',
+    });
+    expect(mockForkWorker).not.toHaveBeenCalled();
+    expect(shared.size).toBe(0);
+    for (const session of createdSessions) expect(session.status).toBe('closed');
+  });
+
+  it.each(['refused', 'threw'])('fail-close %s is quarantined instead of reporting a terminal response', async (mode) => {
+    forkShouldThrow = true;
+    closeShouldRefuse = mode === 'refused';
+    closeShouldThrow = mode === 'threw';
+    const shared = new Map();
+
+    const result = await triggerSessionTurn(freshAsyncReq(`k-close-${mode}`), {
+      larkAppId: APP,
+      activeSessions: shared,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.state).not.toBe('failed');
+    expect(result.errorCode).toBe('trigger_failed');
+    expect(mockCloseSession).toHaveBeenCalledTimes(1);
   });
 
   // ── codex #776 finding #1: attempt-barrier (transition reserved→attempting)
@@ -245,27 +447,62 @@ describe('triggerSessionTurn — idempotency dispatch (real stores)', () => {
     expect(mockForkWorker).not.toHaveBeenCalled(); // still zero forks
   });
 
-  it('barrier release compareAndRemove EIO (unprovable) → 5xx; retry stays TERMINAL (not-live orphan, no reuse-forever)', async () => {
+  it('barrier release compareAndRemove EIO leaves only a non-terminal lease and never reports phantom failed', async () => {
     // Barrier transition throws pre-rename (disk still reserved), but the release
     // compareAndRemove ALSO throws (EIO) → the lease state is unprovable. We must
-    // NOT reuse-forever: resolveIdempotencyHit's not-live guard makes the retry
-    // terminal (the still-reserved same-boot lease has no live worker in the
-    // persistent map, which evicts on closeSession — modeled here by a fresh map).
+    // NOT re-dispatch it, but there is no Session or async terminal evidence, so
+    // neither the first call nor a retry may claim an observable `state:failed`.
     const tSpy = vi.spyOn(idempotencyStore, 'transition').mockImplementationOnce(() => { throw new Error('injected barrier fault'); });
     const rSpy = vi.spyOn(idempotencyStore, 'compareAndRemove').mockImplementationOnce(() => { throw new Error('injected EIO on release unlink'); });
     const first = await triggerSessionTurn(freshAsyncReq('k-beio'), { larkAppId: APP, activeSessions: new Map() });
     tSpy.mockRestore(); rSpy.mockRestore();
     expect(first.ok).toBe(false);
     expect(first.errorCode).toBe('trigger_failed');
+    expect(first.state).not.toBe('failed');
     expect(mockForkWorker).not.toHaveBeenCalled();
     // The reserved lease is still on disk (release couldn't prove removal)…
-    expect(idempotencyStore.lookup(APP, 'k-beio')?.state).toBe('reserved');
-    // …but the session is not live (closed + persistent map evicts) → retry is
-    // TERMINAL, never reused-forever.
+    const stranded = idempotencyStore.lookup(APP, 'k-beio');
+    expect(stranded?.state).toBe('reserved');
+    expect(createdSessions).toHaveLength(0);
+    expect(asyncTriggerStore.lookup(stranded!.sessionId, stranded!.triggerId)).toBeUndefined();
+    // …and the retry remains fail-closed without inventing terminal evidence.
     const retry = await triggerSessionTurn(freshAsyncReq('k-beio'), { larkAppId: APP, activeSessions: new Map() });
-    expect(retry.state).toBe('failed');
+    expect(retry.errorCode).toBe('trigger_failed');
+    expect(retry.state).not.toBe('failed');
     expect(retry.idempotent).toBe(true);
     expect(mockForkWorker).not.toHaveBeenCalled(); // no dispatch on the orphan
+  });
+
+  it('post-rename barrier plus terminal-write failure has no Session and no phantom failed response', async () => {
+    const realTransition = idempotencyStore.transition;
+    const transitionSpy = vi.spyOn(idempotencyStore, 'transition').mockImplementationOnce((...args: any[]) => {
+      realTransition(...args as Parameters<typeof realTransition>);
+      throw new Error('injected post-rename response loss');
+    });
+    const terminalSpy = vi.spyOn(asyncTriggerStore, 'recordFailedStrict')
+      .mockImplementationOnce(() => { throw new Error('injected terminal write failure'); });
+
+    const first = await triggerSessionTurn(freshAsyncReq('k-bpost-double'), {
+      larkAppId: APP,
+      activeSessions: new Map(),
+    });
+    transitionSpy.mockRestore();
+    terminalSpy.mockRestore();
+
+    expect(first.ok).toBe(false);
+    expect(first.errorCode).toBe('trigger_failed');
+    expect(first.state).not.toBe('failed');
+    expect(idempotencyStore.lookup(APP, 'k-bpost-double')?.state).toBe('attempting');
+    expect(createdSessions).toHaveLength(0);
+    expect(mockForkWorker).not.toHaveBeenCalled();
+
+    const retry = await triggerSessionTurn(freshAsyncReq('k-bpost-double'), {
+      larkAppId: APP,
+      activeSessions: new Map(),
+    });
+    expect(retry.errorCode).toBe('trigger_failed');
+    expect(retry.state).not.toBe('failed');
+    expect(mockForkWorker).not.toHaveBeenCalled();
   });
 
   // ── codex #776 round-6 finding #1: worker exits with NO final_output. The
@@ -366,12 +603,13 @@ describe('triggerSessionTurn — idempotency dispatch (real stores)', () => {
   });
 
   it('trim-equivalent keys reuse the SAME lease and do NOT 409 (prompt is identical after strip)', async () => {
-    const a = await triggerSessionTurn({ ...freshAsyncReq('k-trim'), options: { asyncReturnSessionId: true, idempotencyKey: 'k-trim' } } as any, { larkAppId: APP, activeSessions: new Map() });
+    const shared = new Map();
+    const a = await triggerSessionTurn({ ...freshAsyncReq('k-trim'), options: { asyncReturnSessionId: true, idempotencyKey: 'k-trim' } } as any, { larkAppId: APP, activeSessions: shared });
     expect(mockForkWorker).toHaveBeenCalledTimes(1);
     // A retry with a whitespace-padded key trims to the same lookup key; because
     // the renderer strips the key, optionsForHash AND the rendered prompt are
     // identical → legitimate reuse, NOT a 409 idempotency_conflict.
-    const b = await triggerSessionTurn({ ...freshAsyncReq('k-trim'), options: { asyncReturnSessionId: true, idempotencyKey: '  k-trim  ' } } as any, { larkAppId: APP, activeSessions: new Map() });
+    const b = await triggerSessionTurn({ ...freshAsyncReq('k-trim'), options: { asyncReturnSessionId: true, idempotencyKey: '  k-trim  ' } } as any, { larkAppId: APP, activeSessions: shared });
     expect(b.errorCode).not.toBe('idempotency_conflict');
     expect(b.idempotent).toBe(true);
     expect(b.target?.sessionId).toBe(a.target?.sessionId);
@@ -391,6 +629,7 @@ describe('triggerSessionTurn — idempotency dispatch (real stores)', () => {
     expect(res.state).not.toBe('failed');           // NOT a terminal — retryable
     expect(mockForkWorker).not.toHaveBeenCalled();   // nothing dispatched/deferred
     expect(idempotencyStore.lookup(APP, 'k-freeze')).toBeUndefined(); // no lease claimed
+    expect(createdSessions).toHaveLength(0);         // no provisional/closed Session garbage
     // After release, the same key dispatches cleanly (exactly once).
     if (acq.ok) releaseDeviceIsolationFreeze({ nonce: 'n1', leaseId: acq.lease.leaseId });
     const ok = await triggerSessionTurn(freshAsyncReq('k-freeze'), { larkAppId: APP, activeSessions: new Map() });

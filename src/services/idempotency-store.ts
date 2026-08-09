@@ -126,8 +126,14 @@ function withKeyLock<T>(fp: string, fn: () => T): T {
 /** Read + validate. undefined only when ABSENT. Present-but-corrupt THROWS
  *  (on the claim path an unreadable record is NOT provably absent). */
 function readRecord(fp: string): IdempotencyRecord | undefined {
-  if (!existsSync(fp)) return undefined;
-  const data = JSON.parse(readFileSync(fp, 'utf-8')) as IdempotencyRecord;
+  let raw: string;
+  try {
+    raw = readFileSync(fp, 'utf-8');
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') return undefined;
+    throw error;
+  }
+  const data = JSON.parse(raw) as IdempotencyRecord;
   if (
     !data || typeof data !== 'object'
     || typeof data.ownerLarkAppId !== 'string'
@@ -166,7 +172,9 @@ function sameIdentity(a: IdempotencyRecord, b: {
 export function lookup(ownerLarkAppId: string, key: string, kind: IdempotencyKind = 'fresh'): IdempotencyRecord | undefined {
   const rec = readRecord(fileFor(ownerLarkAppId, key, kind));
   if (!rec) return undefined;
-  if (rec.ownerLarkAppId !== ownerLarkAppId) return undefined;
+  if (rec.ownerLarkAppId !== ownerLarkAppId) {
+    throw new Error('idempotency record owner mismatch');
+  }
   return rec;
 }
 

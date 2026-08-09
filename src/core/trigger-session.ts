@@ -28,12 +28,16 @@ import * as messageQueue from '../services/message-queue.js';
 import type { DaemonSession } from './types.js';
 import { activeSessionKey, sessionKey, larkTransportEnabled, isHttpVirtualSession } from './types.js';
 import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
-import { computeInputHash } from '../utils/canonical-input-hash.js';
 import { logger } from '../utils/logger.js';
 import type { CliTurnPayload } from '../types.js';
 import { withBotTurnAdmission } from './bot-turn-mutation-gate.js';
 import { stagePendingRepoSetup } from './pending-repo-journal.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
+import { currentSessionRuntimeHost } from './current-session-runtime.js';
+import type {
+  CommandOutcome,
+  SessionRuntime,
+} from './session-runtime.js';
 
 export interface TriggerSessionDeps {
   larkAppId: string;
@@ -620,14 +624,18 @@ function waitForSessionFinalOutput(
   });
 }
 
-function beginAsyncTrigger(ds: DaemonSession, triggerId: string): void {
-  const createdAt = Date.now();
+function armAsyncTriggerInMemory(ds: DaemonSession, triggerId: string, createdAt: number): void {
   ds.asyncTriggerResults ??= new Map();
   ds.asyncTriggerResults.set(triggerId, {
     status: 'pending',
     createdAt,
   });
   ds.latestAsyncTriggerId = triggerId;
+}
+
+function beginAsyncTrigger(ds: DaemonSession, triggerId: string): void {
+  const createdAt = Date.now();
+  armAsyncTriggerInMemory(ds, triggerId, createdAt);
   // Durably record the pending trigger so a poller can still resolve this
   // session after a daemon restart (the in-memory Map above does not survive
   // one). Stamp the owning bot for cross-bot isolation. Best-effort — a failed
@@ -651,6 +659,79 @@ function buildAsyncQueuedResponse(
       sessionId,
     },
     message,
+  };
+}
+
+function keyedTriggerOutcomeResponse(
+  outcome: CommandOutcome,
+  idempotencyKey: string,
+): TriggerResponse | undefined {
+  if (outcome.kind === 'applied') return undefined;
+  if (outcome.kind === 'duplicate') {
+    return {
+      ...buildAsyncQueuedResponse(
+        outcome.triggerId,
+        outcome.sessionId,
+        outcome.chatId,
+        outcome.message,
+      ),
+      idempotencyKey,
+      idempotent: true,
+    };
+  }
+  if (outcome.kind === 'ambiguous') {
+    if (!outcome.durable) {
+      return {
+        ok: false,
+        triggerId: outcome.triggerId,
+        errorCode: 'trigger_failed',
+        error: outcome.message,
+        target: {
+          kind: 'turn',
+          sessionId: outcome.sessionId,
+          chatId: outcome.chatId,
+        },
+        idempotencyKey,
+        idempotent: outcome.idempotent,
+      };
+    }
+    return {
+      ok: false,
+      state: 'failed',
+      triggerId: outcome.triggerId,
+      errorCode: 'no_output',
+      error: outcome.message,
+      target: {
+        kind: 'turn',
+        sessionId: outcome.sessionId,
+        chatId: outcome.chatId,
+      },
+      idempotencyKey,
+      idempotent: outcome.idempotent,
+    };
+  }
+  if (outcome.kind === 'rejected' && outcome.reason === 'idempotencyConflict') {
+    return {
+      ok: false,
+      errorCode: 'idempotency_conflict',
+      error: outcome.message,
+      idempotencyKey,
+    };
+  }
+  return {
+    ok: false,
+    errorCode: 'trigger_failed',
+    error: outcome.kind === 'staleAddress'
+      ? 'stale SessionRuntime address'
+      : outcome.message,
+    idempotencyKey,
+  };
+}
+
+function keyedTriggerTarget(idempotencyKey: string) {
+  return {
+    kind: 'route' as const,
+    route: { kind: 'idempotency' as const, key: idempotencyKey },
   };
 }
 
@@ -821,7 +902,7 @@ async function triggerSessionTurnAdmitted(
   // "session exists → reuse" map: a turn that crashed before/mid dispatch must
   // resolve to a terminal state, never silently re-run or hang `running`.
   const idempotencyKey = req.options?.idempotencyKey?.trim();
-  // requestHash binds the key to its full business payload — a same-key retry
+  // SessionRuntime binds the key to its full business payload — a same-key retry
   // with a DIFFERENT payload is a caller bug (409), not a silent join. It must
   // cover everything that renders into the prompt / drives execution:
   // instruction, envelope, source, presentation, and the WHOLE options object
@@ -831,80 +912,79 @@ async function triggerSessionTurnAdmitted(
   // (codex #776 round-4). No daemon-generated ids (session/chat/triggerId) are in
   // these inputs, so the hash is stable across retries.
   const { idempotencyKey: _omitKey, ...optionsForHash } = (req.options ?? {}) as Record<string, unknown>;
-  const requestHash = idempotencyKey
-    ? computeInputHash({
-        instruction: req.instruction ?? null,
-        envelope: req.envelope,
-        source: req.source,
-        presentation: req.presentation ?? null,
-        options: optionsForHash,
-      })
-    : '';
-  const ownerBootId = getDaemonBootId();
-  // Records this call may take over (older-boot reserved) — resolved during
-  // lookup, consumed at claim time so we don't re-read.
-  let idempotencyTakeover: idempotencyStore.IdempotencyRecord | undefined;
-  if (idempotencyKey && !dryRun) {
-    // A device-isolation freeze (device-credential enrollment) makes forkWorker
-    // DEFER the spawn and return early WITHOUT forking — so if we crossed the
-    // reserved→attempting barrier and armed beginAsyncTrigger, we would return
-    // `queued` while ds.worker stays null; a same-key retry would see a not-live
-    // attempting lease and resolve `failed`, then the deferred callback would
-    // actually fork and run the turn AFTER the caller saw failed (codex #776
-    // round-8 finding #1). Refuse the keyed dispatch up-front (before any lease
-    // claim / session / async pending), so nothing is dispatched and the caller
-    // can retry cleanly once the freeze releases. Retryable, not terminal.
-    if (currentDeviceIsolationFreezeLease()) {
+  if (idempotencyKey) {
+    if (!req.options?.asyncReturnSessionId
+      || req.options.waitForFinalOutput
+      || req.options.dryRun
+      || req.target.sessionId
+      || req.target.rootMessageId
+      || req.target.chatId) {
       return {
         ok: false,
-        errorCode: 'trigger_failed',
-        error: 'device credential activation in progress; retry the idempotent trigger shortly',
+        errorCode: 'bad_request',
+        error: 'idempotencyKey requires a fresh async virtual trigger without an explicit target',
         idempotencyKey,
       };
     }
-    let hit: idempotencyStore.IdempotencyRecord | undefined;
-    try {
-      hit = idempotencyStore.lookup(larkAppId, idempotencyKey);
-    } catch (err) {
-      // Corrupt/unreadable existing lease — fail-closed (never fall through to a
-      // fresh dispatch that could double-run).
-      return { ok: false, errorCode: 'trigger_failed', error: `idempotency lease unreadable: ${(err as Error).message}` };
+    if (internal?.beforeDispatch || internal?.suppressFinalOutput) {
+      return {
+        ok: false,
+        errorCode: 'bad_request',
+        error: 'idempotent async triggers do not accept an external dispatch hook or final-output suppression',
+        idempotencyKey,
+      };
     }
-    if (hit) {
-      if (hit.requestHash !== requestHash) {
-        return {
-          ok: false,
-          errorCode: 'idempotency_conflict',
-          error: 'idempotencyKey already used with a different request payload',
-          idempotencyKey,
-        };
-      }
-      const decision = resolveIdempotencyHit(hit, ownerBootId, deps.activeSessions);
-      if (decision.kind === 'reuse') {
-        return {
-          ...buildAsyncQueuedResponse(hit.triggerId, hit.sessionId, decision.chatId, decision.message),
-          idempotencyKey,
-          idempotent: true,
-        };
-      }
-      if (decision.kind === 'terminal') {
-        return {
-          ok: false,
-          state: 'failed',
-          triggerId: hit.triggerId,
-          errorCode: 'no_output',
-          error: decision.message,
-          target: { kind: 'turn', sessionId: hit.sessionId, chatId: decision.chatId },
-          idempotencyKey,
-          idempotent: true,
-        };
-      }
-      // decision.kind === 'takeover' — an older-boot pre-dispatch reserved lease.
-      // Fall through to create a fresh session + RE-CLAIM via takeover below.
-      idempotencyTakeover = hit;
-    }
-  }
 
+    const sessionRuntime: SessionRuntime = currentSessionRuntimeHost({
+      ownerLarkAppId: larkAppId,
+      activeSessions: deps.activeSessions,
+      ownerBootId: getDaemonBootId(),
+      keyedTriggerAdmissionBlocked: () => currentDeviceIsolationFreezeLease() !== null,
+    }).runtime;
+    const started = await sessionRuntime.submit({
+      target: keyedTriggerTarget(idempotencyKey),
+      idempotencyKey,
+      command: {
+        kind: 'keyedTrigger.start',
+        input: {
+          semantic: {
+            instruction: req.instruction ?? null,
+            envelope: req.envelope,
+            source: req.source,
+            presentation: req.presentation ?? null,
+            options: optionsForHash,
+          },
+          triggerId,
+          title: triggerTitle(req),
+          prompt,
+          codexAppText,
+          codexAppApplicationContext,
+          codexAppMessageContext,
+          ...(typeof req.options.model === 'string' ? { model: req.options.model } : {}),
+          ...(req.options.reasoningEffort ? { reasoningEffort: req.options.reasoningEffort } : {}),
+          persistInputHistory: internal?.persistInputHistory !== false,
+        },
+      },
+    });
+    if (started.kind === 'applied' && started.action === 'keyedTrigger.started') {
+      return {
+        ...buildAsyncQueuedResponse(
+          started.triggerId,
+          started.sessionId,
+          started.chatId,
+          'queued new session turn; poll by sessionId or triggerId for final output',
+        ),
+        idempotencyKey,
+        idempotent: false,
+      };
+    }
+    return keyedTriggerOutcomeResponse(started, idempotencyKey) ?? {
+      ok: false,
+      errorCode: 'trigger_failed',
+      error: 'SessionRuntime returned an invalid keyed-trigger start outcome',
+      idempotencyKey,
+    };
+  }
   // ── Turn-level idempotency (follow-up async append; validator guarantees the
   // shape: target.sessionId set, asyncReturnSessionId, no wait/dryRun, and
   // mutually exclusive with the fresh-session idempotencyKey above) ──
@@ -1755,70 +1835,6 @@ async function triggerSessionTurnAdmitted(
     newDs.pendingCodexAppMessageContext = undefined;
   };
 
-  // Idempotency claim (fresh async virtual only — validator guarantees this is
-  // the asyncReturnSessionId branch). Bind key → this session as a `reserved`
-  // lease BEFORE any dispatch. Two outcomes to guard:
-  //  - a concurrent same-key trigger already won → abandon our session (never
-  //    dispatched), reuse the winner (exactly-once dispatch);
-  //  - an older-boot pre-dispatch `reserved` lease → take it over for this fresh run.
-  // Any store I/O error THROWS → we roll back the session and 5xx BEFORE dispatch
-  // (fail-closed: never fall through to a fork that could double-run).
-  let idempotencyLease: idempotencyStore.IdempotencyRecord | undefined;
-  if (idempotencyKey) {
-    // Handle a claim/takeover that resolved to an EXISTING winner (we lost the
-    // race, or the older-boot lease was advanced/seized by someone else): tear
-    // down our just-created session and resolve from the winner's terminal
-    // evidence (via resolveIdempotencyHit → async-store), never dispatching.
-    const reuseExistingWinner = async (winner: idempotencyStore.IdempotencyRecord): Promise<TriggerResponse> => {
-      await closeSession(session.sessionId);
-      const decision = resolveIdempotencyHit(winner, ownerBootId, deps.activeSessions);
-      const winnerChatId = (decision.kind !== 'takeover' && decision.chatId) ? decision.chatId : chatId;
-      if (decision.kind === 'terminal') {
-        return {
-          ok: false, state: 'failed', triggerId: winner.triggerId,
-          errorCode: 'no_output', error: decision.message,
-          target: { kind: 'turn', sessionId: winner.sessionId, chatId: winnerChatId },
-          idempotencyKey, idempotent: true,
-        };
-      }
-      return {
-        ...buildAsyncQueuedResponse(winner.triggerId, winner.sessionId, winnerChatId,
-          'idempotency key already claimed; reusing the winning session (no new dispatch)'),
-        idempotencyKey, idempotent: true,
-      };
-    };
-    try {
-      const res = idempotencyTakeover
-        ? idempotencyStore.takeover({
-            ownerLarkAppId: larkAppId, key: idempotencyKey, expect: idempotencyTakeover,
-            sessionId: session.sessionId, triggerId, requestHash, ownerBootId, now: Date.now(),
-          })
-        : idempotencyStore.claim({
-            ownerLarkAppId: larkAppId, sessionId: session.sessionId, triggerId,
-            requestHash, ownerBootId, key: idempotencyKey, now: Date.now(),
-          });
-      if (res.kind === 'existing') return await reuseExistingWinner(res.record);
-      idempotencyLease = res.record;
-    } catch (err) {
-      if (err instanceof idempotencyStore.IdempotencyConflictError) {
-        await closeSession(session.sessionId);
-        return { ok: false, errorCode: 'idempotency_conflict', error: 'idempotencyKey already used with a different request payload', idempotencyKey };
-      }
-      await closeSession(session.sessionId);
-      return { ok: false, errorCode: 'trigger_failed', error: `idempotency claim failed: ${(err as Error).message}` };
-    }
-  }
-
-  // CAS the lease reserved→attempting immediately before dispatch (commit-unknown
-  // barrier). Throws → caller rolls back (releases the reserved lease).
-  const markAttemptingBeforeDispatch = (): void => {
-    if (idempotencyKey && idempotencyLease) {
-      idempotencyLease = idempotencyStore.transition(larkAppId, idempotencyKey, idempotencyLease, {
-        state: 'attempting', now: Date.now(),
-      });
-    }
-  };
-
   if (req.options?.waitForFinalOutput) {
     return waitForSessionFinalOutput(
       newDs,
@@ -1844,146 +1860,24 @@ async function triggerSessionTurnAdmitted(
   }
 
   if (req.options?.asyncReturnSessionId) {
-    // Commit-unknown barrier: CAS the lease reserved→attempting durably BEFORE
-    // beginAsyncTrigger / forkWorker touch the worker.
-    // BEFORE the barrier (still `reserved`, provably no dispatch): a failure here
-    // must truly CONVERGE the lease so a same-key retry does the right thing —
-    // never leaving a current-boot lease bound to the session we're about to
-    // close (resolveIdempotencyHit would otherwise reuse it and hang the poller).
-    // No fork has happened yet, so at-most-once is trivially safe on this path;
-    // the only goal is convergence (finding #1: the old catch swallowed both the
-    // `changed` result AND an EIO throw as "best-effort success").
-    try {
-      markAttemptingBeforeDispatch();
-    } catch (err) {
-      // Did we durably terminalize a CROSSED fence here? If so we can return an
-      // observable terminal `failed` (the caller polls it) rather than a bare
-      // 5xx — codex #776 finding #1: "若已 attempting 则 durable terminalize …
-      // 真正收敛 … 而不是 close 后返回普通 5xx".
-      let terminalizedCrossedFence = false;
-      if (idempotencyKey && idempotencyLease) {
-        try {
-          // idempotencyLease is still the pre-transition `reserved` snapshot
-          // (markAttemptingBeforeDispatch only reassigns it on success).
-          const rm = idempotencyStore.compareAndRemove(larkAppId, idempotencyKey, idempotencyLease);
-          if (rm.kind === 'changed' && rm.sameIdentity && rm.current.state === 'attempting') {
-            // MY exact lease (same immutable identity) advanced to attempting: the
-            // rename landed but a post-rename fsync threw → the disk is now a
-            // CROSSED commit-unknown fence I own. Never delete it — durably
-            // terminalize MY session/trigger so a retry resolves `failed`
-            // (at-most-once), not reuse-forever.
-            asyncTriggerStore.recordFailedStrict(session.sessionId, triggerId, Date.now(), larkAppId, 'dispatch_unknown');
-            terminalizedCrossedFence = true;
-          } else if (rm.kind === 'changed') {
-            // Changed but NOT my identity advanced-to-attempting: either a
-            // DIFFERENT winner replaced the slot (takeover/re-claim), or my lease
-            // moved to an unexpected state. Do NOT fabricate a local terminal on a
-            // session that isn't the current winner (finding #3) — that would fail
-            // MY loser session while the real winner keeps running. Leave the
-            // winner to its own lifecycle; only close my never-dispatched local
-            // session below and return an honest 5xx (a retry resolves via the
-            // winner's own evidence).
-            logger.warn(`[idempotency] barrier-fail release saw the lease change (sameIdentity=${rm.sameIdentity} current rev ${rm.current.revision} state ${rm.current.state} session ${rm.current.sessionId}); not faking a local terminal, leaving the winner`);
-          }
-          // removed / absent → cleanly released; a same-key retry starts fresh.
-        } catch (e) {
-          // Either compareAndRemove THREW (corrupt re-read / EIO unlink) or the
-          // crossed-fence recordFailedStrict THREW (double fault): the store state
-          // is unprovable / not durably terminal. Leave the lease for next-boot
-          // reconcile; the same-boot-needs-live guard in resolveIdempotencyHit
-          // stops a reuse-forever before then (finding #1: unprovable ≠ silent
-          // success). Fall through to the honest 5xx.
-          logger.error(`[idempotency] barrier-fail release could not converge the lease (${(e as Error).message}); left for reconcile`);
-        }
-      }
-      await closeSession(session.sessionId);
-      if (terminalizedCrossedFence) {
-        // Observable terminal: the caller can poll this sessionId and get `failed`.
-        return {
-          ok: false, state: 'failed', triggerId,
-          errorCode: 'no_output',
-          error: `idempotency attempt-barrier crossed then failed; outcome unknown (at-most-once, not re-run): ${(err as Error).message}`,
-          target: { kind: 'turn', sessionId: session.sessionId, chatId },
-          idempotencyKey, idempotent: false,
-        };
-      }
-      return {
-        ok: false, errorCode: 'trigger_failed',
-        error: `idempotency attempt-barrier failed: ${(err as Error).message}`,
-        ...(idempotencyKey ? { idempotencyKey } : {}),
-      };
-    }
-    // AFTER the barrier (now `attempting`, commit-unknown): any synchronous throw
-    // from beginAsyncTrigger/prepare/forkWorker must NOT leave the caller polling
-    // `running` forever. Write the authoritative durable failed (dispatch_unknown)
-    // and close — at-most-once, never re-dispatched (finding #5b).
+    // Unkeyed async turns keep their Current best-effort pending-result and
+    // replay semantics. They are intentionally outside the keyed at-most-once
+    // policy and remain an explicit A1 bypass.
     try {
       beginAsyncTrigger(newDs, triggerId);
-      // Stamp the idempotent-async-turn descriptor so a worker that dies with no
-      // final_output converges to a durable `dispatch_unknown` instead of polling
-      // `running` forever (codex #776 round-6 finding #1). Only for keyed turns:
-      // a non-idempotent async turn has no lease to transition and its
-      // worker-crash semantics are unchanged. The generation is the one this fork
-      // runs on (fork increments from the current max), so the exit handler can
-      // ignore a later generation that already moved on.
-      if (idempotencyKey && idempotencyLease) {
-        const dispatchedGeneration = Math.max(
-          newDs.workerGeneration ?? 0,
-          newDs.session.workerGeneration ?? 0,
-        ) + 1;
-        (newDs.idempotentAsyncTurns ??= new Map()).set(triggerId, {
-          ownerLarkAppId: larkAppId,
-          key: idempotencyKey,
-          kind: 'fresh',
-          workerGeneration: dispatchedGeneration,
-        });
-      }
       const dispatchAttempt = prepareStableDispatch(newDs, true);
       armFinalOutputSuppression(newDs, dispatchAttempt);
-      // Keyed idempotent async turns are at-most-once: once the daemon
-      // terminalizes them on CLI/worker exit, the worker must NEVER replay the
-      // input onto an auto-restarted CLI (codex #776 round-7 finding #1). Pass the
-      // object form so `atMostOnce` rides the init message even when there's no
-      // dispatchAttempt (keyed turns have none).
-      const atMostOnce = !!(idempotencyKey && idempotencyLease);
-      const forkArg = (dispatchAttempt === undefined && !atMostOnce)
+      const forkArg = dispatchAttempt === undefined
         ? triggerId
-        : { turnId: triggerId, ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}), ...(atMostOnce ? { atMostOnce: true } : {}) };
+        : { turnId: triggerId, dispatchAttempt };
       forkWorker(newDs, promptInput, forkArg);
       releaseInitialReservation();
     } catch (err) {
-      // The ONLY thing that lets us honestly report a terminal `failed` is a
-      // DURABLE failed record (that is what trigger-result reads). If the strict
-      // write itself fails (disk full/EIO), we must NOT claim `state:failed` —
-      // the caller could never observe it and would see `running` forever. In
-      // that double-failure case return a 5xx so the caller treats it as an
-      // unknown hard error (and the next boot's reconcile will converge the
-      // still-`attempting` lease). Only on a successful durable write do we
-      // return the terminal failed. (finding: double storage failure must be a
-      // fail-closed 5xx, not a phantom `failed`.)
-      let terminalDurable = false;
-      if (idempotencyKey) {
-        try {
-          asyncTriggerStore.recordFailedStrict(session.sessionId, triggerId, Date.now(), larkAppId, 'dispatch_unknown');
-          terminalDurable = true;
-        } catch (e) {
-          logger.error(`[idempotency] dispatch threw AND recordFailedStrict failed — lease stays attempting for next-boot reconcile: ${(e as Error).message}`);
-        }
-      }
-      try { await closeSession(session.sessionId); } catch { /* best-effort; terminal already durable if terminalDurable */ }
-      if (idempotencyKey && !terminalDurable) {
-        return {
-          ok: false, errorCode: 'trigger_failed',
-          error: `dispatch failed and terminal outcome could not be persisted: ${(err as Error).message}`,
-          target: { kind: 'turn', sessionId: session.sessionId, chatId },
-          idempotencyKey,
-        };
-      }
+      try { await closeSession(session.sessionId); } catch { /* best-effort for legacy unkeyed dispatch. */ }
       return {
         ok: false, state: 'failed', triggerId,
-        errorCode: 'no_output', error: `dispatch failed with unknown outcome: ${(err as Error).message}`,
+        errorCode: 'no_output', error: `dispatch failed with unknown outcome: ${err instanceof Error ? err.message : String(err)}`,
         target: { kind: 'turn', sessionId: session.sessionId, chatId },
-        ...(idempotencyKey ? { idempotencyKey, idempotent: false } : {}),
       };
     }
     return {
@@ -1993,7 +1887,6 @@ async function triggerSessionTurnAdmitted(
         chatId,
         'queued new session turn; poll by sessionId or triggerId for final output',
       ),
-      ...(idempotencyKey ? { idempotencyKey, idempotent: false } : {}),
     };
   }
 

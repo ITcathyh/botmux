@@ -209,7 +209,26 @@ function readSessionsProjectionStrict(fp: string): { raw: string; parsed: Record
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error(`invalid sessions projection at ${fp}`);
   }
-  return { raw, parsed: value as Record<string, Session> };
+  const parsed = value as Record<string, unknown>;
+  for (const [key, candidate] of Object.entries(parsed)) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+      throw new Error(`invalid Session row ${key} at ${fp}`);
+    }
+    const row = candidate as Record<string, unknown>;
+    if (typeof row.sessionId !== 'string'
+      || row.sessionId.length === 0
+      || row.sessionId !== key
+      || typeof row.chatId !== 'string'
+      || row.chatId.length === 0
+      || typeof row.rootMessageId !== 'string'
+      || row.rootMessageId.length === 0
+      || (row.status !== 'active' && row.status !== 'closed')
+      || typeof row.createdAt !== 'string'
+      || row.createdAt.length === 0) {
+      throw new Error(`malformed Session row ${key} at ${fp}`);
+    }
+  }
+  return { raw, parsed: parsed as Record<string, Session> };
 }
 
 function duplicateIds(ids: readonly string[]): string[] {
@@ -423,20 +442,67 @@ export function createSession(
   chatType?: 'group' | 'p2p',
   scope?: 'thread' | 'chat',
 ): Session {
-  load();
-  const session: Session = {
+  return createSessionExact({
     sessionId: randomUUID(),
-    chatId,
-    chatType,
-    rootMessageId,
-    scope,
-    title,
-    status: 'active',
     createdAt: new Date().toISOString(),
+    chatId,
+    rootMessageId,
+    title,
+    chatType,
+    scope,
+  });
+}
+
+/**
+ * Publish a pre-minted Session identity after a command authority has won its
+ * owner-scoped admission. This is intentionally narrower than generic import:
+ * an existing identity is a hard conflict and no caller may overwrite it.
+ */
+export function createSessionExact(input: {
+  sessionId: string;
+  createdAt: string;
+  chatId: string;
+  rootMessageId: string;
+  title: string;
+  chatType?: 'group' | 'p2p';
+  scope?: 'thread' | 'chat';
+}): Session {
+  load();
+  if (sessions.has(input.sessionId)) {
+    throw new Error(`session identity already exists: ${input.sessionId}`);
+  }
+  const session: Session = {
+    sessionId: input.sessionId,
+    chatId: input.chatId,
+    chatType: input.chatType,
+    rootMessageId: input.rootMessageId,
+    scope: input.scope,
+    title: input.title,
+    status: 'active',
+    createdAt: input.createdAt,
   };
   sessions.set(session.sessionId, session);
-  save();
-  logger.info(`Created session ${session.sessionId} (thread: ${rootMessageId})`);
+  try {
+    save();
+  } catch (error) {
+    try {
+      const published = getSessionFresh(input.sessionId);
+      if (published
+        && published.sessionId === input.sessionId
+        && published.chatId === input.chatId
+        && published.rootMessageId === input.rootMessageId
+        && published.createdAt === input.createdAt) {
+        sessions.set(input.sessionId, published);
+        return published;
+      }
+    } catch {
+      // Preserve the original write failure; the Runtime will quarantine an
+      // unprovable publication instead of inventing a retryable outcome.
+    }
+    sessions.delete(session.sessionId);
+    throw error;
+  }
+  logger.info(`Created session ${session.sessionId} (thread: ${input.rootMessageId})`);
   return session;
 }
 
@@ -723,6 +789,21 @@ export function persistActiveRiffLineageExact(
 export function listSessions(): Session[] {
   load();
   return [...sessions.values()];
+}
+
+/**
+ * Fresh, fail-closed read for non-authoritative projections. Unlike the
+ * legacy in-memory loader, a present-but-corrupt owner file is not folded into
+ * an empty fleet: SessionRuntime can report `notReady` instead of minting a
+ * false `notFound` view.
+ */
+export function listSessionsStrict(): Session[] {
+  ensureDir();
+  const fp = getFilePath();
+  return withFileLockSync(fp, () => {
+    const { parsed } = readSessionsProjectionStrict(fp);
+    return Object.values(parsed);
+  });
 }
 
 /**
