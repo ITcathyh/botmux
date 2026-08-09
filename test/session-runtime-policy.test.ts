@@ -118,9 +118,12 @@ function ordinaryTurn(messageKey: string, content = 'hello'): OrdinaryImTranspor
     source: 'lark.im',
     messageKey,
     content,
-    sender: { kind: 'human', openId: 'ou_sender', name: 'Sender' },
-    attachments: [],
+    sender: { kind: 'human', openId: 'ou_sender', unionId: 'on_sender' },
     mentions: [],
+    postParticipantMentions: [],
+    resources: [],
+    messageListener: false,
+    vc: { contextMayLag: false },
   };
 }
 

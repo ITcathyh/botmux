@@ -115,79 +115,6 @@ function routeMatches(
     && sessionAnchorId(ds) === turn.route.canonicalAnchor;
 }
 
-function preparedSemanticsMatch(
-  input: OrdinaryImTransportEnvelope,
-  prepared: PreparedOrdinaryImTurn,
-): boolean {
-  try {
-    if (!Array.isArray(input.attachments)
-      || !Array.isArray(input.mentions)
-      || !Array.isArray(prepared.attachments)
-      || !Array.isArray(prepared.mentions)) {
-      return false;
-    }
-    const inputSemantics = {
-      route: {
-        scope: input.route.scope,
-        canonicalAnchor: input.route.canonicalAnchor,
-        chatId: input.route.chatId,
-        chatType: input.route.chatType,
-      },
-      source: input.source,
-      messageKey: input.messageKey,
-      content: input.content,
-      sender: {
-        kind: input.sender.kind,
-        openId: input.sender.openId,
-        name: input.sender.name,
-      },
-      attachments: input.attachments.map(attachment => ({
-        type: attachment.type,
-        resourceKey: attachment.resourceKey,
-        sourceMessageKey: attachment.sourceMessageKey ?? input.messageKey,
-        name: attachment.name,
-      })),
-      mentions: input.mentions.map(mention => ({
-        key: mention.key,
-        name: mention.name,
-        openId: mention.openId,
-        kind: mention.kind,
-      })),
-    };
-    const preparedSemantics = {
-      route: {
-        scope: prepared.route.scope,
-        canonicalAnchor: prepared.route.canonicalAnchor,
-        chatId: prepared.route.chatId,
-        chatType: prepared.route.chatType,
-      },
-      source: prepared.source,
-      messageKey: prepared.messageKey,
-      content: prepared.content,
-      sender: {
-        kind: prepared.sender.kind,
-        openId: prepared.sender.openId,
-        name: prepared.sender.name,
-      },
-      attachments: prepared.attachments.map(attachment => ({
-        type: attachment.type,
-        resourceKey: attachment.resourceKey,
-        sourceMessageKey: attachment.sourceMessageKey,
-        name: attachment.name,
-      })),
-      mentions: prepared.mentions.map(mention => ({
-        key: mention.key,
-        name: mention.name,
-        openId: mention.openId,
-        kind: mention.kind,
-      })),
-    };
-    return JSON.stringify(preparedSemantics) === JSON.stringify(inputSemantics);
-  } catch {
-    return false;
-  }
-}
-
 /**
  * Compare an injected compiler value with the trusted compiler's exact output.
  * The nominal brand participates only as one expected descriptor among all
@@ -359,6 +286,14 @@ export function createCurrentOrdinaryIngressPort(
       };
     }
 
+    const trustedPrepared = trustedTurnPreparation.prepare(turn);
+    if (trustedPrepared.kind !== 'prepared') {
+      return {
+        kind: 'notCommitted',
+        message: trustedPrepared.message,
+      };
+    }
+
     let prepared;
     try {
       prepared = options.turnPreparation.prepare(turn);
@@ -374,18 +309,10 @@ export function createCurrentOrdinaryIngressPort(
         message: prepared.message,
       };
     }
-    const trustedPrepared = trustedTurnPreparation.prepare(turn);
-    if (trustedPrepared.kind !== 'prepared'
-      || !exactPreparedOutputMatches(prepared.turn, trustedPrepared.turn)) {
+    if (!exactPreparedOutputMatches(prepared.turn, trustedPrepared.turn)) {
       return {
         kind: 'unknown',
         message: 'ordinary IM turn preparation violated the exact compiler contract',
-      };
-    }
-    if (!preparedSemanticsMatch(turn, prepared.turn)) {
-      return {
-        kind: 'unknown',
-        message: 'ordinary IM turn preparation changed transport semantics',
       };
     }
     if (!identityIsCurrent(identity, prepared.turn)) {

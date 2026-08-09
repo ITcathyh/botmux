@@ -73,9 +73,12 @@ function envelope(
     source: 'lark.im',
     messageKey,
     content,
-    sender: { kind: 'human', openId: 'ou_sender', name: 'Sender' },
-    attachments: [],
+    sender: { kind: 'human', openId: 'ou_sender', unionId: 'on_sender' },
     mentions: [],
+    postParticipantMentions: [],
+    resources: [],
+    messageListener: false,
+    vc: { contextMayLag: false },
   };
 }
 
@@ -235,7 +238,7 @@ describe('SessionRuntime staged ordinary ingress protocol', () => {
     expect(begin).not.toHaveBeenCalled();
   });
 
-  it('hashes and passes the normalized turn so an unfolded attachment source is one semantic input', async () => {
+  it('hashes and passes the normalized turn so an unfolded resource source is one semantic input', async () => {
     const registry = new Map<string, DaemonSession>();
     register(registry, makeDaemonSession());
     const begin = vi.fn(() => ({ kind: 'committed' as const }));
@@ -244,10 +247,10 @@ describe('SessionRuntime staged ordinary ingress protocol', () => {
       execute: vi.fn(async () => undefined),
       resume: vi.fn(() => ({ kind: 'committed' as const })),
     } as OrdinaryIngressPort);
-    const base = envelope('om_normalized_hash', 'same attachment');
+    const base = envelope('om_normalized_hash', 'same resource');
     const omitted: OrdinaryImTransportEnvelope = {
       ...base,
-      attachments: [{
+      resources: [{
         type: 'image',
         resourceKey: 'img_1',
         name: 'image.png',
@@ -255,7 +258,7 @@ describe('SessionRuntime staged ordinary ingress protocol', () => {
     };
     const explicit: OrdinaryImTransportEnvelope = {
       ...base,
-      attachments: [{
+      resources: [{
         type: 'image',
         resourceKey: 'img_1',
         sourceMessageKey: base.messageKey,
@@ -271,7 +274,7 @@ describe('SessionRuntime staged ordinary ingress protocol', () => {
     expect(begin).toHaveBeenCalledTimes(1);
     expect(begin.mock.calls[0]?.[0]).toMatchObject({
       turn: {
-        attachments: [{ sourceMessageKey: base.messageKey }],
+        resources: [{ sourceMessageKey: base.messageKey }],
       },
     });
   });

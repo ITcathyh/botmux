@@ -8,12 +8,17 @@ import {
 } from './ordinary-im-turn.js';
 
 export type {
-  NormalizedOrdinaryImAttachmentDescriptor as PreparedOrdinaryImAttachmentDescriptor,
-  OrdinaryImAttachmentDescriptor,
+  NormalizedOrdinaryImResourceDescriptor as PreparedOrdinaryImResourceDescriptor,
   OrdinaryImMentionDescriptor,
+  OrdinaryImResourceDescriptor,
   OrdinaryImSenderDescriptor,
+  OrdinaryImSubstituteIdentity,
+  OrdinaryImSubstituteSnapshot,
   OrdinaryImTransportEnvelope,
   OrdinaryImTurnRoute,
+  OrdinaryImVcContext,
+  OrdinaryImVcTurnOrigin,
+  OrdinaryImWorkflowRewrite,
 } from './ordinary-im-turn.js';
 
 const preparedOrdinaryImTurnBrand: unique symbol = Symbol('PreparedOrdinaryImTurn');

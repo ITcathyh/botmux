@@ -31,13 +31,47 @@ function envelope(): OrdinaryImTransportEnvelope {
     source: 'lark.im',
     messageKey: 'om_compiler_contract',
     content: 'exact content',
-    sender: { kind: 'human', openId: 'ou_sender', name: 'Sender' },
-    attachments: [{
+    quotedMessageKey: 'om_quoted',
+    sender: { kind: 'human', openId: 'ou_sender', unionId: 'on_sender' },
+    resources: [{
       type: 'image',
       resourceKey: 'img_resource',
       name: 'image.png',
     }],
-    mentions: [{ key: '@_user', name: 'Mention', openId: 'ou_mention', kind: 'human' }],
+    mentions: [{
+      key: '@_user',
+      name: 'Mention',
+      openId: 'ou_mention',
+      userId: 'u_mention',
+      unionId: 'on_mention',
+      appId: 'cli_mention',
+    }],
+    postParticipantMentions: [{ key: '@_post_at_1', name: 'Peer', appId: 'cli_peer' }],
+    rewrite: { kind: 'workflowGrill', goal: 'exact goal' },
+    substitute: {
+      target: { name: 'Target', openId: 'ou_target' },
+      observedMention: { name: 'Observed', userId: 'u_target' },
+      disclosure: 'prefix',
+    },
+    messageListener: true,
+    vc: {
+      contextMayLag: true,
+      lifecycle: 'sealed',
+      imTurnOrigin: {
+        listenerAppId: 'cli_listener',
+        meetingId: 'meeting_1',
+        memberId: 'minutes',
+        memberEpoch: 3,
+        agentAppId: OWNER,
+        ownerBootId: 'boot_1',
+        ownerEpoch: 5,
+        membershipGeneration: 7,
+        sinkOwnerGeneration: 11,
+        receiverSessionId: 'session-1',
+        larkMessageId: 'om_compiler_contract',
+        replyTargetSenderOpenId: 'ou_reply_target',
+      },
+    },
   };
 }
 
@@ -153,19 +187,40 @@ describe('Current ordinary ingress compiler contract', () => {
       },
     },
     {
-      name: 'nested attachment path',
+      name: 'nested resource path',
       mutate(turn: PreparedOrdinaryImTurn) {
-        const attachment = Object.freeze({
-          ...turn.attachments[0],
+        const resource = Object.freeze({
+          ...turn.resources[0],
           path: '/tmp/private/image.png',
         });
-        return clonePrepared(turn, { attachments: Object.freeze([attachment]) });
+        return clonePrepared(turn, { resources: Object.freeze([resource]) });
       },
     },
     {
       name: 'unfrozen nested sender',
       mutate(turn: PreparedOrdinaryImTurn) {
         return clonePrepared(turn, { sender: { ...turn.sender } });
+      },
+    },
+    {
+      name: 'changed frozen VC business fact',
+      mutate(turn: PreparedOrdinaryImTurn) {
+        return clonePrepared(turn, {
+          vc: Object.freeze({ ...turn.vc, contextMayLag: false }),
+        });
+      },
+    },
+    {
+      name: 'changed frozen VC routing snapshot',
+      mutate(turn: PreparedOrdinaryImTurn) {
+        const origin = turn.vc.imTurnOrigin;
+        if (!origin) throw new Error('expected VC turn origin');
+        return clonePrepared(turn, {
+          vc: Object.freeze({
+            ...turn.vc,
+            imTurnOrigin: Object.freeze({ ...origin, ownerEpoch: origin.ownerEpoch + 1 }),
+          }),
+        });
       },
     },
   ])('fails closed before boundary execution for $name', ({ mutate }) => {
