@@ -1116,6 +1116,15 @@ export type WorkerToDaemon =
        *  message was posted (silent/suppressed turns also complete). */
       status: 'completed' | 'failed' | 'cancelled' | 'ambiguous';
       errorCode?: string;
+      /** Positive silence evidence. Only set to 'nothing_to_send' when the
+       *  worker's bridge gate deliberately suppressed this turn as genuine
+       *  silence (the model terminated with a bare nothing-to-send sentinel and
+       *  no `botmux send`). It is the ONLY signal a durable/async caller may use
+       *  to settle a turn as completed-with-empty-output. Absent on every other
+       *  `completed` terminal — including the RPC-hydration timeout path, which
+       *  emits `completed` with no final_output after fs-lag and must NOT be
+       *  read as silence (that would mask a real, still-arriving answer). */
+      outputDisposition?: 'nothing_to_send';
     }
   | { type: 'adopt_preamble'; userText: string; assistantText: string; turnId?: string }
   | { type: 'deferred_topic_materialized'; sessionId: string; turnId: string; rootMessageId: string }

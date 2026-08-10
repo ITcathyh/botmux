@@ -43,7 +43,7 @@ import { readProcessStartIdentity } from './core/session-marker.js';
 import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
-import { bridgePostText, shouldEmitEmptyCompletedBridgeFallback, shouldEmitFailedBridgeFallback, shouldSuppressBridgeEmit, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { bridgePostText, isBridgeNothingToSendFinal, shouldEmitEmptyCompletedBridgeFallback, shouldEmitFailedBridgeFallback, shouldSuppressBridgeEmit, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
 import {
   decideHardTimeoutAction,
@@ -5047,6 +5047,10 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
   const remainingPending = bridgeQueue.peek();
   const nextPendingMarkTimeMs = remainingPending.length > 0 ? remainingPending[0].markTimeMs : undefined;
   const cache = new Map<string, ReturnType<typeof drainTranscript>>();
+  // Turns suppressed as GENUINE SILENCE — see emitReadyCodexTurns for the full
+  // rationale. Tracked by object identity across this function's two loops so
+  // the terminal can carry positive silence evidence for a durable/async caller.
+  const nothingToSendTurns = new Set<(typeof ready)[number]>();
   for (let i = 0; i < ready.length; i++) {
     const turn = ready[i];
     const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
@@ -5079,6 +5083,11 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
     if (shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode)) {
       const reason = turn.isLocal ? 'local-typed' : 'model called botmux send within window';
       log(`Bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (${reason})`);
+      // Positive silence evidence for the terminal — only a bare nothing-to-send
+      // sentinel (no prose, no send), never "already sent" / local-typed.
+      if (!adoptMode && isBridgeNothingToSendFinal(assistantText)) {
+        nothingToSendTurns.add(turn);
+      }
       notifyExplicitReplyObserved(
         turn.turnId,
         explicitReplyMarkerForTurnWindow(gateInput, nextBoundaryMs, markers, adoptMode),
@@ -5149,7 +5158,7 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
   // after the model used `botmux send`. Completion is not optional. Emit it
   // only after all corresponding final_output IPC messages have been queued so
   // the daemon observes a stable per-turn ordering.
-  for (const turn of ready) emitTurnTerminal(turn.turnId, 'completed', undefined, turn.dispatchAttempt);
+  for (const turn of ready) emitTurnTerminal(turn.turnId, 'completed', undefined, turn.dispatchAttempt, nothingToSendTurns.has(turn) ? 'nothing_to_send' : undefined);
 }
 
 /** Drain `path` from `fromOffset` and feed the events to the bridge queue
@@ -6441,6 +6450,14 @@ function drainReliableTerminalBeforeInterrupt(): void {
 function emitReadyCodexTurns(): void {
   const ready = codexBridgeQueue.drainEmittable();
   if (ready.length === 0) return;
+  // Turns suppressed as GENUINE SILENCE (model terminated with a bare
+  // nothing-to-send sentinel, no `botmux send`). Tracked by object identity —
+  // both the emit loop and the terminal loop below iterate this same `ready`
+  // array — so the terminal for such a turn can carry positive silence evidence
+  // (outputDisposition: 'nothing_to_send'). A durable/async caller uses ONLY
+  // that flag to settle completed-with-empty; a bare `completed` terminal (e.g.
+  // the RPC-hydration timeout path) must never be read as silence.
+  const nothingToSendTurns = new Set<(typeof ready)[number]>();
   const adoptMode = lastInitConfig?.adoptMode === true;
   // Adopt mode: model is the user's external Codex, no botmux send to
   // gate against — every assistant turn (Lark-driven OR locally typed)
@@ -6479,6 +6496,16 @@ function emitReadyCodexTurns(): void {
     if (!content) continue;
     if (shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode)) {
       log(`Codex bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (gate)`);
+      // Distinguish DELIBERATE SILENCE (bare nothing-to-send sentinel, no prose,
+      // no send) from other suppression reasons (already `botmux send`-ed this
+      // turn, local-typed). Only the former is positive evidence that the model
+      // chose to produce no output — the terminal below carries it so a durable/
+      // async caller can settle completed-with-empty. "Already sent" is NOT
+      // silence: its content went out via final_output/botmux send and the async
+      // result is captured there, so it must not be stamped.
+      if (!adoptMode && isBridgeNothingToSendFinal(turn.finalText)) {
+        nothingToSendTurns.add(turn);
+      }
       notifyExplicitReplyObserved(
         turn.turnId,
         explicitReplyMarkerForTurnWindow(gateInput, nextBoundaryMs, markers, adoptMode),
@@ -6534,6 +6561,7 @@ function emitReadyCodexTurns(): void {
       turn.terminalStatus ?? 'completed',
       turn.terminalErrorCode,
       turn.dispatchAttempt,
+      nothingToSendTurns.has(turn) ? 'nothing_to_send' : undefined,
     );
   }
 }
@@ -15418,6 +15446,7 @@ function emitTurnTerminal(
   status: TurnTerminalStatus,
   errorCode?: string,
   dispatchAttempt?: number,
+  outputDisposition?: 'nothing_to_send',
 ): void {
   if (!sessionId || !turnId) return;
   if (!emittedTurnTerminals.claim(sessionId, turnId, dispatchAttempt)) return;
@@ -15437,6 +15466,7 @@ function emitTurnTerminal(
     status,
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     ...(errorCode ? { errorCode } : {}),
+    ...(outputDisposition ? { outputDisposition } : {}),
   });
   if (terminalReleasesDurableTurn(
     { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt },
