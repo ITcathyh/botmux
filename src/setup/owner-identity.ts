@@ -104,18 +104,18 @@ export async function detectUnusableOwnerEntries(
   const unusable: string[] = [];
   for (const entry of entries) {
     try {
-      if (entry.startsWith('ou_')) {
+      if (entry.startsWith('ou_') || entry.startsWith('on_')) {
+        // ou_ and on_ share ONE definitive-miss test so the two id shapes can
+        // never drift apart. A prior ou_-only `code === 99992361` check let a
+        // target-app-invalid open_id (41012 / 40001) or a code:0-without-user
+        // response slip through and be written as the sole owner — the same
+        // lockout this module exists to prevent.
         const res = await client.contact.v3.user.get({
           path: { user_id: entry },
-          params: { user_id_type: 'open_id' },
+          params: { user_id_type: entry.startsWith('ou_') ? 'open_id' : 'union_id' },
         });
-        if (res?.code === CROSS_APP_OPEN_ID_CODE) unusable.push(entry);
-      } else if (entry.startsWith('on_')) {
-        const res = await client.contact.v3.user.get({
-          path: { user_id: entry },
-          params: { user_id_type: 'union_id' },
-        });
-        // A clean response without a target-app open_id is a definitive miss.
+        // A clean response without a target-app open_id is a definitive miss
+        // (cross-app open_id, or a union_id this app cannot resolve).
         // Permission/scope failures remain inconclusive so onboarding can
         // proceed while newly granted Contact scopes propagate.
         if ((res?.code === 0 && !res?.data?.user?.open_id)
@@ -144,10 +144,12 @@ export async function detectUnusableOwnerEntries(
     } catch (err) {
       // The SDK often throws Axios errors for the same cross-app response that
       // mocks expose as a normal payload. Preserve the definitive verdict in
-      // both transport shapes; every other throw remains inconclusive.
+      // both transport shapes; every other throw remains inconclusive. ou_ and
+      // on_ use the SAME definitive-code set here too — an ou_-only 99992361
+      // check would drop 41012 / 40001 that arrive as a throw.
       const code = larkErrorCode(err);
-      if ((entry.startsWith('ou_') && code === CROSS_APP_OPEN_ID_CODE)
-        || (entry.startsWith('on_') && code !== undefined && DEFINITIVE_USER_ID_CODES.has(code))) {
+      if ((entry.startsWith('ou_') || entry.startsWith('on_'))
+        && code !== undefined && DEFINITIVE_USER_ID_CODES.has(code)) {
         unusable.push(entry);
       }
     }

@@ -124,6 +124,59 @@ describe('scripted setup owner identity', () => {
     )).resolves.toEqual(['ou_source']);
   });
 
+  // P1 regression: an ou_ that the target app proves invalid must be rejected
+  // through the SAME definitive-code set as on_. A prior ou_-only 99992361
+  // check let 41012 / 40001 and code:0-without-user slip through and land as
+  // the sole owner, reproducing the very lockout this module prevents.
+  it('rejects an ou_ the target app reports as an invalid id (41012 / 40001)', async () => {
+    userGetMock.mockResolvedValueOnce({ code: 41012, msg: 'invalid user id' });
+    await expect(detectUnusableOwnerEntries(
+      'cli_target', 'secret', 'feishu', ['ou_invalid'],
+    )).resolves.toEqual(['ou_invalid']);
+
+    userGetMock.mockResolvedValueOnce({ code: 40001, msg: 'invalid param' });
+    await expect(detectUnusableOwnerEntries(
+      'cli_target', 'secret', 'feishu', ['ou_bad_param'],
+    )).resolves.toEqual(['ou_bad_param']);
+  });
+
+  it('rejects an ou_ definitive-invalid id that arrives as an Axios throw', async () => {
+    userGetMock.mockRejectedValueOnce({
+      response: { data: { code: 40001, msg: 'invalid param' } },
+    });
+    await expect(detectUnusableOwnerEntries(
+      'cli_target', 'secret', 'feishu', ['ou_thrown'],
+    )).resolves.toEqual(['ou_thrown']);
+  });
+
+  it('rejects an ou_ with a clean code:0 response that carries no target-app user', async () => {
+    userGetMock.mockResolvedValueOnce({ code: 0, data: {} });
+    await expect(detectUnusableOwnerEntries(
+      'cli_target', 'secret', 'feishu', ['ou_no_user'],
+    )).resolves.toEqual(['ou_no_user']);
+  });
+
+  it('accepts an ou_ that resolves to a target-app user (no false rejection)', async () => {
+    userGetMock.mockResolvedValueOnce({
+      code: 0,
+      data: { user: { open_id: 'ou_same_app', union_id: 'on_owner' } },
+    });
+    await expect(detectUnusableOwnerEntries(
+      'cli_target', 'secret', 'feishu', ['ou_same_app'],
+    )).resolves.toEqual([]);
+    expect(userGetMock).toHaveBeenCalledWith({
+      path: { user_id: 'ou_same_app' },
+      params: { user_id_type: 'open_id' },
+    });
+  });
+
+  it('does not reject an ou_ on a transient (non-definitive) lookup code', async () => {
+    userGetMock.mockResolvedValueOnce({ code: 40003, msg: 'internal error' });
+    await expect(detectUnusableOwnerEntries(
+      'cli_target', 'secret', 'feishu', ['ou_transient'],
+    )).resolves.toEqual([]);
+  });
+
   it('does not reject an owner on transient lookup failure', async () => {
     userGetMock.mockRejectedValueOnce(new Error('ECONNRESET'));
 
