@@ -371,4 +371,35 @@ describe('turn-level idempotency — codex #818 P1 regressions', () => {
     expect(retry.state).toBe('failed');
     expect(mockForkWorker).not.toHaveBeenCalled();
   });
+
+  it('P1-8 (double fault): post-barrier throw + terminalize throw → 5xx + flagged; retry re-terminalizes (no reuse-forever)', async () => {
+    // recordPending throws (post-barrier) AND recordFailedStrict throws in the SAME
+    // request → nothing dispatched, lease attempting, no durable result. For a LIVE
+    // shared worker the exit handler never fires, so without the postBarrierFault
+    // flag + retry re-terminalize, a same-key retry would `reuse` and hang forever.
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    const active = activeWith(ds);
+    const pendSpy = vi.spyOn(asyncTriggerStore, 'recordPending').mockImplementationOnce(() => { throw new Error('injected recordPending fault'); });
+    const failSpy = vi.spyOn(asyncTriggerStore, 'recordFailedStrict').mockImplementationOnce(() => { throw new Error('injected recordFailedStrict fault'); });
+    const first = await triggerSessionTurn(followUpReq('tk-df'), { larkAppId: APP, activeSessions: active });
+    pendSpy.mockRestore();
+    failSpy.mockRestore();
+    // Honest 5xx (no phantom terminal), lease kept attempting, entry flagged.
+    expect(first.ok).toBe(false);
+    expect(first.errorCode).toBe('trigger_failed');
+    expect(first.state).not.toBe('failed');
+    expect(mockSendWorkerInput).not.toHaveBeenCalled();
+    const entry = [...(ds.idempotentAsyncTurns?.values() ?? [])][0];
+    expect(entry?.postBarrierFault).toBe(true);
+    expect(idempotencyStore.lookup(APP, `${SID}\u0000tk-df`, 'turn')?.state).toBe('attempting');
+    // Store recovers → same-key retry re-attempts the strict terminalize and
+    // resolves an observable terminal, WITHOUT reusing/hanging or re-dispatching.
+    const retry = await triggerSessionTurn(followUpReq('tk-df'), { larkAppId: APP, activeSessions: active });
+    expect(retry.state).toBe('failed');
+    expect(retry.idempotent).toBe(true);
+    expect(mockSendWorkerInput).not.toHaveBeenCalled();
+    // Durable terminal now exists; the fault entry is cleared.
+    expect(asyncTriggerStore.lookup(SID, retry.triggerId!)?.result.reason).toBe('dispatch_unknown');
+    expect(ds.idempotentAsyncTurns?.size ?? 0).toBe(0);
+  });
 });

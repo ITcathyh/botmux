@@ -971,6 +971,30 @@ async function triggerSessionTurnAdmitted(
       }
       const decision = resolveIdempotencyHit(hit, ownerBootId, deps.activeSessions);
       if (decision.kind === 'reuse') {
+        // Recovery for the double-fault case (P1-8): a live shared-session turn
+        // whose post-barrier terminalize failed is `attempting` + live-worker, so
+        // resolveIdempotencyHit says `reuse` — but nothing dispatched and no
+        // durable result exists, so reusing would hang `running` forever. If this
+        // turn is flagged postBarrierFault, RE-ATTEMPT the strict terminalize now.
+        const faultDs = activeBySessionId(deps.activeSessions, hit.sessionId);
+        const faultEntry = faultDs?.idempotentAsyncTurns?.get(hit.triggerId);
+        if (faultDs && faultEntry?.postBarrierFault) {
+          try {
+            asyncTriggerStore.recordFailedStrict(hit.sessionId, hit.triggerId, Date.now(), larkAppId, 'dispatch_unknown');
+            faultDs.idempotentAsyncTurns?.delete(hit.triggerId);
+            faultDs.asyncTriggerResults?.delete(hit.triggerId);
+            return {
+              ok: false, state: 'failed', triggerId: hit.triggerId,
+              errorCode: 'no_output', error: 'previous dispatch was interrupted with unknown outcome; not re-run (at-most-once)',
+              target: { kind: 'turn', sessionId: hit.sessionId, chatId: decision.chatId },
+              turnIdempotencyKey, idempotent: true,
+            };
+          } catch (e) {
+            // Strict write still failing (persistent EIO) → keep the fault flag and
+            // return 5xx again; a later retry / worker-exit / boot reconcile converges.
+            return { ok: false, errorCode: 'trigger_failed', error: `idempotent turn terminal outcome could not be persisted: ${(e as Error).message}`, turnIdempotencyKey };
+          }
+        }
         return {
           ...buildAsyncQueuedResponse(hit.triggerId, hit.sessionId, decision.chatId, decision.message),
           turnIdempotencyKey,
@@ -1220,7 +1244,14 @@ async function triggerSessionTurnAdmitted(
           turnIdempotencyKey, idempotent: false,
         };
       } catch (e) {
-        logger.error(`[idempotency] turn post-barrier fault AND recordFailedStrict failed — convergence entry kept for worker-exit/retry: ${(e as Error).message}`);
+        // Double fault: the dispatch-prep threw AND the durable terminalize threw.
+        // Keep the convergence entry but MARK it postBarrierFault so a same-key
+        // retry (or poll) re-attempts the strict terminalize — for a LIVE shared
+        // worker the exit handler never fires, and resolveIdempotencyHit would
+        // otherwise `reuse` the attempting lease forever (codex #818 P1-8).
+        const entry = target.idempotentAsyncTurns?.get(triggerId);
+        if (entry) entry.postBarrierFault = true;
+        logger.error(`[idempotency] turn post-barrier fault AND recordFailedStrict failed — entry marked postBarrierFault for retry/exit convergence: ${(e as Error).message}`);
         return null;
       }
     };
