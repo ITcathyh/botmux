@@ -8462,7 +8462,15 @@ async function handleTrustedCodexAppMarker(
     }
     if (deliverableContent && startedAtMs !== undefined) {
       const suppressMarkers = readSendMarkers();
-      const gateInput = { markTimeMs: startedAtMs, isLocal: false, finalText: deliverableContent };
+      // Pass the RAW finalContent (not the pre-stripped deliverableContent) as
+      // finalText: shouldSuppressBridgeEmit needs to SEE the trailing sentinel to
+      // apply the "already sent this turn + sentinel terminator → suppress
+      // narration" branch. It strips internally for the length comparison, so a
+      // prose+sentinel final is still length-matched on the stripped prose. If we
+      // handed it the already-stripped text, the trailing-sentinel signal would
+      // be invisible and a longer-than-send narration would leak (same class as
+      // the transcript-path bug this fixes).
+      const gateInput = { markTimeMs: startedAtMs, isLocal: false, finalText: finalContent };
       suppressDelivery = suppressDelivery || shouldSuppressBridgeEmit(
         gateInput,
         completedAtMs + 5_001,
