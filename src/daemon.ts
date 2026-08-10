@@ -18300,6 +18300,9 @@ function lookupForeignBotName(senderOpenId: string, larkAppId: string): string {
   return 'Bot';
 }
 
+/** Anchors whose non-delivery notice already went out (once per daemon lifetime). */
+const ordinaryIngressFailureNoticed = new Set<string>();
+
 async function observeOrdinaryIngressOutcome(
   completion: Promise<{ kind: string; message?: string }>,
   context: {
@@ -18328,8 +18331,16 @@ async function observeOrdinaryIngressOutcome(
   }
   // rejected 由各 policy 自己的 UX 负责（如 quota 拒绝已单独提示）；其余终态
   // 意味着 transport 已 ACK 但消息没有送达 CLI——沉默会被读成机器人吞消息，
-  // 必须给用户一条可行动的提示。
+  // 必须给用户一条可行动的提示。同一 anchor 只提示一次：粘滞的 route 隔离会让
+  // 后续每条消息都走到这里，共享群里逐条回 ⚠️ 是纯噪音。
   if (outcome.kind === 'rejected' || !context.replyAnchor) return;
+  const noticeKey = `${context.ownerLarkAppId} ${context.replyAnchor}`;
+  if (ordinaryIngressFailureNoticed.has(noticeKey)) return;
+  ordinaryIngressFailureNoticed.add(noticeKey);
+  if (ordinaryIngressFailureNoticed.size > 256) {
+    const oldest = ordinaryIngressFailureNoticed.values().next().value;
+    if (oldest !== undefined) ordinaryIngressFailureNoticed.delete(oldest);
+  }
   try {
     await sessionReply(
       context.replyAnchor,

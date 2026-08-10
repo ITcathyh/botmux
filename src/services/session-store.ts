@@ -208,7 +208,11 @@ function normalizeCurrentSessionStoreState(
   ownerLarkAppId: string,
 ): StoredSessionState {
   const raw = row as unknown as Record<string, unknown>;
-  if (typeof raw.title !== 'string' || !raw.title.trim()) {
+  // Empty titles are legitimate legacy data (pre-#796 bare `/t` openings wrote
+  // `content.substring(0, 50)` verbatim); only a non-string title is corrupt.
+  // Treating '' as corruption would let one closed legacy row quarantine the
+  // whole route for its chat.
+  if (typeof raw.title !== 'string') {
     corruptCurrentSessionSource(`Session ${row.sessionId} has an invalid title`);
   }
   if (raw.scope !== undefined && raw.scope !== 'thread' && raw.scope !== 'chat') {
