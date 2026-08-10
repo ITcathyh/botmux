@@ -47,8 +47,18 @@ export interface TriggerRequest {
      *  with the same key returns the SAME session + triggerId instead of
      *  creating a new one and re-dispatching — so a lost HTTP response can't make
      *  the turn run twice. Distinct from `dedupKey` (webhook-lifecycle alert
-     *  grouping). Non-empty, ≤200 chars. */
+     *  grouping). Non-empty, ≤200 chars. FRESH async virtual only — mutually
+     *  exclusive with `turnIdempotencyKey` (which is for follow-up turns). */
     idempotencyKey?: string;
+    /** Caller-provided idempotency key for a FOLLOW-UP turn on an existing
+     *  session (requires `target.sessionId`). Same at-most-once dispatch lease as
+     *  `idempotencyKey`, but scoped to (sessionId, turnIdempotencyKey): a retried
+     *  /api/trigger appending to the same session with the same key resolves to
+     *  the SAME turn instead of injecting a second time — so a lost HTTP response
+     *  on an existing-session append can't double-run. Mutually exclusive with
+     *  `idempotencyKey`; only valid with `target.sessionId` + asyncReturnSessionId
+     *  (no wait/dryRun). Non-empty, ≤200 chars. */
+    turnIdempotencyKey?: string;
     status?: 'firing' | 'resolved' | string;
     waitForFinalOutput?: boolean;
     asyncReturnSessionId?: boolean;
@@ -140,6 +150,9 @@ export interface TriggerResponse {
   };
   /** Echo of the caller's `options.idempotencyKey`, when one was supplied. */
   idempotencyKey?: string;
+  /** Echo of the caller's `options.turnIdempotencyKey`, when one was supplied
+   *  (follow-up async turn on an existing session). */
+  turnIdempotencyKey?: string;
   /** True when this response reused an EXISTING session for the idempotency key
    *  (no new session created, no re-dispatch) instead of creating a fresh one.
    *  Absent/false on the first (creating) call and on non-idempotent triggers. */
@@ -263,6 +276,39 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
         body: {
           ok: false, errorCode: 'bad_request',
           error: 'options.idempotencyKey is only supported for a fresh async virtual trigger (target.kind=turn, options.asyncReturnSessionId=true, no waitForFinalOutput/dryRun, and no target.sessionId/rootMessageId/chatId)',
+        },
+      };
+    }
+  }
+  if (options.turnIdempotencyKey !== undefined) {
+    if (typeof options.turnIdempotencyKey !== 'string' || options.turnIdempotencyKey.trim().length === 0 || options.turnIdempotencyKey.length > 200) {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.turnIdempotencyKey must be a non-empty string (<=200 chars)' } };
+    }
+    // Mutually exclusive with the fresh-session `idempotencyKey`: the two key
+    // spaces have different scopes (per-bot fresh dispatch vs per-session turn)
+    // and different validity gates. Allowing both would be ambiguous about which
+    // lease governs the dispatch, so reject up-front rather than pick one.
+    if (options.idempotencyKey !== undefined) {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.turnIdempotencyKey and options.idempotencyKey are mutually exclusive' } };
+    }
+    // Scope lock (follow-up turn only): the turn-level lease is implemented solely
+    // on the existing-session async-return append seam. It REQUIRES target.sessionId
+    // (that is the session whose turn is keyed) and asyncReturnSessionId, and must
+    // not be combined with wait/dryRun or a fresh-session target
+    // (rootMessageId/chatId without sessionId), which take other dispatch paths
+    // that don't hold this lease and would double-run on retry.
+    if (
+      target.kind !== 'turn'
+      || !hasSessionId
+      || !asyncReturnSessionId
+      || waitForFinalOutput
+      || options.dryRun === true
+    ) {
+      return {
+        ok: false, status: 400,
+        body: {
+          ok: false, errorCode: 'bad_request',
+          error: 'options.turnIdempotencyKey is only supported for a follow-up async turn on an existing session (target.kind=turn, target.sessionId set, options.asyncReturnSessionId=true, no waitForFinalOutput/dryRun)',
         },
       };
     }

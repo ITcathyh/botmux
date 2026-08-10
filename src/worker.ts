@@ -10611,6 +10611,12 @@ function sendToPty(
     queuedActivationToken?: string;
     replyTurnId?: string;
     vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
+    /** At-most-once (idempotency lease): tag this keyed input so a CLI exit never
+     *  replays it onto the auto-restarted CLI — excluded from BOTH the inflight
+     *  carry-over and the still-queued pendingMessages drain. Mirrors the init
+     *  path's `atMostOnce → noReplay` for a keyed follow-up delivered to a LIVE
+     *  worker via `type: 'message'` (codex #776 round-8; turn-level PR #71). */
+    atMostOnce?: true;
   } = {},
 ): boolean {
   const next: PendingCliInput = {
@@ -10622,6 +10628,7 @@ function sendToPty(
     ...(opts.queuedActivationToken ? { queuedActivationToken: opts.queuedActivationToken } : {}),
     ...(opts.codexAppInput ? { codexAppInput: opts.codexAppInput } : {}),
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
+    ...(opts.atMostOnce ? { noReplay: true } : {}),
     ...(opts.vcMeetingImTurnOrigin
       ? { vcMeetingImTurnOrigin: opts.vcMeetingImTurnOrigin }
       : {}),
@@ -16145,6 +16152,7 @@ process.on('message', async (raw: unknown) => {
           dispatchAttempt: msg.dispatchAttempt,
           codexAppDispatchId: msg.codexAppDispatchId,
           ...(msg.codexAppSteerable ? { codexAppSteerable: true } : {}),
+          ...(msg.atMostOnce ? { atMostOnce: true } : {}),
           queuedActivationToken: msg.queuedActivationToken,
           replyTurnId: msg.replyTurnId,
           vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,

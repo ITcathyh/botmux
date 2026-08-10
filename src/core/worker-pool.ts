@@ -5427,6 +5427,11 @@ export function sendWorkerInput(
      * Persisted on the accepted ledger entry and forwarded to the worker so the
      * serial runner may steer this turn into an active one. */
     codexAppSteerable?: true;
+    /** At-most-once (idempotency lease): forward to the worker so a keyed
+     * follow-up delivered to a LIVE worker is tagged noReplay and never replays
+     * onto an auto-restarted CLI after a crash+terminalize (turn-level PR #71).
+     * The dormant-fork path rides `atMostOnce` on the fork init instead. */
+    atMostOnce?: true;
   } = {},
 ): boolean {
   const riffRetirementPhase = riffRetirementAdmissionPhase(ds);
@@ -5555,6 +5560,7 @@ export function sendWorkerInput(
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
     ...(codexAppDispatchId ? { codexAppDispatchId } : {}),
     ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
+    ...(opts.atMostOnce ? { atMostOnce: true } : {}),
     ...(vcMeetingImTurnOrigin
       ? { vcMeetingImTurnOrigin }
       : {}),
