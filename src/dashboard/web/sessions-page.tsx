@@ -28,6 +28,7 @@ import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useStoreSelector, useT } from './react-hooks.js';
 import { copyText } from './clipboard.js';
 import { FeedGroupPicker } from './feed-group-picker.js';
+import { BotMultiSelect } from './bot-multi-select.js';
 import {
   KANBAN_TEAM_STORAGE_KEY,
   normalizeHiddenTableColumns,
@@ -1972,7 +1973,6 @@ function CreateSessionDialog(props: {
   const [bindWorkingDir, setBindWorkingDir] = useState('');
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
-  const [botQuery, setBotQuery] = useState('');
   const [keepOpen, setKeepOpen] = useState(() => readStoredCreateKeepOpen(windowStorage()));
   const [keptSuccess, setKeptSuccess] = useState<any>(null);
   const [feedGroups, setFeedGroups] = useState<Array<{ groupId: string; name: string }>>([]);
@@ -2001,7 +2001,6 @@ function CreateSessionDialog(props: {
     setBindWorkingDir('');
     setAdvancedOpen(false);
     setSubmitting(false);
-    setBotQuery('');
     setKeptSuccess(null);
     setFeedGroupId('');
     setNewFeedGroupName('');
@@ -2123,11 +2122,6 @@ function CreateSessionDialog(props: {
   const checkedIds = [...selectedBots];
   const leadOptions = checkedIds;
   const nameOf = (id: string) => bots.find(bot => bot.larkAppId === id)?.botName ?? id;
-  const botQueryNorm = botQuery.trim().toLowerCase();
-  const visibleBots = botQueryNorm
-    ? bots.filter(bot =>
-      bot.botName.toLowerCase().includes(botQueryNorm) || bot.larkAppId.toLowerCase().includes(botQueryNorm))
-    : bots;
   const mentionBots = mentionTrigger
     ? filterMentionBots(bots, mentionTrigger.query).slice(0, 8)
     : [];
@@ -2365,44 +2359,23 @@ function CreateSessionDialog(props: {
         </fieldset>
         <fieldset className="cs-bots">
           <legend>{t('sessions.create.bots')}</legend>
-          {bots.length ? (
-            <>
-              <input
-                className="cs-bot-search"
-                type="search"
-                name="botSearch"
-                placeholder={t('sessions.create.botSearchPlaceholder')}
-                aria-label={t('sessions.create.botSearchPlaceholder')}
-                value={botQuery}
-                onChange={event => setBotQuery(event.currentTarget.value)}
-              />
-              {visibleBots.length ? (
-                <div className="cs-bot-list">
-                  {visibleBots.map(bot => (
-                    <label key={bot.larkAppId} className="cs-bot">
-                      <input
-                        type="checkbox"
-                        name="bot"
-                        value={bot.larkAppId}
-                        checked={selectedBots.has(bot.larkAppId)}
-                        onChange={event => {
-                          const checked = event.currentTarget.checked;
-                          setSelectedBots(prev => {
-                            const next = new Set(prev);
-                            if (checked) next.add(bot.larkAppId);
-                            else next.delete(bot.larkAppId);
-                            if (!next.has(lead)) setLead(next.values().next().value ?? '');
-                            return next;
-                          });
-                        }}
-                      /> <span>{bot.botName}</span>
-                    </label>
-                  ))}
-                </div>
-              ) : <p className="cs-empty">{t('sessions.create.noBotMatch')}</p>}
-              {checkedIds.length ? <small>{t('sessions.create.selectedCount', { n: String(checkedIds.length) })}</small> : null}
-            </>
-          ) : <p className="cs-empty">{t('sessions.create.noBots')}</p>}
+          <BotMultiSelect
+            bots={bots}
+            selected={selectedBots}
+            onToggle={(id, checked) => {
+              setSelectedBots(prev => {
+                const next = new Set(prev);
+                if (checked) next.add(id);
+                else next.delete(id);
+                if (!next.has(lead)) setLead(next.values().next().value ?? '');
+                return next;
+              });
+            }}
+            searchPlaceholder={t('botPicker.searchPlaceholder')}
+            noMatchLabel={t('botPicker.noMatch')}
+            emptyLabel={t('sessions.create.noBots')}
+            selectedCountLabel={n => t('botPicker.selectedCount', { n: String(n) })}
+          />
         </fieldset>
         <fieldset className="cs-mode">
           <legend>{t('sessions.create.mode')}</legend>

@@ -14,6 +14,7 @@ import { useT } from './react-hooks.js';
 import { botOrbStyle, chatAvatarUrlFor } from './ui.js';
 import { copyText } from './clipboard.js';
 import { FeedGroupPicker } from './feed-group-picker.js';
+import { BotMultiSelect } from './bot-multi-select.js';
 import {
   CreateActionButton,
   DropdownMenu,
@@ -125,19 +126,24 @@ function DialogError(props: DialogErrorState) {
   );
 }
 
-function BotCheckboxes(props: { bots: GroupBot[]; excludeIds?: Set<string> }) {
+function BotCheckboxes(props: { bots: GroupBot[]; excludeIds?: Set<string>; tr: Translator }) {
+  const options = availableBotsForPicker(props.bots, props.excludeIds);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const tr = props.tr;
   return (
-    <>
-      {availableBotsForPicker(props.bots, props.excludeIds).map(bot => (
-        <label className="checkbox-row" key={bot.larkAppId}>
-          <input type="checkbox" name="bot" value={bot.larkAppId} />
-          <span className="checkbox-row-main">
-            <strong>{bot.botName ?? bot.larkAppId}</strong>
-            <small>({bot.larkAppId})</small>
-          </span>
-        </label>
-      ))}
-    </>
+    <BotMultiSelect
+      bots={options}
+      selected={selected}
+      onToggle={(id, checked) => setSelected(prev => {
+        const next = new Set(prev);
+        if (checked) next.add(id); else next.delete(id);
+        return next;
+      })}
+      searchPlaceholder={tr('botPicker.searchPlaceholder')}
+      noMatchLabel={tr('botPicker.noMatch')}
+      emptyLabel={tr('botPicker.empty')}
+      selectedCountLabel={n => tr('botPicker.selectedCount', { n: String(n) })}
+    />
   );
 }
 
@@ -507,7 +513,7 @@ function CreateDialog(props: {
         <fieldset className="g-modal-field g-create-bots">
           <legend>{tr('groups.botPicker')}</legend>
           <div className="g-bot-picker">
-            <BotCheckboxes bots={props.bots} />
+            <BotCheckboxes bots={props.bots} tr={tr} />
           </div>
         </fieldset>
 
@@ -692,7 +698,7 @@ function AddBotsDialog(props: {
       <header><h3>{tr('groups.addBots')} · {chat.name ?? chat.chatId}</h3></header>
       <p>{tr('groups.createHelp')}</p>
       <form id="g-addform" onSubmit={ev => void submit(ev)}>
-        <BotCheckboxes bots={props.bots} excludeIds={inChatSet} />
+        <BotCheckboxes bots={props.bots} excludeIds={inChatSet} tr={tr} />
         <div data-add-status aria-live="polite">
           {error ? <DialogError {...error} /> : null}
           {summary ? (
