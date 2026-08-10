@@ -979,6 +979,20 @@ async function triggerSessionTurnAdmitted(
         const faultDs = activeBySessionId(deps.activeSessions, hit.sessionId);
         const faultEntry = faultDs?.idempotentAsyncTurns?.get(hit.triggerId);
         if (faultDs && faultEntry?.postBarrierFault) {
+          // COMPLETED-WINS: the turn may have actually finished between the fault
+          // and this retry (durable owned `completed` on disk). Never terminalize
+          // over a real completion — clear the fault flag and reuse the completed
+          // result (codex #818 P1-8 race). Only terminalize when NOT completed.
+          const durable = asyncTriggerStore.lookup(hit.sessionId, hit.triggerId);
+          const ownedCompleted = durable?.result.status === 'completed'
+            && durable.ownerLarkAppId === hit.ownerLarkAppId;
+          if (ownedCompleted) {
+            faultDs.idempotentAsyncTurns?.delete(hit.triggerId);
+            return {
+              ...buildAsyncQueuedResponse(hit.triggerId, hit.sessionId, decision.chatId, 'idempotency key already completed; reuse the session (poll trigger-result)'),
+              turnIdempotencyKey, idempotent: true,
+            };
+          }
           try {
             asyncTriggerStore.recordFailedStrict(hit.sessionId, hit.triggerId, Date.now(), larkAppId, 'dispatch_unknown');
             faultDs.idempotentAsyncTurns?.delete(hit.triggerId);
@@ -990,8 +1004,18 @@ async function triggerSessionTurnAdmitted(
               turnIdempotencyKey, idempotent: true,
             };
           } catch (e) {
-            // Strict write still failing (persistent EIO) → keep the fault flag and
-            // return 5xx again; a later retry / worker-exit / boot reconcile converges.
+            // recordFailedStrict is completed-wins + owner-proofed: a completed that
+            // landed in the race window throws here → drop the flag and reuse it
+            // (not a 5xx). A genuine I/O failure keeps the flag for the next
+            // retry / worker-exit / boot reconcile.
+            const raced = asyncTriggerStore.lookup(hit.sessionId, hit.triggerId);
+            if (raced?.result.status === 'completed' && raced.ownerLarkAppId === hit.ownerLarkAppId) {
+              faultDs.idempotentAsyncTurns?.delete(hit.triggerId);
+              return {
+                ...buildAsyncQueuedResponse(hit.triggerId, hit.sessionId, decision.chatId, 'idempotency key already completed; reuse the session (poll trigger-result)'),
+                turnIdempotencyKey, idempotent: true,
+              };
+            }
             return { ok: false, errorCode: 'trigger_failed', error: `idempotent turn terminal outcome could not be persisted: ${(e as Error).message}`, turnIdempotencyKey };
           }
         }
@@ -1327,7 +1351,7 @@ async function triggerSessionTurnAdmitted(
           // retry resolves `failed` at-most-once instead of reusing it forever.
           const settled = terminalizeTurnLeaseOnPostBarrierFault(target, triggerId, turnLeaseKey, turnLease);
           return settled ?? {
-            ok: false, errorCode: 'trigger_failed',
+            ok: false, triggerId, errorCode: 'trigger_failed',
             error: `dispatch failed and terminal outcome could not be persisted: ${(err as Error).message}`,
             target: { kind: 'turn', sessionId: target.session.sessionId, chatId },
             ...(turnIdempotencyKey ? { turnIdempotencyKey } : {}),
@@ -1470,7 +1494,7 @@ async function triggerSessionTurnAdmitted(
         if (turnLeaseKey && turnLease) {
           const settled = terminalizeTurnLeaseOnPostBarrierFault(target, triggerId, turnLeaseKey, turnLease);
           return settled ?? {
-            ok: false, errorCode: 'trigger_failed',
+            ok: false, triggerId, errorCode: 'trigger_failed',
             error: `dispatch failed and terminal outcome could not be persisted: ${(err as Error).message}`,
             target: { kind: 'turn', sessionId: target.session.sessionId, chatId },
             turnIdempotencyKey,

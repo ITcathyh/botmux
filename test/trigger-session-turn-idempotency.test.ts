@@ -402,4 +402,26 @@ describe('turn-level idempotency — codex #818 P1 regressions', () => {
     expect(asyncTriggerStore.lookup(SID, retry.triggerId!)?.result.reason).toBe('dispatch_unknown');
     expect(ds.idempotentAsyncTurns?.size ?? 0).toBe(0);
   });
+
+  it('P1-8 completed-wins race: a postBarrierFault turn that actually completed → retry REUSES completed, never terminalizes over it', async () => {
+    // First request double-faults → lease attempting + entry flagged, no dispatch.
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    const active = activeWith(ds);
+    const pendSpy = vi.spyOn(asyncTriggerStore, 'recordPending').mockImplementationOnce(() => { throw new Error('injected recordPending fault'); });
+    const failSpy = vi.spyOn(asyncTriggerStore, 'recordFailedStrict').mockImplementationOnce(() => { throw new Error('injected recordFailedStrict fault'); });
+    const first = await triggerSessionTurn(followUpReq('tk-race'), { larkAppId: APP, activeSessions: active });
+    pendSpy.mockRestore(); failSpy.mockRestore();
+    const flagged = [...(ds.idempotentAsyncTurns?.values() ?? [])][0];
+    expect(flagged?.postBarrierFault).toBe(true);
+    // The turn ACTUALLY completed in the race window (a real durable owned completed
+    // lands on disk for this triggerId).
+    asyncTriggerStore.recordCompleted(SID, first.triggerId!, 'the real answer', Date.now(), APP);
+    // Same-key retry must REUSE the completed result — NOT terminalize over it as failed.
+    const retry = await triggerSessionTurn(followUpReq('tk-race'), { larkAppId: APP, activeSessions: active });
+    expect(retry.idempotent).toBe(true);
+    expect(retry.state).not.toBe('failed');           // completed wins over the fault
+    expect(asyncTriggerStore.lookup(SID, first.triggerId!)?.result.status).toBe('completed'); // untouched
+    expect(ds.idempotentAsyncTurns?.size ?? 0).toBe(0); // fault entry cleared
+    expect(mockSendWorkerInput).not.toHaveBeenCalled(); // never re-dispatched
+  });
 });

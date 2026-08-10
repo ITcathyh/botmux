@@ -1544,6 +1544,54 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
   const memTriggerId = triggerId || ds?.latestAsyncTriggerId;
   const memResult = ds && memTriggerId ? ds.asyncTriggerResults?.get(memTriggerId) : undefined;
 
+  // Best-effort poll-side convergence for the double-fault turn (codex #818 P1-8):
+  // the CONTRACT is that a double-fault returns 5xx and the caller retries with the
+  // same key (that retry path is the authoritative recovery). This block is only a
+  // bonus for a client that happens to poll first — if this turn is flagged
+  // postBarrierFault (post-barrier throw AND the durable terminalize then threw),
+  // nothing dispatched and no durable result exists, yet a live shared worker keeps
+  // `liveActive` true so resolveAsyncTriggerState would otherwise report `running`.
+  // Re-attempt the strict terminalize opportunistically; a persistent EIO simply
+  // falls through to `running` and is converged by a same-key retry or boot reconcile.
+  if (ds && memTriggerId) {
+    const faultEntry = ds.idempotentAsyncTurns?.get(memTriggerId);
+    if (faultEntry?.postBarrierFault) {
+      // COMPLETED-WINS: the turn may have actually finished (durable owned
+      // completed) between the fault and this poll — never terminalize over a real
+      // completion. Only re-attempt the strict terminalize when it is NOT completed
+      // (codex #818 P1-8 race). recordFailedStrict is itself completed-wins, so the
+      // catch also reclassifies a completion that raced in.
+      const durable = asyncTriggerStore.lookup(sessionId, memTriggerId);
+      const ownedCompleted = durable?.result.status === 'completed'
+        && durable.ownerLarkAppId === faultEntry.ownerLarkAppId;
+      if (ownedCompleted) {
+        ds.idempotentAsyncTurns?.delete(memTriggerId);
+      } else {
+        try {
+          asyncTriggerStore.recordFailedStrict(sessionId, memTriggerId, Date.now(), faultEntry.ownerLarkAppId, 'dispatch_unknown');
+          ds.idempotentAsyncTurns?.delete(memTriggerId);
+          ds.asyncTriggerResults?.delete(memTriggerId);
+          return {
+            ok: true, state: 'failed', triggerId: memTriggerId,
+            target: { kind: 'turn', sessionId, chatId: ds.chatId ?? stored?.chatId },
+            errorCode: 'no_output',
+            error: 'previous dispatch was interrupted with unknown outcome; not re-run (at-most-once)',
+            message: 'async trigger terminated without output',
+          };
+        } catch {
+          // A completion that raced in makes recordFailedStrict throw → drop the
+          // flag and fall through to normal resolution (which reports completed).
+          // A genuine I/O failure keeps the flag for the next poll / boot reconcile.
+          const raced = asyncTriggerStore.lookup(sessionId, memTriggerId);
+          if (raced?.result.status === 'completed' && raced.ownerLarkAppId === faultEntry.ownerLarkAppId) {
+            ds.idempotentAsyncTurns?.delete(memTriggerId);
+          }
+          // else: leave the flag; fall through to running.
+        }
+      }
+    }
+  }
+
   const resolved = resolveAsyncTriggerState({
     sessionId,
     liveActive: !!ds,
