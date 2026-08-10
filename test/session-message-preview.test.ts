@@ -40,6 +40,44 @@ afterEach(() => {
 });
 
 describe('buildSessionMessagePreview', () => {
+  it('prefers a newer Current inbound preview over an older legacy queue row', () => {
+    writeJsonl('queues/om_root.jsonl', [
+      { senderType: 'user', content: 'legacy question', createTime: '2000' },
+    ]);
+
+    expect(buildSessionMessagePreview(session({
+      lastInboundPreview: {
+        messageKey: 'om_current_question',
+        content: 'Current question',
+        receivedAtMs: 3_000,
+      },
+    }))).toMatchObject({
+      previewUserText: 'Current question',
+      previewUserFullText: 'Current question',
+      previewUserAt: 3_000,
+      previewBotState: 'waiting',
+    });
+  });
+
+  it('keeps a newer legacy queue row ahead of an older Current inbound preview', () => {
+    writeJsonl('queues/om_root.jsonl', [
+      { senderType: 'user', content: 'newer legacy question', createTime: '4000' },
+    ]);
+
+    expect(buildSessionMessagePreview(session({
+      lastInboundPreview: {
+        messageKey: 'om_older_current_question',
+        content: 'older Current question',
+        receivedAtMs: 3_000,
+      },
+    }))).toMatchObject({
+      previewUserText: 'newer legacy question',
+      previewUserFullText: 'newer legacy question',
+      previewUserAt: 4_000,
+      previewBotState: 'waiting',
+    });
+  });
+
   it('returns the latest user message and bot marker as a replied exchange', () => {
     writeJsonl('queues/om_root.jsonl', [
       { senderType: 'user', content: 'old question', createTime: '1500' },

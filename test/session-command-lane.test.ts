@@ -271,7 +271,7 @@ describe('SessionCommandLane', () => {
             mentions: [],
             postParticipantMentions: [],
             resources: [],
-            messageListener: false,
+            foldedForwardContext: false,
             vc: { contextMayLag: false },
           },
         },

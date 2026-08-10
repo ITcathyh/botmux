@@ -55,6 +55,10 @@ vi.mock('../src/config.js', () => ({
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
+  createCurrentSessionStore: vi.fn(() => ({
+    load: vi.fn(() => ({ kind: 'notFound' })),
+    apply: vi.fn(() => ({ kind: 'unknown', message: 'unused mocked Current Store' })),
+  })),
   registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
   cleanupSessionBridgeSendMarkers: vi.fn(),
   cleanupSessionBridgeSendMarkersNow: vi.fn(),
@@ -62,6 +66,8 @@ vi.mock('../src/services/session-store.js', () => ({
   updateSession: vi.fn(),
   createSession: vi.fn(),
   getSession: vi.fn(),
+  getSessionForOwnerStrict: vi.fn(),
+  listSessionsForOwnerStrict: vi.fn(() => []),
 }));
 
 vi.mock('../src/core/worker-pool.js', () => {
@@ -85,6 +91,7 @@ vi.mock('../src/core/worker-pool.js', () => {
     }
   });
   return {
+  getDaemonBootId: vi.fn(() => 'card-handler-repo-select-test-boot'),
   forkWorker: vi.fn(),
   killWorker: vi.fn(),
   teardownAuthoritativePersistentBackingBeforeClose: vi.fn(),
@@ -105,6 +112,7 @@ vi.mock('../src/core/worker-pool.js', () => {
 vi.mock('../src/core/session-manager.js', () => ({
   getSessionWorkingDir: vi.fn(() => '/tmp'),
   ensureSessionWhiteboard: vi.fn(),
+  snapshotWhiteboardPromptBlock: vi.fn(() => undefined),
   buildNewTopicPrompt: vi.fn(() => 'mock-prompt'),
   buildNewTopicCliInput: vi.fn(() => ({ content: 'mock-prompt' })),
   getAvailableBots: vi.fn(async () => []),
@@ -130,6 +138,8 @@ vi.mock('../src/services/frozen-card-store.js', () => ({
 }));
 
 vi.mock('../src/services/git-worktree.js', () => ({
+  RepoWorktreePreAddRefusal: class RepoWorktreePreAddRefusal extends Error {},
+  isGitWorkTree: vi.fn(async () => true),
   createRepoWorktree: vi.fn(),
   removeRepoWorktree: vi.fn(async () => {}),
   pushWorktreeBranch: vi.fn(async () => {}),
@@ -143,10 +153,6 @@ vi.mock('../src/services/worktree-slug-ai.js', () => ({
   }),
 }));
 
-vi.mock('../src/services/default-worktree.js', () => ({
-  maybeCreateDefaultWorktree: vi.fn(async (_appId: string, baseDir: string) => ({ dir: `${baseDir}-wt` })),
-}));
-
 vi.mock('@larksuiteoapi/node-sdk', () => ({
   Client: class { constructor() {} },
   WSClient: class { start() {} },
@@ -157,14 +163,14 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 // ─── Imports ──────────────────────────────────────────────────────────────
 
 import { handleCardAction, runAutoWorktreeCommit, type CardHandlerDeps } from '../src/im/lark/card-handler.js';
+import { submitCurrentPendingRepoCompletion } from '../src/core/current-pending-repo-completion-submit.js';
 import { forkWorker, killWorker, teardownAuthoritativePersistentBackingBeforeClose, deliverEphemeralOrReply, deliverWriteLinkCard, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock } from '../src/core/worker-pool.js';
 import { buildNewTopicCliInput, getAvailableBots, getSessionWorkingDir } from '../src/core/session-manager.js';
 import { getBot } from '../src/bot-registry.js';
 import { createSession, closeSession, updateSession } from '../src/services/session-store.js';
 import { createRepoWorktree, pushWorktreeBranch, removeRepoWorktree } from '../src/services/git-worktree.js';
-import { maybeCreateDefaultWorktree } from '../src/services/default-worktree.js';
 import { applyConfigField } from '../src/services/bot-config-store.js';
-import { deleteMessage } from '../src/im/lark/client.js';
+import { deleteMessage, replyMessage } from '../src/im/lark/client.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -174,7 +180,6 @@ import { homedir, tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import {
   __testOnly_resetBotTurnMutationGates,
-  withBotTurnMutation,
 } from '../src/core/bot-turn-mutation-gate.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -188,6 +193,11 @@ const PROJECTS: ProjectInfo[] = [
   { name: 'alpha', path: '/repos/alpha', type: 'repo', branch: 'master' },
   { name: 'beta', path: '/repos/beta', type: 'repo', branch: 'main' },
 ];
+
+const pendingRepoCompletionsByDeps = new WeakMap<
+  CardHandlerDeps,
+  Array<ReturnType<typeof submitCurrentPendingRepoCompletion>>
+>();
 
 function makeDs(overrides?: Partial<DaemonSession>): DaemonSession {
   return {
@@ -221,8 +231,27 @@ function makeDs(overrides?: Partial<DaemonSession>): DaemonSession {
 function makeDeps(ds: DaemonSession, projects = PROJECTS) {
   const activeSessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
   const sessionReply = vi.fn(async () => 'om_reply');
-  const deps: CardHandlerDeps = { activeSessions, sessionReply, lastRepoScan: new Map([[CHAT_ID, projects]]) };
-  return { deps, sessionReply };
+  const pendingRepoCompletions: Array<ReturnType<typeof submitCurrentPendingRepoCompletion>> = [];
+  const submitPendingRepoCompletion: typeof submitCurrentPendingRepoCompletion = input => {
+    const completion = submitCurrentPendingRepoCompletion(input);
+    pendingRepoCompletions.push(completion);
+    return completion;
+  };
+  const deps: CardHandlerDeps = {
+    activeSessions,
+    sessionReply,
+    lastRepoScan: new Map([[CHAT_ID, projects]]),
+    submitPendingRepoCompletion,
+  };
+  pendingRepoCompletionsByDeps.set(deps, pendingRepoCompletions);
+  return { deps, sessionReply, pendingRepoCompletions };
+}
+
+async function latestPendingRepoCompletion(deps: CardHandlerDeps) {
+  const completions = pendingRepoCompletionsByDeps.get(deps);
+  if (!completions) throw new Error('test dependency has no pending completion tracker');
+  await vi.waitFor(() => expect(completions.length).toBeGreaterThan(0));
+  return completions.at(-1)!;
 }
 
 function makeSelectEvent(key: 'repo_switch' | 'repo_worktree', path: string) {
@@ -276,6 +305,7 @@ function deferred<T>() {
 beforeEach(() => {
   __testOnly_resetBotTurnMutationGates();
   vi.clearAllMocks();
+  vi.mocked(forkWorker).mockReturnValue(true);
   vi.mocked(deleteMessage).mockReset().mockResolvedValue(true);
   vi.mocked(teardownAuthoritativePersistentBackingBeforeClose).mockImplementation(() => undefined);
   vi.mocked(getBot).mockImplementation(() => ({
@@ -372,7 +402,7 @@ describe('repo select card — plain switch', () => {
   it('mid-session selection publishes the closed preview patch for the displaced session', async () => {
     const ds = makeDs();
     const oldSession = ds.session;
-    const { deps } = makeDeps(ds);
+    const { deps, sessionReply } = makeDeps(ds);
 
     await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
 
@@ -579,7 +609,7 @@ describe('repo select card — plain switch', () => {
     }));
   });
 
-  it('keeps the pending reservation and opening buffers when forkWorker throws synchronously', async () => {
+  it('keeps the pending claim sticky with opening buffers when forkWorker loses its response', async () => {
     const ds = makeDs({
       pendingRepo: true,
       initialStartPending: true,
@@ -600,9 +630,10 @@ describe('repo select card — plain switch', () => {
       makeSelectEvent('repo_switch', '/repos/alpha'),
       deps,
       APP_ID,
-    )).rejects.toThrow('fork preaccept failed');
+    )).resolves.toBeUndefined();
 
     expect(ds.pendingRepo).toBe(true);
+    expect(ds.pendingRepoCommitInFlight).toBe(true);
     expect(ds.initialStartPending).toBe(true);
     expect(ds.pendingPrompt).toBe('first prompt');
     expect(ds.pendingFollowUps).toEqual(['buffered follow-up']);
@@ -705,7 +736,7 @@ describe('repo select card — plain switch', () => {
     await vi.waitFor(() => expect(forkWorker).toHaveBeenCalledTimes(1));
     await vi.waitFor(() => expect(releaseReply).toBeTruthy());
     expect(ds.pendingRepo).toBe(false);
-    expect(ds.pendingRepoCommitInFlight).toBe(true);
+    expect(ds.pendingRepoCommitInFlight).toBe(false);
     expect(ds.session.sessionId).toBe('uuid-old');
 
     const late = await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
@@ -773,6 +804,7 @@ describe('repo select card — plain switch', () => {
     // call killWorker if the stale click were allowed through.
     vi.mocked(forkWorker).mockImplementationOnce((session) => {
       (session as any).worker = { killed: false, send: vi.fn() };
+      return true;
     });
     const { deps } = makeDeps(ds);
     let releaseDelete: (() => void) | undefined;
@@ -856,6 +888,7 @@ describe('repo select card — plain switch', () => {
     });
     vi.mocked(forkWorker).mockImplementationOnce((session) => {
       (session as any).worker = { killed: false, send: vi.fn() };
+      return true;
     });
     const { deps, sessionReply } = makeDeps(ds);
     sessionReply.mockRejectedValueOnce(new Error('reply boom'));
@@ -876,7 +909,7 @@ describe('repo select card — plain switch', () => {
     expect(ds.session.sessionId).toBe('uuid-old');
   });
 
-  it('keeps pending buffers and releases the claim when forkWorker throws, then allows retry', async () => {
+  it('keeps pending buffers and quarantines a forkWorker response loss without replay', async () => {
     const pendingFollowUps = ['buffered follow-up'];
     const ds = makeDs({
       pendingRepo: true,
@@ -890,10 +923,10 @@ describe('repo select card — plain switch', () => {
 
     await expect(
       handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID),
-    ).rejects.toThrow('fork boom');
+    ).resolves.toBeUndefined();
 
     expect(ds.pendingRepo).toBe(true);
-    expect(ds.pendingRepoCommitInFlight).toBe(false);
+    expect(ds.pendingRepoCommitInFlight).toBe(true);
     expect(ds.pendingPrompt).toBe('hello world');
     expect(ds.pendingFollowUps).toBe(pendingFollowUps);
     expect(ds.pendingTurnId).toBe('om_buffered_turn');
@@ -901,12 +934,12 @@ describe('repo select card — plain switch', () => {
 
     await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
 
-    expect(forkWorker).toHaveBeenCalledTimes(2);
-    expect(ds.pendingRepo).toBe(false);
-    expect(ds.pendingRepoCommitInFlight).toBe(false);
-    expect(ds.pendingPrompt).toBeUndefined();
-    expect(ds.pendingFollowUps).toBeUndefined();
-    expect(ds.pendingTurnId).toBeUndefined();
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.pendingRepo).toBe(true);
+    expect(ds.pendingRepoCommitInFlight).toBe(true);
+    expect(ds.pendingPrompt).toBe('hello world');
+    expect(ds.pendingFollowUps).toBe(pendingFollowUps);
+    expect(ds.pendingTurnId).toBe('om_buffered_turn');
   });
 
   it('mid-session selection closes the old session and forks a fresh one', async () => {
@@ -1160,10 +1193,10 @@ describe('repo select card — worktree open', () => {
     // A takeover (Codex-notifier「继续处理」, etc.) can consume pendingRepo while
     // the up-to-30s worktree build runs. The late completion must NOT funnel into
     // commitRepoSelection and kill+replace the just-adopted session.
-    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: { killed: false } as any });
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
     const { deps } = makeDeps(ds);
-    const d = deferred<{ dir: string }>();
-    vi.mocked(maybeCreateDefaultWorktree).mockReturnValueOnce(d.promise as any);
+    const d = deferred<{ path: string; branch: string; baseRef: string }>();
+    vi.mocked(createRepoWorktree).mockReturnValueOnce(d.promise as any);
 
     const run = runAutoWorktreeCommit({
       ds,
@@ -1172,19 +1205,22 @@ describe('repo select card — worktree open', () => {
       baseDir: '/repos/alpha',
       activeSessions: deps.activeSessions,
       notify: vi.fn(),
+      submitPendingRepoCompletion: deps.submitPendingRepoCompletion,
     });
-    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(true));
+    await vi.waitFor(() => expect(createRepoWorktree).toHaveBeenCalledOnce());
+    expect(ds.pendingRepoCommitInFlight).toBe(true);
 
     // Simulate the takeover consuming pendingRepo while git runs.
     ds.pendingRepo = false;
-    d.resolve({ dir: '/repos/alpha-wt' });
+    ds.worker = { killed: false } as DaemonSession['worker'];
+    d.resolve({ path: '/repos/alpha-wt', branch: 'wt/alpha', baseRef: 'origin/main' });
     await run;
 
     // Guard fired: no commit, no fork/kill, workingDir untouched.
     expect(forkWorker).not.toHaveBeenCalled();
     expect(killWorker).not.toHaveBeenCalled();
     expect(ds.workingDir).toBeUndefined();
-    expect(ds.worktreeCreating).toBe(false);
+    expect(ds.pendingRepoCommitInFlight).toBe(true);
   });
 
   it('double click starts ONE background creation and commits once', async () => {
@@ -1194,26 +1230,31 @@ describe('repo select card — worktree open', () => {
     vi.mocked(createRepoWorktree).mockReturnValue(d.promise as any);
 
     const first = await handleCardAction(makeSelectEvent('repo_worktree', '/repos/alpha'), deps, APP_ID);
+    await vi.waitFor(() => expect(createRepoWorktree).toHaveBeenCalledTimes(1));
     const second = await handleCardAction(makeSelectEvent('repo_worktree', '/repos/alpha'), deps, APP_ID);
 
     expect(createRepoWorktree).toHaveBeenCalledTimes(1);
     expect(createRepoWorktree).toHaveBeenCalledWith('/repos/alpha', { slug: 'repo-test' });
     expect(first?.toast?.content).toContain('正在创建');
     expect(second?.toast?.content).toContain('已有一个 worktree 正在创建');
-    expect(ds.worktreeCreating).toBe(true);
+    expect(ds.pendingRepoCommitInFlight).toBe(true);
 
     d.resolve({ path: '/repos/alpha-wt-1', branch: 'wt/1', baseRef: 'origin/master' });
-    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(false));
+    await latestPendingRepoCompletion(deps);
 
     expect(forkWorker).toHaveBeenCalledTimes(1);
     expect(ds.workingDir).toBe('/repos/alpha-wt-1');
     expect(ds.session.workingDir).toBe('/repos/alpha-wt-1');
     expect(ds.pendingRepo).toBe(false);
-    const replies = sessionReply.mock.calls.map(c => c[1]).join();
+    await vi.waitFor(() => expect(
+      vi.mocked(replyMessage).mock.calls.map(c => c[2]).join(),
+    ).toContain('worktree 已创建'));
+    const replies = vi.mocked(replyMessage).mock.calls.map(c => c[2]).join();
     expect(replies).toContain('worktree 已创建');
     // The redundant "已选择" confirmation is suppressed in the worktree flow —
     // the "worktree 已创建：…" line above is the single message the user sees.
     expect(replies).not.toContain('已选择');
+    expect(sessionReply).not.toHaveBeenCalled();
   });
 
   it('blocks a plain switch while git runs — and does NOT commit when the session moved on out-of-band', async () => {
@@ -1223,6 +1264,7 @@ describe('repo select card — worktree open', () => {
     vi.mocked(createRepoWorktree).mockReturnValue(d.promise as any);
 
     await handleCardAction(makeSelectEvent('repo_worktree', '/repos/alpha'), deps, APP_ID);
+    await vi.waitFor(() => expect(createRepoWorktree).toHaveBeenCalledOnce());
     // While git runs, a plain repo pick bounces off the worktree lock…
     const res = await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
     expect(res?.toast?.content).toContain('已有一个 worktree 正在创建');
@@ -1233,35 +1275,38 @@ describe('repo select card — worktree open', () => {
     ds.pendingRepo = false;
 
     d.resolve({ path: '/repos/alpha-wt-1', branch: 'wt/1', baseRef: 'origin/master' });
-    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(false));
+    await latestPendingRepoCompletion(deps);
 
     // Generation guard: no fork, no kill, workingDir untouched.
     expect(forkWorker).not.toHaveBeenCalled();
     expect(killWorker).not.toHaveBeenCalled();
     expect(ds.workingDir).toBeUndefined();
-    expect(sessionReply.mock.calls.map(c => c[1]).join()).toContain('未自动切换');
+    expect(ds.pendingRepoCommitInFlight).toBe(true);
   });
 
-  it('re-checks the generation AFTER the created notice — a plain switch landing during the reply wins', async () => {
+  it('keeps detached created-notice presentation outside first-start authority', async () => {
     const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
     const { deps, sessionReply } = makeDeps(ds);
     vi.mocked(createRepoWorktree).mockResolvedValue({ path: '/repos/alpha-wt-1', branch: 'wt/1', baseRef: 'origin/master' });
-    // The created notice is a Lark round-trip; a plain selection (NOT gated by
-    // worktreeCreating) can consume pendingRepo in that window. Simulate it
-    // from inside the reply itself.
-    vi.mocked(deps.sessionReply).mockImplementation(async (_root, text) => {
-      if (typeof text === 'string' && text.includes('worktree 已创建：') && ds.pendingRepo) ds.pendingRepo = false;
+    // Presentation is detached: even a reply callback that observes pending
+    // state must not become an awaited authority window ahead of the fork.
+    vi.mocked(replyMessage).mockImplementation(async (_app, _root, text) => {
+      if (typeof text === 'string' && text.includes('worktree 已创建：') && ds.pendingRepo) {
+        ds.pendingRepo = false;
+      }
       return 'om_reply';
     });
 
     await handleCardAction(makeSelectEvent('repo_worktree', '/repos/alpha'), deps, APP_ID);
-    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(false));
+    await latestPendingRepoCompletion(deps);
 
-    // The post-reply guard must catch the swap: no fork, no kill, no switch.
-    expect(forkWorker).not.toHaveBeenCalled();
+    expect(forkWorker).toHaveBeenCalledTimes(1);
     expect(killWorker).not.toHaveBeenCalled();
-    expect(ds.workingDir).toBeUndefined();
-    expect(sessionReply.mock.calls.map(c => c[1]).join()).toContain('未自动切换');
+    expect(ds.workingDir).toBe('/repos/alpha-wt-1');
+    expect(ds.pendingRepo).toBe(false);
+    await vi.waitFor(() => expect(
+      vi.mocked(replyMessage).mock.calls.map(c => c[2]).join(),
+    ).toContain('worktree 已创建'));
   });
 
   it('blocks a plain switch while the worktree commit is preparing the prompt (post-guard window)', async () => {
@@ -1283,7 +1328,7 @@ describe('repo select card — worktree open', () => {
     expect(killWorker).not.toHaveBeenCalled();
 
     releaseBots!();
-    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(false));
+    await latestPendingRepoCompletion(deps);
 
     expect(forkWorker).toHaveBeenCalledTimes(1);
     expect(ds.workingDir).toBe('/repos/alpha-wt-1');
@@ -1301,7 +1346,7 @@ describe('repo select card — worktree open', () => {
     });
 
     await handleCardAction(makeSelectEvent('repo_worktree', '/repos/alpha'), deps, APP_ID);
-    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(false));
+    await latestPendingRepoCompletion(deps);
 
     expect(forkWorker).not.toHaveBeenCalled();
   });
@@ -1313,16 +1358,18 @@ describe('repo select card — worktree open', () => {
     vi.mocked(createRepoWorktree).mockReturnValue(d.promise as any);
 
     await handleCardAction(makeSelectEvent('repo_worktree', '/repos/alpha'), deps, APP_ID);
+    await vi.waitFor(() => expect(createRepoWorktree).toHaveBeenCalledOnce());
     // /close deletes the active-map entry but mutates neither sessionId nor
     // pendingRepo — identity against the map is the only tell.
     deps.activeSessions.delete(sessionKey(ROOT_ID, APP_ID));
 
     d.resolve({ path: '/repos/alpha-wt-1', branch: 'wt/1', baseRef: 'origin/master' });
-    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(false));
+    await latestPendingRepoCompletion(deps);
 
     expect(forkWorker).not.toHaveBeenCalled();
     expect(killWorker).not.toHaveBeenCalled();
-    expect(sessionReply.mock.calls.map(c => c[1]).join()).toContain('未自动切换');
+    expect(ds.pendingRepo).toBe(true);
+    expect(ds.pendingRepoCommitInFlight).toBe(true);
   });
 
   it('aborts the pending fork when the session is /close\'d during prompt prep (last-line defence)', async () => {
@@ -1337,25 +1384,29 @@ describe('repo select card — worktree open', () => {
     });
 
     await handleCardAction(makeSelectEvent('repo_worktree', '/repos/alpha'), deps, APP_ID);
-    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(false));
+    await latestPendingRepoCompletion(deps);
 
     expect(forkWorker).not.toHaveBeenCalled();
   });
 
-  it('reports a switch failure as such — the worktree DOES exist on disk', async () => {
+  it('reports an uncertain switch outcome without inviting a duplicate retry', async () => {
     const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
     const { deps, sessionReply } = makeDeps(ds);
     vi.mocked(createRepoWorktree).mockResolvedValue({ path: '/repos/alpha-wt-1', branch: 'wt/1', baseRef: 'origin/master' });
     vi.mocked(forkWorker).mockImplementationOnce(() => { throw new Error('fork boom'); });
 
     await handleCardAction(makeSelectEvent('repo_worktree', '/repos/alpha'), deps, APP_ID);
-    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(false));
+    await latestPendingRepoCompletion(deps);
+    await vi.waitFor(() => expect(
+      vi.mocked(replyMessage).mock.calls.map(c => c[2]).join(),
+    ).toContain('fork boom'));
 
-    const replies = sessionReply.mock.calls.map(c => c[1]).join();
-    expect(replies).toContain('自动切换失败');
+    const replies = vi.mocked(replyMessage).mock.calls.map(c => c[2]).join();
+    expect(replies).toContain('启动结果不确定');
     expect(replies).toContain('fork boom');
     // NOT a creation failure — retrying as one would trip "already exists".
     expect(replies).not.toContain('创建 worktree 失败');
+    expect(replies).not.toContain('/repo /repos/alpha-wt-1');
   });
 
   it('auto-worktree completion submits chat context for an empty group-join prompt', async () => {
@@ -1378,7 +1429,7 @@ describe('repo select card — worktree open', () => {
     });
 
     await handleCardAction(makeSelectEvent('repo_worktree', '/repos/alpha'), deps, APP_ID);
-    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(false));
+    await latestPendingRepoCompletion(deps);
 
     expect(buildNewTopicCliInput).toHaveBeenCalled();
     expect(vi.mocked(buildNewTopicCliInput).mock.calls[0]![0]).toBe('');
@@ -1393,17 +1444,19 @@ describe('repo select card — worktree open', () => {
     expect(ds.session.initialUserTurnPending).toBeUndefined();
   });
 
-  it('creation failure replies an error and releases the in-flight lock', async () => {
+  it('creation response loss replies an error and keeps the in-flight claim sticky', async () => {
     const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
-    const { deps, sessionReply } = makeDeps(ds);
+    const { deps } = makeDeps(ds);
     vi.mocked(createRepoWorktree).mockRejectedValue(new Error('fetch blew up'));
 
     await handleCardAction(makeSelectEvent('repo_worktree', '/repos/alpha'), deps, APP_ID);
-    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(false));
+    await latestPendingRepoCompletion(deps);
+    await vi.waitFor(() => expect(replyMessage).toHaveBeenCalled());
 
     expect(forkWorker).not.toHaveBeenCalled();
     expect(ds.pendingRepo).toBe(true); // still recoverable — card stays
-    expect(sessionReply.mock.calls.map(c => c[1]).join()).toContain('fetch blew up');
+    expect(ds.pendingRepoCommitInFlight).toBe(true);
+    expect(vi.mocked(replyMessage).mock.calls.map(c => c[2]).join()).toContain('fetch blew up');
   });
 
   it('multi-select creates all selected repos under one parent path and opens that parent', async () => {
@@ -1415,23 +1468,23 @@ describe('repo select card — worktree open', () => {
 
     const res = await handleCardAction(makeWorktreeSubmitEvent('feat/multi', ['/repos/alpha', '/repos/beta']), deps, APP_ID);
     expect(res?.toast?.content).toContain('正在创建');
-    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(false));
+    await latestPendingRepoCompletion(deps);
 
     expect(createRepoWorktree).toHaveBeenCalledTimes(2);
     expect(createRepoWorktree).toHaveBeenNthCalledWith(1, '/repos/alpha', {
       branch: 'feat/multi',
-      slug: undefined,
       worktreePath: '/repos/feat-multi/alpha',
     });
     expect(createRepoWorktree).toHaveBeenNthCalledWith(2, '/repos/beta', {
       branch: 'feat/multi',
-      slug: undefined,
       worktreePath: '/repos/feat-multi/beta',
     });
     expect(forkWorker).toHaveBeenCalledTimes(1);
     expect(ds.workingDir).toBe('/repos/feat-multi');
     expect(ds.session.workingDir).toBe('/repos/feat-multi');
-    expect(sessionReply.mock.calls.map(c => c[1]).join()).toContain('worktree 已创建');
+    await vi.waitFor(() => expect(
+      vi.mocked(replyMessage).mock.calls.map(c => c[2]).join(),
+    ).toContain('worktree 已创建'));
   });
 
   it('Riff multi-repo pushes every branch and preserves the user-selected repo order', async () => {
@@ -1454,7 +1507,7 @@ describe('repo select card — worktree open', () => {
       .mockResolvedValueOnce({ path: '/repos/feat-riff/beta', branch: 'feat/riff-beta', baseRef: 'origin/master' });
 
     await handleCardAction(makeWorktreeSubmitEvent('feat/riff', ['/repos/alpha', '/repos/beta']), deps, APP_ID);
-    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(false));
+    await latestPendingRepoCompletion(deps);
 
     expect(pushWorktreeBranch).toHaveBeenCalledTimes(2);
     expect(pushWorktreeBranch).toHaveBeenNthCalledWith(1, '/repos/feat-riff/alpha', 'feat/riff-alpha');
@@ -1485,7 +1538,7 @@ describe('repo select card — worktree open', () => {
     });
 
     await handleCardAction(makeSelectEvent('repo_worktree', '/repos/alpha'), invalidDeps, APP_ID);
-    await vi.waitFor(() => expect(invalidNonRiffDs.worktreeCreating).toBe(false));
+    await latestPendingRepoCompletion(invalidDeps);
     expect(pushWorktreeBranch).not.toHaveBeenCalled();
 
     vi.clearAllMocks();
@@ -1508,7 +1561,7 @@ describe('repo select card — worktree open', () => {
     });
 
     await handleCardAction(makeSelectEvent('repo_worktree', '/repos/alpha'), riffDeps, APP_ID);
-    await vi.waitFor(() => expect(invalidRiffDs.worktreeCreating).toBe(false));
+    await latestPendingRepoCompletion(riffDeps);
     expect(pushWorktreeBranch).toHaveBeenCalledOnce();
     expect(pushWorktreeBranch).toHaveBeenCalledWith('/repos/riff-wt', 'feat/riff-local');
   });
@@ -1553,17 +1606,15 @@ describe('repo select card — worktree open', () => {
       .mockResolvedValueOnce({ path: '/repos/feat-selected/beta', branch: 'feat/selected', baseRef: 'origin/master' });
 
     await handleCardAction(makeWorktreeSubmitEvent('feat/selected', ['/repos/alpha', '/repos/beta']), deps, APP_ID);
-    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(false));
+    await latestPendingRepoCompletion(deps);
 
     expect(createRepoWorktree).toHaveBeenCalledTimes(2);
     expect(createRepoWorktree).toHaveBeenNthCalledWith(1, '/repos/alpha', {
       branch: 'feat/selected',
-      slug: undefined,
       worktreePath: '/repos/feat-selected/alpha',
     });
     expect(createRepoWorktree).toHaveBeenNthCalledWith(2, '/repos/beta', {
       branch: 'feat/selected',
-      slug: undefined,
       worktreePath: '/repos/feat-selected/beta',
     });
     expect(forkWorker).toHaveBeenCalledTimes(1);
@@ -1579,16 +1630,14 @@ describe('repo select card — worktree open', () => {
 
     const res = await handleCardAction(makeWorktreeSubmitEvent('', ['/repos/alpha', '/repos/beta']), deps, APP_ID);
     expect(res?.toast?.content).toContain('正在创建');
-    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(false));
+    await latestPendingRepoCompletion(deps);
 
     expect(createRepoWorktree).toHaveBeenCalledTimes(2);
     expect(createRepoWorktree).toHaveBeenNthCalledWith(1, '/repos/alpha', {
-      branch: undefined,
       slug: 'repo-test',
       worktreePath: '/repos/repo-test/alpha',
     });
     expect(createRepoWorktree).toHaveBeenNthCalledWith(2, '/repos/beta', {
-      branch: undefined,
       slug: 'repo-test',
       worktreePath: '/repos/repo-test/beta',
     });
@@ -1655,12 +1704,10 @@ describe('repo select card — worktree open', () => {
     vi.mocked(createRepoWorktree).mockResolvedValue({ path: '/repos/alpha-feat-one', branch: 'feat/one', baseRef: 'origin/master' });
 
     await handleCardAction(makeWorktreeSubmitEvent('feat/one', ['/repos/alpha']), deps, APP_ID);
-    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(false));
+    await latestPendingRepoCompletion(deps);
 
     expect(createRepoWorktree).toHaveBeenCalledWith('/repos/alpha', {
       branch: 'feat/one',
-      slug: undefined,
-      worktreePath: undefined,
     });
     expect(ds.workingDir).toBe('/repos/alpha-feat-one');
   });
@@ -1809,13 +1856,14 @@ describe('repo select card — worktree open', () => {
 
   it('rolls back already-created worktrees when a later repo in the batch fails', async () => {
     const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
-    const { deps, sessionReply } = makeDeps(ds);
+    const { deps } = makeDeps(ds);
     vi.mocked(createRepoWorktree)
       .mockResolvedValueOnce({ path: '/repos/feat-multi/alpha', branch: 'feat/multi', baseRef: 'origin/master' })
-      .mockRejectedValueOnce(new Error('boom on beta'));
+      .mockResolvedValueOnce({ kind: 'refused', message: 'boom on beta' } as any);
 
     await handleCardAction(makeWorktreeSubmitEvent('feat/multi', ['/repos/alpha', '/repos/beta']), deps, APP_ID);
-    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(false));
+    await latestPendingRepoCompletion(deps);
+    await vi.waitFor(() => expect(replyMessage).toHaveBeenCalled());
 
     expect(createRepoWorktree).toHaveBeenCalledTimes(2);
     // the first repo's worktree (already on disk) is rolled back, not leaked
@@ -1823,14 +1871,15 @@ describe('repo select card — worktree open', () => {
     expect(removeRepoWorktree).toHaveBeenCalledWith('/repos/alpha', '/repos/feat-multi/alpha');
     expect(forkWorker).not.toHaveBeenCalled();
     expect(ds.pendingRepo).toBe(true); // still recoverable — card stays
-    const replies = sessionReply.mock.calls.map(c => c[1]).join();
+    expect(ds.pendingRepoCommitInFlight).toBe(false);
+    const replies = vi.mocked(replyMessage).mock.calls.map(c => c[2]).join();
     expect(replies).toContain('回滚');
     expect(replies).toContain('boom on beta');
   });
 });
 
 describe('auto-worktree detached commit admission', () => {
-  it('holds the delayed commit/fork behind a same-bot mutation after the caller lease ended', async () => {
+  it('routes auto-worktree creation and first fork through the stable Current completion', async () => {
     const ds = makeDs({
       pendingRepo: true,
       pendingPrompt: 'delayed first turn',
@@ -1838,10 +1887,13 @@ describe('auto-worktree detached commit admission', () => {
     });
     const { deps } = makeDeps(ds);
     const { activeSessions } = deps;
-    const worktreeReady = deferred<{ dir: string }>();
-    vi.mocked(maybeCreateDefaultWorktree).mockReturnValueOnce(worktreeReady.promise);
+    vi.mocked(createRepoWorktree).mockResolvedValueOnce({
+      path: '/repos/alpha-wt',
+      branch: 'wt/alpha',
+      baseRef: 'origin/main',
+    });
 
-    const detached = runAutoWorktreeCommit({
+    await runAutoWorktreeCommit({
       ds,
       anchor: ROOT_ID,
       larkAppId: APP_ID,
@@ -1849,20 +1901,15 @@ describe('auto-worktree detached commit admission', () => {
       prompt: 'delayed first turn',
       activeSessions,
       notify: vi.fn(),
+      submitPendingRepoCompletion: deps.submitPendingRepoCompletion,
     });
-    await vi.waitFor(() => expect(maybeCreateDefaultWorktree).toHaveBeenCalledOnce());
 
-    const finishMutation = deferred<void>();
-    const mutation = withBotTurnMutation(APP_ID, () => finishMutation.promise);
-    worktreeReady.resolve({ dir: '/repos/alpha-wt' });
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(forkWorker).not.toHaveBeenCalled();
-
-    finishMutation.resolve();
-    await Promise.all([mutation, detached]);
+    expect(createRepoWorktree).toHaveBeenCalledWith('/repos/alpha', {
+      slug: 'repo-test',
+    });
     expect(forkWorker).toHaveBeenCalledOnce();
     expect(ds.workingDir).toBe('/repos/alpha-wt');
+    expect(ds.pendingRepo).toBe(false);
   });
 });
 

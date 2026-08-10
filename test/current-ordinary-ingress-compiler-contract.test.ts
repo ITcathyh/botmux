@@ -54,7 +54,15 @@ function envelope(): OrdinaryImTransportEnvelope {
       observedMention: { name: 'Observed', userId: 'u_target' },
       disclosure: 'prefix',
     },
-    messageListener: true,
+    foldedForwardContext: false,
+    messageListener: {
+      prompt: 'Investigate the alert.',
+      messageText: 'disk pressure',
+      msgType: 'interactive',
+      senderType: 'bot',
+      replyCardTitle: 'Production alert',
+      workingDir: '/repos/alert-service',
+    },
     vc: {
       contextMayLag: true,
       lifecycle: 'sealed',

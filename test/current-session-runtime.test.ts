@@ -3,16 +3,23 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { currentSessionRuntimeHost } from '../src/core/current-session-runtime.js';
-import type { DaemonSession } from '../src/core/types.js';
+import { createCurrentOrdinaryImTurnPreparationPort } from '../src/core/current-ordinary-im-turn.js';
+import { createCurrentOrdinaryIngressPort } from '../src/core/current-ordinary-ingress.js';
+import type { CurrentOrdinaryRouteOpeningRollbackToken } from '../src/core/current-ordinary-route-registry.js';
+import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 import type { Session } from '../src/types.js';
 import * as idempotencyStore from '../src/services/idempotency-store.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { computeInputHash } from '../src/utils/canonical-input-hash.js';
-import type { OrdinaryImTransportEnvelope } from '../src/core/ordinary-im-turn.js';
+import type {
+  NormalizedOrdinaryImTurn,
+  OrdinaryImTransportEnvelope,
+} from '../src/core/ordinary-im-turn.js';
 import type {
   KeyedTriggerStartInput,
   KeyedTriggerTurnPort,
   OrdinaryIngressPort,
+  PendingRepoCompletionPort,
 } from '../src/core/session-runtime.js';
 
 const APP = 'cli_runtime_projection';
@@ -23,6 +30,28 @@ const target = (key: string) => ({
   kind: 'route' as const,
   route: { kind: 'idempotency' as const, key },
 });
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+function unusedPendingRepoCompletion(): PendingRepoCompletionPort {
+  return {
+    begin() {
+      throw new Error('pending-repo port is only installed in this test');
+    },
+    async execute() {
+      throw new Error('pending-repo port is only installed in this test');
+    },
+    resume() {
+      throw new Error('pending-repo port is only installed in this test');
+    },
+  };
+}
 
 function startInput(key: string): KeyedTriggerStartInput {
   return {
@@ -86,7 +115,7 @@ function ordinaryTurn(
     mentions: [],
     postParticipantMentions: [],
     resources: [],
-    messageListener: false,
+    foldedForwardContext: false,
     vc: { contextMayLag: false },
   };
 }
@@ -335,6 +364,106 @@ describe('Current SessionRuntime projection adapter', () => {
     expect(ordinaryIngress.begin).toHaveBeenCalledTimes(1);
   });
 
+  it('binds a VC receiver ordinary turn to its exact receiver anchor', async () => {
+    const session = sessionStore.createSession(
+      'oc_vc_receiver',
+      'om_vc_receiver_audit_root',
+      'VC receiver',
+      'group',
+    );
+    session.larkAppId = APP;
+    session.scope = 'chat';
+    session.vcMeetingReceiver = {
+      listenerAppId: 'listener-app',
+      meetingId: 'meeting-1',
+      memberId: 'member-1',
+      memberEpoch: 3,
+    };
+    sessionStore.updateSession(session);
+    const receiver = {
+      session,
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId: APP,
+      chatId: session.chatId,
+      chatType: 'group',
+      scope: 'chat',
+      spawnedAt: Date.parse(session.createdAt),
+      cliVersion: 'test',
+      lastMessageAt: Date.parse(session.createdAt),
+      hasHistory: false,
+    } as DaemonSession;
+    const registry = new Map<string, DaemonSession>([[activeSessionKey(receiver), receiver]]);
+    const externalEffects = {
+      execute: vi.fn(async () => ({ kind: 'materialized' as const })),
+    };
+    const commands = {
+      apply: vi.fn(() => ({ kind: 'accepted' as const })),
+    };
+    const ordinaryIngress = createCurrentOrdinaryIngressPort({
+      ownerLarkAppId: APP,
+      activeSessions: registry,
+      turnPreparation: createCurrentOrdinaryImTurnPreparationPort(),
+      externalEffects,
+      commands,
+    });
+    const begin = vi.spyOn(ordinaryIngress, 'begin');
+    const host = currentSessionRuntimeHost({
+      ownerLarkAppId: APP,
+      activeSessions: registry,
+      ownerBootId: 'boot-vc-receiver',
+      runtimeEpoch: 'epoch-vc-receiver',
+      keyedTriggerAdmissionBlocked: () => false,
+      ordinaryIngress,
+    });
+    const projected = await host.projection.read({
+      kind: 'byExternalSession',
+      sessionId: session.sessionId,
+    });
+    if (projected.kind !== 'one') throw new Error('expected VC receiver projection');
+    const receiverAnchor = `vc-receiver:${session.sessionId}`;
+    const turn = {
+      ...ordinaryTurn(session, 'om_vc_receiver_exact'),
+      route: {
+        scope: 'chat' as const,
+        canonicalAnchor: receiverAnchor,
+        chatId: session.chatId,
+        chatType: 'group' as const,
+      },
+    };
+
+    await expect(host.runtime.submit({
+      target: { kind: 'session', address: projected.session.address },
+      idempotencyKey: turn.messageKey,
+      command: { kind: 'ordinary.ingress', input: { turn } },
+    })).resolves.toMatchObject({
+      kind: 'applied',
+      action: 'ordinary.inputCommitted',
+      sessionId: session.sessionId,
+    });
+    expect(begin).toHaveBeenCalledTimes(1);
+    expect(externalEffects.execute).toHaveBeenCalledTimes(1);
+    expect(commands.apply).toHaveBeenCalledTimes(1);
+
+    begin.mockClear();
+    externalEffects.execute.mockClear();
+    commands.apply.mockClear();
+    const wrongAnchorTurn = {
+      ...turn,
+      messageKey: 'om_vc_receiver_wrong',
+      route: { ...turn.route, canonicalAnchor: 'vc-receiver:another-session' },
+    };
+    await expect(host.runtime.submit({
+      target: { kind: 'session', address: projected.session.address },
+      idempotencyKey: wrongAnchorTurn.messageKey,
+      command: { kind: 'ordinary.ingress', input: { turn: wrongAnchorTurn } },
+    })).resolves.toMatchObject({ kind: 'rejected', reason: 'invalidCommand' });
+    expect(begin).not.toHaveBeenCalled();
+    expect(externalEffects.execute).not.toHaveBeenCalled();
+    expect(commands.apply).not.toHaveBeenCalled();
+  });
+
   it('replaces an unwired owner epoch Host when production installs ordinary ingress', async () => {
     const session = sessionStore.createSession('oc_install', 'om_install', 'install', 'group');
     session.larkAppId = APP;
@@ -396,6 +525,205 @@ describe('Current SessionRuntime projection adapter', () => {
       action: 'ordinary.inputCommitted',
       durability: 'processLocal',
     });
+    expect(ordinaryIngress.begin).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves an in-flight ordinary ledger when pending-repo wiring upgrades the same epoch Host', async () => {
+    const session = sessionStore.createSession('oc_ledger', 'om_ledger', 'ledger', 'group');
+    session.larkAppId = APP;
+    session.scope = 'thread';
+    sessionStore.updateSession(session);
+    const activeSessions = new Map<string, DaemonSession>();
+    const effectStarted = deferred<void>();
+    const releaseEffect = deferred<void>();
+    const ordinaryIngress: OrdinaryIngressPort = {
+      begin: vi.fn(() => ({
+        kind: 'effect' as const,
+        intent: Object.freeze({}),
+        continuation: Object.freeze({}),
+      })),
+      execute: vi.fn(async () => {
+        effectStarted.resolve();
+        await releaseEffect.promise;
+        return { kind: 'materialized' };
+      }),
+      resume: vi.fn(() => ({ kind: 'committed' as const })),
+    };
+    const baseOptions = {
+      ownerLarkAppId: APP,
+      activeSessions,
+      ownerBootId: 'boot-ledger-upgrade',
+      runtimeEpoch: 'epoch-ledger-upgrade',
+      keyedTriggerAdmissionBlocked: () => false,
+      ordinaryIngress,
+    };
+    const initial = currentSessionRuntimeHost(baseOptions);
+    const before = await initial.projection.read({
+      kind: 'byExternalSession',
+      sessionId: session.sessionId,
+    });
+    if (before.kind !== 'one') throw new Error('expected initial Session projection');
+    const envelope = ordinaryTurn(session, 'om_ledger_same_input');
+    const first = initial.runtime.submit({
+      target: { kind: 'session', address: before.session.address },
+      idempotencyKey: envelope.messageKey,
+      command: { kind: 'ordinary.ingress', input: { turn: envelope } },
+    });
+    await effectStarted.promise;
+
+    const upgraded = currentSessionRuntimeHost({
+      ...baseOptions,
+      pendingRepoCompletion: unusedPendingRepoCompletion(),
+    });
+    const after = await upgraded.projection.read({
+      kind: 'byExternalSession',
+      sessionId: session.sessionId,
+    });
+    if (after.kind !== 'one') throw new Error('expected upgraded Session projection');
+    const repeated = upgraded.runtime.submit({
+      target: { kind: 'session', address: after.session.address },
+      idempotencyKey: envelope.messageKey,
+      command: { kind: 'ordinary.ingress', input: { turn: envelope } },
+    });
+    releaseEffect.resolve();
+
+    const outcomes = await Promise.all([first, repeated]);
+    expect(outcomes.map(outcome => outcome.kind).sort()).toEqual(['applied', 'duplicate']);
+    expect(ordinaryIngress.begin).toHaveBeenCalledTimes(1);
+    expect(ordinaryIngress.execute).toHaveBeenCalledTimes(1);
+    expect(ordinaryIngress.resume).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves route-provider admission when pending-repo wiring upgrades the same epoch Host', async () => {
+    const activeSessions = new Map<string, DaemonSession>();
+    const effectStarted = deferred<void>();
+    const releaseEffect = deferred<void>();
+    const ordinaryIngress: OrdinaryIngressPort = {
+      begin: vi.fn(() => ({
+        kind: 'effect' as const,
+        intent: Object.freeze({}),
+        continuation: Object.freeze({}),
+      })),
+      execute: vi.fn(async () => {
+        effectStarted.resolve();
+        await releaseEffect.promise;
+        return { kind: 'materialized' };
+      }),
+      resume: vi.fn(() => ({ kind: 'committed' as const })),
+    };
+    const created: DaemonSession[] = [];
+    const openingPlans = new WeakMap<object, NormalizedOrdinaryImTurn>();
+    const openingCreator = {
+      begin(turn: NormalizedOrdinaryImTurn) {
+        const intent = Object.freeze({});
+        const continuation = Object.freeze({});
+        openingPlans.set(continuation, turn);
+        return { kind: 'effect' as const, intent, continuation };
+      },
+      async execute() {
+        return { kind: 'resolved' as const };
+      },
+      resume(continuation: unknown, settlement: { readonly kind: string }) {
+        const turn = openingPlans.get(continuation as object);
+        openingPlans.delete(continuation as object);
+        if (settlement.kind === 'superseded') {
+          return { kind: 'refused' as const, message: 'superseded' };
+        }
+        if (!turn || settlement.kind !== 'returned') {
+          return { kind: 'unknown' as const, message: 'invalid test opening continuation' };
+        }
+        const createdAt = '2026-08-10T01:20:00.000Z';
+        const session: Session = {
+          sessionId: `session-route-ledger-${created.length}`,
+          larkAppId: APP,
+          chatId: turn.route.chatId,
+          chatType: turn.route.chatType,
+          rootMessageId: turn.route.canonicalAnchor,
+          scope: turn.route.scope,
+          title: turn.content,
+          status: 'active',
+          createdAt,
+          initialUserTurnPending: true,
+        };
+        const current: DaemonSession = {
+          session,
+          worker: null,
+          workerPort: null,
+          workerToken: null,
+          workerGeneration: 0,
+          larkAppId: APP,
+          chatId: turn.route.chatId,
+          chatType: turn.route.chatType,
+          scope: turn.route.scope,
+          spawnedAt: Date.parse(createdAt),
+          cliVersion: 'test',
+          lastMessageAt: Date.parse(createdAt),
+          hasHistory: false,
+        };
+        sessionStore.updateSession(session);
+        created.push(current);
+        return {
+          kind: 'created' as const,
+          current,
+          rollbackToken: Object.freeze(
+            Object.create(null),
+          ) as CurrentOrdinaryRouteOpeningRollbackToken,
+        };
+      },
+      rollback() {
+        return { kind: 'rolledBack' as const };
+      },
+    };
+    const baseOptions = {
+      ownerLarkAppId: APP,
+      activeSessions,
+      ownerBootId: 'boot-route-ledger-upgrade',
+      runtimeEpoch: 'epoch-route-ledger-upgrade',
+      keyedTriggerAdmissionBlocked: () => false,
+      ordinaryIngress,
+      ordinaryRouteOpeningCreator: openingCreator,
+    };
+    const initial = currentSessionRuntimeHost(baseOptions);
+    const firstTurn = ordinaryTurn({
+      chatId: 'oc_route_ledger',
+      chatType: 'group',
+      rootMessageId: 'om_route_ledger_first',
+      scope: 'thread',
+    }, 'om_route_ledger_provider_key');
+    const first = initial.runtime.submit({
+      target: { kind: 'route', route: { kind: 'thread', anchorId: firstTurn.route.canonicalAnchor } },
+      idempotencyKey: firstTurn.messageKey,
+      command: { kind: 'ordinary.ingress', input: { turn: firstTurn } },
+    });
+    await effectStarted.promise;
+
+    const upgraded = currentSessionRuntimeHost({
+      ...baseOptions,
+      pendingRepoCompletion: unusedPendingRepoCompletion(),
+    });
+    const conflictingTurn = ordinaryTurn({
+      chatId: 'oc_route_ledger',
+      chatType: 'group',
+      rootMessageId: 'om_route_ledger_conflict',
+      scope: 'thread',
+    }, firstTurn.messageKey);
+    const conflict = upgraded.runtime.submit({
+      target: {
+        kind: 'route',
+        route: { kind: 'thread', anchorId: conflictingTurn.route.canonicalAnchor },
+      },
+      idempotencyKey: conflictingTurn.messageKey,
+      command: { kind: 'ordinary.ingress', input: { turn: conflictingTurn } },
+    });
+    await Promise.resolve();
+    releaseEffect.resolve();
+
+    await expect(first).resolves.toMatchObject({ kind: 'applied' });
+    await expect(conflict).resolves.toMatchObject({
+      kind: 'rejected',
+      reason: 'idempotencyConflict',
+    });
+    expect(created).toHaveLength(1);
     expect(ordinaryIngress.begin).toHaveBeenCalledTimes(1);
   });
 

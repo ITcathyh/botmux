@@ -328,10 +328,12 @@ export const messages: Record<string, string> = {
   'card.repo.riff_worktree_push_failed': '⚠️ 分支 `{branch}` 推送远端失败：{error}\nRiff 沙箱将使用默认分支（可手动 push 后重试）',
   'cmd.repo.worktree_created': '🌿 worktree 已创建：`{path}`\n分支 `{branch}`，基于 `{base}`',
   'cmd.repo.worktree_failed': '❌ 创建 worktree 失败：{error}',
+  'cmd.repo.worktree_create_unknown': '⚠️ worktree 创建结果不确定：{error}\n请等待会话恢复后再重试。',
   'cmd.repo.worktree_in_progress': '⏳ 已有一个 worktree 正在创建，请稍候…',
   'cmd.repo.card_already_consumed': '✅ 仓库已选定，请忽略旧的选仓卡片',
   'cmd.repo.worktree_created_not_switched': '🌿 worktree 已创建：`{path}`（分支 `{branch}`），但会话状态已变化，未自动切换。需要时可用 `/repo {path}` 打开。',
   'cmd.repo.worktree_switch_failed': '⚠️ worktree 已创建：`{path}`，但自动切换失败：{error}\n可用 `/repo {path}` 手动打开。',
+  'cmd.repo.worktree_switch_unknown': '⚠️ worktree `{path}` 的会话启动结果不确定：{error}\n请等待会话恢复，暂勿重试。',
   'cmd.repo.switch_close_failed': '⚠️ 无法安全关闭当前会话，仓库未切换：{error}',
   // 「仅默认目录」模式开启「自动创建 worktree」后，新会话启动时用（daemon 交互新话题 /
   // dashboard 建会话 / webhook 外部事件三条路复用）。

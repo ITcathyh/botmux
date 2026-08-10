@@ -3,7 +3,7 @@
   "purpose": "Target-A 可执行覆盖台账：由源码和 A0 authority inventory 证明已迁移边界与 remaining bypass，不声明 Target-B durability。",
   "authorityInventory": {
     "path": "docs/architecture/session-authority-inventory.json",
-    "sha256": "86cf5d3f5647cf0bf9810c50d19f43abe854f9e03b5fd165d8bde19634b27fbd"
+    "sha256": "013ea3eac114a13cdc22acd91134f9ae9069f3d6d1411cb645c0b651cf78e647"
   },
   "coverage": [
     {
@@ -78,74 +78,193 @@
     {
       "id": "ordinary-im",
       "targetMilestone": "C1",
-      "disposition": "remaining",
-      "description": "ordinary staged reducer 已证明 first transition/resume 共用 Session lane、effect 在 lane 外且 begin/resume 同步，Current Host 也只允许 injected optional port 透传；production daemon 尚未 import/create/inject 该 port，new/follow-up、queued/parked、pending-repo、worker-replacement caller 与 keyed route admission/fail-close 仍属于 C1。",
+      "disposition": "migrated",
+      "description": "ordinary existing-route、new-route creation 与 pending-repo first-start 已由 daemon 的 stable owner/epoch Current Host 统一提交；精确认领 Current production Adapter authority。daemon post-commit 卡片/UI effect 仍在 lane 外且不宣称 C3，C2 mid-session repo、A4 worker lifecycle 与 D2 JSON durability 也不伪装为 C1。",
       "selectors": [
         {
-          "sourceFile": "src/daemon.ts",
+          "sourceFile": "src/core/current-ordinary-ingress-metadata.ts",
           "enclosingFunctions": [
-            "armSharedReplyTarget",
-            "beginNewTurn",
-            "claimNewDaemonSession",
-            "cleanupFailedDelivery",
-            "clearInitialStartBuffers",
-            "clearInitialStartClaim",
-            "deliverPassthroughToExistingSession",
-            "dispatchTurn",
-            "forkReservedInitialRawSession",
-            "forkReservedInitialSession",
-            "handleNewTopicAdmitted",
-            "handleThreadReplyAdmitted",
-            "noteTurnReceived",
-            "reconcileDeferredTopicBinding",
-            "releaseQueuedActivationReservation",
-            "replyInvalidWorkingDirs",
-            "reserveAsyncQueuedActivationTailAdmission",
-            "rollbackRegisteredJoinSession",
-            "scheduleQueuedActivationTailReleaseRetry",
-            "setDirectChatDisplayNameFromSender",
-            "settleAsyncQueuedActivationTailAdmission",
-            "stageClaimedPendingRepoSetup",
-            "stageCurrentBehindQueuedActivation",
-            "startInitialPassthroughSession",
-            "tryAcquireInitialStartClaim"
+            "apply"
+          ],
+          "accessLanes": [
+            "session-runtime-current-adapter"
           ]
         },
         {
-          "sourceFile": "src/core/initial-user-turn.ts"
-        },
-        {
-          "sourceFile": "src/core/reply-target.ts"
-        },
-        {
-          "sourceFile": "src/core/pending-repo-journal.ts"
-        },
-        {
-          "sourceFile": "src/core/command-handler.ts",
+          "sourceFile": "src/core/current-ordinary-ingress-production.ts",
           "enclosingFunctions": [
-            "commitRepoSelection",
-            "forkPendingCli"
+            "admitTail",
+            "apply",
+            "rememberAcceptedInput",
+            "restoreTransientGate",
+            "stageActivationJournal",
+            "stagePendingRepoOpening"
+          ],
+          "accessLanes": [
+            "session-runtime-current-adapter"
           ]
         },
         {
-          "sourceFile": "src/im/lark/card-handler.ts",
+          "sourceFile": "src/core/current-ordinary-route-opening-production.ts",
           "enclosingFunctions": [
-            "commitRepoSelection",
-            "runAutoWorktreeCommit"
+            "publish",
+            "rollback"
+          ],
+          "accessLanes": [
+            "session-runtime-current-adapter"
+          ]
+        },
+        {
+          "sourceFile": "src/core/current-ordinary-route-registry.ts",
+          "enclosingFunctions": [
+            "inspectExisting",
+            "publish"
+          ],
+          "accessLanes": [
+            "session-runtime-current-adapter"
+          ]
+        },
+        {
+          "sourceFile": "src/core/current-pending-repo-completion-production.ts",
+          "enclosingFunctions": [
+            "dispatchWorker"
+          ],
+          "accessLanes": [
+            "session-runtime-current-adapter"
+          ]
+        },
+        {
+          "sourceFile": "src/core/current-pending-repo-completion.ts",
+          "enclosingFunctions": [
+            "begin",
+            "clearExactPendingClaim",
+            "clearFoldedRuntimeBuffers",
+            "restoreRuntime",
+            "resume",
+            "rollbackProvenWorkerRefusalCandidate"
+          ],
+          "accessLanes": [
+            "session-runtime-current-adapter"
           ]
         }
       ],
       "authoritySites": {
-        "recordCount": 337,
-        "mutationCount": 337,
-        "digest": "0c8d82b67cab1098fa8b021edd1a50ed7b040ab063992626f57f6e3ff6dc4525"
+        "recordCount": 91,
+        "mutationCount": 93,
+        "digest": "250cd57ce92738a06ae83247ca092e72c21c59be814e17e73e1de7f1fc85ffb1"
+      },
+      "rawPublisherSelectors": [
+        {
+          "sourceFile": "src/services/session-store.ts",
+          "enclosingFunctions": [
+            "rollbackProvisionalSessionForOwnerStrict"
+          ],
+          "authorityIds": [
+            "current-session-row"
+          ]
+        }
+      ],
+      "authorityRawPublishers": {
+        "recordCount": 1,
+        "publishSiteCount": 2,
+        "digest": "e0187c59704b92b08ef5de7ce087b8d46aa1fad5aa93ecca5f00d2bd55cf2f17"
+      },
+      "productionBinding": {
+        "daemonSource": "src/daemon.ts",
+        "daemonHostFactory": "currentDaemonSessionRuntimeHost",
+        "currentRuntimeSource": "src/core/current-session-runtime.ts",
+        "currentRuntimeFactory": "currentSessionRuntimeHost",
+        "ingressDaemonSource": "src/im/lark/current-ordinary-ingress-daemon.ts",
+        "ingressDaemonFactory": "createCurrentOrdinaryIngressDaemonPort",
+        "ingressLarkSource": "src/im/lark/current-ordinary-ingress-production.ts",
+        "ingressLarkFactory": "createLarkCurrentOrdinaryIngressProductionPort",
+        "ingressCoreSource": "src/core/current-ordinary-ingress-production.ts",
+        "ingressCoreFactory": "createCurrentOrdinaryIngressProductionPort",
+        "routeOpeningSource": "src/core/current-ordinary-route-opening-production.ts",
+        "routeOpeningFactory": "createCurrentOrdinaryRouteOpeningProduction",
+        "routeRegistrySource": "src/core/current-ordinary-route-registry.ts",
+        "routeRegistryFactory": "createCurrentOrdinaryRouteRegistryRuntime",
+        "pendingRepoSubmitSource": "src/core/current-pending-repo-completion-submit.ts",
+        "pendingRepoPortFactory": "currentPendingRepoCompletionPort",
+        "pendingRepoSubmitFunction": "submitCurrentPendingRepoCompletion",
+        "pendingRepoProductionSource": "src/core/current-pending-repo-completion-production.ts",
+        "pendingRepoProductionFactory": "createCurrentPendingRepoCompletionProduction",
+        "pendingRepoDispatchFunction": "dispatchWorker",
+        "ordinaryQueuedActivationRecoveryFunction": "apply",
+        "queuedActivationRecoveryFunction": "prepareQueuedActivationRecoveryFork",
+        "ordinaryCallers": [
+          {
+            "sourceFile": "src/daemon.ts",
+            "enclosingFunction": "handleNewTopicAdmitted",
+            "sessionSubmitCount": 0,
+            "routeSubmitCount": 1
+          },
+          {
+            "sourceFile": "src/daemon.ts",
+            "enclosingFunction": "handleThreadReplyAdmitted",
+            "sessionSubmitCount": 1,
+            "routeSubmitCount": 1
+          }
+        ],
+        "pendingRepoCallerCuts": [
+          {
+            "sourceFile": "src/core/command-handler.ts",
+            "enclosingFunction": "completePendingRepo",
+            "submissionMode": "injected-or-production",
+            "guardedByPendingRepo": false
+          },
+          {
+            "sourceFile": "src/im/lark/card-handler.ts",
+            "enclosingFunction": "commitRepoSelection",
+            "submissionMode": "injected-or-production",
+            "guardedByPendingRepo": true
+          },
+          {
+            "sourceFile": "src/im/lark/card-handler.ts",
+            "enclosingFunction": "runAutoWorktreeCommit",
+            "submissionMode": "injected-or-production",
+            "guardedByPendingRepo": false
+          },
+          {
+            "sourceFile": "src/im/lark/card-handler.ts",
+            "enclosingFunction": "handleCardAction",
+            "submissionMode": "injected-or-production",
+            "guardedByPendingRepo": true
+          },
+          {
+            "sourceFile": "src/daemon.ts",
+            "enclosingFunction": "runCurrentOrdinaryOpeningPostCommit",
+            "submissionMode": "production-direct",
+            "guardedByPendingRepo": false
+          }
+        ],
+        "forbiddenLegacyIdentifiers": [
+          "PreparedThreadReply",
+          "tryAcquireInitialStartClaim",
+          "stageCurrentBehindQueuedActivation",
+          "queuedHasDurableTail",
+          "forkPendingCli"
+        ],
+        "forbiddenOrdinaryCallerCalls": [
+          "forkWorker",
+          "forkSession",
+          "forkReservedInitialSession",
+          "forkReservedInitialRawSession",
+          "sendWorkerInput",
+          "deliverPassthroughToExistingSession",
+          "reserveAsyncQueuedActivationTailAdmission",
+          "settleAsyncQueuedActivationTailAdmission",
+          "stageClaimedPendingRepoSetup",
+          "commitRepoSelection",
+          "forkPendingCli"
+        ]
       }
     },
     {
       "id": "control",
       "targetMilestone": "C2",
       "disposition": "remaining",
-      "description": "Dashboard/card/command close、cancel、activate、rename 仍直接使用 Current mutation surface。",
+      "description": "Dashboard/card/command close、cancel、activate、rename 与非 pending 的 mid-session repo replacement 仍直接使用 Current mutation surface，后置到 C2。",
       "selectors": [
         {
           "sourceFile": "src/core/dashboard-ipc-server.ts"
@@ -153,6 +272,7 @@
         {
           "sourceFile": "src/core/command-handler.ts",
           "enclosingFunctions": [
+            "commitRepoSelection",
             "handleCardCommand",
             "handleCommand"
           ]
@@ -160,7 +280,15 @@
         {
           "sourceFile": "src/im/lark/card-handler.ts",
           "enclosingFunctions": [
+            "commitRepoSelection",
             "handleCardAction"
+          ]
+        },
+        {
+          "sourceFile": "src/daemon.ts",
+          "enclosingFunctions": [
+            "handleNewTopicAdmitted",
+            "handleThreadReplyAdmitted"
           ]
         },
         {
@@ -171,9 +299,9 @@
         }
       ],
       "authoritySites": {
-        "recordCount": 66,
-        "mutationCount": 67,
-        "digest": "4c0cee46447b7e3880b58585eed0955a48ca7909df339de664f15f14a34a755d"
+        "recordCount": 124,
+        "mutationCount": 125,
+        "digest": "80c68a3dde8fe1890673090caf2669fad3acae458b3e0af4a9c007324b70bc0d"
       }
     },
     {
@@ -260,7 +388,7 @@
       "id": "per-session-command-lane",
       "targetMilestone": "A3",
       "disposition": "migrated",
-      "description": "SessionRuntime Session-targeted first transition 与 ordinary resume、executor report/continuation 共用 owner/epoch-bound per-Session FIFO lane；ordinary execute 与其它长 I/O 保持在 lane 外，begin/resume 经同步 guard。Current Host 仅透传 injected optional ordinary port，production daemon 尚未 import/create/inject，ordinary reducer 仍属 C1；该项只以结构 binding 证明 A3 排序边界，不重复认领 A1/A2 authority sites。",
+      "description": "SessionRuntime Session-targeted first transition 与 ordinary resume、executor report/continuation 共用 owner/epoch-bound per-Session FIFO lane；ordinary execute 与其它长 I/O 保持在 lane 外，begin/resume 经同步 guard。production daemon 已通过 stable Current Host 注入 ordinary ports；该项只以结构 binding 证明 A3 排序边界，不重复认领 A1/A2/C1 authority sites。",
       "selectors": [],
       "authoritySites": {
         "recordCount": 0,
@@ -281,21 +409,9 @@
         "synchronousPortGuardFunction": "invokeSynchronousPort",
         "currentSessionRuntimeSource": "src/core/current-session-runtime.ts",
         "currentSessionRuntimeFactory": "currentSessionRuntimeHost",
-        "ordinaryFakeAdapterSource": "src/core/current-ordinary-ingress.ts",
-        "ordinaryFakeAdapterFactory": "createCurrentOrdinaryIngressPort",
-        "ordinaryProductionWired": false,
-        "ordinaryUnwiredProductionProof": {
-          "sourceFile": "src/daemon.ts",
-          "forbiddenImports": [
-            "./core/current-session-runtime.js",
-            "./core/current-ordinary-ingress.js"
-          ],
-          "forbiddenCalls": [
-            "currentSessionRuntimeHost",
-            "createCurrentOrdinaryIngressPort"
-          ],
-          "forbiddenOption": "ordinaryIngress"
-        },
+        "ordinaryPolicySource": "src/core/current-ordinary-ingress.ts",
+        "ordinaryPolicyFactory": "createCurrentOrdinaryIngressPort",
+        "ordinaryProductionWired": true,
         "executorRuntimeSource": "src/core/session-executor-runtime.ts",
         "executorRuntimeFactory": "createSessionExecutorRuntime",
         "currentExecutorAdapterSource": "src/core/current-session-executor-runtime.ts",
@@ -315,7 +431,7 @@
         "deferredPaths": [
           {
             "id": "keyed-route-admission-and-fail-close",
-            "targetMilestone": "C1",
+            "targetMilestone": "A4",
             "sourceFile": "src/core/current-keyed-trigger-turn.ts",
             "enclosingFunction": "failClose"
           },
@@ -385,7 +501,6 @@
             "forkWorker",
             "killWorker",
             "persistActivationAck",
-            "promoteQueuedActivationTail",
             "reparkQueuedActivationFollowUpTail",
             "reparkUnsubmittedQueuedActivation",
             "releaseReservation",
@@ -402,6 +517,13 @@
           ]
         },
         {
+          "sourceFile": "src/core/worker-pool.ts",
+          "enclosingFunctions": [
+            "prepareQueuedActivationRecoveryFork",
+            "promoteQueuedActivationTailTyped"
+          ]
+        },
+        {
           "sourceFile": "src/core/command-handler.ts",
           "enclosingFunctions": [
             "startAdoptSession",
@@ -412,9 +534,9 @@
         }
       ],
       "authoritySites": {
-        "recordCount": 337,
-        "mutationCount": 338,
-        "digest": "4064bdccea18bbdf6856cd2bb4d531f4e28a790453cde42f407b0ad1129fb084"
+        "recordCount": 342,
+        "mutationCount": 343,
+        "digest": "14c6d56360abc231f7a03615ff82fe4f9e3865107a0298226f0ad02beba01260"
       }
     },
     {
@@ -435,9 +557,9 @@
         }
       ],
       "authoritySites": {
-        "recordCount": 28,
-        "mutationCount": 28,
-        "digest": "4294e718ffee15b3fafece59fc93101fcf01677347fd1f2f5b69540b10c31485"
+        "recordCount": 32,
+        "mutationCount": 32,
+        "digest": "82b1c25b554a71a0e68d17200f96cbab38f0057b91a298dad15abac394175c51"
       },
       "rawPublisherSelectors": [
         {
@@ -476,16 +598,16 @@
       "id": "remaining-bypass",
       "targetMilestone": "Target-A",
       "disposition": "remaining",
-      "description": "未被具体 milestone 覆盖的 Session-owned、Actor Host 与 direct legacy writer 仍是 Target-A roll-up bypass；不得以 retained 名义隐藏。",
+      "description": "未被具体 milestone 覆盖的 shared helper、passthrough、Session-owned 与 Actor Host direct writer 仍是 Target-A roll-up bypass；raw JSON publication/durability 留给 D2，不得以 C1 或 retained 名义隐藏。",
       "selectors": [
         {
           "inventoryRemainder": true
         }
       ],
       "authoritySites": {
-        "recordCount": 518,
-        "mutationCount": 521,
-        "digest": "4322ba72135184630398accdd1c16852145b456cb1e9c598af4dde225e80d3d8"
+        "recordCount": 653,
+        "mutationCount": 656,
+        "digest": "dfa0c1ab64a048825edc982081a260029219b995a703ba6329a28d7b0e7ec38a"
       },
       "rawPublisherSelectors": [
         {

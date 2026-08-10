@@ -10,6 +10,7 @@ import {
 export type {
   NormalizedOrdinaryImResourceDescriptor as PreparedOrdinaryImResourceDescriptor,
   OrdinaryImMentionDescriptor,
+  OrdinaryImMessageListenerSnapshot,
   OrdinaryImResourceDescriptor,
   OrdinaryImSenderDescriptor,
   OrdinaryImSubstituteIdentity,

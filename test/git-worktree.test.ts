@@ -12,7 +12,12 @@ import { mkdtempSync, mkdirSync, rmSync, existsSync, realpathSync } from 'node:f
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { createRepoWorktree, removeRepoWorktree, slugFromWorktreeText } from '../src/services/git-worktree.js';
+import {
+  createRepoWorktree,
+  removeRepoWorktree,
+  RepoWorktreePreAddRefusal,
+  slugFromWorktreeText,
+} from '../src/services/git-worktree.js';
 import { localWorktreeSlugFromContext } from '../src/services/worktree-slug-ai.js';
 
 let tempRoot: string;
@@ -226,8 +231,12 @@ describe('createRepoWorktree', () => {
     const repo = makeClone(upstream, 'proj');
     mkdirSync(join(tempRoot, 'proj-feat-x'));
 
-    await expect(createRepoWorktree(repo, { branch: 'feat/x' }))
-      .rejects.toThrow(/already exists/);
+    const refusal = await createRepoWorktree(repo, { branch: 'feat/x' }).catch(error => error);
+    expect(refusal).toBeInstanceOf(RepoWorktreePreAddRefusal);
+    expect(refusal).toMatchObject({
+      phase: 'preAdd',
+      message: expect.stringMatching(/already exists/),
+    });
   });
 
   it('rejects when the branch is already checked out in another worktree', async () => {
@@ -241,8 +250,15 @@ describe('createRepoWorktree', () => {
     git(repo, 'worktree', 'prune');
     git(repo, 'worktree', 'add', join(tempRoot, 'elsewhere'), 'feat/busy');
 
-    await expect(createRepoWorktree(repo, { branch: 'feat/busy' }))
-      .rejects.toThrow(/feat\/busy|already/i);
+    let rejection: unknown;
+    try {
+      await createRepoWorktree(repo, { branch: 'feat/busy' });
+    } catch (error) {
+      rejection = error;
+    }
+    expect(rejection).toBeInstanceOf(Error);
+    expect(rejection).toMatchObject({ message: expect.stringMatching(/feat\/busy|already/i) });
+    expect(rejection).not.toBeInstanceOf(RepoWorktreePreAddRefusal);
   });
 
   it('rejects a non-repo directory', async () => {

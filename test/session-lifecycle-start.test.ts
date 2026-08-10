@@ -99,6 +99,7 @@ vi.mock('../src/services/session-store.js', () => ({
   cleanupSessionBridgeSendMarkersNow: vi.fn(),
   closeSession: vi.fn(),
   updateSession: vi.fn(),
+  getSessionFresh: vi.fn(),
   updateSessionPid: vi.fn(),
   getSessionForOwnerStrict: vi.fn(),
 }));
@@ -236,6 +237,7 @@ beforeEach(() => {
   vi.useRealTimers();
   vi.clearAllMocks();
   vi.mocked(sessionStore.updateSession).mockImplementation(() => undefined);
+  vi.mocked(sessionStore.getSessionFresh).mockReturnValue(undefined);
   __testOnly_resetOrdinaryImDeliveries();
   __testOnly_resetSessionExecutorRuntime();
   vi.mocked(getBot).mockImplementation(() => defaultBot());
@@ -1037,7 +1039,7 @@ describe('Codex App clean-input feature gate', () => {
     expect(ds.session.queuedActivationPending).toBe(true);
   });
 
-  it('rolls back an exact tail promotion when its single durable write fails', () => {
+  it('keeps the exact promotion candidate quarantined when its durable-write outcome is unknown', () => {
     vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
     const ds = makeDs({ hasHistory: true, initialStartPending: true });
     ds.session.cliId = 'claude-code';
@@ -1056,16 +1058,14 @@ describe('Codex App clean-input feature gate', () => {
 
     expect(promoteQueuedActivationTail(ds, { send: false })).toBe(false);
 
-    expect(ds.session.queuedActivationPending).toBeUndefined();
-    expect(ds.session.queuedActivationToken).toBeUndefined();
-    expect(ds.session.queuedActivationInput).toBeUndefined();
-    expect(ds.session.queuedActivationTail).toEqual([expect.objectContaining({
-      id: 'tail-promote-1',
-      turnId: 'turn-promote',
-      dispatchAttempt: 4,
-      cliInput: { content: 'PROMOTE_ME' },
-    })]);
-    expect(ds.pendingPrompt).toBeUndefined();
+    expect(ds.session.queuedActivationPending).toBe(true);
+    expect(ds.session.queuedActivationToken).toEqual(expect.any(String));
+    expect(ds.session.queuedActivationInput).toEqual({ content: 'PROMOTE_ME' });
+    expect(ds.session.queuedActivationTurnId).toBe('turn-promote');
+    expect(ds.session.queuedActivationDispatchAttempt).toBe(4);
+    expect(ds.session.queuedActivationTail).toBeUndefined();
+    expect(ds.pendingPrompt).toBe('PROMOTE_ME');
+    expect(ds.quarantinedActivationTailPromotion).toBe(true);
   });
 
   // ── Central quarantine guard (resolveQuarantinedForkPlan inside forkWorker) ──
@@ -1127,9 +1127,51 @@ describe('Codex App clean-input feature gate', () => {
       // Gate stays held and the session stays quarantined for a later boundary.
       expect(ds.initialStartPending).toBe(true);
       expect(ds.quarantinedActivationTailPromotion).toBe(true);
-      // Old head not promoted, still parked exactly.
-      expect(ds.session.queuedActivationPending).toBeUndefined();
-      expect(ds.session.queuedActivationTail?.[0]?.turnId).toBe('turn-old-head');
+      // Persistence may have published, so retain the exact candidate journal
+      // and never reconstruct/retry it from the old tail in this process.
+      expect(ds.session.queuedActivationPending).toBe(true);
+      expect(ds.session.queuedActivationTurnId).toBe('turn-old-head');
+      expect(ds.session.queuedActivationTail).toBeUndefined();
+
+      const stillUnknown = forkWorker(ds, '', true);
+      expect(stillUnknown).toBe(false);
+      expect(ds.quarantinedActivationTailPromotion).toBe(true);
+      expect(forkMock).not.toHaveBeenCalled();
+      expect(sessionStore.updateSession).toHaveBeenCalledTimes(1);
+
+      vi.mocked(sessionStore.getSessionFresh).mockReturnValue({
+        ...structuredClone(ds.session),
+        queuedActivationTail: [{
+          id: 'concurrent-tail',
+          order: 9,
+          userPrompt: 'CONCURRENT',
+          cliInput: { content: 'CONCURRENT' },
+          turnId: 'turn-concurrent',
+        }],
+      });
+      expect(forkWorker(ds, '', true)).toBe(false);
+      expect(ds.quarantinedActivationTailPromotion).toBe(true);
+      expect(forkMock).not.toHaveBeenCalled();
+
+      vi.mocked(sessionStore.getSessionFresh).mockReturnValue({
+        ...structuredClone(ds.session),
+        codexAppDispatchLedger: [],
+      });
+      expect(forkWorker(ds, '', true)).toBe(false);
+      expect(ds.quarantinedActivationTailPromotion).toBe(true);
+      expect(forkMock).not.toHaveBeenCalled();
+
+      vi.mocked(sessionStore.getSessionFresh).mockReturnValue(structuredClone(ds.session));
+      const recovered = forkWorker(ds, '', true);
+      expect(recovered).toBe(true);
+      expect(ds.quarantinedActivationTailPromotion).toBeUndefined();
+      expect(ds.session.queuedActivationTurnId).toBe('turn-old-head');
+      expect(forkMock).toHaveBeenCalledTimes(1);
+      const worker = forkMock.mock.results.at(-1)!.value;
+      const init = vi.mocked(worker.send).mock.calls[0][0];
+      expect(init.type).toBe('init');
+      expect(init.prompt).toBe('');
+      expect(init.queuedActivationToken).toBe(ds.session.queuedActivationToken);
     });
 
     it('retry SUCCEEDS (Codex App) → clears quarantine, forks a recovery worker for the PROMOTED OLD HEAD via the ledger', () => {

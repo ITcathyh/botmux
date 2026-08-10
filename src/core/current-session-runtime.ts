@@ -2,12 +2,20 @@ import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import * as idempotencyStore from '../services/idempotency-store.js';
 import * as sessionStore from '../services/session-store.js';
 import type { Session } from '../types.js';
-import type { DaemonSession } from './types.js';
+import {
+  activeSessionAnchorId,
+  storedActiveSessionAnchorId,
+  type DaemonSession,
+} from './types.js';
 import {
   currentSessionCommandLane,
   currentSessionLaneAddress,
 } from './current-session-command-lane.js';
 import { createCurrentKeyedTriggerTurnPort } from './current-keyed-trigger-turn.js';
+import {
+  createCurrentOrdinaryRouteRegistryRuntime,
+  type CurrentOrdinaryRouteOpeningCreator,
+} from './current-ordinary-route-registry.js';
 import {
   createSessionRuntimeHost,
   type CommandOutcomeFor,
@@ -17,6 +25,7 @@ import {
   type KeyedTriggerReserveResult,
   type KeyedTriggerSettlementResult,
   type OrdinaryIngressPort,
+  type PendingRepoCompletionPort,
   type SessionDirectory,
   type SessionDirectoryQuery,
   type SessionDirectoryRead,
@@ -24,9 +33,11 @@ import {
   type OrdinaryIngressRouteBinding,
   type SessionCommand,
   type SessionCommandRequest,
+  type SessionAddress,
   type SessionProjection,
   type SessionRuntime,
   type SessionRoute,
+  type SessionView,
   type KeyedTriggerTurnPort,
 } from './session-runtime.js';
 
@@ -355,12 +366,13 @@ function routeFor(session: Pick<Session, 'scope' | 'chatId' | 'rootMessageId'>):
 
 function ordinaryIngressBindingFor(
   session: Pick<Session, 'scope' | 'chatId' | 'chatType' | 'rootMessageId'>,
+  canonicalAnchor: string,
   chatType = session.chatType ?? 'group',
 ): OrdinaryIngressRouteBinding {
   const scope = session.scope === 'chat' ? 'chat' : 'thread';
   return {
     scope,
-    canonicalAnchor: scope === 'chat' ? session.chatId : session.rootMessageId,
+    canonicalAnchor,
     chatId: session.chatId,
     chatType,
   };
@@ -387,7 +399,11 @@ class CurrentSessionDirectory implements SessionDirectory {
         key: ds.session.sessionId,
         sessionId: ds.session.sessionId,
         route: routeFor(ds.session),
-        ordinaryIngressBinding: ordinaryIngressBindingFor(ds.session, ds.chatType),
+        ordinaryIngressBinding: ordinaryIngressBindingFor(
+          ds.session,
+          activeSessionAnchorId(ds),
+          ds.chatType,
+        ),
         recordStatus: ds.session.status === 'active' ? 'active' : 'closed',
         executorStatus: executorStatusFor(ds),
       });
@@ -398,7 +414,10 @@ class CurrentSessionDirectory implements SessionDirectory {
         key: session.sessionId,
         sessionId: session.sessionId,
         route: routeFor(session),
-        ordinaryIngressBinding: ordinaryIngressBindingFor(session),
+        ordinaryIngressBinding: ordinaryIngressBindingFor(
+          session,
+          storedActiveSessionAnchorId(session),
+        ),
         recordStatus: session.status === 'active' ? 'active' : 'closed',
         executorStatus: session.queued ? 'idle' : 'dormant',
       });
@@ -442,6 +461,14 @@ export interface CurrentSessionRuntimeHost {
 interface CachedCurrentSessionRuntimeHost {
   runtimeEpoch: string;
   ordinaryIngress?: OrdinaryIngressPort;
+  ordinaryRouteOpeningCreator?: CurrentOrdinaryRouteOpeningCreator;
+  pendingRepoCompletion?: PendingRepoCompletionPort;
+  portBindings: {
+    ordinaryIngress?: OrdinaryIngressPort;
+    pendingRepoCompletion?: PendingRepoCompletionPort;
+  };
+  innerHost: CurrentSessionRuntimeHost;
+  routeHost?: CurrentSessionRuntimeHost;
   lease: { active: boolean };
   host: CurrentSessionRuntimeHost;
 }
@@ -455,6 +482,20 @@ function leaseCurrentSessionRuntimeHost(
   host: CurrentSessionRuntimeHost,
   lease: { active: boolean },
 ): CurrentSessionRuntimeHost {
+  const outerByInner = new WeakMap<object, SessionAddress>();
+  const innerByOuter = new WeakMap<object, SessionAddress>();
+  const outwardAddress = (inner: SessionAddress): SessionAddress => {
+    const existing = outerByInner.get(inner);
+    if (existing) return existing;
+    const outer = Object.freeze(Object.create(null)) as SessionAddress;
+    outerByInner.set(inner, outer);
+    innerByOuter.set(outer, inner);
+    return outer;
+  };
+  const outwardView = (view: SessionView): SessionView => ({
+    ...view,
+    address: outwardAddress(view.address),
+  });
   return {
     runtime: {
       submit<C extends SessionCommand>(
@@ -463,18 +504,39 @@ function leaseCurrentSessionRuntimeHost(
         if (!lease.active) {
           return Promise.resolve({ kind: 'staleAddress' } as CommandOutcomeFor<C>);
         }
-        return host.runtime.submit(request);
+        if (request.target.kind !== 'session') return host.runtime.submit(request);
+        const innerAddress = innerByOuter.get(request.target.address);
+        if (!innerAddress) {
+          return Promise.resolve({ kind: 'staleAddress' } as CommandOutcomeFor<C>);
+        }
+        return host.runtime.submit({
+          ...request,
+          target: { kind: 'session', address: innerAddress },
+        } as SessionCommandRequest<C>);
       },
     },
     projection: {
-      read(query) {
+      async read(query) {
         if (!lease.active) {
-          return Promise.resolve({
+          return {
             kind: 'notReady',
             message: 'Current SessionRuntime Host lease was superseded',
-          });
+          };
         }
-        return host.projection.read(query);
+        const projected = await host.projection.read(query);
+        if (!lease.active) {
+          return {
+            kind: 'notReady',
+            message: 'Current SessionRuntime Host lease was superseded',
+          };
+        }
+        if (projected.kind === 'one') {
+          return { kind: 'one', session: outwardView(projected.session) };
+        }
+        if (projected.kind === 'list') {
+          return { kind: 'list', sessions: projected.sessions.map(outwardView) };
+        }
+        return projected;
       },
     },
   };
@@ -491,25 +553,19 @@ export function currentSessionRuntimeHost(options: {
   keyedTriggerTurns?: KeyedTriggerTurnPort;
   /** Production composition seam for ordinary Lark message ingress. */
   ordinaryIngress?: OrdinaryIngressPort;
+  /** Production-owned full opening creation; absent keeps route targets unsupported. */
+  ordinaryRouteOpeningCreator?: CurrentOrdinaryRouteOpeningCreator;
+  /** Staged Current seam for pending-repository first-start completion. */
+  pendingRepoCompletion?: PendingRepoCompletionPort;
 }): CurrentSessionRuntimeHost {
   const runtimeEpoch = options.runtimeEpoch ?? options.ownerBootId;
   const cacheable = options.keyedTriggerTurns === undefined;
-  let byOwner = hostsByRegistry.get(options.activeSessions);
-  if (!byOwner) {
-    byOwner = new Map();
-    hostsByRegistry.set(options.activeSessions, byOwner);
-  }
-  const cached = byOwner.get(options.ownerLarkAppId);
-  if (cacheable && cached?.runtimeEpoch === runtimeEpoch) {
-    if (options.ordinaryIngress === undefined
-        || cached.ordinaryIngress === options.ordinaryIngress) {
-      return cached.host;
-    }
-    if (cached.ordinaryIngress !== undefined) {
-      throw new Error('Current SessionRuntime owner epoch already has a different ordinary ingress port');
-    }
-  }
-  const innerHost = createSessionRuntimeHost({
+  const createInnerHost = (input: {
+    portBindings?: {
+      ordinaryIngress?: OrdinaryIngressPort;
+      pendingRepoCompletion?: PendingRepoCompletionPort;
+    };
+  } = {}): CurrentSessionRuntimeHost => createSessionRuntimeHost({
     directory: new CurrentSessionDirectory(options.ownerLarkAppId, options.activeSessions),
     keyedTriggers: new CurrentKeyedTriggerAuthority(
       options.ownerLarkAppId,
@@ -521,7 +577,12 @@ export function currentSessionRuntimeHost(options: {
       ownerLarkAppId: options.ownerLarkAppId,
       activeSessions: options.activeSessions,
     }),
-    ordinaryIngress: options.ordinaryIngress,
+    ...(input.portBindings
+      ? { portBindings: input.portBindings }
+      : {
+          ordinaryIngress: options.ordinaryIngress,
+          pendingRepoCompletion: options.pendingRepoCompletion,
+        }),
     sessionStore: sessionStore.createCurrentSessionStore({
       ownerLarkAppId: options.ownerLarkAppId,
       runtimeEpoch,
@@ -533,14 +594,109 @@ export function currentSessionRuntimeHost(options: {
       sessionId,
     ),
   });
-  if (!cacheable) return innerHost;
+  const composeRouteHost = (
+    innerHost: CurrentSessionRuntimeHost,
+    ordinaryIngress: OrdinaryIngressPort | undefined,
+    openingCreator: CurrentOrdinaryRouteOpeningCreator | undefined,
+  ): CurrentSessionRuntimeHost | undefined => (
+    ordinaryIngress && openingCreator
+      ? {
+          projection: innerHost.projection,
+          runtime: createCurrentOrdinaryRouteRegistryRuntime({
+            ownerLarkAppId: options.ownerLarkAppId,
+            activeSessions: options.activeSessions,
+            openingCreator,
+            downstream: innerHost,
+          }),
+        }
+      : undefined
+  );
 
+  if (!cacheable) {
+    const innerHost = createInnerHost();
+    return composeRouteHost(
+      innerHost,
+      options.ordinaryIngress,
+      options.ordinaryRouteOpeningCreator,
+    ) ?? innerHost;
+  }
+
+  let byOwner = hostsByRegistry.get(options.activeSessions);
+  if (!byOwner) {
+    byOwner = new Map();
+    hostsByRegistry.set(options.activeSessions, byOwner);
+  }
+  const cached = byOwner.get(options.ownerLarkAppId);
+  if (cached?.runtimeEpoch === runtimeEpoch) {
+    const ordinaryCompatible = options.ordinaryIngress === undefined
+      || cached.ordinaryIngress === options.ordinaryIngress;
+    const routeCreatorCompatible = options.ordinaryRouteOpeningCreator === undefined
+      || cached.ordinaryRouteOpeningCreator === options.ordinaryRouteOpeningCreator;
+    const pendingRepoCompatible = options.pendingRepoCompletion === undefined
+      || cached.pendingRepoCompletion === options.pendingRepoCompletion;
+    if (ordinaryCompatible && routeCreatorCompatible && pendingRepoCompatible) {
+      return cached.host;
+    }
+    if (!ordinaryCompatible && cached.ordinaryIngress !== undefined) {
+      throw new Error('Current SessionRuntime owner epoch already has a different ordinary ingress port');
+    }
+    if (!pendingRepoCompatible && cached.pendingRepoCompletion !== undefined) {
+      throw new Error('Current SessionRuntime owner epoch already has a different pending-repo completion port');
+    }
+    if (!routeCreatorCompatible && cached.ordinaryRouteOpeningCreator !== undefined) {
+      throw new Error('Current SessionRuntime owner epoch already has a different ordinary route opening creator');
+    }
+    const ordinaryIngress = options.ordinaryIngress ?? cached.ordinaryIngress;
+    const ordinaryRouteOpeningCreator = options.ordinaryRouteOpeningCreator
+      ?? cached.ordinaryRouteOpeningCreator;
+    const pendingRepoCompletion = options.pendingRepoCompletion
+      ?? cached.pendingRepoCompletion;
+    const routeHost = cached.routeHost ?? composeRouteHost(
+      cached.innerHost,
+      ordinaryIngress,
+      ordinaryRouteOpeningCreator,
+    );
+    cached.portBindings.ordinaryIngress = ordinaryIngress;
+    cached.portBindings.pendingRepoCompletion = pendingRepoCompletion;
+    const composedHost = routeHost ?? cached.innerHost;
+    const lease = { active: true };
+    const host = leaseCurrentSessionRuntimeHost(composedHost, lease);
+    cached.lease.active = false;
+    byOwner.set(options.ownerLarkAppId, {
+      runtimeEpoch,
+      ordinaryIngress,
+      ordinaryRouteOpeningCreator,
+      pendingRepoCompletion,
+      portBindings: cached.portBindings,
+      innerHost: cached.innerHost,
+      routeHost,
+      lease,
+      host,
+    });
+    return host;
+  }
+
+  const portBindings = {
+    ordinaryIngress: options.ordinaryIngress,
+    pendingRepoCompletion: options.pendingRepoCompletion,
+  };
+  const innerHost = createInnerHost({ portBindings });
+  const routeHost = composeRouteHost(
+    innerHost,
+    options.ordinaryIngress,
+    options.ordinaryRouteOpeningCreator,
+  );
   const lease = { active: true };
-  const host = leaseCurrentSessionRuntimeHost(innerHost, lease);
+  const host = leaseCurrentSessionRuntimeHost(routeHost ?? innerHost, lease);
   if (cached) cached.lease.active = false;
   byOwner.set(options.ownerLarkAppId, {
     runtimeEpoch,
     ordinaryIngress: options.ordinaryIngress,
+    ordinaryRouteOpeningCreator: options.ordinaryRouteOpeningCreator,
+    pendingRepoCompletion: options.pendingRepoCompletion,
+    portBindings,
+    innerHost,
+    routeHost,
     lease,
     host,
   });

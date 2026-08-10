@@ -85,7 +85,7 @@ import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock } from '../../core/worker-pool.js';
-import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
+import { getSessionWorkingDir, persistStreamCardState, resumeSession } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
 import { publishAttentionPatch, publishClosedSessionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
 import { fallbackTurnId } from '../../core/reply-target.js';
@@ -112,7 +112,11 @@ import {
 } from '../../services/local-cli-opener.js';
 import { hasProtectedSessionMutationOwnership } from '../../core/session-mutation-guard.js';
 import { persistPendingRepoCardMessageId } from '../../core/pending-repo-journal.js';
-import { runDetachedBotTurnAdmission, withBotTurnAdmission, withBotTurnMutation } from '../../core/bot-turn-mutation-gate.js';
+import {
+  submitCurrentPendingRepoCompletion,
+  type CurrentPendingRepoCompletionSubmitInput,
+} from '../../core/current-pending-repo-completion-submit.js';
+import { withBotTurnAdmission, withBotTurnMutation } from '../../core/bot-turn-mutation-gate.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -139,6 +143,9 @@ export interface CardHandlerDeps {
   codexNotifierCardAction?: (data: CardActionData, larkAppId: string) => Promise<any>;
   /** 授权成功后重放之前被拦截的消息，让用户无需再 @ 一遍。 */
   replayGrantedMessage?: (data: any, larkAppId: string) => void;
+  submitPendingRepoCompletion?: (
+    input: CurrentPendingRepoCompletionSubmitInput,
+  ) => ReturnType<typeof submitCurrentPendingRepoCompletion>;
 }
 
 /**
@@ -414,6 +421,9 @@ export async function commitRepoSelection(
     operatorOpenId?: string;
     activeSessions: Map<string, DaemonSession>;
     sessionReply: (rid: string, content: string, msgType?: string, turnId?: string) => Promise<string>;
+    submitPendingRepoCompletion?: (
+      input: CurrentPendingRepoCompletionSubmitInput,
+    ) => ReturnType<typeof submitCurrentPendingRepoCompletion>;
   },
   dirPath: string,
   dirLabel: string,
@@ -432,9 +442,6 @@ export async function commitRepoSelection(
   // `/close` deletes the active-map entry without touching sessionId or
   // pendingRepo — identity against the map is the only tell that the session
   // this flow captured is gone. Checked alongside the generation snapshots.
-  const repoSessionKey = activeSessionKey(ds);
-  const sessionStillActive = () => activeSessions.get(repoSessionKey) === ds;
-  const commitGenSessionId = ds.session.sessionId;
   const pinWorkingDir = opts?.pinWorkingDir !== false;
 
   // Card callbacks are replayable. Only the currently published picker may
@@ -471,192 +478,53 @@ export async function commitRepoSelection(
   }
 
   if (ds.pendingRepo) {
-    const targetSessionId = ds.session.sessionId;
-    ds.pendingRepoCommitInFlight = true;
+    const cardToWithdraw = cardMessageId ?? ds.repoCardMessageId;
+    const submit = ctx.submitPendingRepoCompletion ?? submitCurrentPendingRepoCompletion;
+    const completion = await submit({
+      ownerLarkAppId: ds.larkAppId,
+      activeSessions,
+      sessionId: ds.session.sessionId,
+      daemonSession: ds,
+      selection: {
+        kind: 'directory',
+        path: dirPath,
+        pinWorkingDir,
+        ...(opts?.riffRepoDirs ? { riffRepoDirs: opts.riffRepoDirs } : {}),
+      },
+    });
+    const committed = completion.kind === 'applied' || completion.kind === 'duplicate';
+    if (!committed) {
+      logger.warn(
+        `[${tag(ds)}] Pending repo completion refused (${completion.kind}): `
+        + `${'message' in completion ? completion.message : 'stale Session address'}`,
+      );
+      return false;
+    }
     try {
-      const started = await withBotTurnMutation(ds.larkAppId, async () => {
-      const current = [...activeSessions.values()].find(
-        candidate => candidate.session.sessionId === targetSessionId
-          && candidate.session.status === 'active',
-      );
-      if (!current || current !== ds || !current.pendingRepo) return false;
-      // "Start directly" launches in the resolved default cwd without pinning
-      // HOME onto the session for sibling-bot inheritance.
-      if (pinWorkingDir) {
-        ds.workingDir = dirPath;
-        ds.session.workingDir = dirPath;
-      }
-      // riff 多仓 stamp：只有多仓 worktree 流显式传入（保留用户选择顺序，首仓=primary）；
-      // 其它选仓路径一律清除旧 stamp——workingDir 变了，旧的多仓组合不再成立。
-      ds.session.riffRepoDirs = opts?.riffRepoDirs;
-      sessionStore.updateSession(ds.session);
-      const selfBot = getBot(ds.larkAppId);
-      const botCfg = selfBot.config;
-      const effectiveCliId = sessionCliId(ds);
-
-      // Keep pendingRepo=true across this await. New topic messages therefore
-      // remain buffered on this same session instead of racing a worker-null
-      // safety-net fork. Snapshot every pending field only after it settles.
-      const needsPromptContext = !ds.pendingRawInput ||
-        (ds.pendingPrompt?.trim().length ?? 0) > 0 ||
-        (ds.pendingAttachments?.length ?? 0) > 0 ||
-        (ds.pendingFollowUps?.length ?? 0) > 0 ||
-        ds.pendingChatContext !== undefined;
-      const availableBots = needsPromptContext
-        ? await getAvailableBots(ds.larkAppId, ds.chatId)
-        : [];
-      if (!sessionStillActive() || ds.session.sessionId !== commitGenSessionId ||
-          !ds.pendingRepo || (ds.worker && !ds.worker.killed)) {
-        logger.warn(`[${tag(ds)}] Session changed while preparing the pending-CLI prompt (${commitGenSessionId} → ${ds.session.sessionId}, active=${sessionStillActive()}, pending=${!!ds.pendingRepo}, worker=${!!ds.worker}) — aborting this fork`);
-        return;
-      }
-
-      const pendingPrompt = ds.pendingPrompt ?? '';
-      const pendingRawInput = ds.pendingRawInput;
-      // Raw-input cold start still wraps any input buffered while the repo card
-      // was pending — see the skip_repo branch for the rationale.
-      const hasBufferedInput =
-        pendingPrompt.trim().length > 0 ||
-        ds.pendingCodexAppText !== undefined ||
-        (ds.pendingAttachments?.length ?? 0) > 0 ||
-        (ds.pendingFollowUps?.length ?? 0) > 0 ||
-        ds.pendingChatContext !== undefined;
-      // Nothing to submit at all (session created by a bare `/repo`, i.e. the
-      // message IS the command). Boot the CLI idle instead of burning an empty
-      // `<user_message>` opening on it, and mark the session so the user's NEXT
-      // real message becomes the new-topic first turn. Mirrors the text
-      // `/repo` path in command-handler's forkPendingCli.
-      const emptyStart = !pendingRawInput && !hasBufferedInput;
-      if (!pendingRawInput || hasBufferedInput) ensureSessionWhiteboard(ds);
-      const wrappedInput = hasBufferedInput
-        ? buildNewTopicCliInput(
-            pendingPrompt,
-            ds.session.sessionId,
-            effectiveCliId,
-            botCfg.cliPathOverride,
-            ds.pendingAttachments,
-            ds.pendingMentions,
-            availableBots,
-            ds.pendingFollowUps,
-            { name: selfBot.botName, openId: selfBot.botOpenId },
-            locTarget,
-            ds.pendingSender,
-            {
-              larkAppId: ds.larkAppId,
-              chatId: ds.chatId,
-              whiteboardId: ds.session.whiteboardId,
-              substituteTrigger: ds.pendingSubstituteTrigger,
-              codexAppText: ds.pendingCodexAppText,
-              codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
-              codexAppMessageContext: ds.pendingCodexAppMessageContext,
-              codexAppFollowUps: ds.pendingCodexAppFollowUps,
-              codexAppFollowUpContexts: ds.pendingCodexAppFollowUpContexts,
-              chatContext: ds.pendingChatContext,
-            },
-          )
-        : undefined;
-      const prompt = pendingRawInput ? '' : (wrappedInput ?? '');
-      // Last-line defence: prompt prep awaited above — if anything replaced
-      // OR closed the session in that window, forking now would clobber it
-      // (or resurrect a /close'd session).
-      if (!sessionStillActive() || ds.session.sessionId !== commitGenSessionId) {
-        logger.warn(`[${tag(ds)}] Session replaced or closed while preparing the pending-CLI prompt (${commitGenSessionId} → ${ds.session.sessionId}, active=${sessionStillActive()}) — aborting this fork`);
-        return false;
-      }
-      if (pendingRawInput && hasBufferedInput && wrappedInput) {
-        ds.pendingFollowUpInput = {
-          userPrompt: ds.pendingCodexAppText !== undefined || ds.pendingCodexAppFollowUps
-            ? [ds.pendingCodexAppText ?? '', ...(ds.pendingCodexAppFollowUps ?? [])].filter(Boolean).join('\n\n')
-            : pendingPrompt || ds.pendingFollowUps?.join('\n\n') || '',
-          cliInput: wrappedInput.content,
-          ...((ds.pendingFollowUpTurnIds?.at(-1) ?? ds.pendingFollowUpTurnId)
-            ? { turnId: ds.pendingFollowUpTurnIds?.at(-1) ?? ds.pendingFollowUpTurnId }
-            : {}),
-          ...(effectiveCliId === 'codex-app' && botCfg.codexAppCleanInput === true && wrappedInput.codexAppInput
-            ? { codexAppInput: wrappedInput.codexAppInput }
-            : {}),
-          codexAppInputGateFrozen: true,
-        };
-      }
-      if (pendingRawInput) rememberLastCliInput(ds, pendingRawInput, pendingRawInput);
-      else if (hasBufferedInput && wrappedInput) rememberLastCliInput(ds, pendingPrompt, wrappedInput);
-      // Keep the reservation and every buffered opening field intact through
-      // forkWorker's synchronous pre-accept/write-ahead phase. If it throws,
-      // the user can retry this exact selection without losing the first turn.
-      const pendingTurnId = ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId;
-      forkWorker(
-        ds,
-        prompt,
-        !pendingRawInput && pendingTurnId ? { turnId: pendingTurnId } : false,
-      );
-      ds.pendingRepo = false;
-      // A queued activation owns the route through its adapter-level ACK. Every
-      // buffer below was synchronously folded into prompt N and is safe to clear;
-      // later inbounds observe this gate and enter the separate exact staged FIFO.
-      ds.initialStartPending = ds.session.queuedActivationPending === true;
-      publishAttentionPatch(ds);
-      // Durable, one-shot: the CLI is up but has never received a real user turn.
-      // Bare `/repo` idle-booted above (empty prompt, no turn); mark the session
-      // so the user's NEXT real message becomes the new-topic first turn.
-      if (emptyStart) markInitialUserTurnPending(ds);
-      ds.pendingPrompt = undefined;
-      ds.pendingCodexAppText = undefined;
-      ds.pendingCodexAppApplicationContext = undefined;
-      ds.pendingCodexAppMessageContext = undefined;
-      ds.pendingChatContext = undefined;
-      ds.pendingAttachments = undefined;
-      ds.pendingMentions = undefined;
-      ds.pendingSubstituteTrigger = undefined;
-      ds.pendingSender = undefined;
-      ds.pendingFollowUps = undefined;
-      ds.pendingFollowUpTurnId = undefined;
-      ds.pendingFollowUpTurnIds = undefined;
-      ds.pendingCodexAppFollowUps = undefined;
-      ds.pendingCodexAppFollowUpContexts = undefined;
-      ds.pendingCodexAppFollowUpGateAccepted = undefined;
-      ds.pendingTurnId = undefined;
-      return true;
-      });
-      if (!started) return false;
-      // Invalidate synchronously at the successful commit boundary. Card
-      // withdrawal and confirmation are best effort and may await/fail;
-      // neither may leave a replayable mutation capability behind.
-      const cardToWithdraw = cardMessageId ?? ds.repoCardMessageId;
-      markRepoCardConsumed(ds, cardToWithdraw);
-      ds.repoCardMessageId = undefined;
-      // Keep the pending-selection claim until the confirmation attempt
-      // settles. This prevents a second picker action from reinterpreting the
-      // freshly-started session as a mid-session repository switch.
-      try {
-        if (!opts?.suppressConfirmReply) {
-          await sessionReply(
-            rootId,
-            t('cmd.repo.selected_in_pending', { name: dirLabel }, locTarget),
-            undefined,
-            fallbackTurnId(ds, undefined),
-          );
-        } else if (opts.confirmReplyText) {
-          await sessionReply(
-            rootId,
-            opts.confirmReplyText,
-            undefined,
-            fallbackTurnId(ds, undefined),
-          );
-        }
-      } catch (err) {
-        logger.warn(
-          `[${tag(ds)}] Confirm reply after pending repo commit failed: `
-          + `${err instanceof Error ? err.message : String(err)}`,
+      if (!opts?.suppressConfirmReply) {
+        await sessionReply(
+          rootId,
+          t('cmd.repo.selected_in_pending', { name: dirLabel }, locTarget),
+          undefined,
+          fallbackTurnId(ds, undefined),
+        );
+      } else if (opts.confirmReplyText) {
+        await sessionReply(
+          rootId,
+          opts.confirmReplyText,
+          undefined,
+          fallbackTurnId(ds, undefined),
         );
       }
-      // Withdrawal is deliberately detached so the card callback can ACK
-      // before Lark observes that the source message disappeared.
-      deferRepoCardWithdraw(larkAppId, cardToWithdraw);
-      logger.info(`[${tag(ds)}] Repo selected: ${dirPath}, spawning CLI`);
-      return true;
-    } finally {
-      ds.pendingRepoCommitInFlight = false;
+    } catch (err) {
+      logger.warn(
+        `[${tag(ds)}] Confirm reply after pending repo commit failed: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
     }
+    deferRepoCardWithdraw(larkAppId, cardToWithdraw);
+    logger.info(`[${tag(ds)}] Repo selected: ${dirPath}, first start committed`);
+    return true;
   } else {
     // Mid-session repo switch — close old session, start fresh.
     // ZMX close is identity/generation verified and may refuse. Prove teardown
@@ -792,18 +660,11 @@ export async function commitRepoSelection(
 }
 
 /**
- * 仅默认目录 + auto-worktree 的**异步**提交：`ds` 必须已注册进 activeSessions 且处于
- * `pendingRepo` 挂起态（prompt 已 buffer，入站路由不会去抢 fork——见 daemon.ts pendingRepo
- * 分支），本函数在**关键路径之外**（调用方 `void` 掉、立即返回）跑：
- *   1) 在 `baseDir` 建独立 worktree（非 git / 失败 → 回退 baseDir，均经 `notify` 发提示）
- *   2) 用与「选仓库卡」完全相同的 {@link commitRepoSelection} 提交该目录并 fork——复用其
- *      prompt 重建（会 fold 进等待期间 buffer 的后续消息）、代际守卫、僵尸防护。
- *
- * 这样避免了把 git fetch（可长达 30s）同步塞进 spawn/fork 链路的三宗罪：放大重复 spawn
- * 竞态、worker=null 期间被路由在**基目录**抢 fork、阻塞 dashboard/webhook 响应。
- *
- * 永不抛出：worktree 失败已在内部回退；commitRepoSelection 异常被兜底 log（会话仍留在
- * pendingRepo，用户可 /repo 自救），绝不让 unhandled rejection 掀掉 daemon。
+ * Submit the auto-worktree first-start intent through the same stable Runtime
+ * port as card and text selections. Worktree creation, exact-owner fencing,
+ * fork publication, and pending-buffer cleanup all stay inside that port.
+ * Typed refusal or transport failure is logged and never falls back to a
+ * caller-owned fork/mutation path.
  */
 export async function runAutoWorktreeCommit(deps: {
   ds: DaemonSession;
@@ -815,59 +676,35 @@ export async function runAutoWorktreeCommit(deps: {
   operatorOpenId?: string;
   activeSessions: Map<string, DaemonSession>;
   notify: (message: string) => Promise<unknown> | void;
+  submitPendingRepoCompletion?: (
+    input: CurrentPendingRepoCompletionSubmitInput,
+  ) => ReturnType<typeof submitCurrentPendingRepoCompletion>;
 }): Promise<void> {
-  const { ds, anchor, larkAppId, baseDir, title, prompt, operatorOpenId, activeSessions, notify } = deps;
-  ds.worktreeCreating = true;
-  // Surface the pending row NOW (all three callers funnel through here, so this is
-  // the single place that guarantees the session is visible on SSE-only dashboards
-  // during the up-to-30s build) — commitRepoSelection's forkWorker is what would
-  // otherwise emit session.spawned, far too late.
+  const { ds, larkAppId, baseDir, activeSessions } = deps;
   announcePendingRepoSession(ds);
+  const submit = deps.submitPendingRepoCompletion ?? submitCurrentPendingRepoCompletion;
   try {
-    const { maybeCreateDefaultWorktree } = await import('../../services/default-worktree.js');
-    const wt = await maybeCreateDefaultWorktree(larkAppId, baseDir, {
-      isBotDefaultDir: true, title, prompt, locale: localeForBot(larkAppId), notify,
-    });
-    // The pendingRepo placeholder can legitimately be consumed WHILE this
-    // up-to-30s build runs — e.g. the Codex-notifier「继续处理」callback adopts
-    // the same DM session and clears pendingRepo before we get here. If we now
-    // funneled into commitRepoSelection, its mid-session branch would kill the
-    // freshly-adopted worker and replace it with a botmux-owned worktree
-    // session. Bail on the late result instead: the takeover already owns the
-    // session. (commitRepoSelection also re-checks pendingRepo under its claim,
-    // but that check runs after an await — fence here before any mutation.)
-    if (!ds.pendingRepo) {
-      logger.info(`[${tag(ds)}] auto-worktree completion ignored — pendingRepo already consumed (session taken over)`);
-      return;
-    }
-    // Commit even on fallback (wt.dir === baseDir) — the session must still start.
-    // commitRepoSelection has its own /close + generation guards and, for a
-    // pendingRepo session, folds any messages buffered during creation (pendingPrompt
-    // + pendingFollowUps) into the first turn. suppressConfirmReply: the worktree
-    // helper already posted the '已创建/回退' line, so skip the '已选择' confirmation.
-    // The worktree build is intentionally detached from its caller's inbound
-    // admission. Re-enter with a fresh lease at the delayed commit/fork edge;
-    // the outer lease may have ended minutes ago and must not authorize this
-    // descendant across a bot-wide config mutation.
-    await runDetachedBotTurnAdmission(larkAppId, () => commitRepoSelection(
-      {
-        ds, rootId: anchor, larkAppId, operatorOpenId, activeSessions,
-        // Never reached under suppressConfirmReply for a pendingRepo session.
-        sessionReply: async () => '',
+    const completion = await submit({
+      ownerLarkAppId: larkAppId,
+      activeSessions,
+      sessionId: ds.session.sessionId,
+      daemonSession: ds,
+      selection: {
+        kind: 'autoWorktree',
+        baseDir,
       },
-      wt.dir,
-      pathBasename(wt.dir),
-      { suppressConfirmReply: true },
-    ));
-  } catch (e) {
-    // No recovery fork here: forking with an empty prompt would DROP the buffered
-    // first turn (pendingPrompt lives only in-memory, not the message queue). Leave
-    // the session as commitRepoSelection left it — the inbound router's worker=null
-    // branch re-forks (with the pinned dir) on the user's next message, and a still-
-    // pending session keeps buffering. Loud log so the rare mid-commit throw is seen.
-    logger.error(`[${tag(ds)}] auto-worktree commit failed (session recoverable on next message): ${e instanceof Error ? e.message : e}`);
-  } finally {
-    ds.worktreeCreating = false;
+    });
+    if (completion.kind !== 'applied' && completion.kind !== 'duplicate') {
+      logger.warn(
+        `[${tag(ds)}] auto-worktree completion refused (${completion.kind}): `
+        + `${'message' in completion ? completion.message : 'stale Session address'}`,
+      );
+    }
+  } catch (error) {
+    logger.error(
+      `[${tag(ds)}] auto-worktree completion submit failed without legacy fallback: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    );
   }
 }
 
@@ -3115,7 +2952,16 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         // helper gives this card path the bot mutation, exact-owner recheck,
         // buffered-sidecar handling, and fork-before-release ordering.
         const started = await commitRepoSelection(
-          { ds, rootId, cardMessageId, larkAppId: larkAppId ?? ds.larkAppId, operatorOpenId, activeSessions, sessionReply },
+          {
+            ds,
+            rootId,
+            cardMessageId,
+            larkAppId: larkAppId ?? ds.larkAppId,
+            operatorOpenId,
+            activeSessions,
+            sessionReply,
+            submitPendingRepoCompletion: deps.submitPendingRepoCompletion,
+          },
           cwd,
           cwd,
           {
@@ -3160,7 +3006,16 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const selectedPath = validation.resolvedPath;
       const displayName = pathBasename(selectedPath) || selectedPath;
       await commitRepoSelection(
-        { ds, rootId, cardMessageId, larkAppId, operatorOpenId, activeSessions, sessionReply },
+        {
+          ds,
+          rootId,
+          cardMessageId,
+          larkAppId,
+          operatorOpenId,
+          activeSessions,
+          sessionReply,
+          submitPendingRepoCompletion: deps.submitPendingRepoCompletion,
+        },
         selectedPath,
         displayName,
       );
@@ -3234,10 +3089,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         return { toast: { type: 'info', content: t('cmd.repo.worktree_in_progress', undefined, locDs) } };
       }
       const branch = String(action?.form_value?.repo_worktree_branch ?? '').trim() || undefined;
-      const multiParent = selectedPaths.length > 1
+      const multiParent = selectedPaths.length > 1 && !ds.pendingRepo
         ? multiWorktreeParentPath(selectedPaths, branch ?? await worktreeSlugFromContextAI(ds.session.title, ds.pendingPrompt) ?? 'worktree')
         : undefined;
-      if (multiParent) {
+      if (selectedPaths.length > 1) {
         const duplicateNames = duplicateMultiWorktreeChildNames(selectedPaths, lastRepoScan.get(ds.chatId));
         if (duplicateNames.length > 0) {
           return { toast: { type: 'error', content: t('card.repo.worktree_child_conflict', { names: duplicateNames.join(', ') }, locDs) } };
@@ -3422,9 +3277,65 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // Shared commit context for a resolved directory — funnels the dropdown,
   // worktree and manual-entry flows through the same module-level
   // commitRepoSelection (pin dir, then fork pending CLI or close+recreate).
-  const commitCtx = { ds: targetDs, rootId, cardMessageId, larkAppId, operatorOpenId, activeSessions, sessionReply };
+  const commitCtx = {
+    ds: targetDs,
+    rootId,
+    cardMessageId,
+    larkAppId,
+    operatorOpenId,
+    activeSessions,
+    sessionReply,
+    submitPendingRepoCompletion: deps.submitPendingRepoCompletion,
+  };
 
   if (isWorktreeOpen) {
+    if (targetDs.pendingRepo) {
+      if (targetDs.pendingRepoCommitInFlight) {
+        return {
+          toast: {
+            type: 'info',
+            content: t('cmd.repo.worktree_in_progress', undefined, locTarget),
+          },
+        };
+      }
+      const submit = deps.submitPendingRepoCompletion ?? submitCurrentPendingRepoCompletion;
+      const cardToWithdraw = cardMessageId ?? targetDs.repoCardMessageId;
+      const completion = submit({
+        ownerLarkAppId: targetDs.larkAppId,
+        activeSessions,
+        sessionId: targetDs.session.sessionId,
+        daemonSession: targetDs,
+        selection: {
+          kind: 'worktree',
+          repositories: selectedWorktreePaths.map(sourcePath => ({
+            sourcePath,
+            childName: worktreeChildNameForRepo(sourcePath, cached),
+          })),
+          ...(action?.value?.branch?.trim()
+            ? { branch: action.value.branch.trim() }
+            : {}),
+          layout: selectedWorktreePaths.length > 1
+            ? { kind: 'group', parentRoot: dirname(selectedWorktreePaths[0]!) }
+            : { kind: 'sibling' },
+        },
+      });
+      void completion.then(outcome => {
+        if (outcome.kind === 'applied' || outcome.kind === 'duplicate') {
+          deferRepoCardWithdraw(larkAppId, cardToWithdraw);
+        } else {
+          logger.warn(
+            `[${tag(targetDs)}] Pending repo worktree completion refused (${outcome.kind}): `
+            + `${'message' in outcome ? outcome.message : 'stale Session address'}`,
+          );
+        }
+      }).catch(error => {
+        logger.error(
+          `[${tag(targetDs)}] Pending repo worktree submit failed without legacy fallback: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
+      return { toast: { type: 'info', content: t('card.repo.toast_worktree_creating', undefined, locTarget) } };
+    }
     // Worktree creation involves a `git fetch` that can take many seconds —
     // ack the card action immediately with a toast and finish asynchronously.
     // On failure the card (and pendingRepo state) stays put so the user can

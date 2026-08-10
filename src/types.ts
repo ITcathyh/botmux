@@ -284,6 +284,14 @@ export interface Session {
   createdAt: string;
   /** Last user/bot/scheduler input that was routed into this session. */
   lastMessageAt?: string;
+  /** Latest ordinary-IM user preview committed by the Current metadata lane.
+   * Presentation evidence only: it is neither an executable input mailbox nor
+   * a worker-delivery receipt. `messageKey` makes an exact retry idempotent. */
+  lastInboundPreview?: {
+    messageKey: string;
+    content: string;
+    receivedAtMs: number;
+  };
   closedAt?: string;
   /**
    * Restore/runtime ownership quarantine. Set when botmux cannot prove that an
@@ -836,6 +844,9 @@ export interface QueuedActivationTailEntry {
 export interface PendingRepoSetup {
   mode: 'picker' | 'auto_worktree';
   prompt: string;
+  /** Exact opening accepted before repository staging. Completion must consume
+   * this payload verbatim instead of attempting to reconstruct rich context. */
+  cliInput?: CliTurnPayload;
   rawInput?: string;
   turnId?: string;
   baseDir?: string;

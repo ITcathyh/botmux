@@ -34,6 +34,37 @@ export interface CreateRepoWorktreeOptions {
   worktreePath?: string;
 }
 
+/**
+ * Creation stopped before `git worktree add` was invoked, so no linked
+ * worktree can have been created by this attempt. Callers may safely treat
+ * this narrow failure as a refusal; every error at/after the add boundary
+ * remains untyped because its side-effect outcome may be unknown.
+ */
+export class RepoWorktreePreAddRefusal extends Error {
+  readonly phase = 'preAdd' as const;
+
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'RepoWorktreePreAddRefusal';
+  }
+}
+
+function preAddRefusalMessage(error: unknown): string {
+  try {
+    if (error instanceof Error && typeof error.message === 'string' && error.message.length > 0) {
+      return error.message;
+    }
+  } catch {
+    // Fall through to a side-effect-free best effort for hostile thrown values.
+  }
+  try {
+    const rendered = String(error);
+    return rendered || 'worktree creation refused before git worktree add';
+  } catch {
+    return 'worktree creation refused before git worktree add';
+  }
+}
+
 async function git(args: string[], cwd: string, timeoutMs = 10_000): Promise<string> {
   try {
     const { stdout } = await execFileP('git', args, { cwd, timeout: timeoutMs, encoding: 'utf-8' });
@@ -131,9 +162,10 @@ async function resolveMainWorktree(dir: string): Promise<string> {
  * The base ref is fetched first so the worktree starts from the remote's
  * latest state; fetch failure degrades to the local (possibly stale) ref.
  */
-export async function createRepoWorktree(
+async function createRepoWorktreeAttempt(
   repoPath: string,
-  opts: CreateRepoWorktreeOptions = {},
+  opts: CreateRepoWorktreeOptions,
+  markWorktreeAddStarted: () => void,
 ): Promise<WorktreeCreation> {
   const startDir = resolve(repoPath);
   await git(['rev-parse', '--git-dir'], startDir); // not a repo → throw early
@@ -218,6 +250,7 @@ export async function createRepoWorktree(
   if (await localBranchExists(repo, branch)) {
     // Existing branch: check it out as-is (git rejects it if the branch is
     // already checked out in another worktree — surface that error verbatim).
+    markWorktreeAddStarted();
     await git(['worktree', 'add', wtPath, branch], repo, 60_000);
     logger.info(`[git-worktree] created ${wtPath} on existing branch ${branch}`);
     return { path: wtPath, branch, baseRef: branch };
@@ -232,15 +265,32 @@ export async function createRepoWorktree(
 
     const remoteRef = `origin/${branch}`;
     if (await remoteBranchExists(repo, branch)) {
+      markWorktreeAddStarted();
       await git(['worktree', 'add', '-b', branch, '--track', wtPath, remoteRef], repo, 60_000);
       logger.info(`[git-worktree] created ${wtPath} tracking ${remoteRef}`);
       return { path: wtPath, branch, baseRef: remoteRef };
     }
   }
 
+  markWorktreeAddStarted();
   await git(['worktree', 'add', '-b', branch, wtPath, baseRef], repo, 60_000);
   logger.info(`[git-worktree] created ${wtPath} (branch ${branch} from ${baseRef})`);
   return { path: wtPath, branch, baseRef };
+}
+
+export async function createRepoWorktree(
+  repoPath: string,
+  opts: CreateRepoWorktreeOptions = {},
+): Promise<WorktreeCreation> {
+  let worktreeAddStarted = false;
+  try {
+    return await createRepoWorktreeAttempt(repoPath, opts, () => {
+      worktreeAddStarted = true;
+    });
+  } catch (error) {
+    if (worktreeAddStarted) throw error;
+    throw new RepoWorktreePreAddRefusal(preAddRefusalMessage(error), { cause: error });
+  }
 }
 
 /**

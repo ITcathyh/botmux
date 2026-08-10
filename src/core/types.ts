@@ -94,6 +94,10 @@ export interface DaemonSession {
    *  separate from worktreeCreating because plain select, skip, and /repo can
    *  also await prompt context before the fork. */
   pendingRepoCommitInFlight?: boolean;
+  /** Opaque generation of the exact pending-repo completion claim. The boolean
+   *  is only a coarse admission flag; release/settlement must match this token
+   *  so an older attempt cannot clear a newer same-object claim (ABA). */
+  pendingRepoCommitClaimToken?: string;
   /** A fresh live-route owner has been published but its opening input has not
    * reached the first fork yet. Same-anchor turns must buffer into the opening
    * input instead of reforking worker:null and overtaking it. In-memory only. */
@@ -556,15 +560,37 @@ export function storedSessionAnchorId(
     ?? (session.scope === 'chat' ? session.chatId : session.rootMessageId);
 }
 
+/** Resolve the authoritative activeSessions anchor. Dedicated VC receivers
+ * share a visible chat route but own an isolated Current routing slot. */
+export function activeSessionAnchorId(ds: DaemonSession): string {
+  return ds.session.vcMeetingReceiver
+    ? `vc-receiver:${ds.session.sessionId}`
+    : sessionAnchorId(ds);
+}
+
+/** Persisted equivalent of {@link activeSessionAnchorId}. */
+export function storedActiveSessionAnchorId(
+  session: Pick<
+    Session,
+    | 'sessionId'
+    | 'scope'
+    | 'chatId'
+    | 'rootMessageId'
+    | 'deferredScheduleRun'
+    | 'vcMeetingReceiver'
+  >,
+): string {
+  return session.vcMeetingReceiver
+    ? `vc-receiver:${session.sessionId}`
+    : storedSessionAnchorId(session);
+}
+
 /** Storage key for the daemon-owned activeSessions map. A VC receiver is a
  * dedicated conversation even though its visible output route is a chat, so
  * key it by its immutable session id instead of collapsing it into the normal
  * `(chatId, appId)` chat-scope slot. */
 export function activeSessionKey(ds: DaemonSession): string {
-  const anchor = ds.session.vcMeetingReceiver
-    ? `vc-receiver:${ds.session.sessionId}`
-    : sessionAnchorId(ds);
-  return sessionKey(anchor, ds.larkAppId);
+  return sessionKey(activeSessionAnchorId(ds), ds.larkAppId);
 }
 
 /** A session whose only IM surface is a Feishu document comment thread.

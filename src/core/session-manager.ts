@@ -826,9 +826,9 @@ export function ensureSessionWhiteboard(ds: DaemonSession): void {
   }
 }
 
-function renderWhiteboardBlock(opts?: { whiteboardId?: string }): string {
-  if (!whiteboardEnabled() || !opts?.whiteboardId) return '';
-  const meta = getWhiteboard(opts.whiteboardId);
+export function snapshotWhiteboardPromptBlock(whiteboardId?: string): string {
+  if (!whiteboardEnabled() || !whiteboardId) return '';
+  const meta = getWhiteboard(whiteboardId);
   if (!meta || meta.archived) return '';
   const id = xmlEscape(meta.id);
   return [
@@ -840,6 +840,15 @@ function renderWhiteboardBlock(opts?: { whiteboardId?: string }): string {
     '不要直接读写本地文件；不要写密钥/隐私；用户可见结论仍必须 `botmux send`。',
     '</whiteboard>',
   ].join('\n');
+}
+
+function resolveWhiteboardPromptBlock(
+  opts?: { whiteboardId?: string; whiteboardBlock?: string },
+): string {
+  if (opts && Object.prototype.hasOwnProperty.call(opts, 'whiteboardBlock')) {
+    return opts.whiteboardBlock ?? '';
+  }
+  return snapshotWhiteboardPromptBlock(opts?.whiteboardId);
 }
 
 function renderSummaryMemoryBlock(larkAppId: string | undefined): string {
@@ -955,7 +964,7 @@ export function buildNewTopicPrompt(
   botIdentity?: { name?: string; openId?: string },
   locale?: Locale,
   sender?: ResolvedSender,
-  opts?: { larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger; chatContext?: ChatContext },
+  opts?: { larkAppId?: string; chatId?: string; whiteboardId?: string; whiteboardBlock?: string; substituteTrigger?: SubstituteTrigger; chatContext?: ChatContext },
 ): string {
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
   // Non-Claude CLIs receive the botmux routing hints inline via the prompt
@@ -1001,7 +1010,7 @@ export function buildNewTopicPrompt(
   }
 
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
-  const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts?.whiteboardId });
+  const whiteboardBlock = resolveWhiteboardPromptBlock(opts);
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId);
   const chatContextPolicyBlock = renderChatContextPolicyBlock(opts?.chatContext, locale);
   const chatContextBlock = renderChatContextBlock(opts?.chatContext);
@@ -1085,6 +1094,7 @@ export function buildNewTopicCliInput(
     larkAppId?: string;
     chatId?: string;
     whiteboardId?: string;
+    whiteboardBlock?: string;
     substituteTrigger?: SubstituteTrigger;
     codexAppText?: string;
     codexAppApplicationContext?: string;
@@ -1102,7 +1112,7 @@ export function buildNewTopicCliInput(
   // clean input when the caller also preserved their matching raw texts.
   if (cliId !== 'codex-app' || (followUps && followUps.length > 0 && !opts?.codexAppFollowUps)) return { content };
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
-  const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts?.whiteboardId });
+  const whiteboardBlock = resolveWhiteboardPromptBlock(opts);
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId);
   const senderBlock = renderSenderTag(sender);
   const substitutePolicyBlock = renderSubstitutePolicy(opts?.substituteTrigger);
@@ -1142,11 +1152,11 @@ export function buildNewTopicCliInput(
 export function buildFollowUpContent(
   content: string,
   sessionId: string,
-  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger; codexAppText?: string; codexAppApplicationContext?: string; codexAppMessageContext?: string },
+  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string; whiteboardBlock?: string; substituteTrigger?: SubstituteTrigger; codexAppText?: string; codexAppApplicationContext?: string; codexAppMessageContext?: string },
 ): string {
   const parts: string[] = [];
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId, { followUp: true });
-  const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts?.whiteboardId });
+  const whiteboardBlock = resolveWhiteboardPromptBlock(opts);
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId);
   const skipSessionId = opts?.isAdoptMode || (opts?.cliId
     ? createCliAdapterSync(opts.cliId, opts.cliPathOverride).injectsSessionContext
@@ -1198,12 +1208,12 @@ export function buildFollowUpContent(
 export function buildFollowUpCliInput(
   content: string,
   sessionId: string,
-  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger; codexAppText?: string; codexAppApplicationContext?: string; codexAppMessageContext?: string },
+  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string; whiteboardBlock?: string; substituteTrigger?: SubstituteTrigger; codexAppText?: string; codexAppApplicationContext?: string; codexAppMessageContext?: string },
 ): CliTurnPayload {
   const legacyContent = buildFollowUpContent(content, sessionId, opts);
   if (opts?.cliId !== 'codex-app' || opts.isAdoptMode) return { content: legacyContent };
   const roleBlock = renderRoleContextBlock(opts.larkAppId, opts.chatId, { followUp: true });
-  const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts.whiteboardId });
+  const whiteboardBlock = resolveWhiteboardPromptBlock(opts);
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts.larkAppId);
   const senderBlock = renderSenderTag(opts.sender);
   const substitutePolicyBlock = renderSubstitutePolicy(opts.substituteTrigger);

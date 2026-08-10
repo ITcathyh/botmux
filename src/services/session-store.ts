@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { withFileLockSync } from '../utils/file-lock.js';
@@ -277,6 +278,67 @@ export function getSessionForOwnerStrict(
   return withFileLockSync(fp, () => (
     readCurrentSessionStoreSourceStrict(fp, ownerLarkAppId).parsed[sessionId]
   ));
+}
+
+export type ProvisionalSessionRollbackResult =
+  | { readonly kind: 'rolledBack' }
+  | { readonly kind: 'unknown'; readonly message: string };
+
+/**
+ * Delete one exact, still-uncommitted opening row from its owner file.
+ * Mismatch is unknown rather than success: callers must never remove a row
+ * that may have acquired newer Session authority.
+ */
+export function rollbackProvisionalSessionForOwnerStrict(
+  ownerLarkAppId: string,
+  expected: Session,
+): ProvisionalSessionRollbackResult {
+  const fp = join(config.session.dataDir, `sessions-${ownerLarkAppId}.json`);
+  mkdirSync(dirname(fp), { recursive: true });
+  try {
+    const result = withFileLockSync(fp, () => {
+      const source = readCurrentSessionStoreSourceStrict(fp, ownerLarkAppId);
+      const durable = source.parsed[expected.sessionId];
+      if (!durable) return { kind: 'rolledBack' as const };
+      if (expected.status !== 'active'
+          || expected.initialUserTurnPending !== true
+          || !isDeepStrictEqual(durable, JSON.parse(JSON.stringify(expected)))) {
+        return {
+          kind: 'unknown' as const,
+          message: 'provisional Session rollback lost its exact durable opening',
+        };
+      }
+      delete source.parsed[expected.sessionId];
+      const json = JSON.stringify(source.parsed, null, 2);
+      const tmpFp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
+      try {
+        writeFileSync(tmpFp, json, 'utf-8');
+        renameSync(tmpFp, fp);
+      } finally {
+        try { unlinkSync(tmpFp); } catch { /* rename or cleanup already removed it */ }
+      }
+      const readback = readCurrentSessionStoreSourceStrict(fp, ownerLarkAppId);
+      return readback.parsed[expected.sessionId]
+        ? {
+            kind: 'unknown' as const,
+            message: 'provisional Session rollback could not prove durable deletion',
+          }
+        : { kind: 'rolledBack' as const };
+    });
+    if (result.kind === 'rolledBack'
+        && loaded
+        && currentAppId === ownerLarkAppId) {
+      sessions.delete(expected.sessionId);
+    }
+    return result;
+  } catch (error) {
+    return {
+      kind: 'unknown',
+      message: `provisional Session rollback outcome is unknown: ${error instanceof Error
+        ? error.message
+        : String(error)}`,
+    };
+  }
 }
 
 // Legacy fields from the removed「处理中」placeholder-card PATCH delivery. They

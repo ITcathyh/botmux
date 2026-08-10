@@ -327,10 +327,12 @@ export const messages: Record<string, string> = {
   'card.repo.riff_worktree_push_failed': '⚠️ Failed to push branch `{branch}` to origin: {error}\nThe riff sandbox will use the default branch (push manually and retry).',
   'cmd.repo.worktree_created': '🌿 Worktree created: `{path}`\nBranch `{branch}`, based on `{base}`',
   'cmd.repo.worktree_failed': '❌ Worktree creation failed: {error}',
+  'cmd.repo.worktree_create_unknown': '⚠️ The worktree creation outcome is uncertain: {error}\nWait for session recovery before retrying.',
   'cmd.repo.worktree_in_progress': '⏳ A worktree is already being created — please wait…',
   'cmd.repo.card_already_consumed': '✅ Repo already selected — please ignore the old card',
   'cmd.repo.worktree_created_not_switched': '🌿 Worktree created: `{path}` (branch `{branch}`), but the session changed meanwhile — not switched automatically. Use `/repo {path}` to open it.',
   'cmd.repo.worktree_switch_failed': '⚠️ Worktree created at `{path}`, but switching to it failed: {error}\nUse `/repo {path}` to open it manually.',
+  'cmd.repo.worktree_switch_unknown': '⚠️ The session start outcome for worktree `{path}` is uncertain: {error}\nWait for session recovery; do not retry yet.',
   'cmd.repo.switch_close_failed': '⚠️ Could not safely close the current session; repository was not switched: {error}',
   // Used when 「default-directory-only」mode has「auto-create worktree」on, at new
   // session start (shared by interactive new topic / dashboard create / webhook).

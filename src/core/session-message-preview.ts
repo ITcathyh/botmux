@@ -143,6 +143,26 @@ function numberOrUndefined(value: unknown): number | undefined {
   return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
+function currentInboundPreview(
+  session: Session,
+): { content: string; receivedAtMs: number } | undefined {
+  const preview = session.lastInboundPreview;
+  if (
+    !preview
+    || typeof preview.messageKey !== 'string'
+    || preview.messageKey.length === 0
+    || typeof preview.content !== 'string'
+    || !Number.isFinite(preview.receivedAtMs)
+    || preview.receivedAtMs <= 0
+  ) {
+    return undefined;
+  }
+  return {
+    content: preview.content,
+    receivedAtMs: preview.receivedAtMs,
+  };
+}
+
 function sessionActivityAt(session: Session): number | undefined {
   const value = session.lastMessageAt ?? session.createdAt;
   if (!value) return undefined;
@@ -158,9 +178,10 @@ function safeJsonlKey(value: unknown): string | undefined {
 /**
  * Build the latest user/bot exchange shown on dashboard session cards.
  *
- * User text comes from the local inbound queue (with persisted lastUserPrompt
- * as a fallback). Bot text comes from the append-only turn-sends marker written
- * by `botmux send`. Both reads are bounded and best-effort so a corrupt marker
+ * User text comes from the newest of the Current metadata observation and the
+ * legacy local inbound queue (with persisted lastUserPrompt as a fallback).
+ * Bot text comes from the append-only turn-sends marker written by `botmux
+ * send`. File reads are bounded and best-effort so corrupt presentation data
  * cannot break `/api/sessions`.
  */
 export function buildSessionMessagePreview(session: Session): SessionMessagePreview {
@@ -189,13 +210,22 @@ export function buildSessionMessagePreview(session: Session): SessionMessagePrev
       )
     : undefined;
 
+  const legacyUserAt = numberOrUndefined(latestUser?.createTime);
+  const currentUser = currentInboundPreview(session);
+  const currentUserIsNewest = currentUser
+    && (!latestUser || legacyUserAt === undefined || currentUser.receivedAtMs >= legacyUserAt);
+  const selectedUser = currentUserIsNewest
+    ? { content: currentUser.content, receivedAtMs: currentUser.receivedAtMs }
+    : latestUser
+      ? { content: latestUser.content, receivedAtMs: legacyUserAt }
+      : undefined;
   const userFullText = compactMultiline(
-    latestUser?.content ?? session.lastUserPrompt ?? '',
+    selectedUser?.content ?? session.lastUserPrompt ?? '',
     FULL_PREVIEW_LENGTH,
   );
   const botFullText = compactMultiline(latestBot?.previewText ?? '', FULL_PREVIEW_LENGTH);
   const previewUserAt = userFullText
-    ? (numberOrUndefined(latestUser?.createTime) ?? sessionActivityAt(session))
+    ? (selectedUser?.receivedAtMs ?? sessionActivityAt(session))
     : undefined;
   const previewBotAt = numberOrUndefined(latestBot?.sentAtMs);
 

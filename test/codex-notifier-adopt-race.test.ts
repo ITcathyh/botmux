@@ -212,6 +212,8 @@ describe('P2 · clear actually removes what the predicate flagged', () => {
   it('the launch-window fields the predicate now covers are all cleared', () => {
     const ds = makeDs({
       pendingRepo: false,
+      pendingRepoCommitInFlight: true,
+      pendingRepoCommitClaimToken: 'claim-retired-by-notifier-adopt',
       pendingRawInput: '/status',
       pendingFollowUpInput: { userPrompt: 'go', cliInput: 'wrapped go' },
       pendingPrompt: 'hi',
@@ -223,6 +225,8 @@ describe('P2 · clear actually removes what the predicate flagged', () => {
     expect(ds.pendingRawInput).toBeUndefined();
     expect(ds.pendingFollowUpInput).toBeUndefined();
     expect(ds.pendingRepo).toBe(false);
+    expect(ds.pendingRepoCommitInFlight).toBe(false);
+    expect(ds.pendingRepoCommitClaimToken).toBeUndefined();
   });
 });
 

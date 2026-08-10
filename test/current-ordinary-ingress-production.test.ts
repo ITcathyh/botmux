@@ -66,7 +66,7 @@ function turn(messageKey: string): OrdinaryImTransportEnvelope {
     mentions: [],
     postParticipantMentions: [],
     resources: [],
-    messageListener: false,
+    foldedForwardContext: false,
     vc: { contextMayLag: false },
   };
 }

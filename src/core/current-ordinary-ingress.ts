@@ -25,8 +25,8 @@ import {
   releaseInitialUserTurn,
 } from './initial-user-turn.js';
 import {
+  activeSessionAnchorId,
   activeSessionKey,
-  sessionAnchorId,
   sessionKey,
   type DaemonSession,
 } from './types.js';
@@ -84,10 +84,19 @@ export interface CurrentOrdinaryIngressCommandAdapter {
   apply(command: CurrentOrdinaryIngressCommand): CurrentOrdinaryIngressCommandResult;
 }
 
+export interface CurrentOrdinaryIngressPreMaterializationModule {
+  /** Runs in the Session lane; it must not await or retain Current authority. */
+  apply(
+    current: DaemonSession,
+    input: CurrentOrdinaryIngressMaterializeInput,
+  ): { readonly kind: 'ready' } | { readonly kind: 'unknown'; readonly message: string };
+}
+
 export interface CurrentOrdinaryIngressOptions {
   readonly ownerLarkAppId: string;
   readonly activeSessions: ReadonlyMap<string, DaemonSession>;
   readonly turnPreparation: CurrentOrdinaryImTurnPreparationPort;
+  readonly preMaterialization?: CurrentOrdinaryIngressPreMaterializationModule;
   readonly externalEffects: CurrentOrdinaryIngressExternalEffectExecutor;
   readonly commands: CurrentOrdinaryIngressCommandAdapter;
 }
@@ -140,7 +149,7 @@ function routeMatches(
   return ds.scope === turn.route.scope
     && ds.chatId === turn.route.chatId
     && ds.chatType === turn.route.chatType
-    && sessionAnchorId(ds) === turn.route.canonicalAnchor;
+    && activeSessionAnchorId(ds) === turn.route.canonicalAnchor;
 }
 
 /**
@@ -227,7 +236,9 @@ function classify(ds: DaemonSession): CurrentOrdinaryIngressCommandKind {
 }
 
 function canOwnOpening(kind: CurrentOrdinaryIngressCommandKind): boolean {
-  return kind === 'sendLive' || kind === 'startColdReplacement';
+  return kind === 'sendLive'
+    || kind === 'startColdReplacement'
+    || kind === 'parkPendingRepoFollower';
 }
 
 function isObject(value: unknown): value is Record<PropertyKey, unknown> {
@@ -390,6 +401,52 @@ export function createCurrentOrdinaryIngressPort(
       sessionId: resolved.stamp.sessionId,
       turn: prepared.turn,
     });
+    if (options.preMaterialization) {
+      let preparation: ReturnType<CurrentOrdinaryIngressPreMaterializationModule['apply']>;
+      try {
+        preparation = options.preMaterialization.apply(current, input);
+      } catch (error) {
+        return {
+          kind: 'unknown',
+          message: `ordinary ingress Current preparation failed: ${error instanceof Error
+            ? error.message
+            : String(error)}`,
+        };
+      }
+      if (isObject(preparation)) {
+        let then: unknown;
+        try {
+          then = (preparation as { readonly then?: unknown }).then;
+        } catch {
+          return {
+            kind: 'unknown',
+            message: 'ordinary ingress Current preparation returned an unreadable result',
+          };
+        }
+        if (typeof then === 'function') {
+          try { void Promise.resolve(preparation).catch(() => undefined); }
+          catch { /* outcome remains unknown */ }
+          return {
+            kind: 'unknown',
+            message: 'ordinary ingress Current preparation must return synchronously',
+          };
+        }
+      }
+      if (!preparation || preparation.kind !== 'ready') {
+        return {
+          kind: 'unknown',
+          message: preparation && preparation.kind === 'unknown'
+            ? preparation.message
+            : 'ordinary ingress Current preparation returned an invalid result',
+        };
+      }
+      if (!resolveCurrent(resolved.stamp, prepared.turn)) {
+        return {
+          kind: 'unknown',
+          message: 'Current Session identity changed during ordinary ingress Current preparation',
+        };
+      }
+    }
     const arrival = reserveArrival(resolved.stamp);
     const intent = frozenToken();
     const continuation = frozenToken();

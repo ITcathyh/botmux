@@ -7,6 +7,8 @@
  * current JSON/journal adapters remain behind the injected ports.
  */
 
+import { types as nodeUtilTypes } from 'node:util';
+
 import { computeInputHash } from '../utils/canonical-input-hash.js';
 import type { ExternalTriggerBusinessInput } from './external-trigger-envelope.js';
 import {
@@ -225,6 +227,63 @@ export interface OrdinaryIngressPort {
   ): OrdinaryIngressTransitionResult;
 }
 
+export type PendingRepoCompletionSelection =
+  | {
+      readonly kind: 'directory';
+      readonly path: string;
+      readonly pinWorkingDir: boolean;
+      readonly riffRepoDirs?: readonly string[];
+    }
+  | {
+      readonly kind: 'worktree';
+      /** Ordered source repositories and their detached display/layout names. */
+      readonly repositories: readonly {
+        readonly sourcePath: string;
+        readonly childName: string;
+      }[];
+      readonly branch?: string;
+      readonly layout:
+        | { readonly kind: 'sibling' }
+        | { readonly kind: 'group'; readonly parentRoot: string };
+    }
+  | {
+      /** Bot-default auto-worktree policy, including its proven fallback path. */
+      readonly kind: 'autoWorktree';
+      readonly baseDir: string;
+    };
+
+export interface PendingRepoCompletionInput {
+  /** Transport-neutral selection; card/text/automatic callers compile to this. */
+  readonly selection: PendingRepoCompletionSelection;
+}
+
+export type PendingRepoCompletionTransitionResult =
+  | { readonly kind: 'committed' }
+  | {
+      readonly kind: 'rejected';
+      readonly reason: 'selectionBusy' | 'notPendingRepo';
+      readonly message: string;
+    }
+  | { readonly kind: 'retryable'; readonly message: string }
+  | { readonly kind: 'unknown'; readonly message: string }
+  | { readonly kind: 'staleAddress' }
+  | { readonly kind: 'effect'; readonly intent: unknown; readonly continuation: unknown };
+
+export type PendingRepoCompletionEffectSettlement = OrdinaryIngressEffectSettlement;
+
+/** Current staged port; external worktree/roster effects execute outside the Session lane. */
+export interface PendingRepoCompletionPort {
+  begin(input: {
+    readonly sessionId: string;
+    readonly selection: PendingRepoCompletionSelection;
+  }): PendingRepoCompletionTransitionResult;
+  execute(intent: unknown): Promise<unknown>;
+  resume(
+    continuation: unknown,
+    settlement: PendingRepoCompletionEffectSettlement,
+  ): PendingRepoCompletionTransitionResult;
+}
+
 export type ExecutorBindingObservation =
   | {
       kind: 'current';
@@ -261,6 +320,11 @@ export type OrdinaryIngressCommand = {
   input: OrdinaryIngressInput;
 };
 
+export type PendingRepoCompletionCommand = {
+  kind: 'pendingRepo.complete';
+  input: PendingRepoCompletionInput;
+};
+
 export interface ControlRenameInput {
   title: string;
   updatedAt: string;
@@ -286,6 +350,7 @@ export type ExecutorInputCommittedCommand = {
 export type SessionCommand =
   | KeyedTriggerCommand
   | OrdinaryIngressCommand
+  | PendingRepoCompletionCommand
   | ControlRenameCommand
   | ExecutorInputCommittedCommand;
 
@@ -357,6 +422,29 @@ export type OrdinaryIngressCommandOutcome =
   | { kind: 'staleAddress' }
   | { kind: 'notWired'; command: 'ordinary.ingress'; message: string }
   | { kind: 'retryable'; message: string }
+  | { kind: 'quarantined'; message: string };
+
+export type PendingRepoCompletionCommandOutcome =
+  | {
+      kind: 'applied';
+      action: 'pendingRepo.firstStartCommitted';
+      sessionId: string;
+    }
+  | {
+      kind: 'duplicate';
+      state: 'inFlight' | 'committed';
+      sessionId: string;
+      message: string;
+    }
+  | {
+      kind: 'rejected';
+      reason: 'idempotencyConflict' | 'invalidCommand' | 'selectionBusy' | 'notPendingRepo';
+      message: string;
+    }
+  | { kind: 'staleAddress' }
+  | { kind: 'notWired'; command: 'pendingRepo.complete'; message: string }
+  | { kind: 'retryable'; message: string }
+  | { kind: 'ambiguous'; message: string }
   | { kind: 'quarantined'; message: string };
 
 export type ControlRenameCommandOutcome =
@@ -435,6 +523,7 @@ export type ExecutorInputCommittedCommandOutcome =
 export type CommandOutcome =
   | KeyedTriggerCommandOutcome
   | OrdinaryIngressCommandOutcome
+  | PendingRepoCompletionCommandOutcome
   | ControlRenameCommandOutcome
   | ExecutorInputCommittedCommandOutcome;
 
@@ -443,6 +532,8 @@ export type CommandOutcomeFor<C extends SessionCommand> =
     ? KeyedTriggerCommandOutcome
     : C extends OrdinaryIngressCommand
       ? OrdinaryIngressCommandOutcome
+      : C extends PendingRepoCompletionCommand
+        ? PendingRepoCompletionCommandOutcome
       : C extends ControlRenameCommand
         ? ControlRenameCommandOutcome
         : C extends ExecutorInputCommittedCommand
@@ -635,6 +726,12 @@ export function createSessionRuntimeHost(options: {
   keyedTriggers: KeyedTriggerAuthority;
   keyedTriggerTurns: KeyedTriggerTurnPort;
   ordinaryIngress?: OrdinaryIngressPort;
+  pendingRepoCompletion?: PendingRepoCompletionPort;
+  /** Owner/epoch-stable optional ports used by a composition Host upgrade. */
+  portBindings?: {
+    ordinaryIngress?: OrdinaryIngressPort;
+    pendingRepoCompletion?: PendingRepoCompletionPort;
+  };
   sessionStore?: SessionStore;
   executorObservations?: ExecutorObservationPort;
   dispatchInputCommits?: DispatchInputCommitEvidencePort;
@@ -643,6 +740,17 @@ export function createSessionRuntimeHost(options: {
   /** Maps a Host-local Session id to its opaque owner-scoped lane address. */
   sessionLaneAddress?: (sessionId: string) => SessionLaneAddress;
 }): { runtime: SessionRuntime; projection: SessionProjection } {
+  if (options.portBindings
+      && (options.ordinaryIngress !== undefined
+        || options.pendingRepoCompletion !== undefined)) {
+    throw new Error('SessionRuntime optional ports must use direct options or one binding slot');
+  }
+  const ordinaryIngressPort = (): OrdinaryIngressPort | undefined => (
+    options.portBindings?.ordinaryIngress ?? options.ordinaryIngress
+  );
+  const pendingRepoCompletionPort = (): PendingRepoCompletionPort | undefined => (
+    options.portBindings?.pendingRepoCompletion ?? options.pendingRepoCompletion
+  );
   if (!!options.commandLane !== !!options.sessionLaneAddress) {
     throw new Error('SessionRuntime requires both command lane and lane address resolver');
   }
@@ -683,6 +791,16 @@ export function createSessionRuntimeHost(options: {
         message: string;
       };
   const ordinaryInputs = new Map<string, OrdinaryInputRecord>();
+  interface PendingRepoAttempt {
+    readonly terminal: Promise<PendingRepoCompletionCommandOutcome>;
+    settle(outcome: PendingRepoCompletionCommandOutcome): void;
+  }
+  type PendingRepoRecord =
+    | { requestHash: string; state: 'received'; attempt: PendingRepoAttempt }
+    | { requestHash: string; state: 'committed' }
+    | { requestHash: string; state: 'unknown'; message: string };
+  const pendingRepoCompletions = new Map<string, PendingRepoRecord>();
+  const activePendingRepoCompletion = new Map<string, string>();
   const controlCommands = new Map<string, {
     requestHash: string;
     sessionId: string;
@@ -694,7 +812,7 @@ export function createSessionRuntimeHost(options: {
     executor: ExecutorAddress;
   }>();
   const sessionCommandIdentities = new Map<string, {
-    kind: OrdinaryIngressCommand['kind'] | ControlRenameCommand['kind'] | ExecutorInputCommittedCommand['kind'];
+    kind: OrdinaryIngressCommand['kind'] | PendingRepoCompletionCommand['kind'] | ControlRenameCommand['kind'] | ExecutorInputCommittedCommand['kind'];
     requestHash: string;
   }>();
   const scopedCommandKey = (sessionId: string, idempotencyKey: string): string => (
@@ -705,6 +823,22 @@ export function createSessionRuntimeHost(options: {
     let resolveTerminal!: (outcome: OrdinaryIngressCommandOutcome) => void;
     let settled = false;
     const terminal = new Promise<OrdinaryIngressCommandOutcome>((resolve) => {
+      resolveTerminal = resolve;
+    });
+    return {
+      terminal,
+      settle(outcome) {
+        if (settled) return;
+        settled = true;
+        resolveTerminal(outcome);
+      },
+    };
+  };
+
+  const createPendingRepoAttempt = (): PendingRepoAttempt => {
+    let resolveTerminal!: (outcome: PendingRepoCompletionCommandOutcome) => void;
+    let settled = false;
+    const terminal = new Promise<PendingRepoCompletionCommandOutcome>((resolve) => {
       resolveTerminal = resolve;
     });
     return {
@@ -730,6 +864,148 @@ export function createSessionRuntimeHost(options: {
     && left.canonicalAnchor === right.canonicalAnchor
     && left.chatId === right.chatId
     && left.chatType === right.chatType;
+  type ExactRecord = ReadonlyMap<string, unknown>;
+  const inspectExactRecord = (
+    value: unknown,
+    expectedKeys: readonly string[],
+    optionalKeys: readonly string[] = [],
+  ): ExactRecord | undefined => {
+    if (!value || typeof value !== 'object' || nodeUtilTypes.isProxy(value)) return undefined;
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) return undefined;
+    const allowed = new Set([...expectedKeys, ...optionalKeys]);
+    const keys = Reflect.ownKeys(value);
+    if (keys.some(key => typeof key !== 'string' || !allowed.has(key))) return undefined;
+    if (expectedKeys.some(key => !keys.includes(key))) return undefined;
+    const fields = new Map<string, unknown>();
+    for (const key of keys) {
+      if (typeof key !== 'string') return undefined;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) return undefined;
+      fields.set(key, descriptor.value);
+    }
+    return fields;
+  };
+  const inspectExactArray = (value: unknown): readonly unknown[] | undefined => {
+    if (!Array.isArray(value)
+      || nodeUtilTypes.isProxy(value)
+      || Object.getPrototypeOf(value) !== Array.prototype) {
+      return undefined;
+    }
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+    if (!lengthDescriptor
+      || !('value' in lengthDescriptor)
+      || !Number.isSafeInteger(lengthDescriptor.value)
+      || lengthDescriptor.value < 0) {
+      return undefined;
+    }
+    const length = lengthDescriptor.value as number;
+    const keys = Reflect.ownKeys(value);
+    if (keys.length !== length + 1 || !keys.includes('length')) return undefined;
+    const items: unknown[] = [];
+    for (let index = 0; index < length; index += 1) {
+      const key = String(index);
+      if (!keys.includes(key)) return undefined;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) return undefined;
+      items.push(descriptor.value);
+    }
+    return items;
+  };
+  const nonemptyString = (value: unknown): value is string => (
+    typeof value === 'string' && value.length > 0
+  );
+  const normalizePendingRepoSelection = (
+    candidate: unknown,
+  ): PendingRepoCompletionSelection | undefined => {
+    try {
+      const discriminator = inspectExactRecord(candidate, ['kind'], [
+        'path',
+        'pinWorkingDir',
+        'riffRepoDirs',
+        'repositories',
+        'branch',
+        'layout',
+        'baseDir',
+      ]);
+      const kind = discriminator?.get('kind');
+      if (kind === 'directory') {
+        const record = inspectExactRecord(
+          candidate,
+          ['kind', 'path', 'pinWorkingDir'],
+          ['riffRepoDirs'],
+        );
+        const path = record?.get('path');
+        const pinWorkingDir = record?.get('pinWorkingDir');
+        if (!record || !nonemptyString(path) || typeof pinWorkingDir !== 'boolean') {
+          return undefined;
+        }
+        const rawRiffRepoDirs = record.get('riffRepoDirs');
+        let riffRepoDirs: readonly string[] | undefined;
+        if (rawRiffRepoDirs !== undefined) {
+          const values = inspectExactArray(rawRiffRepoDirs);
+          if (!values || values.some(value => !nonemptyString(value))) return undefined;
+          riffRepoDirs = Object.freeze([...values] as string[]);
+        }
+        return Object.freeze({
+          kind,
+          path,
+          pinWorkingDir,
+          ...(riffRepoDirs ? { riffRepoDirs } : {}),
+        });
+      }
+      if (kind === 'autoWorktree') {
+        const record = inspectExactRecord(candidate, ['kind', 'baseDir']);
+        const baseDir = record?.get('baseDir');
+        if (!record || !nonemptyString(baseDir)) return undefined;
+        return Object.freeze({ kind, baseDir });
+      }
+      if (kind !== 'worktree') return undefined;
+      const record = inspectExactRecord(
+        candidate,
+        ['kind', 'repositories', 'layout'],
+        ['branch'],
+      );
+      if (!record) return undefined;
+      const rawRepositories = inspectExactArray(record.get('repositories'));
+      if (!rawRepositories || rawRepositories.length === 0) return undefined;
+      const repositories: Array<{ readonly sourcePath: string; readonly childName: string }> = [];
+      for (const rawRepository of rawRepositories) {
+        const repository = inspectExactRecord(rawRepository, ['sourcePath', 'childName']);
+        const sourcePath = repository?.get('sourcePath');
+        const childName = repository?.get('childName');
+        if (!repository || !nonemptyString(sourcePath) || !nonemptyString(childName)) {
+          return undefined;
+        }
+        repositories.push(Object.freeze({ sourcePath, childName }));
+      }
+      const rawLayout = record.get('layout');
+      const layoutDiscriminator = inspectExactRecord(rawLayout, ['kind'], ['parentRoot']);
+      const layoutKind = layoutDiscriminator?.get('kind');
+      let layout: Extract<PendingRepoCompletionSelection, { readonly kind: 'worktree' }>['layout'];
+      if (layoutKind === 'sibling') {
+        if (!inspectExactRecord(rawLayout, ['kind'])) return undefined;
+        layout = Object.freeze({ kind: layoutKind });
+      } else if (layoutKind === 'group') {
+        const group = inspectExactRecord(rawLayout, ['kind', 'parentRoot']);
+        const parentRoot = group?.get('parentRoot');
+        if (!group || !nonemptyString(parentRoot)) return undefined;
+        layout = Object.freeze({ kind: layoutKind, parentRoot });
+      } else {
+        return undefined;
+      }
+      const branch = record.get('branch');
+      if (branch !== undefined && !nonemptyString(branch)) return undefined;
+      return Object.freeze({
+        kind,
+        repositories: Object.freeze(repositories),
+        ...(branch === undefined ? {} : { branch }),
+        layout,
+      });
+    } catch {
+      return undefined;
+    }
+  };
 
   const addressFor = (row: SessionDirectoryRow): SessionAddress => {
     const existing = addresses.get(row.key);
@@ -789,9 +1065,20 @@ export function createSessionRuntimeHost(options: {
     readonly continuation: unknown;
   }
 
+  interface PendingRepoEffectStep {
+    readonly kind: 'pendingRepoEffect';
+    readonly sessionId: string;
+    readonly completionKey: string;
+    readonly requestHash: string;
+    readonly attempt: PendingRepoAttempt;
+    readonly intent: unknown;
+    readonly continuation: unknown;
+  }
+
   type CriticalResult =
     | { kind: 'outcome'; outcome: CommandOutcome }
     | OrdinaryEffectStep
+    | PendingRepoEffectStep
     | {
         kind: 'ordinaryJoin';
         sessionId: string;
@@ -803,6 +1090,11 @@ export function createSessionRuntimeHost(options: {
         ordinaryKey: string;
         attempt: OrdinaryAttempt;
         outcome: Extract<OrdinaryIngressCommandOutcome, { kind: 'retryable' }>;
+      }
+    | {
+        kind: 'pendingRepoJoin';
+        sessionId: string;
+        attempt: PendingRepoAttempt;
       }
     | {
         kind: 'failClose';
@@ -923,6 +1215,100 @@ export function createSessionRuntimeHost(options: {
       return quarantineOrdinaryAttempt(
         step,
         `ordinary ingress transition could not be inspected: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  };
+
+  const settlePendingRepoTransition = (
+    step: Pick<PendingRepoEffectStep, 'sessionId' | 'completionKey' | 'requestHash' | 'attempt'>,
+    transition: Exclude<PendingRepoCompletionTransitionResult, { kind: 'effect' }>,
+  ): CriticalResult => {
+    let terminal: PendingRepoCompletionCommandOutcome;
+    if (transition.kind === 'committed') {
+      pendingRepoCompletions.set(step.completionKey, {
+        requestHash: step.requestHash,
+        state: 'committed',
+      });
+      terminal = {
+        kind: 'applied',
+        action: 'pendingRepo.firstStartCommitted',
+        sessionId: step.sessionId,
+      };
+    } else if (transition.kind === 'rejected') {
+      pendingRepoCompletions.delete(step.completionKey);
+      sessionCommandIdentities.delete(step.completionKey);
+      terminal = {
+        kind: 'rejected',
+        reason: transition.reason,
+        message: transition.message,
+      };
+    } else if (transition.kind === 'retryable') {
+      pendingRepoCompletions.delete(step.completionKey);
+      sessionCommandIdentities.delete(step.completionKey);
+      terminal = transition;
+    } else if (transition.kind === 'staleAddress') {
+      pendingRepoCompletions.delete(step.completionKey);
+      terminal = transition;
+    } else {
+      pendingRepoCompletions.set(step.completionKey, {
+        requestHash: step.requestHash,
+        state: 'unknown',
+        message: transition.message,
+      });
+      terminal = { kind: 'ambiguous', message: transition.message };
+    }
+    if (activePendingRepoCompletion.get(step.sessionId) === step.completionKey) {
+      activePendingRepoCompletion.delete(step.sessionId);
+    }
+    step.attempt.settle(terminal);
+    return outcome(terminal);
+  };
+
+  const quarantinePendingRepoAttempt = (
+    step: Pick<PendingRepoEffectStep, 'sessionId' | 'completionKey' | 'requestHash' | 'attempt'>,
+    message: string,
+  ): CriticalResult => {
+    pendingRepoCompletions.set(step.completionKey, {
+      requestHash: step.requestHash,
+      state: 'unknown',
+      message,
+    });
+    if (activePendingRepoCompletion.get(step.sessionId) === step.completionKey) {
+      activePendingRepoCompletion.delete(step.sessionId);
+    }
+    const terminal: PendingRepoCompletionCommandOutcome = { kind: 'quarantined', message };
+    step.attempt.settle(terminal);
+    return outcome(terminal);
+  };
+
+  const transitionPendingRepoAttempt = (
+    step: Pick<PendingRepoEffectStep, 'sessionId' | 'completionKey' | 'requestHash' | 'attempt'>,
+    transition: PendingRepoCompletionTransitionResult,
+  ): CriticalResult => {
+    try {
+      if (!transition || typeof transition !== 'object') {
+        return quarantinePendingRepoAttempt(step, 'pending-repo completion transition is invalid');
+      }
+      if (transition.kind === 'effect') {
+        return {
+          ...step,
+          kind: 'pendingRepoEffect',
+          intent: transition.intent,
+          continuation: transition.continuation,
+        };
+      }
+      if (transition.kind === 'committed'
+        || transition.kind === 'staleAddress'
+        || transition.kind === 'retryable'
+        || transition.kind === 'unknown'
+        || transition.kind === 'rejected') {
+        return settlePendingRepoTransition(step, transition);
+      }
+      return quarantinePendingRepoAttempt(step, 'pending-repo completion transition is invalid');
+    } catch (error) {
+      return quarantinePendingRepoAttempt(
+        step,
+        `pending-repo completion transition could not be inspected: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
   };
@@ -1516,6 +1902,113 @@ export function createSessionRuntimeHost(options: {
         message: applied.message,
       });
     }
+    if (request.command.kind === 'pendingRepo.complete') {
+      if (request.target.kind !== 'session') {
+        return outcome({
+          kind: 'rejected',
+          reason: 'invalidCommand',
+          message: 'pending-repo completion requires an address resolved by this SessionRuntime epoch',
+        });
+      }
+      const selection = normalizePendingRepoSelection(request.command.input.selection);
+      if (!selection) {
+        return outcome({
+          kind: 'rejected',
+          reason: 'invalidCommand',
+          message: 'pending-repo completion selection is invalid',
+        });
+      }
+      const pendingRepoCompletion = pendingRepoCompletionPort();
+      if (!pendingRepoCompletion) {
+        return outcome({
+          kind: 'notWired',
+          command: 'pendingRepo.complete',
+          message: 'pending-repo completion is not connected to this Current SessionRuntime host',
+        });
+      }
+      const slot = addressSlots.get(request.target.address)!;
+      let requestHash: string;
+      try {
+        requestHash = computeInputHash(selection);
+      } catch (error) {
+        return outcome({
+          kind: 'rejected',
+          reason: 'invalidCommand',
+          message: `pending-repo completion selection is not canonicalizable: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
+      const completionKey = scopedCommandKey(slot.sessionId, request.idempotencyKey);
+      const prior = pendingRepoCompletions.get(completionKey);
+      if (prior) {
+        if (prior.requestHash !== requestHash) {
+          return outcome({
+            kind: 'rejected',
+            reason: 'idempotencyConflict',
+            message: 'idempotency key already used with a different pending-repo selection',
+          });
+        }
+        if (prior.state === 'received') {
+          return { kind: 'pendingRepoJoin', sessionId: slot.sessionId, attempt: prior.attempt };
+        }
+        if (prior.state === 'unknown') {
+          return outcome({ kind: 'ambiguous', message: prior.message });
+        }
+        return outcome({
+          kind: 'duplicate',
+          state: 'committed',
+          sessionId: slot.sessionId,
+          message: 'pending-repo first start was already committed in this runtime epoch',
+        });
+      }
+      const activeKey = activePendingRepoCompletion.get(slot.sessionId);
+      if (activeKey && activeKey !== completionKey) {
+        return outcome({
+          kind: 'rejected',
+          reason: 'selectionBusy',
+          message: 'another pending-repo selection is already being prepared',
+        });
+      }
+      const existingIdentity = sessionCommandIdentities.get(completionKey);
+      if (existingIdentity
+        && (existingIdentity.kind !== request.command.kind
+          || existingIdentity.requestHash !== requestHash)) {
+        return outcome({
+          kind: 'rejected',
+          reason: 'idempotencyConflict',
+          message: 'Session idempotency key already belongs to a different semantic command',
+        });
+      }
+      if (!existingIdentity) {
+        sessionCommandIdentities.set(completionKey, {
+          kind: request.command.kind,
+          requestHash,
+        });
+      }
+      const attempt = createPendingRepoAttempt();
+      pendingRepoCompletions.set(completionKey, {
+        requestHash,
+        state: 'received',
+        attempt,
+      });
+      activePendingRepoCompletion.set(slot.sessionId, completionKey);
+      const step = { sessionId: slot.sessionId, completionKey, requestHash, attempt };
+      let transition: PendingRepoCompletionTransitionResult;
+      try {
+        transition = invokeSynchronousPort(
+          'PendingRepoCompletionPort.begin',
+          () => pendingRepoCompletion.begin({
+            sessionId: slot.sessionId,
+            selection,
+          }),
+        );
+      } catch (error) {
+        return quarantinePendingRepoAttempt(
+          step,
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+      return transitionPendingRepoAttempt(step, transition);
+    }
     if (request.command.kind === 'ordinary.ingress') {
       if (request.target.kind !== 'session') {
         return outcome({
@@ -1549,7 +2042,8 @@ export function createSessionRuntimeHost(options: {
           message: 'ordinary ingress turn route does not match the target Session address',
         });
       }
-      if (!options.ordinaryIngress) {
+      const ordinaryIngress = ordinaryIngressPort();
+      if (!ordinaryIngress) {
         return outcome({
           kind: 'notWired',
           command: 'ordinary.ingress',
@@ -1617,7 +2111,7 @@ export function createSessionRuntimeHost(options: {
       try {
         transition = invokeSynchronousPort(
           'OrdinaryIngressPort.begin',
-          () => options.ordinaryIngress!.begin({
+          () => ordinaryIngress.begin({
             sessionId: slot.sessionId,
             turn: ordinaryTurn,
           }),
@@ -1793,11 +2287,18 @@ export function createSessionRuntimeHost(options: {
       step.attempt.settle(terminal);
       return outcome(terminal);
     }
+    const ordinaryIngress = ordinaryIngressPort();
+    if (!ordinaryIngress) {
+      return quarantineOrdinaryAttempt(
+        step,
+        'ordinary ingress port disappeared during an in-flight attempt',
+      );
+    }
     let transition: OrdinaryIngressTransitionResult;
     try {
       transition = invokeSynchronousPort(
         'OrdinaryIngressPort.resume',
-        () => options.ordinaryIngress!.resume(step.continuation, settlement),
+        () => ordinaryIngress.resume(step.continuation, settlement),
       );
     } catch (error) {
       return quarantineOrdinaryAttempt(
@@ -1813,11 +2314,18 @@ export function createSessionRuntimeHost(options: {
   ): Promise<OrdinaryIngressCommandOutcome> => {
     let step = initial;
     for (;;) {
+      const ordinaryIngress = ordinaryIngressPort();
+      if (!ordinaryIngress) {
+        return {
+          kind: 'quarantined',
+          message: 'ordinary ingress port disappeared during effect execution',
+        };
+      }
       let settlement: OrdinaryIngressEffectSettlement;
       try {
         settlement = {
           kind: 'returned',
-          value: await options.ordinaryIngress!.execute(step.intent),
+          value: await ordinaryIngress.execute(step.intent),
         };
       } catch (error) {
         settlement = { kind: 'threw', error };
@@ -1859,6 +2367,94 @@ export function createSessionRuntimeHost(options: {
     return terminal;
   };
 
+  const resumePendingRepoAttempt = (
+    step: PendingRepoEffectStep,
+    settlement: PendingRepoCompletionEffectSettlement,
+  ): CriticalResult => {
+    const current = pendingRepoCompletions.get(step.completionKey);
+    if (current?.state !== 'received' || current.attempt !== step.attempt) {
+      return quarantinePendingRepoAttempt(
+        step,
+        'pending-repo continuation no longer owns the Current attempt',
+      );
+    }
+    const pendingRepoCompletion = pendingRepoCompletionPort();
+    if (!pendingRepoCompletion) {
+      return quarantinePendingRepoAttempt(
+        step,
+        'pending-repo completion port disappeared during an in-flight attempt',
+      );
+    }
+    let transition: PendingRepoCompletionTransitionResult;
+    try {
+      transition = invokeSynchronousPort(
+        'PendingRepoCompletionPort.resume',
+        () => pendingRepoCompletion.resume(step.continuation, settlement),
+      );
+    } catch (error) {
+      return quarantinePendingRepoAttempt(
+        step,
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+    return transitionPendingRepoAttempt(step, transition);
+  };
+
+  const runPendingRepoEffects = async (
+    initial: PendingRepoEffectStep,
+  ): Promise<PendingRepoCompletionCommandOutcome> => {
+    let step = initial;
+    for (;;) {
+      const pendingRepoCompletion = pendingRepoCompletionPort();
+      if (!pendingRepoCompletion) {
+        return {
+          kind: 'quarantined',
+          message: 'pending-repo completion port disappeared during effect execution',
+        };
+      }
+      let settlement: PendingRepoCompletionEffectSettlement;
+      try {
+        settlement = {
+          kind: 'returned',
+          value: await pendingRepoCompletion.execute(step.intent),
+        };
+      } catch (error) {
+        settlement = { kind: 'threw', error };
+      }
+      const resumed = await commandLane.submit(
+        sessionLaneAddress(step.sessionId),
+        () => resumePendingRepoAttempt(step, settlement),
+      );
+      if (resumed.kind === 'pendingRepoEffect') {
+        step = resumed;
+        continue;
+      }
+      if (resumed.kind === 'outcome') {
+        return resumed.outcome as PendingRepoCompletionCommandOutcome;
+      }
+      return {
+        kind: 'quarantined',
+        message: 'pending-repo continuation produced an invalid Runtime transition',
+      };
+    }
+  };
+
+  const joinPendingRepoAttempt = async (
+    sessionId: string,
+    attempt: PendingRepoAttempt,
+  ): Promise<PendingRepoCompletionCommandOutcome> => {
+    const terminal = await attempt.terminal;
+    if (terminal.kind === 'applied') {
+      return {
+        kind: 'duplicate',
+        state: 'committed',
+        sessionId,
+        message: 'pending-repo completion joined the winning first start',
+      };
+    }
+    return terminal;
+  };
+
   const submit = async <C extends SessionCommand>(
     request: SessionCommandRequest<C>,
   ): Promise<CommandOutcomeFor<C>> => {
@@ -1881,8 +2477,14 @@ export function createSessionRuntimeHost(options: {
     if (result.kind === 'ordinaryEffect') {
       return await runOrdinaryEffects(result) as CommandOutcomeFor<C>;
     }
+    if (result.kind === 'pendingRepoEffect') {
+      return await runPendingRepoEffects(result) as CommandOutcomeFor<C>;
+    }
     if (result.kind === 'ordinaryJoin') {
       return await joinOrdinaryAttempt(result.sessionId, result.attempt) as CommandOutcomeFor<C>;
+    }
+    if (result.kind === 'pendingRepoJoin') {
+      return await joinPendingRepoAttempt(result.sessionId, result.attempt) as CommandOutcomeFor<C>;
     }
     if (result.kind === 'ordinaryRetryable') {
       await commandLane.submit(sessionLaneAddress(result.sessionId), () => {

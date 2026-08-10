@@ -86,7 +86,7 @@ function envelope(
     mentions: [],
     postParticipantMentions: [],
     resources: [],
-    messageListener: false,
+    foldedForwardContext: false,
     vc: { contextMayLag: false },
   };
 }

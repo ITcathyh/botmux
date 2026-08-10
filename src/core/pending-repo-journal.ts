@@ -4,7 +4,8 @@ import * as sessionStore from '../services/session-store.js';
 
 export function stagePendingRepoSetup(
   ds: DaemonSession,
-  args: Pick<PendingRepoSetup, 'mode'> & Partial<Pick<PendingRepoSetup, 'baseDir' | 'turnId'>>,
+  args: Pick<PendingRepoSetup, 'mode'>
+    & Partial<Pick<PendingRepoSetup, 'baseDir' | 'turnId' | 'cliInput'>>,
 ): void {
   const prior = {
     queued: ds.session.queued,
@@ -16,6 +17,7 @@ export function stagePendingRepoSetup(
   const setup: PendingRepoSetup = {
     mode: args.mode,
     prompt: ds.pendingPrompt ?? '',
+    ...(args.cliInput ? { cliInput: structuredClone(args.cliInput) } : {}),
     ...(ds.pendingRawInput ? { rawInput: ds.pendingRawInput } : {}),
     ...(args.turnId ? { turnId: args.turnId } : {}),
     ...(args.baseDir ? { baseDir: args.baseDir } : {}),

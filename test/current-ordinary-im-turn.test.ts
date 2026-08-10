@@ -32,7 +32,7 @@ function transportEnvelope(): OrdinaryImTransportEnvelope {
       resourceKey: 'img_resource_1',
       name: 'image.png',
     }],
-    messageListener: false,
+    foldedForwardContext: false,
     vc: { contextMayLag: false },
   };
 }
@@ -111,7 +111,15 @@ describe('Current ordinary IM turn preparation', () => {
         },
         disclosure: 'none',
       },
-      messageListener: true,
+      foldedForwardContext: false,
+      messageListener: {
+        prompt: 'Investigate the alert.',
+        messageText: 'disk pressure',
+        msgType: 'interactive',
+        senderType: 'bot',
+        replyCardTitle: 'Production alert',
+        workingDir: '/repos/alert-service',
+      },
       vc: { contextMayLag: true, lifecycle: 'sealed' },
     } as const satisfies OrdinaryImTransportEnvelope;
 
@@ -641,7 +649,7 @@ describe('Current ordinary IM turn preparation', () => {
       'mentions',
       'postParticipantMentions',
       'resources',
-      'messageListener',
+      'foldedForwardContext',
       'vc',
     ]);
     const serialized = JSON.stringify(result.turn);

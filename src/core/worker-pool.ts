@@ -15,6 +15,7 @@ import { cliSupportsNativeUsage } from '../services/transcript-resolver.js';
 import { cleanupTraexAskHooks, installHook } from '../adapters/hook-installer.js';
 import { hookCommandFor } from '../adapters/hook-command.js';
 import { randomBytes, randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { config } from '../config.js';
 import { readGlobalConfig } from '../global-config.js';
 import * as sessionStore from '../services/session-store.js';
@@ -5843,22 +5844,43 @@ export function sendWorkerInput(
   return true;
 }
 
-/** Promote the oldest durable activation successor into a fresh tokened
- * journal and (for Codex App) its single accepted-ledger owner in one store
- * update, then hand it to the current worker. The tail is never shifted merely
- * because ChildProcess.send returned: the promoted journal survives until the
- * adapter ACK carrying this token arrives. */
-export function promoteQueuedActivationTail(
+type QueuedActivationPromotionResult =
+  | { readonly kind: 'ready'; readonly head?: QueuedActivationTailEntry }
+  | { readonly kind: 'refused'; readonly message: string }
+  | { readonly kind: 'unknown'; readonly message: string };
+
+function cloneQueuedActivationTailEntry(
+  entry: QueuedActivationTailEntry,
+): QueuedActivationTailEntry {
+  return {
+    ...entry,
+    cliInput: {
+      ...entry.cliInput,
+      ...(entry.cliInput.codexAppInput
+        ? { codexAppInput: structuredClone(entry.cliInput.codexAppInput) }
+        : {}),
+    },
+  };
+}
+
+/** Typed authority behind tail promotion. A durable-write exception is
+ * response loss: retain the exact candidate mirror and quarantine it so no
+ * caller can roll it back, fork it, or retry it in this process. */
+function promoteQueuedActivationTailTyped(
   ds: DaemonSession,
   opts: { send?: boolean } = {},
-): boolean {
-  if (ds.session.queuedActivationPending) return true;
+): QueuedActivationPromotionResult {
+  if (ds.session.queuedActivationPending) {
+    return { kind: 'ready' };
+  }
   if (opts.send !== false
-    && (!ds.worker || ds.worker.killed)) return false;
+    && (!ds.worker || ds.worker.killed)) {
+    return { kind: 'refused', message: 'queued activation has no live worker' };
+  }
   const ordered = [...(ds.session.queuedActivationTail ?? [])]
     .sort((a, b) => a.order - b.order || a.id.localeCompare(b.id));
   const head = ordered[0];
-  if (!head) return false;
+  if (!head) return { kind: 'refused', message: 'queued activation tail has no head' };
 
   const priorJournal = snapshotQueuedActivationJournal(ds.session);
   const priorTail = ds.session.queuedActivationTail?.map(entry => ({
@@ -5872,6 +5894,7 @@ export function promoteQueuedActivationTail(
   }));
   const priorLedger = ds.session.codexAppDispatchLedger?.map(entry => ({ ...entry }));
   const priorPendingPrompt = ds.pendingPrompt;
+  const priorInitialStartPending = ds.initialStartPending;
   const token = randomUUID();
   const replyContext = frozenReplyContextForTurn(ds, head.turnId);
   // The tail entry crossed its admission boundary with the clean-input gate
@@ -5933,20 +5956,45 @@ export function promoteQueuedActivationTail(
       vcMeetingImTurnOrigin,
       { persist: false },
     );
-    sessionStore.updateSession(ds.session);
   } catch (err) {
     restoreQueuedActivationJournal(ds.session, priorJournal);
     ds.session.queuedActivationTail = priorTail;
     ds.session.codexAppDispatchLedger = priorLedger;
     ds.pendingPrompt = priorPendingPrompt;
+    ds.initialStartPending = priorInitialStartPending;
     logger.error(
       `[${tag(ds)}] Failed to atomically promote queued activation tail ${head.id}: `
       + `${err instanceof Error ? err.message : String(err)}`,
     );
-    return false;
+    return {
+      kind: 'refused',
+      message: `queued activation candidate could not be prepared: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    };
+  }
+  try {
+    sessionStore.updateSession(ds.session);
+  } catch (err) {
+    ds.quarantinedActivationTailPromotion = true;
+    if (opts.send !== false && ds.worker && !ds.worker.killed) {
+      try { ds.worker.kill(); } catch { /* recovery remains journal-authoritative */ }
+    }
+    logger.error(
+      `[${tag(ds)}] Durable outcome is unknown while promoting activation tail ${head.id}; `
+      + `retaining the exact candidate mirror: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return {
+      kind: 'unknown',
+      message: `queued activation promotion persistence outcome is unknown: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    };
   }
 
-  if (opts.send === false) return true;
+  if (opts.send === false) {
+    return { kind: 'ready', head: cloneQueuedActivationTailEntry(head) };
+  }
   try {
     ds.worker!.send({
       type: 'message',
@@ -5975,7 +6023,161 @@ export function promoteQueuedActivationTail(
     );
     try { ds.worker!.kill(); } catch { /* exit/error path will fence runtime */ }
   }
-  return true;
+  return { kind: 'ready', head: cloneQueuedActivationTailEntry(head) };
+}
+
+/** Promote the oldest durable activation successor into a fresh tokened
+ * journal and (for Codex App) its single accepted-ledger owner in one store
+ * update, then hand it to the current worker. False is fail-closed: the caller
+ * must not fork or retry, and an unknown durable outcome remains quarantined in
+ * the candidate mirror. */
+export function promoteQueuedActivationTail(
+  ds: DaemonSession,
+  opts: { send?: boolean } = {},
+): boolean {
+  return promoteQueuedActivationTailTyped(ds, opts).kind === 'ready';
+}
+
+export type PreparedQueuedActivationRecoveryFork =
+  | {
+      readonly kind: 'ready';
+      readonly source: 'promotedTail';
+      readonly promptInput: string | CliTurnPayload;
+      readonly resumeOrTurnId: {
+        readonly resume: boolean;
+        readonly turnId: string;
+        readonly dispatchAttempt?: number;
+      };
+      readonly logicalInput: {
+        readonly userPrompt: string;
+        readonly cliInput: CliTurnPayload;
+      };
+    }
+  | {
+      readonly kind: 'ready';
+      readonly source: 'existingJournal';
+      readonly promptInput: string | CliTurnPayload;
+      readonly resumeOrTurnId: {
+        readonly resume: boolean;
+        readonly turnId: string;
+        readonly dispatchAttempt?: number;
+      };
+    }
+  | { readonly kind: 'refused'; readonly message: string }
+  | { readonly kind: 'unknown'; readonly message: string };
+
+function queuedActivationAuthorityMatchesFresh(
+  candidate: Session,
+  fresh: Session,
+  requireCodexLedgerOwner: boolean,
+): boolean {
+  const authority = (session: Session) => ({
+    pending: session.queuedActivationPending,
+    token: session.queuedActivationToken,
+    input: session.queuedActivationInput,
+    turnId: session.queuedActivationTurnId,
+    dispatchAttempt: session.queuedActivationDispatchAttempt,
+    resume: session.queuedActivationResume,
+    tail: session.queuedActivationTail,
+  });
+  if (!isDeepStrictEqual(authority(fresh), authority(candidate))) return false;
+  if (!requireCodexLedgerOwner) return true;
+
+  const token = candidate.queuedActivationToken;
+  const candidateOwners = (candidate.codexAppDispatchLedger ?? [])
+    .filter(entry => entry.queuedActivationToken === token);
+  const freshOwners = (fresh.codexAppDispatchLedger ?? [])
+    .filter(entry => entry.queuedActivationToken === token);
+  return candidateOwners.length === 1
+    && freshOwners.length === 1
+    && isDeepStrictEqual(freshOwners[0], candidateOwners[0]);
+}
+
+/** Atomically promote a durable tail head and derive the one exact cold-fork
+ * recovery command. Unknown retains/quarantines the candidate and forbids a
+ * fork; ready is the only result that authorizes process I/O. */
+export function prepareQueuedActivationRecoveryFork(
+  ds: DaemonSession,
+): PreparedQueuedActivationRecoveryFork {
+  const alreadyJournaled = ds.session.queuedActivationPending === true;
+  const promoted = alreadyJournaled
+    ? undefined
+    : promoteQueuedActivationTailTyped(ds, { send: false });
+  if (promoted && promoted.kind !== 'ready') return promoted;
+  const head = promoted?.head;
+  const queuedInput = ds.session.queuedActivationInput;
+  const queuedToken = ds.session.queuedActivationToken;
+  const queuedTurnId = ds.session.queuedActivationTurnId;
+  if (!queuedInput
+    || typeof queuedInput.content !== 'string'
+    || typeof queuedToken !== 'string'
+    || queuedToken.length === 0
+    || typeof queuedTurnId !== 'string'
+    || queuedTurnId.length === 0
+    || (!alreadyJournaled && !head)) {
+    ds.quarantinedActivationTailPromotion = true;
+    return {
+      kind: 'unknown',
+      message: 'queued activation promotion produced an incomplete recovery journal',
+    };
+  }
+  try {
+    const recoverThroughCodexLedger =
+      (ds.session.cliId ?? getBot(ds.larkAppId).config.cliId) === 'codex-app';
+    const promptInput = recoverThroughCodexLedger ? '' : structuredClone(queuedInput);
+    const resumeOrTurnId = {
+      resume: ds.session.queuedActivationResume ?? ds.hasHistory,
+      turnId: queuedTurnId,
+      dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
+    };
+    if (alreadyJournaled) {
+      if (ds.quarantinedActivationTailPromotion) {
+        const fresh = sessionStore.getSessionFresh(ds.session.sessionId);
+        if (!fresh
+          || !queuedActivationAuthorityMatchesFresh(
+            ds.session,
+            fresh,
+            recoverThroughCodexLedger,
+          )) {
+          return {
+            kind: 'unknown',
+            message: 'queued activation recovery has no exact durable candidate proof',
+          };
+        }
+      }
+      return {
+        kind: 'ready',
+        source: 'existingJournal',
+        promptInput,
+        resumeOrTurnId,
+      };
+    }
+    if (!head) {
+      ds.quarantinedActivationTailPromotion = true;
+      return {
+        kind: 'unknown',
+        message: 'queued activation promotion lost its exact tail head',
+      };
+    }
+    return {
+      kind: 'ready',
+      source: 'promotedTail',
+      promptInput,
+      resumeOrTurnId,
+      logicalInput: {
+        userPrompt: head.userPrompt,
+        cliInput: structuredClone(head.cliInput),
+      },
+    };
+  } catch (err) {
+    ds.quarantinedActivationTailPromotion = true;
+    return {
+      kind: 'unknown',
+      message: `queued activation recovery plan is unreadable: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    };
+  }
 }
 
 export type QueuedActivationTailReservation = Pick<QueuedActivationTailEntry, 'id' | 'order'> & {
@@ -5990,7 +6192,15 @@ export type QueuedActivationTailReservation = Pick<QueuedActivationTailEntry, 'i
 export function reserveQueuedActivationTailAdmission(
   ds: DaemonSession,
 ): QueuedActivationTailReservation {
-  const order = (ds.session.queuedActivationTailNextOrder ?? 0) + 1;
+  // Restored/legacy rows may have a durable tail without the later-added
+  // next-order watermark. Derive the floor from both authorities so a newly
+  // admitted follower can never tie (and UUID-sort ahead of) an older head.
+  const tailOrderFloor = (ds.session.queuedActivationTail ?? [])
+    .reduce((floor, entry) => Math.max(floor, entry.order), 0);
+  const order = Math.max(
+    ds.session.queuedActivationTailNextOrder ?? 0,
+    tailOrderFloor,
+  ) + 1;
   ds.session.queuedActivationTailNextOrder = order;
   return {
     id: randomUUID(),
@@ -6114,27 +6324,20 @@ export function resolveQuarantinedForkPlan(
     );
     return { fork: false, promptInput, resumeOrTurnId };
   }
-  if (!promoteQueuedActivationTail(ds, { send: false })) {
+  const recovery = prepareQueuedActivationRecoveryFork(ds);
+  if (recovery.kind !== 'ready') {
     logger.warn(
       `[${tag(ds)}] Quarantined activation-tail promotion still failing at fork boundary; `
-      + `keeping worker:null quarantined owner (no fork) to avoid a live worker beside an unpromoted tail`,
+      + `keeping worker:null quarantined owner (no fork) to avoid a live worker beside an unpromoted tail: `
+      + recovery.message,
     );
     return { fork: false, promptInput, resumeOrTurnId };
   }
   ds.quarantinedActivationTailPromotion = undefined;
-  // Promotion succeeded: the old head is now the tokened queued activation. Fork
-  // THAT, exactly like the daemon's queuedActivation recovery — Codex App through
-  // its dispatch ledger (empty prompt), non-Codex by resubmitting the exact input.
-  const recoverThroughCodexLedger =
-    (ds.session.cliId ?? getBot(ds.larkAppId).config.cliId) === 'codex-app';
   return {
     fork: true,
-    promptInput: recoverThroughCodexLedger ? '' : (ds.session.queuedActivationInput ?? ''),
-    resumeOrTurnId: {
-      resume: ds.session.queuedActivationResume ?? ds.hasHistory,
-      turnId: ds.session.queuedActivationTurnId,
-      dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
-    },
+    promptInput: recovery.promptInput,
+    resumeOrTurnId: recovery.resumeOrTurnId,
   };
 }
 

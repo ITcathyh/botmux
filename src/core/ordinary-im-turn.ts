@@ -101,6 +101,24 @@ export interface OrdinaryImVcContext {
   readonly imTurnOrigin?: OrdinaryImVcTurnOrigin;
 }
 
+/**
+ * Detached listener match captured by the Lark router.  Presence carries the
+ * listener semantic; it is not reduced to an authorization boolean because
+ * opening policy and prompt rendering both consume the exact same snapshot.
+ */
+export interface OrdinaryImMessageListenerSnapshot {
+  readonly prompt: string;
+  readonly messageText: string;
+  readonly msgType: string;
+  readonly senderType: 'user' | 'bot';
+  readonly name?: string;
+  readonly replyCardTitle?: string;
+  readonly workingDir?: string;
+  readonly messageTitle?: string;
+  readonly senderOpenId?: string;
+  readonly senderName?: string;
+}
+
 /** State-neutral input already shaped by the IM transport Adapter. */
 export interface OrdinaryImTransportEnvelope {
   readonly route: OrdinaryImTurnRoute;
@@ -115,7 +133,9 @@ export interface OrdinaryImTransportEnvelope {
   readonly resources: readonly OrdinaryImResourceDescriptor[];
   readonly rewrite?: OrdinaryImWorkflowRewrite;
   readonly substitute?: OrdinaryImSubstituteSnapshot;
-  readonly messageListener: boolean;
+  /** True when this turn already folds a prior forwarded message into content. */
+  readonly foldedForwardContext: boolean;
+  readonly messageListener?: OrdinaryImMessageListenerSnapshot;
   readonly vc: OrdinaryImVcContext;
 }
 
@@ -133,7 +153,8 @@ export interface NormalizedOrdinaryImTurn {
   readonly resources: readonly NormalizedOrdinaryImResourceDescriptor[];
   readonly rewrite?: OrdinaryImWorkflowRewrite;
   readonly substitute?: NormalizedOrdinaryImSubstituteSnapshot;
-  readonly messageListener: boolean;
+  readonly foldedForwardContext: boolean;
+  readonly messageListener?: OrdinaryImMessageListenerSnapshot;
   readonly vc: OrdinaryImVcContext;
 }
 
@@ -510,6 +531,65 @@ function normalizeVc(value: unknown, envelopeMessageKey: string): OrdinaryImVcCo
   });
 }
 
+function normalizeMessageListener(value: unknown): OrdinaryImMessageListenerSnapshot {
+  const listener = requireRecord(
+    value,
+    'ordinary IM message-listener snapshot',
+    ['prompt', 'messageText', 'msgType', 'senderType'],
+    [
+      'name',
+      'replyCardTitle',
+      'workingDir',
+      'messageTitle',
+      'senderOpenId',
+      'senderName',
+    ],
+  );
+  if (listener.senderType !== 'user' && listener.senderType !== 'bot') {
+    throw new NormalizationError(
+      'invalidEnvelope',
+      'ordinary IM message-listener snapshot.senderType is invalid',
+    );
+  }
+  const optionalText = (key: string): string | undefined => (
+    listener[key] === undefined
+      ? undefined
+      : text(listener[key], `ordinary IM message-listener snapshot.${key}`)
+  );
+  return Object.freeze({
+    prompt: text(listener.prompt, 'ordinary IM message-listener snapshot.prompt'),
+    messageText: text(
+      listener.messageText,
+      'ordinary IM message-listener snapshot.messageText',
+    ),
+    msgType: text(listener.msgType, 'ordinary IM message-listener snapshot.msgType', {
+      empty: false,
+    }),
+    senderType: listener.senderType,
+    ...(optionalText('name') === undefined ? {} : { name: optionalText('name') }),
+    ...(optionalText('replyCardTitle') === undefined
+      ? {}
+      : { replyCardTitle: optionalText('replyCardTitle') }),
+    ...(optionalText('workingDir') === undefined
+      ? {}
+      : { workingDir: optionalText('workingDir') }),
+    ...(optionalText('messageTitle') === undefined
+      ? {}
+      : { messageTitle: optionalText('messageTitle') }),
+    ...(listener.senderOpenId === undefined
+      ? {}
+      : {
+          senderOpenId: optionalIdentity(
+            listener.senderOpenId,
+            'ordinary IM message-listener snapshot.senderOpenId',
+          ),
+        }),
+    ...(optionalText('senderName') === undefined
+      ? {}
+      : { senderName: optionalText('senderName') }),
+  });
+}
+
 function normalizeList<T>(
   value: unknown,
   label: string,
@@ -571,21 +651,22 @@ export function normalizeOrdinaryImTurn(
       'mentions',
       'postParticipantMentions',
       'resources',
-      'messageListener',
+      'foldedForwardContext',
       'vc',
     ], [
       'quotedMessageKey',
       'replyRootMessageKey',
       'rewrite',
       'substitute',
+      'messageListener',
     ]);
     if (envelope.source !== 'lark.im') {
       throw new NormalizationError('invalidEnvelope', 'ordinary IM source is invalid');
     }
-    if (typeof envelope.messageListener !== 'boolean') {
+    if (typeof envelope.foldedForwardContext !== 'boolean') {
       throw new NormalizationError(
         'invalidEnvelope',
-        'ordinary IM messageListener must be a boolean',
+        'ordinary IM foldedForwardContext must be a boolean',
       );
     }
 
@@ -626,7 +707,10 @@ export function normalizeOrdinaryImTurn(
       ...(envelope.substitute === undefined
         ? {}
         : { substitute: normalizeSubstitute(envelope.substitute) }),
-      messageListener: envelope.messageListener,
+      foldedForwardContext: envelope.foldedForwardContext,
+      ...(envelope.messageListener === undefined
+        ? {}
+        : { messageListener: normalizeMessageListener(envelope.messageListener) }),
       vc: normalizeVc(envelope.vc, messageKey),
     });
     return Object.freeze({ kind: 'normalized', turn });

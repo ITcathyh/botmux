@@ -186,27 +186,43 @@ describe('SessionRuntime coverage ledger', () => {
       ordinaryEffectRunnerFunction: 'runOrdinaryEffects',
       ordinaryResumeFunction: 'resumeOrdinaryAttempt',
       synchronousPortGuardFunction: 'invokeSynchronousPort',
-      ordinaryFakeAdapterSource: 'src/core/current-ordinary-ingress.ts',
-      ordinaryFakeAdapterFactory: 'createCurrentOrdinaryIngressPort',
-      ordinaryProductionWired: false,
-      ordinaryUnwiredProductionProof: {
-        sourceFile: 'src/daemon.ts',
-        forbiddenImports: [
-          './core/current-session-runtime.js',
-          './core/current-ordinary-ingress.js',
-        ],
-        forbiddenCalls: [
-          'currentSessionRuntimeHost',
-          'createCurrentOrdinaryIngressPort',
-        ],
-        forbiddenOption: 'ordinaryIngress',
-      },
+      ordinaryPolicySource: 'src/core/current-ordinary-ingress.ts',
+      ordinaryPolicyFactory: 'createCurrentOrdinaryIngressPort',
+      ordinaryProductionWired: true,
     });
     expect(ordinary).toMatchObject({
       targetMilestone: 'C1',
-      disposition: 'remaining',
+      disposition: 'migrated',
     });
-    expect(ordinary.productionBinding).toBeUndefined();
+    expect(ordinary.productionBinding).toMatchObject({
+      daemonSource: 'src/daemon.ts',
+      daemonHostFactory: 'currentDaemonSessionRuntimeHost',
+      currentRuntimeSource: 'src/core/current-session-runtime.ts',
+      currentRuntimeFactory: 'currentSessionRuntimeHost',
+      ingressDaemonSource: 'src/im/lark/current-ordinary-ingress-daemon.ts',
+      ingressDaemonFactory: 'createCurrentOrdinaryIngressDaemonPort',
+      ingressLarkSource: 'src/im/lark/current-ordinary-ingress-production.ts',
+      ingressLarkFactory: 'createLarkCurrentOrdinaryIngressProductionPort',
+      ingressCoreSource: 'src/core/current-ordinary-ingress-production.ts',
+      ingressCoreFactory: 'createCurrentOrdinaryIngressProductionPort',
+      routeOpeningSource: 'src/core/current-ordinary-route-opening-production.ts',
+      routeOpeningFactory: 'createCurrentOrdinaryRouteOpeningProduction',
+      routeRegistrySource: 'src/core/current-ordinary-route-registry.ts',
+      routeRegistryFactory: 'createCurrentOrdinaryRouteRegistryRuntime',
+      pendingRepoSubmitSource: 'src/core/current-pending-repo-completion-submit.ts',
+      pendingRepoPortFactory: 'currentPendingRepoCompletionPort',
+      pendingRepoSubmitFunction: 'submitCurrentPendingRepoCompletion',
+      pendingRepoProductionSource: 'src/core/current-pending-repo-completion-production.ts',
+      pendingRepoProductionFactory: 'createCurrentPendingRepoCompletionProduction',
+      pendingRepoDispatchFunction: 'dispatchWorker',
+      ordinaryQueuedActivationRecoveryFunction: 'apply',
+      queuedActivationRecoveryFunction: 'prepareQueuedActivationRecoveryFork',
+    });
+    expect(ordinary.rawPublisherSelectors).toEqual([{
+      sourceFile: 'src/services/session-store.ts',
+      enclosingFunctions: ['rollbackProvisionalSessionForOwnerStrict'],
+      authorityIds: ['current-session-row'],
+    }]);
     expect(() => auditSessionRuntimeCoverage({ ledger })).not.toThrow();
   });
 
@@ -232,45 +248,155 @@ describe('SessionRuntime coverage ledger', () => {
       .toThrow(/synchronousPortGuardFunction must be invokeSynchronousPort/i);
   });
 
-  it('rejects claiming the fake ordinary Current port as production-wired', () => {
+  it('rejects deleting the ordinary Current production-wiring claim', () => {
     const ledger = cloneLedger();
     const lane = ledger.coverage.find((entry: any) => entry.id === 'per-session-command-lane');
-    lane.productionBinding.ordinaryProductionWired = true;
+    lane.productionBinding.ordinaryProductionWired = false;
 
     expect(() => auditSessionRuntimeCoverage({ ledger }))
-      .toThrow(/ordinaryProductionWired.*false|ordinary.*must remain unwired/i);
+      .toThrow(/ordinaryProductionWired.*true|ordinary.*must remain production-wired/i);
   });
 
   it.each([
     {
-      label: 'production source',
-      remove: (proof: Record<string, any>) => { delete proof.sourceFile; },
+      label: 'stable daemon Host',
+      field: 'daemonHostFactory',
     },
     {
-      label: 'forbidden production imports',
-      remove: (proof: Record<string, any>) => {
-        proof.forbiddenImports = (proof.forbiddenImports ?? []).slice(0, -1);
-      },
+      label: 'full ingress port',
+      field: 'ingressDaemonFactory',
     },
     {
-      label: 'forbidden production factories',
-      remove: (proof: Record<string, any>) => {
-        proof.forbiddenCalls = (proof.forbiddenCalls ?? []).slice(0, -1);
-      },
+      label: 'route-opening port',
+      field: 'routeOpeningFactory',
     },
     {
-      label: 'forbidden ordinary port injection',
-      remove: (proof: Record<string, any>) => { delete proof.forbiddenOption; },
+      label: 'pending first-start submit',
+      field: 'pendingRepoSubmitFunction',
     },
-  ])('rejects deleting the false ordinary-wiring proof for $label', ({ remove }) => {
+    {
+      label: 'pending first-start dispatch',
+      field: 'pendingRepoDispatchFunction',
+    },
+    {
+      label: 'ordinary queued-activation recovery',
+      field: 'ordinaryQueuedActivationRecoveryFunction',
+    },
+  ])('rejects deleting the ordinary production proof for $label', ({ field }) => {
     const ledger = cloneLedger();
-    const lane = ledger.coverage.find((entry: any) => entry.id === 'per-session-command-lane');
-    const proof = lane.productionBinding.ordinaryUnwiredProductionProof ?? {};
-    remove(proof);
-    lane.productionBinding.ordinaryUnwiredProductionProof = proof;
+    const ordinary = ledger.coverage.find((entry: any) => entry.id === 'ordinary-im');
+    delete ordinary.productionBinding[field];
 
     expect(() => auditSessionRuntimeCoverage({ ledger }))
-      .toThrow(/ordinaryUnwiredProductionProof|ordinary production.*unwired/i);
+      .toThrow(new RegExp(`ordinary-im\\.productionBinding\\.${field}`, 'i'));
+  });
+
+  it.each([
+    {
+      sourceFile: 'src/core/current-ordinary-ingress-production.ts',
+      enclosingFunction: 'apply',
+    },
+    {
+      sourceFile: 'src/core/current-pending-repo-completion-production.ts',
+      enclosingFunction: 'dispatchWorker',
+    },
+    {
+      sourceFile: 'src/core/current-pending-repo-completion.ts',
+      enclosingFunction: 'clearExactPendingClaim',
+    },
+    {
+      sourceFile: 'src/core/current-pending-repo-completion.ts',
+      enclosingFunction: 'rollbackProvenWorkerRefusalCandidate',
+    },
+  ])(
+    'rejects deleting exact ordinary Current authority $sourceFile#$enclosingFunction',
+    ({ sourceFile, enclosingFunction }) => {
+      const ledger = cloneLedger();
+      const ordinary = ledger.coverage.find((entry: any) => entry.id === 'ordinary-im');
+      const selector = ordinary.selectors.find((candidate: any) => (
+        candidate.sourceFile === sourceFile
+        && candidate.enclosingFunctions?.includes(enclosingFunction)
+      ));
+      if (selector.enclosingFunctions.length === 1) {
+        ordinary.selectors = ordinary.selectors.filter(
+          (candidate: any) => candidate !== selector,
+        );
+      } else {
+        selector.enclosingFunctions = selector.enclosingFunctions
+          .filter((name: string) => name !== enclosingFunction);
+      }
+
+      expect(() => auditSessionRuntimeCoverage({ ledger }))
+        .toThrow(/ordinary-im selectors.*exact Current authority partition/i);
+    },
+  );
+
+  it.each([
+    'prepareQueuedActivationRecoveryFork',
+    'promoteQueuedActivationTailTyped',
+  ])('keeps A4 tail authority in its exact typed selector: %s', (enclosingFunction) => {
+    const ledger = cloneLedger();
+    const activation = ledger.coverage.find((entry: any) => entry.id === 'activation-restore');
+    const selector = activation.selectors.find((candidate: any) => (
+      candidate.sourceFile === 'src/core/worker-pool.ts'
+      && candidate.enclosingFunctions?.includes(enclosingFunction)
+    ));
+    selector.enclosingFunctions = selector.enclosingFunctions
+      .filter((name: string) => name !== enclosingFunction);
+
+    expect(() => auditSessionRuntimeCoverage({ ledger }))
+      .toThrow(/activation-restore.*exact typed tail authority selector/i);
+  });
+
+  it('rejects deleting an existing/route one-submit caller proof', () => {
+    const ledger = cloneLedger();
+    const ordinary = ledger.coverage.find((entry: any) => entry.id === 'ordinary-im');
+    ordinary.productionBinding.ordinaryCallers = ordinary.productionBinding.ordinaryCallers
+      .filter((caller: any) => caller.enclosingFunction !== 'handleThreadReplyAdmitted');
+
+    expect(() => auditSessionRuntimeCoverage({ ledger }))
+      .toThrow(/ordinaryCallers.*handleThreadReplyAdmitted|every ordinary caller/i);
+  });
+
+  it('rejects deleting a pending first-start caller cut', () => {
+    const ledger = cloneLedger();
+    const ordinary = ledger.coverage.find((entry: any) => entry.id === 'ordinary-im');
+    ordinary.productionBinding.pendingRepoCallerCuts = ordinary.productionBinding.pendingRepoCallerCuts
+      .filter((caller: any) => caller.enclosingFunction !== 'handleCardAction');
+
+    expect(() => auditSessionRuntimeCoverage({ ledger }))
+      .toThrow(/pendingRepoCallerCuts.*handleCardAction|every pending-repo first-start caller/i);
+  });
+
+  it('rejects deleting the legacy ordinary-tail regression fence', () => {
+    const ledger = cloneLedger();
+    const ordinary = ledger.coverage.find((entry: any) => entry.id === 'ordinary-im');
+    ordinary.productionBinding.forbiddenLegacyIdentifiers = [];
+
+    expect(() => auditSessionRuntimeCoverage({ ledger }))
+      .toThrow(/forbiddenLegacyIdentifiers.*(exact legacy|must not be empty)|legacy ordinary/i);
+  });
+
+  it('keeps ordinary migrated selectors exact and mid-session repo in C2', () => {
+    const ledger = cloneLedger();
+    const ordinary = ledger.coverage.find((entry: any) => entry.id === 'ordinary-im');
+    const control = ledger.coverage.find((entry: any) => entry.id === 'control');
+
+    expect(ordinary.selectors.every((selector: any) => (
+      selector.accessLanes?.length === 1
+      && selector.accessLanes[0] === 'session-runtime-current-adapter'
+    ))).toBe(true);
+    expect(ordinary.selectors.some((selector: any) => (
+      selector.sourceFile === 'src/daemon.ts'
+      && selector.enclosingFunctions?.some((name: string) => (
+        name === 'handleThreadReplyAdmitted'
+        || name === 'runCurrentOrdinaryOpeningPostCommit'
+      ))
+    ))).toBe(false);
+    expect(control.selectors.some((selector: any) => (
+      selector.sourceFile === 'src/im/lark/card-handler.ts'
+      && selector.enclosingFunctions?.includes('commitRepoSelection')
+    ))).toBe(true);
   });
 
   it('rejects deleting the shared Current lane composition seam', () => {
@@ -291,9 +417,12 @@ describe('SessionRuntime coverage ledger', () => {
       .toThrow(/reportCallCount.*exact report routes/i);
   });
 
-  it('keeps keyed route fail-close and long lifecycle work as named remainders', () => {
+  it('keeps keyed fail-close and long lifecycle work as named A4 remainders', () => {
     const ledger = cloneLedger();
     const lane = ledger.coverage.find((entry: any) => entry.id === 'per-session-command-lane');
+    expect(lane.productionBinding.deferredPaths.every(
+      (path: any) => path.targetMilestone === 'A4',
+    )).toBe(true);
     lane.productionBinding.deferredPaths = lane.productionBinding.deferredPaths
       .filter((path: any) => path.id !== 'keyed-route-admission-and-fail-close');
 

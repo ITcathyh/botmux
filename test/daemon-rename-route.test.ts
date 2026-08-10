@@ -65,6 +65,11 @@ const mocks = vi.hoisted(() => {
       return session;
     }),
     updateSession: vi.fn((session: any) => { sessions.set(session.sessionId, session); }),
+    getSessionFresh: vi.fn(),
+    getSessionForOwnerStrict: vi.fn((_ownerLarkAppId: string, sessionId: string) => (
+      sessions.get(sessionId)
+    )),
+    listSessionsForOwnerStrict: vi.fn(() => [...sessions.values()]),
     getSession: vi.fn((sessionId: string) => sessions.get(sessionId)),
     closeSession: vi.fn((sessionId: string) => {
       const session = sessions.get(sessionId);
@@ -112,6 +117,9 @@ vi.mock('../src/services/session-store.js', async () => {
     ...actual,
     createSession: mocks.createSession,
     updateSession: mocks.updateSession,
+    getSessionFresh: mocks.getSessionFresh,
+    getSessionForOwnerStrict: mocks.getSessionForOwnerStrict,
+    listSessionsForOwnerStrict: mocks.listSessionsForOwnerStrict,
     getSession: mocks.getSession,
     closeSession: mocks.closeSession,
   };
@@ -469,6 +477,12 @@ function resetRouteTestState(): void {
   mocks.sendMessage.mockResolvedValue('om_top');
   mocks.getChatMode.mockResolvedValue('group');
   mocks.getChatNameAndMode.mockResolvedValue({ name: null, mode: 'group' });
+  mocks.sessions.clear();
+  mocks.getSessionFresh.mockReturnValue(undefined);
+  mocks.forkWorker.mockImplementation((ds: any) => {
+    ds.worker = { killed: false, send: vi.fn() };
+    return true;
+  });
   activeSessions.clear();
   rmSync(crossRefPath(), { force: true });
   rmSync(botsConfigPath(), { force: true });
@@ -492,8 +506,10 @@ describe('/rename production routing — must not pre-create a session (review P
     mocks.getChatMode.mockResolvedValue('group');
     mocks.getChatNameAndMode.mockResolvedValue({ name: null, mode: 'group' });
     mocks.sessions.clear();
+    mocks.getSessionFresh.mockReturnValue(undefined);
     mocks.forkWorker.mockImplementation((ds: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      return true;
     });
     mocks.scanMultipleProjects.mockReturnValue([]);
     mocks.getAvailableBots.mockResolvedValue([]);
@@ -974,7 +990,7 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(repliedText()).toContain(`Session: ${incumbent.session.sessionId}`);
   });
 
-  it('registration-race loser reroute preserves the forward-seed STRUCTURED @mentions in the canonical owner window (#750 seed under-count guard)', async () => {
+  it('fails closed when a new-topic opening loses its exact registry slot', async () => {
     // codex merge blocking: a new-topic that loses the CAS reroutes to the
     // canonical owner via handleThreadReplyAdmitted with a fully PREPARED reply.
     // The prepared `parsed` must carry the MERGED seed+follow-up structured
@@ -999,13 +1015,14 @@ describe('/rename production routing — must not pre-create a session (review P
 
     // Rerouted to the incumbent (CAS loser).
     expect(activeSessions.get(sessionKey(anchor, APP))).toBe(incumbent);
-    // The canonical owner's per-turn participant window must still include the
-    // seed's structured @OtherBot — proving the prepared reroute carried the
-    // merged mentions rather than re-parsing only the follow-up.
+    // Current opening authority cannot graft a losing attempt onto an existing
+    // Session. Its prepared metadata remains detached and the canonical owner
+    // is left untouched for an explicit retry/reconciliation boundary.
     const entry = incumbent.session.replyTargets?.['om_seed_followup'];
-    expect(entry).toBeTruthy();
-    const participantIds = (entry?.participants ?? []).map(p => p.openId);
-    expect(participantIds).toContain(OTHER_BOT);
+    expect(entry).toBeUndefined();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(activeSessions.get(sessionKey(anchor, APP))).toBe(incumbent);
+    expect(JSON.stringify(incumbent.session)).not.toContain(OTHER_BOT);
   });
 
   it('new topic: passes the accepted Lark message id into the first worker', async () => {
@@ -1015,7 +1032,10 @@ describe('/rename production routing — must not pre-create a session (review P
     );
 
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
-    expect(mocks.forkWorker.mock.calls[0]?.[2]).toEqual({ turnId: 'om_workflow_new' });
+    expect(mocks.forkWorker.mock.calls[0]?.[2]).toEqual({
+      resume: false,
+      turnId: 'om_workflow_new',
+    });
     const ds = activeSessions.get(sessionKey('om_workflow_new', APP));
     expect(ds?.session.nativeSessionTitle).toBe('[BotMux·Lark] /workflow new 修复首轮授权');
   });
@@ -1198,7 +1218,7 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(mocks.getChatNameAndMode).toHaveBeenCalledTimes(2);
   });
 
-  it('delivers an ordinary loser turn to the canonical owner exactly once', async () => {
+  it('does not deliver an exact-slot loser into the canonical owner', async () => {
     const anchor = 'om_collision_delivery';
     const incumbent = seedThreadSession(anchor, 'canonical owner');
     const send = vi.fn();
@@ -1210,13 +1230,9 @@ describe('/rename production routing — must not pre-create a session (review P
     );
 
     expect(activeSessions.get(sessionKey(anchor, APP))).toBe(incumbent);
-    expect(mocks.createSession).toHaveBeenCalledTimes(1);
-    expect(mocks.closeSession).toHaveBeenCalledWith(
-      mocks.createSession.mock.results[0]!.value.sessionId,
-    );
     const inputCalls = send.mock.calls.filter(call => call[0]?.type === 'message');
-    expect(inputCalls).toHaveLength(1);
-    expect(JSON.stringify(inputCalls[0]![0])).toContain('deliver this once');
+    expect(inputCalls).toHaveLength(0);
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
   });
 
   it('buffers a later turn while the winning initial start is paused, then forks once in input order', async () => {
@@ -1244,29 +1260,17 @@ describe('/rename production routing — must not pre-create a session (review P
     );
     await preparationStarted;
 
-    const owner = activeSessions.get(sessionKey(anchor, APP))!;
-    expect(owner.initialStartPending).toBe(true);
-    expect(owner.worker).toBeNull();
-
-    await handleThreadReply(
+    const second = handleThreadReply(
       makeEventData('om_initial_order_second', 'second task', anchor),
       makeCtx(anchor, 'om_initial_order_second'),
     );
 
     expect(mocks.forkWorker).not.toHaveBeenCalled();
-    expect(owner.pendingFollowUps).toBeUndefined();
-    expect(owner.session.queuedActivationTail).toEqual([
-      expect.objectContaining({
-        turnId: 'om_initial_order_second',
-        cliInput: expect.objectContaining({
-          content: expect.stringContaining('second task'),
-        }),
-      }),
-    ]);
 
     releasePreparation([]);
-    await first;
+    await Promise.all([first, second]);
 
+    const owner = activeSessions.get(sessionKey(anchor, APP))!;
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
     const openingInput = mocks.forkWorker.mock.calls[0]![1];
     expect(openingInput.content.indexOf('first task')).toBeGreaterThanOrEqual(0);
@@ -1275,9 +1279,7 @@ describe('/rename production routing — must not pre-create a session (review P
       type: 'message',
       turnId: 'om_initial_order_second',
       content: expect.stringContaining('second task'),
-      queuedActivationToken: expect.any(String),
     }));
-    expect(owner.initialStartPending).toBe(true);
     expect(owner.pendingFollowUps).toBeUndefined();
   });
 
@@ -1286,7 +1288,6 @@ describe('/rename production routing — must not pre-create a session (review P
     const openingToken = 'token-no-project-text';
     const send = vi.fn();
     mocks.forkWorker.mockImplementationOnce((owner: any, input: any) => {
-      expect(owner.session.queued).toBe(true);
       expect(input.content).toContain('OPENING_TEXT_N');
       Object.assign(owner.session, {
         queued: false,
@@ -1297,6 +1298,7 @@ describe('/rename production routing — must not pre-create a session (review P
         queuedActivationResume: false,
       });
       owner.worker = { killed: false, send };
+      return true;
     });
 
     await handleNewTopic(
@@ -1306,7 +1308,7 @@ describe('/rename production routing — must not pre-create a session (review P
 
     const owner = activeSessions.get(sessionKey(anchor, APP))!;
     expect(mocks.scanMultipleProjects).toHaveBeenCalled();
-    expect(owner.pendingRepo).toBe(false);
+    expect(owner.pendingRepo).not.toBe(true);
     expect(owner.initialStartPending).toBe(true);
     expect(owner.session.queuedActivationToken).toBe(openingToken);
 
@@ -1361,6 +1363,7 @@ describe('/rename production routing — must not pre-create a session (review P
         queuedActivationResume: false,
       });
       owner.worker = { killed: false, send };
+      return true;
     });
 
     await handleNewTopic(
@@ -1435,17 +1438,19 @@ describe('/rename production routing — must not pre-create a session (review P
   it('replays a retained queued activation exactly, then releases the later inbound with its own turn id', async () => {
     const anchor = 'om_reparked_activation_root';
     const ds = seedThreadSession(anchor, 're-parked activation');
-    const exactOpening = {
+    const exactOpening = Object.freeze({
       content: '<user_message>BACKLOG_N\n\nPRIOR_TRIGGER_REPLY</user_message>',
-    };
+    });
     Object.assign(ds.session, {
       cliId: 'claude-code',
       workingDir: '/tmp',
-      queued: true,
-      queuedPrompt: 'STALE_REBUILD_SOURCE_MUST_NOT_BE_USED',
+      queued: false,
+      queuedActivationPending: true,
+      queuedActivationToken: 'retained-activation-token',
       queuedActivationInput: exactOpening,
       queuedActivationTurnId: 'om_prior_trigger',
       queuedActivationDispatchAttempt: 4,
+      queuedActivationResume: false,
     });
     ds.workingDir = '/tmp';
 
@@ -1459,8 +1464,10 @@ describe('/rename production routing — must not pre-create a session (review P
       resume: false,
       turnId: 'om_prior_trigger',
       dispatchAttempt: 4,
+      codexAppInputGateFrozen: true,
     });
-    expect(mocks.forkWorker.mock.calls[0]![1]).toBe(exactOpening);
+    expect(mocks.forkWorker.mock.calls[0]![1]).toStrictEqual(exactOpening);
+    expect(mocks.forkWorker.mock.calls[0]![1]).not.toBe(exactOpening);
     expect(JSON.stringify(mocks.forkWorker.mock.calls[0]![1]))
       .not.toContain('STALE_REBUILD_SOURCE_MUST_NOT_BE_USED');
     expect(ds.session.queuedActivationTail).toEqual([
@@ -1474,7 +1481,15 @@ describe('/rename production routing — must not pre-create a session (review P
     ]);
 
     const send = vi.mocked(ds.worker!.send);
-    expect(releaseQueuedActivationReservation(ds)).toBe(true);
+    Object.assign(ds.session, {
+      queuedActivationPending: undefined,
+      queuedActivationToken: undefined,
+      queuedActivationInput: undefined,
+      queuedActivationTurnId: undefined,
+      queuedActivationDispatchAttempt: undefined,
+      queuedActivationResume: undefined,
+    });
+    expect(onQueuedActivationSubmitted(ds, 'retained-activation-token')).toBe(true);
     expect(send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'message',
       turnId: 'om_later_n_plus_1',
@@ -1696,25 +1711,25 @@ describe('/rename production routing — must not pre-create a session (review P
     });
     ds.workingDir = '/tmp';
 
-    let announceFirstDownload!: () => void;
-    const firstDownloadStarted = new Promise<void>(resolve => { announceFirstDownload = resolve; });
-    let releaseFirstDownload!: () => void;
-    const firstDownloadGate = new Promise<void>(resolve => { releaseFirstDownload = resolve; });
-    mocks.downloadResources.mockImplementationOnce(async () => {
-      announceFirstDownload();
-      await firstDownloadGate;
-      return { attachments: [], needLogin: false };
+    let announceFirstMaterialization!: () => void;
+    const firstMaterializationStarted = new Promise<void>(resolve => {
+      announceFirstMaterialization = resolve;
+    });
+    let releaseFirstMaterialization!: () => void;
+    const firstMaterializationGate = new Promise<void>(resolve => {
+      releaseFirstMaterialization = resolve;
+    });
+    mocks.getAvailableBots.mockImplementationOnce(async () => {
+      announceFirstMaterialization();
+      await firstMaterializationGate;
+      return [];
     });
 
     const first = handleThreadReply(
       makeEventData('om_fresh_owner_n', 'OWNER_REPLY_N', anchor),
       makeCtx(anchor, 'om_fresh_owner_n'),
     );
-    await firstDownloadStarted;
-
-    expect(ds.initialStartPending).toBe(true);
-    expect(ds.initialStartClaimToken).toEqual(expect.any(String));
-    const ownerToken = ds.initialStartClaimToken;
+    await firstMaterializationStarted;
 
     const follower = handleThreadReply(
       makeEventData('om_fresh_follower_n1', 'FOLLOWER_REPLY_N_PLUS_1', anchor),
@@ -1722,11 +1737,9 @@ describe('/rename production routing — must not pre-create a session (review P
     );
 
     expect(mocks.forkWorker).not.toHaveBeenCalled();
-    expect(ds.initialStartClaimToken).toBe(ownerToken);
 
-    releaseFirstDownload();
-    await first;
-    await follower;
+    releaseFirstMaterialization();
+    await Promise.all([first, follower]);
 
     expect(ds.pendingFollowUps).toBeUndefined();
     expect(ds.session.queuedActivationTail).toEqual([
@@ -1744,10 +1757,18 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(opening.content.indexOf('OWNER_REPLY_N')).toBeGreaterThan(opening.content.indexOf('BACKLOG_N'));
     expect(opening.content).not.toContain('FOLLOWER_REPLY_N_PLUS_1');
     expect(ds.initialStartPending).toBe(true);
-    expect(ds.initialStartClaimToken).toBe(ownerToken);
 
     const send = vi.mocked(ds.worker!.send);
-    expect(onQueuedActivationSubmitted(ds)).toBe(true);
+    const openingToken = ds.session.queuedActivationToken!;
+    Object.assign(ds.session, {
+      queuedActivationPending: undefined,
+      queuedActivationToken: undefined,
+      queuedActivationInput: undefined,
+      queuedActivationTurnId: undefined,
+      queuedActivationDispatchAttempt: undefined,
+      queuedActivationResume: undefined,
+    });
+    expect(onQueuedActivationSubmitted(ds, openingToken)).toBe(true);
     expect(send).toHaveBeenCalledTimes(1);
     expect(send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'message',
@@ -1836,6 +1857,86 @@ describe('/rename production routing — must not pre-create a session (review P
     },
   );
 
+  it('reforks the exact promoted head after live ACK promotion persistence loses its response', () => {
+    const ds = seedThreadSession('om_ack_promotion_loss', 'ACK promotion response loss');
+    ds.session.cliId = 'claude-code';
+    ds.hasHistory = true;
+    ds.initialStartPending = true;
+    const oldWorker = {
+      killed: false,
+      send: vi.fn(),
+      kill: vi.fn(() => {
+        oldWorker.killed = true;
+        return true;
+      }),
+    };
+    ds.worker = oldWorker as any;
+    ds.session.queuedActivationTail = [
+      {
+        id: 'tail-n-plus-1',
+        order: 1,
+        userPrompt: 'N_PLUS_1',
+        cliInput: { content: 'EXACT_N_PLUS_1' },
+        turnId: 'turn-n-plus-1',
+        dispatchAttempt: 11,
+      },
+      {
+        id: 'tail-n-plus-2',
+        order: 2,
+        userPrompt: 'N_PLUS_2',
+        cliInput: { content: 'EXACT_N_PLUS_2' },
+        turnId: 'turn-n-plus-2',
+        dispatchAttempt: 12,
+      },
+    ];
+    ds.session.queuedActivationTailNextOrder = 2;
+    mocks.updateSession.mockImplementationOnce(() => {
+      throw new Error('promotion persistence response lost after publish');
+    });
+
+    expect(releaseQueuedActivationReservation(ds, 'opening-token')).toBe(false);
+    expect(oldWorker.send).not.toHaveBeenCalled();
+    expect(oldWorker.kill).toHaveBeenCalledTimes(1);
+    expect(ds.quarantinedActivationTailPromotion).toBe(true);
+    expect(ds.session).toMatchObject({
+      queuedActivationPending: true,
+      queuedActivationInput: { content: 'EXACT_N_PLUS_1' },
+      queuedActivationTurnId: 'turn-n-plus-1',
+      queuedActivationDispatchAttempt: 11,
+    });
+    expect(ds.session.queuedActivationToken).toEqual(expect.any(String));
+    expect(ds.session.queuedActivationTail).toEqual([
+      expect.objectContaining({
+        turnId: 'turn-n-plus-2',
+        cliInput: { content: 'EXACT_N_PLUS_2' },
+      }),
+    ]);
+
+    mocks.forkWorker.mockImplementation((current, input, resumeOrTurnId) => {
+      current.worker = { killed: false, send: vi.fn() };
+      expect(input).toEqual({ content: 'EXACT_N_PLUS_1' });
+      expect(resumeOrTurnId).toEqual({
+        resume: true,
+        turnId: 'turn-n-plus-1',
+        dispatchAttempt: 11,
+      });
+      return true;
+    });
+    expect(releaseQueuedActivationReservation(ds, 'opening-token')).toBe(false);
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(ds.quarantinedActivationTailPromotion).toBe(true);
+    expect(mocks.updateSession).toHaveBeenCalledTimes(1);
+
+    mocks.getSessionFresh.mockReturnValue(structuredClone(ds.session));
+    expect(releaseQueuedActivationReservation(ds, 'opening-token')).toBe(true);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.quarantinedActivationTailPromotion).toBeUndefined();
+    expect(ds.session.queuedActivationTurnId).toBe('turn-n-plus-1');
+    expect(ds.session.queuedActivationTail).toEqual([
+      expect.objectContaining({ turnId: 'turn-n-plus-2' }),
+    ]);
+  });
+
   it('parks a late follower after ACK→worker-exit and reforks it before the next inbound', async () => {
     const anchor = 'om_ack_exit_late_admission';
     const ds = seedThreadSession(anchor, 'ACK exit late admission');
@@ -1874,7 +1975,8 @@ describe('/rename production routing — must not pre-create a session (review P
     );
 
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
-    expect(mocks.forkWorker.mock.calls[0]![1]).toBe(ds.session.queuedActivationInput);
+    expect(mocks.forkWorker.mock.calls[0]![1]).toStrictEqual(ds.session.queuedActivationInput);
+    expect(mocks.forkWorker.mock.calls[0]![1]).not.toBe(ds.session.queuedActivationInput);
     expect(mocks.forkWorker.mock.calls[0]![1].content).toBe('LATE_N_PLUS_1');
     expect(ds.session.queuedActivationTail).toEqual([
       expect.objectContaining({
@@ -1917,7 +2019,7 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(ds.queuedActivationTailReleaseRetryTimer).toBeUndefined();
   });
 
-  it('releases a failed queued-refork claim so a later inbound can become the owner', async () => {
+  it('keeps a response-lost queued start sticky and durably tails a later inbound', async () => {
     const anchor = 'om_failed_queued_claim_root';
     const ds = seedThreadSession(anchor, 'failed queued claim');
     Object.assign(ds.session, {
@@ -1934,24 +2036,37 @@ describe('/rename production routing — must not pre-create a session (review P
     await expect(handleThreadReply(
       makeEventData('om_failed_owner', 'FAILED_OWNER_REPLY', anchor),
       makeCtx(anchor, 'om_failed_owner'),
-    )).rejects.toThrow('pre-fork acceptance failed');
+    )).resolves.toBeUndefined();
 
     expect(ds.worker).toBeNull();
-    expect(ds.initialStartPending).toBe(false);
-    expect(ds.initialStartClaimToken).toBeUndefined();
-
-    mocks.forkWorker.mockImplementation((owner: any) => {
-      owner.worker = { killed: false, send: vi.fn() };
+    expect(ds.session).toMatchObject({
+      queuedActivationPending: true,
+      queuedActivationToken: expect.any(String),
+      queuedActivationInput: expect.objectContaining({
+        content: expect.stringContaining('FAILED_OWNER_REPLY'),
+      }),
     });
+    const retainedToken = ds.session.queuedActivationToken;
+    const retainedInput = structuredClone(ds.session.queuedActivationInput!);
+
     await handleThreadReply(
       makeEventData('om_retry_owner', 'RETRY_OWNER_REPLY', anchor),
       makeCtx(anchor, 'om_retry_owner'),
     );
 
-    expect(mocks.forkWorker).toHaveBeenCalledTimes(2);
-    expect(mocks.forkWorker.mock.calls[1]![1].content).toContain('RETRY_OWNER_REPLY');
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.session.queuedActivationInput).toStrictEqual(retainedInput);
+    expect(ds.session.queuedActivationInput?.content).not.toContain('RETRY_OWNER_REPLY');
+    expect(ds.session.queuedActivationTail).toEqual([
+      expect.objectContaining({
+        turnId: 'om_retry_owner',
+        cliInput: expect.objectContaining({
+          content: expect.stringContaining('RETRY_OWNER_REPLY'),
+        }),
+      }),
+    ]);
     expect(ds.initialStartPending).toBe(true);
-    expect(ds.initialStartClaimToken).toEqual(expect.any(String));
+    expect(ds.session.queuedActivationToken).toBe(retainedToken);
   });
 
   it('retains a tokened generic ACK successor after IPC failure and recovers it before the next inbound', async () => {
@@ -2003,7 +2118,8 @@ describe('/rename production routing — must not pre-create a session (review P
 
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
     const reforkedHead = mocks.forkWorker.mock.calls[0]![1];
-    expect(reforkedHead).toBe(ds.session.queuedActivationInput);
+    expect(reforkedHead).toStrictEqual(ds.session.queuedActivationInput);
+    expect(reforkedHead).not.toBe(ds.session.queuedActivationInput);
     expect(reforkedHead.content).toContain('GENERIC_TAIL_N_PLUS_1');
     expect(reforkedHead.content).not.toContain('AFTER_TAIL_N_PLUS_2');
     expect(ds.session.queuedActivationTail).toEqual([

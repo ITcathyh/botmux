@@ -122,7 +122,7 @@ function ordinaryTurn(messageKey: string, content = 'hello'): OrdinaryImTranspor
     mentions: [],
     postParticipantMentions: [],
     resources: [],
-    messageListener: false,
+    foldedForwardContext: false,
     vc: { contextMayLag: false },
   };
 }

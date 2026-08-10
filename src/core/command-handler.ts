@@ -31,9 +31,7 @@ import {
   getSessionWorkingDir,
   getProjectScanDir,
   getProjectScanDirs,
-  rememberLastCliInput,
   buildNewTopicCliInput,
-  ensureSessionWhiteboard,
   getAvailableBots,
 } from './session-manager.js';
 import { markInitialUserTurnPending } from './initial-user-turn.js';
@@ -101,6 +99,10 @@ import {
   configuredRuntimeDisplayName,
   sessionConfiguredRuntimeDisplayName,
 } from './cli-runtime-display.js';
+import {
+  submitCurrentPendingRepoCompletion,
+  type CurrentPendingRepoCompletionSubmitInput,
+} from './current-pending-repo-completion-submit.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
@@ -406,6 +408,9 @@ export interface CommandHandlerDeps {
   lastRepoScan: Map<string, import('../services/project-scanner.js').ProjectInfo[]>;
   /** 会前预热文档评论会话：立即启动 CLI、读取文档并进入待命。 */
   prewarmDocCommentSession?: (ds: DaemonSession, sub: DocSubscription) => Promise<void>;
+  submitPendingRepoCompletion?: (
+    input: CurrentPendingRepoCompletionSubmitInput,
+  ) => ReturnType<typeof submitCurrentPendingRepoCompletion>;
 }
 
 // ─── Schedule command ────────────────────────────────────────────────────────
@@ -1568,152 +1573,41 @@ export async function handleCommand(
           break;
         }
 
-        // First-spawn fork: consume the buffered prompt/attachments and start the
-        // CLI in whatever workingDir is currently set on the session. Shared by
-        // `commitRepoSelection` (a repo was named) and the bare-`/repo` launch
-        // (use the default workingDir) — both only run while `pendingRepo`.
-        const forkPendingCli = async (
+        const completePendingRepo = async (
           replyText: string,
-          selection?: { path: string; riffRepoDirs?: string[] },
-        ) => {
-          const targetSessionId = ds!.session.sessionId;
-          const started = await withBotTurnMutation(ds!.larkAppId, async () => {
-            const current = [...activeSessions.values()].find(
-              candidate => candidate.session.sessionId === targetSessionId
-                && candidate.session.status === 'active',
-            );
-            if (!current || current !== ds || !current.pendingRepo) return false;
-            if (selection) {
-              current.workingDir = selection.path;
-              current.session.workingDir = selection.path;
-              current.session.riffRepoDirs = selection.riffRepoDirs;
-              sessionStore.updateSession(current.session);
-            }
-            const selfBot = getBot(current.larkAppId);
-            const botCfg = selfBot.config;
-            const pendingPrompt = current.pendingPrompt ?? '';
-            const pendingRawInput = current.pendingRawInput;
-            const hasBufferedInput = pendingPrompt.trim().length > 0
-              || current.pendingCodexAppText !== undefined
-              || (current.pendingAttachments?.length ?? 0) > 0
-              || (current.pendingFollowUps?.length ?? 0) > 0
-              || current.pendingChatContext !== undefined;
-            let wrappedInput: { content: string; codexAppInput?: CodexAppTurnInput } | undefined;
-            if (hasBufferedInput) {
-              const { buildNewTopicCliInput: buildInput, ensureSessionWhiteboard, getAvailableBots } = await import('./session-manager.js');
-              ensureSessionWhiteboard(current);
-              const availableBots = await getAvailableBots(current.larkAppId, current.chatId);
-              // Detached lifecycle work can still close/replace while the
-              // roster lookup awaits.  Never fork the captured generation.
-              if (current.session.status !== 'active'
-                || [...activeSessions.values()].find(candidate => candidate.session.sessionId === targetSessionId) !== current
-                || !current.pendingRepo) return false;
-              wrappedInput = buildInput(
-                pendingPrompt,
-                current.session.sessionId,
-                current.session.cliId ?? botCfg.cliId,
-                current.session.cliPathOverride ?? botCfg.cliPathOverride,
-                current.pendingAttachments,
-                current.pendingMentions,
-                availableBots,
-                current.pendingFollowUps,
-                { name: selfBot.botName, openId: selfBot.botOpenId },
-                loc,
-                current.pendingSender,
-                {
-                  larkAppId,
-                  chatId: current.chatId,
-                  whiteboardId: current.session.whiteboardId,
-                  substituteTrigger: current.pendingSubstituteTrigger,
-                  codexAppText: current.pendingCodexAppText,
-                  codexAppApplicationContext: current.pendingCodexAppApplicationContext,
-                  codexAppMessageContext: current.pendingCodexAppMessageContext,
-                  codexAppFollowUps: current.pendingCodexAppFollowUps,
-                  codexAppFollowUpContexts: current.pendingCodexAppFollowUpContexts,
-                  chatContext: current.pendingChatContext,
-                },
-              );
-            }
-            if (pendingRawInput && hasBufferedInput && wrappedInput) {
-              current.pendingFollowUpInput = {
-                userPrompt: current.pendingCodexAppText !== undefined || current.pendingCodexAppFollowUps
-                  ? [current.pendingCodexAppText ?? '', ...(current.pendingCodexAppFollowUps ?? [])].filter(Boolean).join('\n\n')
-                  : pendingPrompt || current.pendingFollowUps?.join('\n\n') || '',
-                cliInput: wrappedInput.content,
-                ...((current.pendingFollowUpTurnIds?.at(-1) ?? current.pendingFollowUpTurnId)
-                  ? { turnId: current.pendingFollowUpTurnIds?.at(-1) ?? current.pendingFollowUpTurnId }
-                  : {}),
-                ...((current.session.cliId ?? botCfg.cliId) === 'codex-app' && botCfg.codexAppCleanInput === true && wrappedInput.codexAppInput
-                  ? { codexAppInput: wrappedInput.codexAppInput }
-                  : {}),
-                codexAppInputGateFrozen: true,
-              };
-            }
-            if (pendingRawInput) rememberLastCliInput(current, pendingRawInput, pendingRawInput);
-            else if (hasBufferedInput && wrappedInput) rememberLastCliInput(current, pendingPrompt, wrappedInput);
-
-            // forkWorker performs the synchronous pre-accept/write-ahead work.
-            // Keep the opening reservation and every buffered field intact if
-            // that step throws, so a failed launch cannot silently consume the
-            // first user turn or expose this worker:null owner as scratch.
-            const pendingTurnId = current.pendingTurnId
-              ?? current.session.pendingRepoSetup?.turnId;
-            // Nothing to submit at all (bare `/repo`: the message IS the
-            // command). The CLI boots idle, so the user's NEXT real message is
-            // its first turn and must carry the full new-topic opening — see
-            // markInitialUserTurnPending below.
-            const emptyStart = !pendingRawInput && !hasBufferedInput;
-            forkWorker(
-              current,
-              pendingRawInput ? '' : (wrappedInput ?? ''),
-              !pendingRawInput && pendingTurnId ? { turnId: pendingTurnId } : false,
-            );
-            current.pendingRepo = false;
-            current.pendingRepoCommitInFlight = true;
-            // Queued activation ownership lasts through adapter submission.
-            // These source buffers were folded into opening N; clear them but
-            // keep the gate so later inbounds enter the exact post-ACK FIFO.
-            current.initialStartPending = current.session.queuedActivationPending === true;
-            // Durable, one-shot: an empty-started CLI has never received a real
-            // user turn, so the next business message must be built as a NEW
-            // TOPIC (routing + built-in skill discovery + identity), not a
-            // follow-up. Set after the fork so a throwing fork leaves it clean.
-            if (emptyStart) markInitialUserTurnPending(current);
-            publishAttentionPatch(current);
-            current.pendingPrompt = undefined;
-            current.pendingCodexAppText = undefined;
-            current.pendingCodexAppApplicationContext = undefined;
-            current.pendingCodexAppMessageContext = undefined;
-            current.pendingChatContext = undefined;
-            current.pendingAttachments = undefined;
-            current.pendingMentions = undefined;
-            current.pendingSubstituteTrigger = undefined;
-            current.pendingSender = undefined;
-            current.pendingFollowUps = undefined;
-            current.pendingFollowUpTurnId = undefined;
-            current.pendingFollowUpTurnIds = undefined;
-            current.pendingCodexAppFollowUps = undefined;
-            current.pendingCodexAppFollowUpContexts = undefined;
-            current.pendingCodexAppFollowUpGateAccepted = undefined;
-            current.pendingTurnId = undefined;
-            const cardToWithdraw = current.repoCardMessageId;
-            markRepoCardConsumed(current, cardToWithdraw);
-            current.repoCardMessageId = undefined;
-            return { current, cardToWithdraw };
+          selection: CurrentPendingRepoCompletionSubmitInput['selection'],
+        ): Promise<boolean> => {
+          const current = ds!;
+          const cardToWithdraw = current.repoCardMessageId;
+          const submit = deps.submitPendingRepoCompletion ?? submitCurrentPendingRepoCompletion;
+          const completion = await submit({
+            ownerLarkAppId: current.larkAppId,
+            activeSessions,
+            sessionId: current.session.sessionId,
+            daemonSession: current,
+            selection,
           });
-          if (!started) return false;
+          if (completion.kind !== 'applied' && completion.kind !== 'duplicate') {
+            logger.warn(
+              `[${logTag}] Pending repo completion refused (${completion.kind}): `
+              + `${'message' in completion ? completion.message : 'stale Session address'}`,
+            );
+            return false;
+          }
           try {
+            await sessionReply(rootId, replyText);
+          } catch (error) {
+            logger.warn(
+              `[${logTag}] Confirm reply after pending repo completion failed: `
+              + `${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+          if (cardToWithdraw) {
             try {
-              await sessionReply(rootId, replyText);
-            } catch (e) {
-              logger.warn(`[${logTag}] Confirm reply after pending repo commit failed: ${e instanceof Error ? e.message : e}`);
+              await deleteMessage(current.larkAppId, cardToWithdraw);
+            } catch {
+              // Card withdrawal is cosmetic after the Runtime commit.
             }
-            if (started.cardToWithdraw) {
-              try { await deleteMessage(started.current.larkAppId, started.cardToWithdraw); }
-              catch { /* best-effort */ }
-            }
-          } finally {
-            started.current.pendingRepoCommitInFlight = false;
           }
           return true;
         };
@@ -1724,11 +1618,13 @@ export async function handleCommand(
         // numeric `/repo <N>` form and the `/repo <path|name>` form.
         const commitRepoSelection = async (selectedPath: string, displayName: string, how: string): Promise<boolean> => {
           if (ds!.pendingRepo) {
-            // First spawn: the cwd pin and fork are one exclusive commit. Two
-            // simultaneous selections cannot make A reply while forking B's cwd.
-            const started = await forkPendingCli(
+            const started = await completePendingRepo(
               t('cmd.repo.selected_in_pending', { name: displayName }, loc),
-              { path: selectedPath, riffRepoDirs: undefined },
+              {
+                kind: 'directory',
+                path: selectedPath,
+                pinWorkingDir: true,
+              },
             );
             if (!started) return false;
           } else {
@@ -1894,6 +1790,19 @@ export async function handleCommand(
             }
             repoPath = resolved.path;
           }
+          if (ds.pendingRepo) {
+            await sessionReply(rootId, t('cmd.repo.worktree_creating', { repo: repoPath }, loc));
+            await completePendingRepo(
+              t('cmd.repo.selected_in_pending', { name: basename(repoPath) }, loc),
+              {
+                kind: 'worktree',
+                repositories: [{ sourcePath: repoPath, childName: basename(repoPath) }],
+                ...(branchArg ? { branch: branchArg } : {}),
+                layout: { kind: 'sibling' },
+              },
+            );
+            break;
+          }
           if (ds.worktreeCreating || ds.pendingRepoCommitInFlight) {
             await sessionReply(rootId, t('cmd.repo.worktree_in_progress', undefined, loc));
             break;
@@ -2027,10 +1936,14 @@ export async function handleCommand(
             break;
           }
           const cwd = getSessionWorkingDir(ds);
-          // bare /repo is the text twin of skip_repo: launch in the default
-          // cwd without pinning it (forkPendingCli does not write workingDir).
-          // Confirmation + card withdraw run under the claim inside forkPendingCli.
-          await forkPendingCli(t('cmd.skip.opened', { cwd }, loc));
+          await completePendingRepo(
+            t('cmd.skip.opened', { cwd }, loc),
+            {
+              kind: 'directory',
+              path: cwd,
+              pinWorkingDir: false,
+            },
+          );
           logger.info(`[${logTag}] Bare /repo while pending → launch in workingDir ${cwd}`);
           break;
         }

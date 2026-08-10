@@ -20,7 +20,7 @@ const authorityInventoryPath = resolve(repoRoot, authorityInventoryRelativePath)
 const expectedCoverage = new Map([
   ['keyed-trigger-start', { targetMilestone: 'A1', disposition: 'migrated' }],
   ['current-session-store-adapter', { targetMilestone: 'A1', disposition: 'migrated' }],
-  ['ordinary-im', { targetMilestone: 'C1', disposition: 'remaining' }],
+  ['ordinary-im', { targetMilestone: 'C1', disposition: 'migrated' }],
   ['control', { targetMilestone: 'C2', disposition: 'remaining' }],
   ['executor-generation', { targetMilestone: 'A2', disposition: 'migrated' }],
   ['per-session-command-lane', { targetMilestone: 'A3', disposition: 'migrated' }],
@@ -92,9 +92,9 @@ const mandatorySessionLaneBinding = Object.freeze({
   synchronousPortGuardFunction: 'invokeSynchronousPort',
   currentSessionRuntimeSource: 'src/core/current-session-runtime.ts',
   currentSessionRuntimeFactory: 'currentSessionRuntimeHost',
-  ordinaryFakeAdapterSource: 'src/core/current-ordinary-ingress.ts',
-  ordinaryFakeAdapterFactory: 'createCurrentOrdinaryIngressPort',
-  ordinaryProductionWired: false,
+  ordinaryPolicySource: 'src/core/current-ordinary-ingress.ts',
+  ordinaryPolicyFactory: 'createCurrentOrdinaryIngressPort',
+  ordinaryProductionWired: true,
   executorRuntimeSource: 'src/core/session-executor-runtime.ts',
   executorRuntimeFactory: 'createSessionExecutorRuntime',
   currentExecutorAdapterSource: 'src/core/current-session-executor-runtime.ts',
@@ -105,22 +105,115 @@ const mandatorySessionLaneBinding = Object.freeze({
   resumeCallCount: 4,
 });
 
-const mandatoryOrdinaryUnwiredProductionProof = Object.freeze({
-  sourceFile: 'src/daemon.ts',
-  forbiddenImports: [
-    './core/current-session-runtime.js',
-    './core/current-ordinary-ingress.js',
-  ],
-  forbiddenCalls: [
-    'currentSessionRuntimeHost',
-    'createCurrentOrdinaryIngressPort',
-  ],
-  forbiddenOption: 'ordinaryIngress',
+const mandatoryOrdinaryProductionBinding = Object.freeze({
+  daemonSource: 'src/daemon.ts',
+  daemonHostFactory: 'currentDaemonSessionRuntimeHost',
+  currentRuntimeSource: 'src/core/current-session-runtime.ts',
+  currentRuntimeFactory: 'currentSessionRuntimeHost',
+  ingressDaemonSource: 'src/im/lark/current-ordinary-ingress-daemon.ts',
+  ingressDaemonFactory: 'createCurrentOrdinaryIngressDaemonPort',
+  ingressLarkSource: 'src/im/lark/current-ordinary-ingress-production.ts',
+  ingressLarkFactory: 'createLarkCurrentOrdinaryIngressProductionPort',
+  ingressCoreSource: 'src/core/current-ordinary-ingress-production.ts',
+  ingressCoreFactory: 'createCurrentOrdinaryIngressProductionPort',
+  routeOpeningSource: 'src/core/current-ordinary-route-opening-production.ts',
+  routeOpeningFactory: 'createCurrentOrdinaryRouteOpeningProduction',
+  routeRegistrySource: 'src/core/current-ordinary-route-registry.ts',
+  routeRegistryFactory: 'createCurrentOrdinaryRouteRegistryRuntime',
+  pendingRepoSubmitSource: 'src/core/current-pending-repo-completion-submit.ts',
+  pendingRepoPortFactory: 'currentPendingRepoCompletionPort',
+  pendingRepoSubmitFunction: 'submitCurrentPendingRepoCompletion',
+  pendingRepoProductionSource: 'src/core/current-pending-repo-completion-production.ts',
+  pendingRepoProductionFactory: 'createCurrentPendingRepoCompletionProduction',
+  pendingRepoDispatchFunction: 'dispatchWorker',
+  ordinaryQueuedActivationRecoveryFunction: 'apply',
+  queuedActivationRecoveryFunction: 'prepareQueuedActivationRecoveryFork',
 });
+
+const mandatoryOrdinaryAuthoritySelectors = new Map([
+  ['src/core/current-ordinary-ingress-metadata.ts', ['apply']],
+  ['src/core/current-ordinary-ingress-production.ts', [
+    'admitTail',
+    'apply',
+    'rememberAcceptedInput',
+    'restoreTransientGate',
+    'stageActivationJournal',
+    'stagePendingRepoOpening',
+  ]],
+  ['src/core/current-ordinary-route-opening-production.ts', ['publish', 'rollback']],
+  ['src/core/current-ordinary-route-registry.ts', ['inspectExisting', 'publish']],
+  ['src/core/current-pending-repo-completion-production.ts', ['dispatchWorker']],
+  ['src/core/current-pending-repo-completion.ts', [
+    'begin',
+    'clearExactPendingClaim',
+    'clearFoldedRuntimeBuffers',
+    'restoreRuntime',
+    'resume',
+    'rollbackProvenWorkerRefusalCandidate',
+  ]],
+]);
+
+const mandatoryActivationTailAuthoritySelector = Object.freeze({
+  sourceFile: 'src/core/worker-pool.ts',
+  enclosingFunctions: Object.freeze([
+    'prepareQueuedActivationRecoveryFork',
+    'promoteQueuedActivationTailTyped',
+  ]),
+});
+
+const mandatoryOrdinaryCallers = new Map([
+  ['src/daemon.ts#handleNewTopicAdmitted', { sessionSubmitCount: 0, routeSubmitCount: 1 }],
+  ['src/daemon.ts#handleThreadReplyAdmitted', { sessionSubmitCount: 1, routeSubmitCount: 1 }],
+]);
+
+const mandatoryPendingRepoCallerCuts = new Map([
+  ['src/core/command-handler.ts#completePendingRepo', {
+    submissionMode: 'injected-or-production',
+    guardedByPendingRepo: false,
+  }],
+  ['src/im/lark/card-handler.ts#commitRepoSelection', {
+    submissionMode: 'injected-or-production',
+    guardedByPendingRepo: true,
+  }],
+  ['src/im/lark/card-handler.ts#runAutoWorktreeCommit', {
+    submissionMode: 'injected-or-production',
+    guardedByPendingRepo: false,
+  }],
+  ['src/im/lark/card-handler.ts#handleCardAction', {
+    submissionMode: 'injected-or-production',
+    guardedByPendingRepo: true,
+  }],
+  ['src/daemon.ts#runCurrentOrdinaryOpeningPostCommit', {
+    submissionMode: 'production-direct',
+    guardedByPendingRepo: false,
+  }],
+]);
+
+const mandatoryForbiddenLegacyOrdinaryIdentifiers = [
+  'PreparedThreadReply',
+  'tryAcquireInitialStartClaim',
+  'stageCurrentBehindQueuedActivation',
+  'queuedHasDurableTail',
+  'forkPendingCli',
+];
+
+const mandatoryForbiddenOrdinaryCallerCalls = [
+  'forkWorker',
+  'forkSession',
+  'forkReservedInitialSession',
+  'forkReservedInitialRawSession',
+  'sendWorkerInput',
+  'deliverPassthroughToExistingSession',
+  'reserveAsyncQueuedActivationTailAdmission',
+  'settleAsyncQueuedActivationTailAdmission',
+  'stageClaimedPendingRepoSetup',
+  'commitRepoSelection',
+  'forkPendingCli',
+];
 
 const mandatorySessionLaneDeferredPaths = new Map([
   ['keyed-route-admission-and-fail-close', {
-    targetMilestone: 'C1',
+    targetMilestone: 'A4',
     sourceFile: 'src/core/current-keyed-trigger-turn.ts',
     enclosingFunction: 'failClose',
   }],
@@ -279,6 +372,7 @@ function validateLedgerSchema(ledger) {
     for (const selector of entry.selectors) validateSelectorSchema(selector, entry.id);
 
     const bindsRawPublishers = entry.id === 'current-session-store-adapter'
+      || entry.id === 'ordinary-im'
       || entry.id === 'path-specific-retained'
       || entry.id === 'remaining-bypass';
     if (bindsRawPublishers) {
@@ -314,13 +408,18 @@ function validateLedgerSchema(ledger) {
 
   const keyedTrigger = ledger.coverage.find(entry => entry.id === 'keyed-trigger-start');
   validateKeyedProductionBindingSchema(keyedTrigger.productionBinding);
+  const ordinary = ledger.coverage.find(entry => entry.id === 'ordinary-im');
+  validateOrdinaryProductionBindingSchema(ordinary.productionBinding);
   const executor = ledger.coverage.find(entry => entry.id === 'executor-generation');
   validateExecutorSelectors(executor.selectors);
   validateExecutorProductionBindingSchema(executor.productionBinding);
   const sessionLane = ledger.coverage.find(entry => entry.id === 'per-session-command-lane');
   validateSessionLaneProductionBindingSchema(sessionLane.productionBinding);
+  const activation = ledger.coverage.find(entry => entry.id === 'activation-restore');
+  validateActivationTailAuthoritySelector(activation.selectors);
   for (const entry of ledger.coverage) {
     if (entry.id !== 'keyed-trigger-start'
+      && entry.id !== 'ordinary-im'
       && entry.id !== 'executor-generation'
       && entry.id !== 'per-session-command-lane') {
       assert(entry.productionBinding === undefined, `${entry.id} must not claim a migrated production binding`);
@@ -460,6 +559,69 @@ function sameStringSet(actual, expected) {
     && actual.every(value => expected.includes(value));
 }
 
+function validateOrdinaryAuthoritySelectors(selectors) {
+  assert(
+    selectors.length === mandatoryOrdinaryAuthoritySelectors.size,
+    'ordinary-im selectors must remain the exact Current authority partition',
+  );
+  const seen = new Set();
+  for (const selector of selectors) {
+    const expectedFunctions = mandatoryOrdinaryAuthoritySelectors.get(selector.sourceFile);
+    assert(
+      expectedFunctions,
+      `ordinary-im selectors must remain the exact Current authority partition: ${selector.sourceFile}`,
+    );
+    assert(
+      !seen.has(selector.sourceFile),
+      `ordinary-im selectors duplicate exact Current authority source: ${selector.sourceFile}`,
+    );
+    seen.add(selector.sourceFile);
+    assert(
+      sameStringSet(selector.enclosingFunctions ?? [], expectedFunctions),
+      `ordinary-im selectors must remain the exact Current authority partition: ${selector.sourceFile}`,
+    );
+    assert(
+      sameStringSet(selector.accessLanes ?? [], ['session-runtime-current-adapter']),
+      `ordinary-im selectors must use only the exact Current authority access lane: ${selector.sourceFile}`,
+    );
+    assert(
+      selector.authorityIds === undefined,
+      `ordinary-im selectors must not widen through authority IDs: ${selector.sourceFile}`,
+    );
+  }
+  for (const source of mandatoryOrdinaryAuthoritySelectors.keys()) {
+    assert(
+      seen.has(source),
+      `ordinary-im selectors must remain the exact Current authority partition: ${source}`,
+    );
+  }
+}
+
+function validateActivationTailAuthoritySelector(selectors) {
+  const expected = mandatoryActivationTailAuthoritySelector;
+  const candidates = selectors.filter(selector => (
+    selector.sourceFile === expected.sourceFile
+    && selector.enclosingFunctions?.some(fn => expected.enclosingFunctions.includes(fn))
+  ));
+  assert(
+    candidates.length === 1,
+    'activation-restore must keep one exact typed tail authority selector',
+  );
+  const [selector] = candidates;
+  assert(
+    sameStringSet(selector.enclosingFunctions ?? [], expected.enclosingFunctions)
+      && selector.accessLanes === undefined
+      && selector.authorityIds === undefined,
+    'activation-restore must keep the exact typed tail authority selector',
+  );
+  assert(
+    selectors.every(candidate => (
+      !candidate.enclosingFunctions?.includes('promoteQueuedActivationTail')
+    )),
+    'activation-restore must not bind the obsolete untyped tail wrapper',
+  );
+}
+
 function validateExecutorSelectors(selectors) {
   assert(
     selectors.length === mandatoryExecutorSelectors.size,
@@ -542,52 +704,90 @@ function validateExecutorProductionBindingSchema(binding) {
   );
 }
 
-function validateOrdinaryUnwiredProductionProof(proof) {
+function validateOrdinaryNamedBindings(value, label, mandatory, valueFields) {
+  assert(Array.isArray(value), `ordinary-im.productionBinding.${label} must be an array`);
   assert(
-    isPlainObject(proof),
-    'per-session-command-lane.productionBinding.ordinaryUnwiredProductionProof must be an object',
+    value.length === mandatory.size,
+    `ordinary-im.productionBinding.${label} must cover every ${label === 'ordinaryCallers' ? 'ordinary caller' : 'pending-repo first-start caller'}`,
   );
-  const allowedKeys = new Set([
-    'sourceFile',
-    'forbiddenImports',
-    'forbiddenCalls',
-    'forbiddenOption',
-  ]);
-  for (const key of Object.keys(proof)) {
+  const seen = new Set();
+  for (const record of value) {
+    assert(isPlainObject(record), `ordinary-im.productionBinding.${label} record must be an object`);
+    const allowedKeys = new Set(['sourceFile', 'enclosingFunction', ...valueFields]);
+    for (const key of Object.keys(record)) {
+      assert(allowedKeys.has(key), `ordinary-im.productionBinding.${label} has unsupported field: ${key}`);
+    }
+    const key = `${record.sourceFile}#${record.enclosingFunction}`;
+    assert(!seen.has(key), `ordinary-im.productionBinding.${label} duplicates ${key}`);
+    seen.add(key);
+    const expected = mandatory.get(key);
+    assert(expected, `ordinary-im.productionBinding.${label} has unknown caller ${key}`);
+    for (const [field, expectedValue] of Object.entries(expected)) {
+      assert(
+        record[field] === expectedValue,
+        `ordinary-im.productionBinding.${label} ${key}.${field} must be ${expectedValue}`,
+      );
+    }
+  }
+  for (const key of mandatory.keys()) {
     assert(
-      allowedKeys.has(key),
-      `ordinaryUnwiredProductionProof has unsupported field: ${key}`,
+      seen.has(key),
+      `ordinary-im.productionBinding.${label} must include ${key.split('#')[1]}`,
     );
   }
-  assert(
-    proof.sourceFile === mandatoryOrdinaryUnwiredProductionProof.sourceFile,
-    `ordinaryUnwiredProductionProof.sourceFile must be ${mandatoryOrdinaryUnwiredProductionProof.sourceFile}`,
+}
+
+function validateOrdinaryProductionBindingSchema(binding) {
+  assert(isPlainObject(binding), 'ordinary-im.productionBinding must be an object');
+  const allowedKeys = new Set([
+    ...Object.keys(mandatoryOrdinaryProductionBinding),
+    'ordinaryCallers',
+    'pendingRepoCallerCuts',
+    'forbiddenLegacyIdentifiers',
+    'forbiddenOrdinaryCallerCalls',
+  ]);
+  for (const key of Object.keys(binding)) {
+    assert(allowedKeys.has(key), `ordinary-im.productionBinding has unsupported field: ${key}`);
+  }
+  for (const [field, expected] of Object.entries(mandatoryOrdinaryProductionBinding)) {
+    assert(
+      binding[field] === expected,
+      `ordinary-im.productionBinding.${field} must be ${expected}`,
+    );
+  }
+  validateOrdinaryNamedBindings(
+    binding.ordinaryCallers,
+    'ordinaryCallers',
+    mandatoryOrdinaryCallers,
+    ['sessionSubmitCount', 'routeSubmitCount'],
+  );
+  validateOrdinaryNamedBindings(
+    binding.pendingRepoCallerCuts,
+    'pendingRepoCallerCuts',
+    mandatoryPendingRepoCallerCuts,
+    ['submissionMode', 'guardedByPendingRepo'],
   );
   validateStringArray(
-    proof.forbiddenImports,
-    'ordinaryUnwiredProductionProof.forbiddenImports',
+    binding.forbiddenLegacyIdentifiers,
+    'ordinary-im.productionBinding.forbiddenLegacyIdentifiers',
   );
   assert(
     sameStringSet(
-      proof.forbiddenImports,
-      mandatoryOrdinaryUnwiredProductionProof.forbiddenImports,
+      binding.forbiddenLegacyIdentifiers,
+      mandatoryForbiddenLegacyOrdinaryIdentifiers,
     ),
-    'ordinaryUnwiredProductionProof.forbiddenImports must cover the exact production imports',
+    'ordinary-im.productionBinding.forbiddenLegacyIdentifiers must cover the exact legacy ordinary identifiers',
   );
   validateStringArray(
-    proof.forbiddenCalls,
-    'ordinaryUnwiredProductionProof.forbiddenCalls',
+    binding.forbiddenOrdinaryCallerCalls,
+    'ordinary-im.productionBinding.forbiddenOrdinaryCallerCalls',
   );
   assert(
     sameStringSet(
-      proof.forbiddenCalls,
-      mandatoryOrdinaryUnwiredProductionProof.forbiddenCalls,
+      binding.forbiddenOrdinaryCallerCalls,
+      mandatoryForbiddenOrdinaryCallerCalls,
     ),
-    'ordinaryUnwiredProductionProof.forbiddenCalls must cover the exact production factories',
-  );
-  assert(
-    proof.forbiddenOption === mandatoryOrdinaryUnwiredProductionProof.forbiddenOption,
-    `ordinaryUnwiredProductionProof.forbiddenOption must be ${mandatoryOrdinaryUnwiredProductionProof.forbiddenOption}`,
+    'ordinary-im.productionBinding.forbiddenOrdinaryCallerCalls must cover every direct legacy ordinary call',
   );
 }
 
@@ -597,7 +797,6 @@ function validateSessionLaneProductionBindingSchema(binding) {
     ...Object.keys(mandatorySessionLaneBinding),
     'observationKinds',
     'deferredPaths',
-    'ordinaryUnwiredProductionProof',
   ]);
   for (const key of Object.keys(binding)) {
     assert(allowedKeys.has(key), `per-session-command-lane.productionBinding has unsupported field: ${key}`);
@@ -625,7 +824,6 @@ function validateSessionLaneProductionBindingSchema(binding) {
       );
     }
   }
-  validateOrdinaryUnwiredProductionProof(binding.ordinaryUnwiredProductionProof);
   validateStringArray(
     binding.observationKinds,
     'per-session-command-lane.productionBinding.observationKinds',
@@ -1100,6 +1298,312 @@ function resolvedTransitionCallback(parsed, argument, label) {
   throw new Error(`${label} must name an inline or local synchronous transition callback`);
 }
 
+function variableDeclarationsWithin(node, expected) {
+  const declarations = [];
+  const visit = current => {
+    if (ts.isVariableDeclaration(current)
+      && ts.isIdentifier(current.name)
+      && current.name.text === expected) {
+      declarations.push(current);
+    }
+    ts.forEachChild(current, visit);
+  };
+  visit(node);
+  return declarations;
+}
+
+function mutationsWithinRange(node, start, end) {
+  const mutations = [];
+  const mutatingMethods = new Set([
+    'add',
+    'clear',
+    'createSession',
+    'delete',
+    'pop',
+    'push',
+    'reverse',
+    'set',
+    'shift',
+    'sort',
+    'splice',
+    'unshift',
+    'updateSession',
+  ]);
+  const visit = current => {
+    if (current.end < start || current.pos > end) return;
+    if (ts.isBinaryExpression(current)
+      && current.operatorToken.kind >= ts.SyntaxKind.FirstAssignment
+      && current.operatorToken.kind <= ts.SyntaxKind.LastAssignment) {
+      mutations.push(current);
+    } else if (ts.isDeleteExpression(current)
+      || ts.isPostfixUnaryExpression(current)
+      || (ts.isPrefixUnaryExpression(current)
+        && (current.operator === ts.SyntaxKind.PlusPlusToken
+          || current.operator === ts.SyntaxKind.MinusMinusToken))) {
+      mutations.push(current);
+    } else if (ts.isCallExpression(current)) {
+      const name = calledName(current)?.split('.').at(-1);
+      if (name && mutatingMethods.has(name)) mutations.push(current);
+    }
+    ts.forEachChild(current, visit);
+  };
+  visit(node);
+  return mutations;
+}
+
+function ordinaryCallerSlice(parsed, caller, submitCall, forbiddenCalls, label) {
+  const block = ancestorWithin(submitCall, caller, ts.isBlock);
+  assert(block, `${label} submit must remain in one lexical caller block`);
+  const compileCalls = callExpressionsWithin(block, 'compileLarkOrdinaryImTurn')
+    .filter(call => call.pos < submitCall.pos)
+    .sort((left, right) => right.pos - left.pos);
+  assert(compileCalls.length > 0, `${label} must compile one typed ordinary transport turn`);
+  const compileStatement = block.statements.find(statement => nodeContains(statement, compileCalls[0]));
+  const submitStatement = block.statements.find(statement => nodeContains(statement, submitCall));
+  const terminalReturn = block.statements.find(statement => (
+    ts.isReturnStatement(statement) && statement.pos > submitCall.pos
+  ));
+  assert(
+    compileStatement && submitStatement && terminalReturn,
+    `${label} must end its compiled ordinary path after the one submit`,
+  );
+  const start = compileStatement.pos;
+  const end = terminalReturn.end;
+  const submitCalls = callExpressionsWithin(block, 'host.runtime.submit')
+    .filter(call => call.pos >= start && call.end <= end && containsStringLiteral(call, 'ordinary.ingress'));
+  assert(submitCalls.length === 1, `${label} compiled ordinary path must contain one submit`);
+  for (const forbidden of forbiddenCalls) {
+    const calls = callExpressionsWithin(block, forbidden)
+      .filter(call => call.pos >= start && call.end <= end);
+    assert(calls.length === 0, `${label} ordinary path regressed to direct ${forbidden}`);
+  }
+  assert(
+    mutationsWithinRange(block, start, end).length === 0,
+    `${label} ordinary path must not regain direct Session/registry mutation after compilation`,
+  );
+}
+
+function assertDirectFactoryOption(call, propertyName, factoryName, label) {
+  const option = objectLiteralOwnProperty(call.arguments[0], propertyName);
+  assert(
+    option
+      && ts.isPropertyAssignment(option)
+      && ts.isCallExpression(option.initializer)
+      && calledName(option.initializer) === factoryName,
+    `${label} must inject ${propertyName} from ${factoryName}`,
+  );
+}
+
+function validateOrdinaryProductionBinding(binding, authoritySites, assigned) {
+  const daemon = sourceFile(binding.daemonSource);
+  const daemonHost = findNamedFunction(daemon, binding.daemonHostFactory);
+  const hostComposition = callExpressionsWithin(daemonHost, binding.currentRuntimeFactory);
+  assert(hostComposition.length === 1, 'C1 daemon must compose exactly one stable Current Host shape');
+  assertDirectFactoryOption(
+    hostComposition[0],
+    'ordinaryIngress',
+    'currentOrdinaryIngressPort',
+    'C1 daemon Current Host',
+  );
+  assertDirectFactoryOption(
+    hostComposition[0],
+    'ordinaryRouteOpeningCreator',
+    'currentOrdinaryOpeningCreator',
+    'C1 daemon Current Host',
+  );
+  assertDirectFactoryOption(
+    hostComposition[0],
+    'pendingRepoCompletion',
+    binding.pendingRepoPortFactory,
+    'C1 daemon Current Host',
+  );
+
+  const daemonIngressFactory = findNamedFunction(daemon, 'currentOrdinaryIngressPort');
+  assert(
+    callExpressionsWithin(daemonIngressFactory, binding.ingressDaemonFactory).length === 1
+      && containsIdentifier(daemonIngressFactory, 'currentOrdinaryIngressPorts'),
+    'C1 daemon ordinary ingress port must remain owner-cached and fully composed',
+  );
+  const daemonOpeningFactory = findNamedFunction(daemon, 'currentOrdinaryOpeningCreator');
+  assert(
+    callExpressionsWithin(daemonOpeningFactory, binding.routeOpeningFactory).length === 1
+      && containsIdentifier(daemonOpeningFactory, 'currentOrdinaryOpeningCreators')
+      && containsIdentifier(daemonOpeningFactory, 'ownerBootId'),
+    'C1 daemon route-opening creator must remain owner/boot stable',
+  );
+
+  const currentRuntime = sourceFile(binding.currentRuntimeSource);
+  const currentRuntimeFactory = findNamedFunction(currentRuntime, binding.currentRuntimeFactory);
+  assert(
+    callExpressionsWithin(currentRuntimeFactory, 'createSessionRuntimeHost').length === 1
+      && callExpressionsWithin(currentRuntimeFactory, binding.routeRegistryFactory).length === 1
+      && containsIdentifier(currentRuntimeFactory, 'hostsByRegistry')
+      && containsIdentifier(currentRuntimeFactory, 'portBindings')
+      && containsIdentifier(currentRuntimeFactory, 'ordinaryCompatible')
+      && containsIdentifier(currentRuntimeFactory, 'routeCreatorCompatible')
+      && containsIdentifier(currentRuntimeFactory, 'pendingRepoCompatible'),
+    'C1 Current Host must keep one owner/epoch cache while adding all production ports',
+  );
+
+  const ingressDaemon = sourceFile(binding.ingressDaemonSource);
+  const ingressDaemonFactory = findNamedFunction(ingressDaemon, binding.ingressDaemonFactory);
+  assert(
+    callExpressionsWithin(ingressDaemonFactory, binding.ingressLarkFactory).length === 1,
+    'C1 daemon ingress Adapter must compose the Lark production port exactly once',
+  );
+  const ingressLark = sourceFile(binding.ingressLarkSource);
+  const ingressLarkFactory = findNamedFunction(ingressLark, binding.ingressLarkFactory);
+  assert(
+    callExpressionsWithin(ingressLarkFactory, binding.ingressCoreFactory).length === 1,
+    'C1 Lark materializer must compose the core production port exactly once',
+  );
+  const ingressCore = sourceFile(binding.ingressCoreSource);
+  const ingressCoreFactory = findNamedFunction(ingressCore, binding.ingressCoreFactory);
+  assert(
+    callExpressionsWithin(ingressCoreFactory, mandatorySessionLaneBinding.ordinaryPolicyFactory).length === 1,
+    'C1 core production port must terminate at the staged ordinary policy exactly once',
+  );
+  const ordinaryQueuedRecovery = findNamedFunction(
+    ingressCore,
+    binding.ordinaryQueuedActivationRecoveryFunction,
+  );
+  assert(
+    callExpressionsWithin(
+      ordinaryQueuedRecovery,
+      binding.queuedActivationRecoveryFunction,
+    ).length === 1,
+    'C1 ordinary queued-activation recovery must use the one typed A4 recovery helper',
+  );
+  findNamedFunction(sourceFile(binding.routeOpeningSource), binding.routeOpeningFactory);
+  findNamedFunction(sourceFile(binding.routeRegistrySource), binding.routeRegistryFactory);
+
+  const pendingSubmit = sourceFile(binding.pendingRepoSubmitSource);
+  const pendingPortFactory = findNamedFunction(pendingSubmit, binding.pendingRepoPortFactory);
+  assert(
+    callExpressionsWithin(pendingPortFactory, binding.pendingRepoProductionFactory).length === 1
+      && containsIdentifier(pendingPortFactory, 'portsByRegistry')
+      && containsIdentifier(pendingPortFactory, 'ownerBootId'),
+    'C1 pending-repo port must remain registry/owner/boot stable',
+  );
+  const pendingSubmitFunction = findNamedFunction(
+    pendingSubmit,
+    binding.pendingRepoSubmitFunction,
+  );
+  assert(
+    callExpressionsWithin(pendingSubmitFunction, binding.currentRuntimeFactory).length === 1
+      && callExpressionsWithin(pendingSubmitFunction, binding.pendingRepoPortFactory).length === 1
+      && callExpressionsWithin(pendingSubmitFunction, 'host.runtime.submit').length === 1
+      && containsStringLiteral(pendingSubmitFunction, 'pendingRepo.complete')
+      && containsStringLiteral(pendingSubmitFunction, 'session'),
+    'C1 pending-repo helper must project and submit one semantic first-start command through the stable Host',
+  );
+  const pendingProduction = sourceFile(binding.pendingRepoProductionSource);
+  findNamedFunction(pendingProduction, binding.pendingRepoProductionFactory);
+  const pendingDispatch = findNamedFunction(
+    pendingProduction,
+    binding.pendingRepoDispatchFunction,
+  );
+  assert(
+    callExpressionsWithin(
+      pendingDispatch,
+      binding.queuedActivationRecoveryFunction,
+    ).length === 1,
+    'C1 pending-repo dispatch must route an empty first-start tail through the one typed A4 recovery helper',
+  );
+
+  for (const callerBinding of binding.ordinaryCallers) {
+    const parsed = sourceFile(callerBinding.sourceFile);
+    const caller = findNamedFunction(parsed, callerBinding.enclosingFunction);
+    const submits = callExpressionsWithin(caller, 'host.runtime.submit')
+      .filter(call => containsStringLiteral(call, 'ordinary.ingress'));
+    const sessionSubmits = submits.filter(call => containsStringLiteral(call, 'session'));
+    const routeSubmits = submits.filter(call => containsStringLiteral(call, 'route'));
+    assert(
+      submits.length === callerBinding.sessionSubmitCount + callerBinding.routeSubmitCount
+        && sessionSubmits.length === callerBinding.sessionSubmitCount
+        && routeSubmits.length === callerBinding.routeSubmitCount
+        && callExpressionsWithin(caller, binding.daemonHostFactory).length === submits.length,
+      `C1 ordinary caller ${callerBinding.enclosingFunction} must use one stable Host submit per existing/route path`,
+    );
+    for (const [index, submit] of submits.entries()) {
+      ordinaryCallerSlice(
+        parsed,
+        caller,
+        submit,
+        binding.forbiddenOrdinaryCallerCalls,
+        `C1 ${callerBinding.enclosingFunction} submit ${index + 1}`,
+      );
+    }
+  }
+
+  for (const callerBinding of binding.pendingRepoCallerCuts) {
+    const parsed = sourceFile(callerBinding.sourceFile);
+    const caller = findNamedFunction(parsed, callerBinding.enclosingFunction);
+    let submitCalls;
+    if (callerBinding.submissionMode === 'production-direct') {
+      submitCalls = callExpressionsWithin(caller, binding.pendingRepoSubmitFunction);
+    } else {
+      const adapters = variableDeclarationsWithin(caller, 'submit').filter(declaration => (
+        declaration.initializer
+          && containsIdentifier(declaration.initializer, binding.pendingRepoSubmitFunction)
+      ));
+      submitCalls = callExpressionsWithin(caller, 'submit')
+        .filter(call => ts.isIdentifier(call.expression) && call.expression.text === 'submit');
+      assert(
+        adapters.length === 1,
+        `C1 pending-repo caller ${callerBinding.enclosingFunction} must retain one injected-or-production Current submit seam`,
+      );
+    }
+    assert(
+      submitCalls.length === 1,
+      `C1 pending-repo caller ${callerBinding.enclosingFunction} must issue exactly one production submit`,
+    );
+    const guarded = ancestorWithin(submitCalls[0], caller, ts.isIfStatement);
+    if (callerBinding.guardedByPendingRepo) {
+      assert(
+        guarded
+          && containsIdentifier(guarded.expression, 'pendingRepo')
+          && nodeContains(guarded.thenStatement, submitCalls[0])
+          && callExpressionsWithin(guarded.thenStatement, 'forkWorker').length === 0
+          && callExpressionsWithin(guarded.thenStatement, 'forkSession').length === 0,
+        `C1 pending-repo caller ${callerBinding.enclosingFunction} must cut only the pending branch without swallowing C2 mid-session repo`,
+      );
+    } else {
+      assert(
+        callExpressionsWithin(caller, 'forkWorker').length === 0
+          && callExpressionsWithin(caller, 'forkSession').length === 0,
+        `C1 pending-repo caller ${callerBinding.enclosingFunction} must not retain a legacy fork path`,
+      );
+    }
+  }
+
+  for (const identifier of binding.forbiddenLegacyIdentifiers) {
+    assert(
+      !containsIdentifier(daemon, identifier)
+        && !containsIdentifier(sourceFile('src/core/command-handler.ts'), identifier),
+      `C1 legacy ordinary identifier ${identifier} returned to production`,
+    );
+  }
+
+  const ordinarySources = new Set([
+    binding.ingressCoreSource,
+    'src/core/current-ordinary-ingress-metadata.ts',
+    binding.routeOpeningSource,
+    binding.routeRegistrySource,
+    binding.pendingRepoProductionSource,
+    'src/core/current-pending-repo-completion.ts',
+  ]);
+  for (const site of authoritySites.filter(site => (
+    site.accessLane === 'session-runtime-current-adapter'
+      && ordinarySources.has(site.sourceFile)
+  ))) {
+    assert(
+      assigned.get(siteIdentity(site)) === 'ordinary-im',
+      `C1 Current ordinary authority site escaped migrated coverage: ${siteIdentity(site)}`,
+    );
+  }
+}
+
 function validateSessionLaneProductionBinding(binding) {
   const lane = sourceFile(binding.laneSource);
   const laneFactory = findNamedFunction(lane, binding.laneFactory);
@@ -1196,7 +1700,7 @@ function validateSessionLaneProductionBinding(binding) {
   );
   const ordinaryBeginCalls = callExpressionsWithin(
     sessionTransition,
-    'options.ordinaryIngress.begin',
+    'ordinaryIngress.begin',
   );
   assert(
     ordinaryBeginCalls.length === 1,
@@ -1216,7 +1720,7 @@ function validateSessionLaneProductionBinding(binding) {
   );
   const ordinaryResumePortCalls = callExpressionsWithin(
     ordinaryResume,
-    'options.ordinaryIngress.resume',
+    'ordinaryIngress.resume',
   );
   assert(
     ordinaryResumePortCalls.length === 1,
@@ -1253,7 +1757,7 @@ function validateSessionLaneProductionBinding(binding) {
   );
   const ordinaryExecuteCalls = callExpressionsWithin(
     ordinaryEffectRunner,
-    'options.ordinaryIngress.execute',
+    'ordinaryIngress.execute',
   );
   assert(
     ordinaryExecuteCalls.length === 1
@@ -1315,47 +1819,16 @@ function validateSessionLaneProductionBinding(binding) {
       && containsIdentifier(currentSessionComposition[0], 'currentSessionLaneAddress'),
     'A3 Current SessionRuntime must inject the shared owner/epoch Session lane and address resolver',
   );
-  const currentSessionCompositionProperties = objectLiteralOwnPropertyNames(
-    currentSessionComposition[0].arguments[0],
-  );
-  const ordinaryIngressPassThrough = objectLiteralOwnProperty(
-    currentSessionComposition[0].arguments[0],
-    'ordinaryIngress',
-  );
   assert(
-    currentSessionCompositionProperties.has('ordinaryIngress')
-      && ordinaryIngressPassThrough
-      && ts.isPropertyAssignment(ordinaryIngressPassThrough)
-      && ts.isPropertyAccessExpression(ordinaryIngressPassThrough.initializer)
-      && ts.isIdentifier(ordinaryIngressPassThrough.initializer.expression)
-      && ordinaryIngressPassThrough.initializer.expression.text === 'options'
-      && ordinaryIngressPassThrough.initializer.name.text === 'ordinaryIngress'
+    containsIdentifier(currentSessionComposition[0], 'ordinaryIngress')
+      && containsIdentifier(currentSessionComposition[0], 'pendingRepoCompletion')
+      && containsIdentifier(currentSessionComposition[0], 'portBindings')
       && !importedModules(currentSessionRuntime).includes('./current-ordinary-ingress.js'),
-    'A3 Current SessionRuntime may only pass through an injected ordinary port; it must not create the Current Adapter',
+    'A3 Current SessionRuntime must bind injected ordinary/pending ports without creating the policy Adapter',
   );
   findNamedFunction(
-    sourceFile(binding.ordinaryFakeAdapterSource),
-    binding.ordinaryFakeAdapterFactory,
-  );
-
-  const ordinaryUnwiredProof = binding.ordinaryUnwiredProductionProof;
-  const ordinaryProduction = sourceFile(ordinaryUnwiredProof.sourceFile);
-  const ordinaryProductionImports = importedModules(ordinaryProduction);
-  for (const forbidden of ordinaryUnwiredProof.forbiddenImports) {
-    assert(
-      !ordinaryProductionImports.includes(forbidden),
-      `ordinaryProductionWired=false forbids production import ${forbidden}`,
-    );
-  }
-  for (const forbidden of ordinaryUnwiredProof.forbiddenCalls) {
-    assert(
-      callExpressionsWithin(ordinaryProduction, forbidden).length === 0,
-      `ordinaryProductionWired=false forbids production create/call ${forbidden}`,
-    );
-  }
-  assert(
-    !containsIdentifier(ordinaryProduction, ordinaryUnwiredProof.forbiddenOption),
-    `ordinaryProductionWired=false forbids production injection option ${ordinaryUnwiredProof.forbiddenOption}`,
+    sourceFile(binding.ordinaryPolicySource),
+    binding.ordinaryPolicyFactory,
   );
 
   const executorRuntime = sourceFile(binding.executorRuntimeSource);
@@ -1490,6 +1963,7 @@ export function auditSessionRuntimeCoverage({ ledger } = {}) {
         selected.push(site);
       }
     }
+    if (entry.id === 'ordinary-im') validateOrdinaryAuthoritySelectors(entry.selectors);
     validateAuthorityDisposition(entry, selected);
     const actual = selectedSiteFacts(selected);
     assert(
@@ -1547,6 +2021,16 @@ export function auditSessionRuntimeCoverage({ ledger } = {}) {
       === 'current-session-store-adapter',
     'CurrentSessionStore apply raw publisher must remain in the migrated A1 adapter, not retained',
   );
+  const ordinaryRollback = facts.rawPublishers.find(writer => (
+    writer.sourceFile === 'src/services/session-store.ts'
+      && writer.enclosingFunction === 'rollbackProvisionalSessionForOwnerStrict'
+      && writer.authorityId === 'current-session-row'
+  ));
+  assert(ordinaryRollback, 'C1 provisional route rollback raw publisher is missing');
+  assert(
+    assignedRawPublishers.get(rawPublisherIdentity(ordinaryRollback)) === 'ordinary-im',
+    'C1 provisional route rollback raw publisher must remain in ordinary-im, not D2 remainder',
+  );
   for (const entry of coverageLedger.coverage) {
     const actual = rawFactsByEntry.get(entry.id);
     if (!actual) continue;
@@ -1559,6 +2043,8 @@ export function auditSessionRuntimeCoverage({ ledger } = {}) {
   }
   const keyedTrigger = coverageLedger.coverage.find(entry => entry.id === 'keyed-trigger-start');
   validateMigratedProductionBinding(keyedTrigger.productionBinding, facts.sites);
+  const ordinary = coverageLedger.coverage.find(entry => entry.id === 'ordinary-im');
+  validateOrdinaryProductionBinding(ordinary.productionBinding, facts.sites, assigned);
   const executor = coverageLedger.coverage.find(entry => entry.id === 'executor-generation');
   validateExecutorProductionBinding(executor.productionBinding, facts.sites, assigned);
   const sessionLane = coverageLedger.coverage.find(entry => entry.id === 'per-session-command-lane');
