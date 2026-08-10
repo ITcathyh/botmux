@@ -330,4 +330,45 @@ describe('turn-level idempotency — codex #818 P1 regressions', () => {
     expect(mockSendWorkerInput).not.toHaveBeenCalled();
     expect(idempotencyStore.lookup(APP, `${SID}\u0000tk-gated`, 'turn')).toBeUndefined();
   });
+
+  it('P1-7 (live): a post-barrier beginAsyncTrigger throw terminalizes the lease; retry resolves failed, no reuse-forever', async () => {
+    // Inject a throw in beginAsyncTrigger (via its recordPending call) AFTER the
+    // reserved->attempting barrier. Without the unified post-barrier try this
+    // leaves lease=attempting + no convergence entry + no async record -> a
+    // same-key retry reuses it forever. The fix must durably terminalize here.
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    const active = activeWith(ds);
+    const pSpy = vi.spyOn(asyncTriggerStore, 'recordPending').mockImplementationOnce(() => { throw new Error('injected recordPending fault'); });
+    const res = await triggerSessionTurn(followUpReq('tk-pb'), { larkAppId: APP, activeSessions: active });
+    pSpy.mockRestore();
+    // Observable terminal (not a hang): the caller polls failed at-most-once.
+    expect(res.ok).toBe(false);
+    expect(res.state).toBe('failed');
+    expect(res.errorCode).toBe('no_output');
+    expect(mockSendWorkerInput).not.toHaveBeenCalled(); // nothing dispatched
+    // Durable terminal written; convergence entry dropped after the successful write.
+    expect(asyncTriggerStore.lookup(SID, res.triggerId!)?.result.reason).toBe('dispatch_unknown');
+    expect(ds.idempotentAsyncTurns?.get(res.triggerId!)).toBeUndefined();
+    // Same-key retry must NOT reuse-forever - it resolves the terminal, no dispatch.
+    const retry = await triggerSessionTurn(followUpReq('tk-pb'), { larkAppId: APP, activeSessions: active });
+    expect(retry.state).toBe('failed');
+    expect(retry.idempotent).toBe(true);
+    expect(mockSendWorkerInput).not.toHaveBeenCalled();
+  });
+
+  it('P1-7 (dormant): a post-barrier beginAsyncTrigger throw on the fork path terminalizes the lease too', async () => {
+    const ds = existingDs({ worker: null, hasHistory: true }); // dormant -> fork path
+    const active = activeWith(ds);
+    const pSpy = vi.spyOn(asyncTriggerStore, 'recordPending').mockImplementationOnce(() => { throw new Error('injected recordPending fault'); });
+    const res = await triggerSessionTurn(followUpReq('tk-pbd'), { larkAppId: APP, activeSessions: active });
+    pSpy.mockRestore();
+    expect(res.ok).toBe(false);
+    expect(res.state).toBe('failed');
+    expect(mockForkWorker).not.toHaveBeenCalled(); // fork never reached
+    expect(asyncTriggerStore.lookup(SID, res.triggerId!)?.result.reason).toBe('dispatch_unknown');
+    expect(ds.idempotentAsyncTurns?.get(res.triggerId!)).toBeUndefined();
+    const retry = await triggerSessionTurn(followUpReq('tk-pbd'), { larkAppId: APP, activeSessions: active });
+    expect(retry.state).toBe('failed');
+    expect(mockForkWorker).not.toHaveBeenCalled();
+  });
 });

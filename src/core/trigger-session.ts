@@ -1191,6 +1191,39 @@ async function triggerSessionTurnAdmitted(
         workerGeneration: dispatchedGeneration,
       });
     };
+    // Durably terminalize a keyed turn lease after a post-barrier fault (a throw or
+    // synchronous refusal between the reserved→attempting barrier and a proven
+    // dispatch). Returns an observable terminal `failed` response when the durable
+    // write succeeds (and drops the convergence entry); returns null when the write
+    // itself throws — the caller returns a 5xx and the entry is KEPT so worker-exit
+    // / retry / next-boot reconcile can still converge the still-attempting lease
+    // (codex #818 P1-6/P1-7). No session close (shared session).
+    const terminalizeTurnLeaseOnPostBarrierFault = (
+      target: DaemonSession,
+      triggerId: string,
+      leaseKey: string | undefined,
+      lease: idempotencyStore.IdempotencyRecord | undefined,
+    ): TriggerResponse | null => {
+      target.asyncTriggerResults?.delete(triggerId);
+      if (target.latestAsyncTriggerId === triggerId) target.latestAsyncTriggerId = undefined;
+      if (!leaseKey || !lease) {
+        target.idempotentAsyncTurns?.delete(triggerId);
+        return null;
+      }
+      try {
+        asyncTriggerStore.recordFailedStrict(target.session.sessionId, triggerId, Date.now(), larkAppId, 'dispatch_unknown');
+        target.idempotentAsyncTurns?.delete(triggerId);
+        return {
+          ok: false, state: 'failed', triggerId,
+          errorCode: 'no_output', error: 'previous dispatch was interrupted with unknown outcome; not re-run (at-most-once)',
+          target: { kind: 'turn', sessionId: target.session.sessionId, chatId },
+          turnIdempotencyKey, idempotent: false,
+        };
+      } catch (e) {
+        logger.error(`[idempotency] turn post-barrier fault AND recordFailedStrict failed — convergence entry kept for worker-exit/retry: ${(e as Error).message}`);
+        return null;
+      }
+    };
 
     if (workerIsLive) {
       if (req.options?.waitForFinalOutput) {
@@ -1235,18 +1268,40 @@ async function triggerSessionTurnAdmitted(
             return { ok: false, errorCode: 'trigger_failed', error: `turn idempotency claim failed: ${(err as Error).message}` };
           }
         }
-        beginAsyncTrigger(target, triggerId);
+        // Post-barrier convergence: the lease is `attempting` from here on, so ANY
+        // throw between the barrier and a proven dispatch (beginAsyncTrigger /
+        // prepareStableDispatch / arm / sendWorkerInput) must durably terminalize
+        // the lease — else it stays `attempting` with no convergence entry and a
+        // same-key retry reuses it forever (codex #818 P1-7). Mirrors the
+        // fresh-session path's single wrapping try. Stamp convergence FIRST (before
+        // beginAsyncTrigger) so even an early throw leaves a Map entry that
+        // worker-exit can converge as a backstop.
         if (turnLease) stampTurnConvergence();
-        const dispatchAttempt = prepareStableDispatch(target, false);
-        armFinalOutputSuppression(target, dispatchAttempt);
-        const accepted = sendWorkerInput(target, content, triggerId, {
-          ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
-          // At-most-once: a keyed follow-up delivered to a LIVE worker must be
-          // tagged so a CLI crash never replays it onto the auto-restarted CLI
-          // after the daemon has already terminalized it (dispatch_unknown). The
-          // dormant-fork branch rides atMostOnce on the fork init instead.
-          ...(turnLease ? { atMostOnce: true } : {}),
-        });
+        let accepted: boolean;
+        try {
+          beginAsyncTrigger(target, triggerId);
+          const dispatchAttempt = prepareStableDispatch(target, false);
+          armFinalOutputSuppression(target, dispatchAttempt);
+          accepted = sendWorkerInput(target, content, triggerId, {
+            ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+            // At-most-once: a keyed follow-up delivered to a LIVE worker must be
+            // tagged so a CLI crash never replays it onto the auto-restarted CLI
+            // after the daemon has already terminalized it (dispatch_unknown). The
+            // dormant-fork branch rides atMostOnce on the fork init instead.
+            ...(turnLease ? { atMostOnce: true } : {}),
+          });
+        } catch (err) {
+          // A throw AFTER the barrier (begin/prepare/arm/send). Nothing is proven
+          // dispatched; terminalize the attempting lease durably so a same-key
+          // retry resolves `failed` at-most-once instead of reusing it forever.
+          const settled = terminalizeTurnLeaseOnPostBarrierFault(target, triggerId, turnLeaseKey, turnLease);
+          return settled ?? {
+            ok: false, errorCode: 'trigger_failed',
+            error: `dispatch failed and terminal outcome could not be persisted: ${(err as Error).message}`,
+            target: { kind: 'turn', sessionId: target.session.sessionId, chatId },
+            ...(turnIdempotencyKey ? { turnIdempotencyKey } : {}),
+          };
+        }
         if (!accepted) {
           target.asyncTriggerResults?.delete(triggerId);
           if (target.latestAsyncTriggerId === triggerId) target.latestAsyncTriggerId = undefined;
@@ -1256,15 +1311,9 @@ async function triggerSessionTurnAdmitted(
           // lease with no worker and hanging. Only DROP the convergence entry AFTER
           // the durable terminal write succeeds — if it throws (EIO), the lease is
           // still attempting + async still pending, so the entry MUST survive so a
-          // later worker-exit / retry can still converge it (codex #818 P1-6: the
-          // old code cleared the entry first, leaving an unconvergeable attempting).
+          // later worker-exit / retry can still converge it (codex #818 P1-6).
           if (turnLeaseKey && turnLease) {
-            try {
-              asyncTriggerStore.recordFailedStrict(target.session.sessionId, triggerId, Date.now(), larkAppId, 'dispatch_unknown');
-              target.idempotentAsyncTurns?.delete(triggerId);
-            } catch (e) {
-              logger.error(`[idempotency] turn dispatch refused AND recordFailedStrict failed — convergence entry kept for worker-exit/retry: ${(e as Error).message}`);
-            }
+            terminalizeTurnLeaseOnPostBarrierFault(target, triggerId, turnLeaseKey, turnLease);
           } else {
             target.idempotentAsyncTurns?.delete(triggerId);
           }
@@ -1363,15 +1412,19 @@ async function triggerSessionTurnAdmitted(
           return { ok: false, errorCode: 'trigger_failed', error: `turn idempotency claim failed: ${(err as Error).message}` };
         }
       }
-      beginAsyncTrigger(target, triggerId);
+      // Post-barrier convergence (same as the live branch — codex #818 P1-7): the
+      // lease is `attempting`, so a throw anywhere between the barrier and a proven
+      // fork (beginAsyncTrigger / prepareStableDispatch / forkWorker) must durably
+      // terminalize it. Stamp FIRST so an early throw still has a Map backstop.
       if (turnLease) stampTurnConvergence();
-      const dispatchAttempt = prepareStableDispatch(target, true);
-      armFinalOutputSuppression(target, dispatchAttempt);
       // Keyed turns are at-most-once: once terminalized on worker exit, the input
       // must NEVER replay onto an auto-restarted CLI. Ride `atMostOnce` on the
       // fork init (mirrors the fresh-session path).
       const atMostOnce = !!(turnLeaseKey && turnLease);
       try {
+        beginAsyncTrigger(target, triggerId);
+        const dispatchAttempt = prepareStableDispatch(target, true);
+        armFinalOutputSuppression(target, dispatchAttempt);
         forkWorker(target, content, {
           resume: target.hasHistory,
           turnId: triggerId,
@@ -1379,34 +1432,17 @@ async function triggerSessionTurnAdmitted(
           ...(atMostOnce ? { atMostOnce: true } : {}),
         });
       } catch (err) {
-        // Fork threw AFTER the attempting barrier (commit-unknown). Write the
-        // authoritative durable failed (dispatch_unknown) so the caller polls a
-        // terminal instead of `running` forever; at-most-once, never re-dispatched.
+        // A throw AFTER the attempting barrier (begin/prepare/fork). Terminalize
+        // the lease durably so the caller polls a terminal instead of `running`
+        // forever; at-most-once, never re-dispatched. Keyed turns route through the
+        // shared helper (session is never closed); a non-keyed turn rethrows.
         if (turnLeaseKey && turnLease) {
-          let terminalDurable = false;
-          try {
-            asyncTriggerStore.recordFailedStrict(target.session.sessionId, triggerId, Date.now(), larkAppId, 'dispatch_unknown');
-            terminalDurable = true;
-            // Drop the convergence entry ONLY after the durable terminal write
-            // succeeds. On EIO the entry MUST survive so a worker-exit / retry can
-            // still converge the still-attempting lease (codex #818 P1-6).
-            target.idempotentAsyncTurns?.delete(triggerId);
-          } catch (e) {
-            logger.error(`[idempotency] turn fork threw AND recordFailedStrict failed — convergence entry kept for worker-exit/retry: ${(e as Error).message}`);
-          }
-          if (!terminalDurable) {
-            return {
-              ok: false, errorCode: 'trigger_failed',
-              error: `dispatch failed and terminal outcome could not be persisted: ${(err as Error).message}`,
-              target: { kind: 'turn', sessionId: target.session.sessionId, chatId },
-              turnIdempotencyKey,
-            };
-          }
-          return {
-            ok: false, state: 'failed', triggerId,
-            errorCode: 'no_output', error: `dispatch failed with unknown outcome: ${(err as Error).message}`,
+          const settled = terminalizeTurnLeaseOnPostBarrierFault(target, triggerId, turnLeaseKey, turnLease);
+          return settled ?? {
+            ok: false, errorCode: 'trigger_failed',
+            error: `dispatch failed and terminal outcome could not be persisted: ${(err as Error).message}`,
             target: { kind: 'turn', sessionId: target.session.sessionId, chatId },
-            turnIdempotencyKey, idempotent: false,
+            turnIdempotencyKey,
           };
         }
         throw err;
