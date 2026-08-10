@@ -5919,6 +5919,9 @@ export function forkWorker(
       const gatedDispatchAttempt = typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
         ? resumeOrTurnId.dispatchAttempt
         : undefined;
+      const gatedAtMostOnce = typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
+        ? resumeOrTurnId.atMostOnce
+        : undefined;
       sendWorkerInput(ds, promptInput, gatedTurnId, {
         ...(gatedDispatchAttempt !== undefined
           ? { dispatchAttempt: gatedDispatchAttempt }
@@ -5928,6 +5931,12 @@ export function forkWorker(
         // rerouted through the transfer gate must carry the flag here too, or it
         // silently downgrades true → false like the direct-route branch did.
         ...(gatedPrompt.codexAppSteerable === true ? { codexAppSteerable: true as const } : {}),
+        // At-most-once (codex #818 P1-5): a keyed follow-up fork rerouted through
+        // the transfer gate to sendWorkerInput must preserve atMostOnce, else the
+        // replacement CLI's input is replayable and a crash after the daemon
+        // terminalized the turn re-runs it. forkWorker's own init path sets this
+        // from resumeOrTurnId.atMostOnce; the reroute must forward it identically.
+        ...(gatedAtMostOnce ? { atMostOnce: true as const } : {}),
       });
     } else {
       transferGate.needsWorker = true;
@@ -8676,8 +8685,9 @@ function setupWorkerHandlers(
               logger.error(`[${t}] Failed to persist async terminal-settle for ${msg.turnId.substring(0, 8)}: ${err.message}`);
             }
             // Cleared like the final_output path so worker-exit convergence does
-            // not retro-fail this now-completed turn.
-            if (ds.idempotentAsyncTurn?.triggerId === msg.turnId) ds.idempotentAsyncTurn = undefined;
+            // not retro-fail this now-completed turn. Per-triggerId delete so a
+            // concurrent sibling keyed turn's convergence entry is untouched.
+            ds.idempotentAsyncTurns?.delete(msg.turnId);
             logger.info(`[${t}] Settled async HTTP turn ${msg.turnId.substring(0, 8)} completed (empty output; nothing-to-send)`);
           }
         }
@@ -9394,10 +9404,12 @@ function deliverFinalOutput(
     // (with content + usage) after a daemon restart drops the in-memory Map.
     // Stamp the owning bot for cross-bot isolation.
     asyncTriggerStore.recordCompleted(ds.session.sessionId, msg.turnId, msg.content, completedAt, ds.larkAppId, msg.usage);
-    // This idempotent async turn produced its terminal output — clear the
-    // worker-exit convergence stamp so a later graceful exit of this generation
-    // is not retro-failed (codex #776 round-6 finding #1).
-    if (ds.idempotentAsyncTurn?.triggerId === msg.turnId) ds.idempotentAsyncTurn = undefined;
+    // This idempotent async turn produced its terminal output — drop its
+    // worker-exit convergence entry so a later graceful exit of this generation
+    // is not retro-failed (codex #776 round-6 finding #1). Per-triggerId delete so
+    // a concurrent sibling keyed turn on the same shared session is untouched
+    // (codex #818 P1-1).
+    ds.idempotentAsyncTurns?.delete(msg.turnId);
     ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
     logger.info(`[${t}] Captured final_output for Async HTTP request (turn ${msg.turnId.substring(0, 8)})`);
     onComplete?.(true);

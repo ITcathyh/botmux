@@ -335,6 +335,43 @@ export async function reconcileIdempotencyLeasesOnBoot(
     // own in-flight leases.
     if (record.ownerLarkAppId !== ownerLarkAppId) continue;
     if (record.ownerBootId === currentBootId) continue;
+    // TURN leases govern a follow-up turn on a SHARED, long-lived session — NOT a
+    // throwaway fresh-session. The fresh-session reconcile below quarantines +
+    // closeSession(record.sessionId) to stop restore reviving an orphaned session;
+    // doing that to a turn lease would destroy a healthy shared session that other
+    // (completed or future) turns depend on (codex #818 P1-3). So reconcile a turn
+    // lease by fencing ONLY the exact turn: terminalize an attempting lease into
+    // the async store (so the caller polls `failed` at-most-once) or CAS-remove a
+    // provably-pre-dispatch reserved lease — and NEVER touch the session. A
+    // genuine I/O failure still throws → fail-closed (aggregated below).
+    if (record.kind === 'turn') {
+      try {
+        const asyncRec = asyncTriggerStore.lookup(record.sessionId, record.triggerId);
+        const outcome = (asyncRec && asyncRec.ownerLarkAppId === ownerLarkAppId) ? asyncRec.result.status : undefined;
+        if (outcome === 'completed' || outcome === 'failed') continue; // already durable-terminal
+        if (record.state === 'attempting') {
+          terminalizeAttempting(record); // durable dispatch_unknown; throws on real I/O failure
+          continue;
+        }
+        // reserved: provably never dispatched → fenced remove (only if still this
+        // exact snapshot). changed-under-us / EIO throws → fail-closed. We do NOT
+        // reclassify a different-identity winner here: turn leases never close a
+        // session, and the winner (if any) is a live/attempting turn the
+        // worker-exit convergence + retry path already handle at-most-once.
+        const rm = idempotencyStore.compareAndRemoveByPath(file, record);
+        if (rm.kind === 'changed' && rm.current.state === 'attempting' && rm.current.ownerBootId !== currentBootId) {
+          // A previous-boot crossed the commit-unknown barrier for this same turn
+          // → terminalize by the current record so the caller polls `failed`.
+          terminalizeAttempting(rm.current);
+        }
+        continue;
+      } catch (err) {
+        const e = err as Error;
+        logger.error(`[idempotency] reconcile could not converge TURN lease for ${record.sessionId}/${record.triggerId}: ${e.message}`);
+        if (!hardFailure) hardFailure = e;
+        continue;
+      }
+    }
     try {
       // Trust async terminal evidence ONLY when it was written by THIS owner. A
       // foreign completed/failed on the same sessionId/triggerId must NOT let us
@@ -492,47 +529,55 @@ export function convergeIdempotentAsyncTurnOnWorkerExit(
   ds: DaemonSession,
   exitingWorkerGeneration: number,
 ): IdempotentExitConvergence {
-  const turn = ds.idempotentAsyncTurn;
-  if (!turn) return 'noop';
-  // Only converge the generation this turn was dispatched on. A later worker
-  // generation (post-completion re-fork, takeover) exiting must not retro-fail a
-  // turn that already produced output on an earlier generation.
-  if (turn.workerGeneration !== exitingWorkerGeneration) return 'noop';
-  // Already completed by THIS owner (final_output cleared the stamp, or a durable
-  // owner-matched completed exists)? Then clear the stamp and skip the write.
-  // CRITICAL: only OUR OWN completed counts. async-trigger-store is keyed by
-  // sessionId, so a foreign/unstamped completed on the same sessionId/triggerId
-  // must NOT clear our only exit-convergence stamp (codex #776 round-7 finding
-  // #3): if it did, onCliExit (Node worker still live) would leave no stamp, then
-  // resolveIdempotencyHit ignores the foreign outcome yet reuses the attempting
-  // lease via liveWorker, and the later onWorkerExit — now stampless — can never
-  // converge it → permanent running. Owner positive-proof, mirroring the
-  // resolveIdempotencyHit / reconcile evidence gates.
-  const existing = asyncTriggerStore.lookup(ds.session.sessionId, turn.triggerId);
-  const ownedCompleted = existing?.result.status === 'completed'
-    && existing.ownerLarkAppId === turn.ownerLarkAppId;
-  if (ownedCompleted) { ds.idempotentAsyncTurn = undefined; return 'converged'; }
-  try {
-    // recordFailedStrict is itself owner-proofed (throws on owner mismatch) and
-    // completed-wins, so a foreign-occupied slot throws here → caught below →
-    // stamp intact, caller fail-closes. Never clobbers another bot's evidence.
-    asyncTriggerStore.recordFailedStrict(ds.session.sessionId, turn.triggerId, Date.now(), turn.ownerLarkAppId, 'dispatch_unknown');
-    logger.warn(`[idempotency] worker exit converged incomplete idempotent async turn ${ds.session.sessionId}/${turn.triggerId} (gen ${exitingWorkerGeneration}) → durable dispatch_unknown`);
-    // The turn is now durably terminal; clear the stamp so a subsequent exit of a
-    // replacement generation is a no-op.
-    ds.idempotentAsyncTurn = undefined;
-    return 'converged';
-  } catch (err) {
-    // Durable write failed (EIO/ENOSPC, or a foreign-occupied slot). Keep the
-    // stamp and report write_failed so the caller takes this session to an
-    // observable fail-closed terminal (close it). We must NOT merely wait for a
-    // next-boot reconcile: the same Node worker auto-restarts to a healthy idle
-    // CLI, per-item noReplay stops the keyed input from re-running, and the live
-    // ds would otherwise strand the poller on `running` forever (codex #776
-    // round-8 finding #2).
-    logger.error(`[idempotency] worker-exit convergence write failed for ${ds.session.sessionId}/${turn.triggerId}; caller must fail-close: ${(err as Error).message}`);
-    return 'write_failed';
+  const turns = ds.idempotentAsyncTurns;
+  if (!turns || turns.size === 0) return 'noop';
+  // Converge EVERY still-pending keyed turn dispatched on the exiting generation
+  // — a shared session can hold multiple concurrent keyed turns, and a single
+  // slot would only converge the last one, stranding the rest `pending` forever
+  // (codex #818 P1-1). Aggregate outcome: if ANY turn's durable write fails the
+  // caller must fail-close the whole session (some turn is unconvergeable); else
+  // `converged` if we settled/observed-completed at least one, `noop` if none of
+  // the entries belonged to this generation.
+  let convergedAny = false;
+  let anyWriteFailed = false;
+  for (const [triggerId, turn] of [...turns.entries()]) {
+    // Only converge the generation each turn was dispatched on. A later worker
+    // generation (post-completion re-fork, takeover) exiting must not retro-fail
+    // a turn that already produced output on an earlier generation.
+    if (turn.workerGeneration !== exitingWorkerGeneration) continue;
+    // Already completed by THIS owner (final_output cleared the entry, or a durable
+    // owner-matched completed exists)? Then drop the entry and skip the write.
+    // CRITICAL: only OUR OWN completed counts. async-trigger-store is keyed by
+    // sessionId, so a foreign/unstamped completed on the same sessionId/triggerId
+    // must NOT clear our convergence stamp (codex #776 round-7 finding #3).
+    const existing = asyncTriggerStore.lookup(ds.session.sessionId, triggerId);
+    const ownedCompleted = existing?.result.status === 'completed'
+      && existing.ownerLarkAppId === turn.ownerLarkAppId;
+    if (ownedCompleted) { turns.delete(triggerId); convergedAny = true; continue; }
+    try {
+      // recordFailedStrict is itself owner-proofed (throws on owner mismatch) and
+      // completed-wins, so a foreign-occupied slot throws here → caught below →
+      // entry intact, caller fail-closes. Never clobbers another bot's evidence.
+      asyncTriggerStore.recordFailedStrict(ds.session.sessionId, triggerId, Date.now(), turn.ownerLarkAppId, 'dispatch_unknown');
+      logger.warn(`[idempotency] worker exit converged incomplete idempotent async turn ${ds.session.sessionId}/${triggerId} (gen ${exitingWorkerGeneration}) → durable dispatch_unknown`);
+      // The turn is now durably terminal; drop the entry so a subsequent exit of a
+      // replacement generation is a no-op for it.
+      turns.delete(triggerId);
+      convergedAny = true;
+    } catch (err) {
+      // Durable write failed (EIO/ENOSPC, or a foreign-occupied slot). Keep the
+      // entry and report write_failed so the caller takes this session to an
+      // observable fail-closed terminal (close it). We must NOT merely wait for a
+      // next-boot reconcile: the same Node worker auto-restarts to a healthy idle
+      // CLI, per-item noReplay stops the keyed input from re-running, and the live
+      // ds would otherwise strand the poller on `running` forever (codex #776
+      // round-8 finding #2).
+      logger.error(`[idempotency] worker-exit convergence write failed for ${ds.session.sessionId}/${triggerId}; caller must fail-close: ${(err as Error).message}`);
+      anyWriteFailed = true;
+    }
   }
+  if (anyWriteFailed) return 'write_failed';
+  return convergedAny ? 'converged' : 'noop';
 }
 
 function waitForSessionFinalOutput(
@@ -865,23 +910,30 @@ async function triggerSessionTurnAdmitted(
   // mutually exclusive with the fresh-session idempotencyKey above) ──
   // Same at-most-once dispatch LEASE as the fresh-session key, but scoped to
   // (sessionId, turnIdempotencyKey) so a retried append to an existing session
-  // resolves to the SAME turn instead of injecting twice. The lease key is
-  // namespaced `turn:<sessionId>:<key>` so it can never collide with a
-  // fresh-session key in the same per-bot store. The heavy lifting (claim →
-  // reserved→attempting barrier → convergence) reuses idempotencyStore unchanged
-  // and is woven into deliverToExisting's async branch below; here we only do the
-  // fast pre-check (reuse/terminal short-circuit before touching the worker).
+  // resolves to the SAME turn instead of injecting twice. UNFORGEABLE domain
+  // separation from fresh-session keys comes from the store's `kind: 'turn'`
+  // (baked into the on-disk key digest) — NOT a user-constructable string prefix
+  // (codex #818 P1-2). The lease key still embeds sessionId so two different
+  // sessions with the same turnIdempotencyKey never share a lease. The heavy
+  // lifting (claim → reserved→attempting barrier → convergence) reuses
+  // idempotencyStore and is woven into deliverToExisting's async branch below;
+  // here we only do the fast pre-check (reuse/terminal short-circuit).
   const turnIdempotencyKey = req.options?.turnIdempotencyKey?.trim();
   const turnLeaseKey = turnIdempotencyKey && req.target.sessionId
-    ? `turn:${req.target.sessionId}:${turnIdempotencyKey}`
+    ? `${req.target.sessionId}\u0000${turnIdempotencyKey}`
     : undefined;
   // requestHash binds the key to its full business payload (same rule as the
   // fresh-session key): a same-key retry with a DIFFERENT payload is a caller bug
   // (409), not a silent join. Excludes both idempotency keys (lookup keys, not
-  // payload).
+  // payload). Also binds the target sessionId so a turn hash can never be
+  // mistaken for (or collide with) any other session's/seam's hash (codex #818
+  // P1-2: the fresh hash omits sessionId, so without this a same-payload fresh
+  // and turn request could hash-match).
   const { idempotencyKey: _omitK1, turnIdempotencyKey: _omitK2, ...turnOptionsForHash } = (req.options ?? {}) as Record<string, unknown>;
   const turnRequestHash = turnLeaseKey
     ? computeInputHash({
+        seam: 'turn',
+        sessionId: req.target.sessionId ?? null,
         instruction: req.instruction ?? null,
         envelope: req.envelope,
         source: req.source,
@@ -904,7 +956,7 @@ async function triggerSessionTurnAdmitted(
     }
     let hit: idempotencyStore.IdempotencyRecord | undefined;
     try {
-      hit = idempotencyStore.lookup(larkAppId, turnLeaseKey);
+      hit = idempotencyStore.lookup(larkAppId, turnLeaseKey, 'turn');
     } catch (err) {
       return { ok: false, errorCode: 'trigger_failed', error: `idempotency lease unreadable: ${(err as Error).message}` };
     }
@@ -1064,8 +1116,29 @@ async function triggerSessionTurnAdmitted(
     // { lease: undefined } and dispatches exactly as before.
     const claimTurnLeaseForDispatch = ():
       | { reuse: TriggerResponse }
+      | { retry: TriggerResponse }
       | { lease: idempotencyStore.IdempotencyRecord | undefined } => {
       if (!turnLeaseKey) return { lease: undefined };
+      // At-most-once cannot be held through the queued-activation durable tail:
+      // that staging path (admitQueuedActivationTail → promotion → queuedActivation
+      // fork) does not carry atMostOnce/noReplay, so a turn durably staged there
+      // could execute on a replacement CLI AFTER the caller already saw
+      // dispatch_unknown (codex #818 P1-4). Rather than thread the lease through
+      // that whole subsystem, refuse the keyed dispatch RETRYABLY while the
+      // admission gate owns submission order — nothing is claimed or dispatched, so
+      // the caller simply retries once the opening activation drains. (A no-key
+      // follow-up is unaffected: it just queues as before.)
+      if (queuedBehindActivation) {
+        return {
+          retry: {
+            ok: false,
+            triggerId,
+            errorCode: 'trigger_failed',
+            error: 'session activation in progress; retry the idempotent follow-up shortly',
+            turnIdempotencyKey,
+          },
+        };
+      }
       const reuseWinner = (winner: idempotencyStore.IdempotencyRecord): TriggerResponse => {
         // No session to close (existing-session append): just resolve from the
         // winner's terminal evidence, never dispatching a second time.
@@ -1088,17 +1161,17 @@ async function triggerSessionTurnAdmitted(
       const res = turnIdempotencyTakeover
         ? idempotencyStore.takeover({
             ownerLarkAppId: larkAppId, key: turnLeaseKey, expect: turnIdempotencyTakeover,
-            sessionId: target.session.sessionId, triggerId, requestHash: turnRequestHash, ownerBootId, now: Date.now(),
+            sessionId: target.session.sessionId, triggerId, requestHash: turnRequestHash, ownerBootId, now: Date.now(), kind: 'turn',
           })
         : idempotencyStore.claim({
             ownerLarkAppId: larkAppId, sessionId: target.session.sessionId, triggerId,
-            requestHash: turnRequestHash, ownerBootId, key: turnLeaseKey, now: Date.now(),
+            requestHash: turnRequestHash, ownerBootId, key: turnLeaseKey, now: Date.now(), kind: 'turn',
           });
       if (res.kind === 'existing') return { reuse: reuseWinner(res.record) };
       // Commit-unknown barrier: CAS reserved→attempting durably BEFORE dispatch.
       const attempting = idempotencyStore.transition(larkAppId, turnLeaseKey, res.record, {
         state: 'attempting', now: Date.now(),
-      });
+      }, 'turn');
       return { lease: attempting };
     };
     // Stamp the idempotent-async-turn descriptor so a worker that dies with no
@@ -1111,12 +1184,12 @@ async function triggerSessionTurnAdmitted(
         target.workerGeneration ?? 0,
         target.session.workerGeneration ?? 0,
       ) + (workerIsLive ? 0 : 1);
-      target.idempotentAsyncTurn = {
+      (target.idempotentAsyncTurns ??= new Map()).set(triggerId, {
         ownerLarkAppId: larkAppId,
         key: turnLeaseKey,
-        triggerId,
+        kind: 'turn',
         workerGeneration: dispatchedGeneration,
-      };
+      });
     };
 
     if (workerIsLive) {
@@ -1153,6 +1226,7 @@ async function triggerSessionTurnAdmitted(
           try {
             const claimed = claimTurnLeaseForDispatch();
             if ('reuse' in claimed) return claimed.reuse;
+            if ('retry' in claimed) return claimed.retry;
             turnLease = claimed.lease;
           } catch (err) {
             if (err instanceof idempotencyStore.IdempotencyConflictError) {
@@ -1176,18 +1250,23 @@ async function triggerSessionTurnAdmitted(
         if (!accepted) {
           target.asyncTriggerResults?.delete(triggerId);
           if (target.latestAsyncTriggerId === triggerId) target.latestAsyncTriggerId = undefined;
-          target.idempotentAsyncTurn = undefined;
           // The worker refused the input synchronously — nothing was dispatched.
           // Terminalize the attempting lease durably so a same-key retry resolves
           // `failed` (at-most-once) rather than seeing a live-looking attempting
-          // lease with no worker and hanging. Best-effort: on write failure the
-          // lease stays attempting for the next-boot reconcile to converge.
+          // lease with no worker and hanging. Only DROP the convergence entry AFTER
+          // the durable terminal write succeeds — if it throws (EIO), the lease is
+          // still attempting + async still pending, so the entry MUST survive so a
+          // later worker-exit / retry can still converge it (codex #818 P1-6: the
+          // old code cleared the entry first, leaving an unconvergeable attempting).
           if (turnLeaseKey && turnLease) {
             try {
               asyncTriggerStore.recordFailedStrict(target.session.sessionId, triggerId, Date.now(), larkAppId, 'dispatch_unknown');
+              target.idempotentAsyncTurns?.delete(triggerId);
             } catch (e) {
-              logger.error(`[idempotency] turn dispatch refused AND recordFailedStrict failed — lease stays attempting for next-boot reconcile: ${(e as Error).message}`);
+              logger.error(`[idempotency] turn dispatch refused AND recordFailedStrict failed — convergence entry kept for worker-exit/retry: ${(e as Error).message}`);
             }
+          } else {
+            target.idempotentAsyncTurns?.delete(triggerId);
           }
           return {
             ok: false,
@@ -1275,6 +1354,7 @@ async function triggerSessionTurnAdmitted(
         try {
           const claimed = claimTurnLeaseForDispatch();
           if ('reuse' in claimed) return claimed.reuse;
+          if ('retry' in claimed) return claimed.retry;
           turnLease = claimed.lease;
         } catch (err) {
           if (err instanceof idempotencyStore.IdempotencyConflictError) {
@@ -1303,13 +1383,16 @@ async function triggerSessionTurnAdmitted(
         // authoritative durable failed (dispatch_unknown) so the caller polls a
         // terminal instead of `running` forever; at-most-once, never re-dispatched.
         if (turnLeaseKey && turnLease) {
-          target.idempotentAsyncTurn = undefined;
           let terminalDurable = false;
           try {
             asyncTriggerStore.recordFailedStrict(target.session.sessionId, triggerId, Date.now(), larkAppId, 'dispatch_unknown');
             terminalDurable = true;
+            // Drop the convergence entry ONLY after the durable terminal write
+            // succeeds. On EIO the entry MUST survive so a worker-exit / retry can
+            // still converge the still-attempting lease (codex #818 P1-6).
+            target.idempotentAsyncTurns?.delete(triggerId);
           } catch (e) {
-            logger.error(`[idempotency] turn fork threw AND recordFailedStrict failed — lease stays attempting for next-boot reconcile: ${(e as Error).message}`);
+            logger.error(`[idempotency] turn fork threw AND recordFailedStrict failed — convergence entry kept for worker-exit/retry: ${(e as Error).message}`);
           }
           if (!terminalDurable) {
             return {
@@ -1751,12 +1834,12 @@ async function triggerSessionTurnAdmitted(
           newDs.workerGeneration ?? 0,
           newDs.session.workerGeneration ?? 0,
         ) + 1;
-        newDs.idempotentAsyncTurn = {
+        (newDs.idempotentAsyncTurns ??= new Map()).set(triggerId, {
           ownerLarkAppId: larkAppId,
           key: idempotencyKey,
-          triggerId,
+          kind: 'fresh',
           workerGeneration: dispatchedGeneration,
-        };
+        });
       }
       const dispatchAttempt = prepareStableDispatch(newDs, true);
       armFinalOutputSuppression(newDs, dispatchAttempt);

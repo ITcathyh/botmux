@@ -6,8 +6,10 @@
  * worker-pool) mocked so we can drive the worker-live (sendWorkerInput) and
  * dormant (forkWorker) dispatch branches and assert the at-most-once lease.
  *
- * The turn lease key is namespaced `turn:<sessionId>:<key>` and reuses the same
- * reserved→attempting barrier + worker-exit convergence as the fresh-session key.
+ * The turn lease is stored under the unforgeable `turn` store kind (codex #818
+ * P1-2 — a domain separator baked into the key digest, NOT a user-constructable
+ * string prefix) and reuses the same reserved→attempting barrier + per-triggerId
+ * worker-exit convergence as the fresh-session key.
  *
  * Run:  pnpm vitest run test/trigger-session-turn-idempotency.test.ts
  */
@@ -70,6 +72,7 @@ vi.mock('../src/im/lark/card-handler.js', () => ({ runAutoWorktreeCommit: vi.fn(
 // dispatch side effects. Either can be made to throw/refuse on demand.
 let forkShouldThrow = false;
 let sendShouldRefuse = false;
+let queuedActivationGateActive = false;
 const mockForkWorker = vi.fn(() => { if (forkShouldThrow) throw new Error('injected fork failure'); });
 const mockSendWorkerInput = vi.fn(() => !sendShouldRefuse);
 const mockCloseSession = vi.fn(async () => ({ ok: true, alreadyClosed: false, known: true }));
@@ -81,10 +84,10 @@ vi.mock('../src/core/worker-pool.js', () => ({
   closeSession: (...a: any[]) => mockCloseSession(...a),
   getDaemonBootId: () => 'boot-CURRENT',
   withActiveSessionKeyLock: (_map: any, _key: string, action: () => any) => action(),
-  hasQueuedActivationAdmissionGate: () => false,
+  hasQueuedActivationAdmissionGate: () => queuedActivationGateActive,
 }));
 
-import { triggerSessionTurn } from '../src/core/trigger-session.js';
+import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit } from '../src/core/trigger-session.js';
 import * as asyncTriggerStore from '../src/services/async-trigger-store.js';
 import * as idempotencyStore from '../src/services/idempotency-store.js';
 import { sessionKey } from '../src/core/types.js';
@@ -133,7 +136,7 @@ beforeEach(() => {
   process.env.SESSION_DATA_DIR = tempDir;
   existingRows.length = 0;
   existingRows.push({ sessionId: SID, chatId: CHAT, scope: 'chat', status: 'active' });
-  forkShouldThrow = false; sendShouldRefuse = false;
+  forkShouldThrow = false; sendShouldRefuse = false; queuedActivationGateActive = false;
   mockForkWorker.mockClear(); mockSendWorkerInput.mockClear(); mockCloseSession.mockClear();
 });
 afterEach(() => {
@@ -154,12 +157,15 @@ describe('turn-level idempotency — worker LIVE (sendWorkerInput) branch', () =
     // live-branch replay defect — the fresh-session/dormant paths use the fork
     // init's atMostOnce, the live path needs it threaded through the message IPC).
     expect(mockSendWorkerInput.mock.calls[0][3]?.atMostOnce).toBe(true);
-    const lease = idempotencyStore.lookup(APP, `turn:${SID}:tk-1`);
+    // Turn lease lives under the unforgeable `turn` store kind (codex #818 P1-2:
+    // NOT a user-constructable string prefix); key embeds sessionId.
+    const lease = idempotencyStore.lookup(APP, `${SID}\u0000tk-1`, 'turn');
     expect(lease?.state).toBe('attempting'); // barrier crossed before send
     expect(lease?.sessionId).toBe(SID);
-    // The idempotent-async-turn convergence stamp is set for at-most-once.
-    expect(ds.idempotentAsyncTurn?.key).toBe(`turn:${SID}:tk-1`);
-    expect(ds.idempotentAsyncTurn?.triggerId).toBe(res.triggerId);
+    // The idempotent-async-turn convergence entry is set per-triggerId (Map, not a
+    // single slot — codex #818 P1-1).
+    expect(ds.idempotentAsyncTurns?.get(res.triggerId!)?.key).toBe(`${SID}\u0000tk-1`);
+    expect(ds.idempotentAsyncTurns?.get(res.triggerId!)?.kind).toBe('turn');
   });
 
   it('same key + same payload retry: reuses in-flight turn, does NOT send again', async () => {
@@ -207,7 +213,7 @@ describe('turn-level idempotency — worker LIVE (sendWorkerInput) branch', () =
     // Authoritative durable failed so trigger-result converges (not stuck running).
     expect(asyncTriggerStore.lookup(SID, res.triggerId!)?.result.status).toBe('failed');
     expect(asyncTriggerStore.lookup(SID, res.triggerId!)?.result.reason).toBe('dispatch_unknown');
-    expect(ds.idempotentAsyncTurn).toBeUndefined(); // stamp cleared on refusal
+    expect(ds.idempotentAsyncTurns?.get(res.triggerId!)).toBeUndefined(); // entry dropped after durable failed
     // Retry: at-most-once — resolves the terminal, never re-sends.
     sendShouldRefuse = false;
     const sendsBefore = mockSendWorkerInput.mock.calls.length;
@@ -228,7 +234,7 @@ describe('turn-level idempotency — worker DORMANT (forkWorker) branch', () => 
     const forkArg = mockForkWorker.mock.calls[0][2];
     expect(forkArg.atMostOnce).toBe(true);   // at-most-once rides the fork init
     expect(forkArg.resume).toBe(true);       // existing session resumes context
-    expect(idempotencyStore.lookup(APP, `turn:${SID}:tk-fork`)?.state).toBe('attempting');
+    expect(idempotencyStore.lookup(APP, `${SID}\u0000tk-fork`, 'turn')?.state).toBe('attempting');
   });
 
   it('fork throw AFTER the barrier → durable failed(dispatch_unknown); retry does NOT re-fork', async () => {
@@ -239,7 +245,7 @@ describe('turn-level idempotency — worker DORMANT (forkWorker) branch', () => 
     expect(res.state).toBe('failed');
     expect(res.errorCode).toBe('no_output');
     expect(asyncTriggerStore.lookup(SID, res.triggerId!)?.result.reason).toBe('dispatch_unknown');
-    expect(ds.idempotentAsyncTurn).toBeUndefined();
+    expect(ds.idempotentAsyncTurns?.get(res.triggerId!)).toBeUndefined();
     forkShouldThrow = false;
     const forksBefore = mockForkWorker.mock.calls.length;
     const retry = await triggerSessionTurn(followUpReq('tk-fthrow'), { larkAppId: APP, activeSessions: active });
@@ -258,6 +264,70 @@ describe('turn-level idempotency — no key (unchanged behavior)', () => {
     // No key → a plain replayable input (atMostOnce must NOT be set, else an
     // ordinary follow-up would be wrongly dropped on a CLI restart).
     expect(mockSendWorkerInput.mock.calls[0][3]?.atMostOnce).toBeUndefined();
-    expect(ds.idempotentAsyncTurn).toBeUndefined(); // no lease, no convergence stamp
+    expect(ds.idempotentAsyncTurns?.size ?? 0).toBe(0); // no lease, no convergence entry
+  });
+});
+
+// ── codex #818 review regressions: the structural at-most-once defects the
+//    first round missed, each pinned with the deterministic scenario codex gave.
+describe('turn-level idempotency — codex #818 P1 regressions', () => {
+  it('P1-1: two concurrent keyed turns on ONE session BOTH converge on worker exit (no lost stamp)', async () => {
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    const active = activeWith(ds);
+    const a = await triggerSessionTurn(followUpReq('tk-A'), { larkAppId: APP, activeSessions: active });
+    const b = await triggerSessionTurn(followUpReq('tk-B'), { larkAppId: APP, activeSessions: active });
+    // Both stamps coexist (a single slot would have let B clobber A).
+    expect(ds.idempotentAsyncTurns?.size).toBe(2);
+    expect(ds.idempotentAsyncTurns?.get(a.triggerId!)).toBeDefined();
+    expect(ds.idempotentAsyncTurns?.get(b.triggerId!)).toBeDefined();
+    const gen = ds.idempotentAsyncTurns!.get(a.triggerId!)!.workerGeneration;
+    // Worker dies with neither completed → BOTH must converge to dispatch_unknown.
+    ds.worker = null;
+    const outcome = convergeIdempotentAsyncTurnOnWorkerExit(ds, gen);
+    expect(outcome).toBe('converged');
+    expect(asyncTriggerStore.lookup(SID, a.triggerId!)?.result.status).toBe('failed');
+    expect(asyncTriggerStore.lookup(SID, b.triggerId!)?.result.status).toBe('failed'); // NOT stranded pending
+    expect(ds.idempotentAsyncTurns?.size ?? 0).toBe(0);
+  });
+
+  it('P1-2: a fresh idempotencyKey cannot collide with a turn key of the same string', async () => {
+    // Claim a turn lease under key "sess_existing<NUL>tk-collide".
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    await triggerSessionTurn(followUpReq('tk-collide'), { larkAppId: APP, activeSessions: activeWith(ds) });
+    const turnLease = idempotencyStore.lookup(APP, `${SID}\u0000tk-collide`, 'turn');
+    expect(turnLease?.state).toBe('attempting');
+    // The SAME string under the fresh (default) kind is a DIFFERENT file → absent.
+    expect(idempotencyStore.lookup(APP, `${SID}\u0000tk-collide`)).toBeUndefined();
+    expect(idempotencyStore.lookup(APP, `${SID}\u0000tk-collide`, 'fresh')).toBeUndefined();
+  });
+
+  it('P1-3: boot reconcile terminalizes a turn lease but NEVER closes the shared session', async () => {
+    // Seed an attempting TURN lease from a PREVIOUS boot (ownerBootId differs from
+    // the reconcile's currentBootId) on a still-live shared session.
+    idempotencyStore.claim({
+      ownerLarkAppId: APP, sessionId: SID, triggerId: 'trg_prev',
+      requestHash: 'sha256:x', ownerBootId: 'boot-OLD', key: `${SID}\u0000tk-recon`, now: 1, kind: 'turn',
+    });
+    idempotencyStore.transition(APP, `${SID}\u0000tk-recon`,
+      idempotencyStore.lookup(APP, `${SID}\u0000tk-recon`, 'turn')!, { state: 'attempting', now: 2 }, 'turn');
+    mockCloseSession.mockClear();
+    const quarantined = await reconcileIdempotencyLeasesOnBoot(APP, 'boot-CURRENT', () => ({ chatId: CHAT }));
+    // The exact turn is terminalized (caller polls failed at-most-once)…
+    expect(asyncTriggerStore.lookup(SID, 'trg_prev')?.result.reason).toBe('dispatch_unknown');
+    // …but the SHARED session is NEVER closed or quarantined (fresh-session-only teardown).
+    expect(mockCloseSession).not.toHaveBeenCalled();
+    expect(quarantined.has(SID)).toBe(false);
+  });
+
+  it('P1-4: a keyed follow-up is refused RETRYABLY (no claim, no dispatch) while an activation gate is active', async () => {
+    queuedActivationGateActive = true; // opening activation still owns submission order
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    const res = await triggerSessionTurn(followUpReq('tk-gated'), { larkAppId: APP, activeSessions: activeWith(ds) });
+    expect(res.ok).toBe(false);
+    expect(res.errorCode).toBe('trigger_failed');
+    expect(res.error).toMatch(/activation in progress/i);
+    // Nothing claimed, nothing dispatched — the caller retries once the gate drains.
+    expect(mockSendWorkerInput).not.toHaveBeenCalled();
+    expect(idempotencyStore.lookup(APP, `${SID}\u0000tk-gated`, 'turn')).toBeUndefined();
   });
 });

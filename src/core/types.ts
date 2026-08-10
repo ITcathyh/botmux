@@ -332,16 +332,23 @@ export interface DaemonSession {
    *  ds.worker=null but keeps the session in activeSessions + the async record
    *  `pending`, which would otherwise poll `running` forever and let a same-key
    *  retry reuse the dead session until the next daemon reconcile (codex #776
-   *  round-6 finding #1). Cleared once the turn completes (final_output). */
-  idempotentAsyncTurn?: {
+   *  round-6 finding #1). Keyed by triggerId so MULTIPLE concurrent keyed turns
+   *  on ONE shared session each get their own convergence stamp — a single slot
+   *  let a later turn's stamp clobber an earlier turn's, stranding the earlier
+   *  turn `pending` forever on worker exit (codex #818 P1-1). Each entry is
+   *  removed once its OWN turn completes (final_output / nothing-to-send) or is
+   *  converged on worker exit; a fresh-session turn is just the 1-entry case. */
+  idempotentAsyncTurns?: Map<string, {
     ownerLarkAppId: string;
     key: string;
-    triggerId: string;
+    /** Store domain of the lease key (fresh async-virtual vs follow-up turn) so
+     *  convergence looks the lease up under the correct unforgeable namespace. */
+    kind: 'fresh' | 'turn';
     /** The worker generation this turn was dispatched on. The exit handler only
      *  converges when the DYING generation is this one (a later generation that
      *  completed and moved on must not be retro-failed). */
     workerGeneration: number;
-  };
+  }>;
   /** Stable turn ids whose automatic transcript fallback is capture/discard.
    *  turn_terminal clears the entry; bounded in trigger-session for crash
    *  paths that never produce a terminal. */
