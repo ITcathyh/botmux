@@ -979,22 +979,30 @@ async function triggerSessionTurnAdmitted(
         const faultDs = activeBySessionId(deps.activeSessions, hit.sessionId);
         const faultEntry = faultDs?.idempotentAsyncTurns?.get(hit.triggerId);
         if (faultDs && faultEntry?.postBarrierFault) {
-          // COMPLETED-WINS: the turn may have actually finished between the fault
-          // and this retry (durable owned `completed` on disk). Never terminalize
-          // over a real completion — clear the fault flag and reuse the completed
-          // result (codex #818 P1-8 race). Only terminalize when NOT completed.
-          const durable = asyncTriggerStore.lookup(hit.sessionId, hit.triggerId);
-          const ownedCompleted = durable?.result.status === 'completed'
-            && durable.ownerLarkAppId === hit.ownerLarkAppId;
-          if (ownedCompleted) {
+          // COMPLETED-WINS (codex #818 P1-8 race): the turn may have actually
+          // finished between the fault and this retry. The AUTHORITATIVE decision
+          // is recordFailedStrict's IN-LOCK outcome — no TOCTOU: if a completed is
+          // on disk when the lock is held it returns `already_completed` (no write),
+          // else `written_failed`. A pre-read fast-path avoids the lock when already
+          // visibly completed, but correctness rests on the in-lock return.
+          const preRead = asyncTriggerStore.lookup(hit.sessionId, hit.triggerId);
+          const reuseCompleted = (): TriggerResponse => {
             faultDs.idempotentAsyncTurns?.delete(hit.triggerId);
             return {
               ...buildAsyncQueuedResponse(hit.triggerId, hit.sessionId, decision.chatId, 'idempotency key already completed; reuse the session (poll trigger-result)'),
               turnIdempotencyKey, idempotent: true,
             };
+          };
+          if (preRead?.result.status === 'completed' && preRead.ownerLarkAppId === hit.ownerLarkAppId) {
+            return reuseCompleted();
           }
           try {
-            asyncTriggerStore.recordFailedStrict(hit.sessionId, hit.triggerId, Date.now(), larkAppId, 'dispatch_unknown');
+            const outcome = asyncTriggerStore.recordFailedStrict(hit.sessionId, hit.triggerId, Date.now(), larkAppId, 'dispatch_unknown');
+            if (outcome === 'already_completed') {
+              // A completion landed AFTER our pre-read but was seen under the lock —
+              // completed wins, nothing was written. Reuse it, never report failed.
+              return reuseCompleted();
+            }
             faultDs.idempotentAsyncTurns?.delete(hit.triggerId);
             faultDs.asyncTriggerResults?.delete(hit.triggerId);
             return {
@@ -1004,18 +1012,8 @@ async function triggerSessionTurnAdmitted(
               turnIdempotencyKey, idempotent: true,
             };
           } catch (e) {
-            // recordFailedStrict is completed-wins + owner-proofed: a completed that
-            // landed in the race window throws here → drop the flag and reuse it
-            // (not a 5xx). A genuine I/O failure keeps the flag for the next
-            // retry / worker-exit / boot reconcile.
-            const raced = asyncTriggerStore.lookup(hit.sessionId, hit.triggerId);
-            if (raced?.result.status === 'completed' && raced.ownerLarkAppId === hit.ownerLarkAppId) {
-              faultDs.idempotentAsyncTurns?.delete(hit.triggerId);
-              return {
-                ...buildAsyncQueuedResponse(hit.triggerId, hit.sessionId, decision.chatId, 'idempotency key already completed; reuse the session (poll trigger-result)'),
-                turnIdempotencyKey, idempotent: true,
-              };
-            }
+            // Genuine I/O failure (owner mismatch / EIO) — keep the flag for the
+            // next retry / worker-exit / boot reconcile; do NOT report a phantom.
             return { ok: false, errorCode: 'trigger_failed', error: `idempotent turn terminal outcome could not be persisted: ${(e as Error).message}`, turnIdempotencyKey };
           }
         }
@@ -1259,8 +1257,16 @@ async function triggerSessionTurnAdmitted(
         return null;
       }
       try {
-        asyncTriggerStore.recordFailedStrict(target.session.sessionId, triggerId, Date.now(), larkAppId, 'dispatch_unknown');
+        const outcome = asyncTriggerStore.recordFailedStrict(target.session.sessionId, triggerId, Date.now(), larkAppId, 'dispatch_unknown');
         target.idempotentAsyncTurns?.delete(triggerId);
+        if (outcome === 'already_completed') {
+          // Defensive: a completed somehow already exists (completed-wins) — reuse
+          // it instead of reporting failed over a real completion.
+          return {
+            ...buildAsyncQueuedResponse(triggerId, target.session.sessionId, chatId, 'idempotency key already completed; reuse the session (poll trigger-result)'),
+            turnIdempotencyKey, idempotent: false,
+          };
+        }
         return {
           ok: false, state: 'failed', triggerId,
           errorCode: 'no_output', error: 'previous dispatch was interrupted with unknown outcome; not re-run (at-most-once)',

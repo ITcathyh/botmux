@@ -184,20 +184,26 @@ export function recordCompleted(
  *     failure — the whole point is that this evidence is authoritative).
  *
  * Completed-wins invariant: if a `completed` result is ALREADY on disk for this
- * triggerId, this is a no-op (the turn finished; the stronger proof stands). We
- * deliberately do NOT make `failed` irreversible — a completed arriving later
- * still wins via recordCompleted (same lock).
+ * triggerId, this is a no-op and returns `already_completed` (the turn finished;
+ * the stronger proof stands). We deliberately do NOT make `failed` irreversible —
+ * a completed arriving later still wins via recordCompleted (same lock).
+ *
+ * Returns a discriminated in-lock outcome so a caller that races a late completion
+ * reacts to what ACTUALLY happened under the lock (no TOCTOU): `already_completed`
+ * = a completed was on disk, nothing written, the caller must resolve completed;
+ * `written_failed` = the durable failed was written (codex #818 P1-8 race).
  */
+export type RecordFailedStrictOutcome = 'written_failed' | 'already_completed';
 export function recordFailedStrict(
   sessionId: string,
   triggerId: string,
   failedAt: number,
   ownerLarkAppId: string,
   reason: 'dispatch_unknown' = 'dispatch_unknown',
-): void {
+): RecordFailedStrictOutcome {
   if (!ownerLarkAppId) throw new Error('recordFailedStrict requires ownerLarkAppId');
   ensureDir();
-  withFileLockSync(getFilePath(sessionId), () => {
+  return withFileLockSync(getFilePath(sessionId), () => {
     const file = loadStrict(sessionId); // ONLY ENOENT is empty; corrupt/EIO throws
     // Owner proof: never overwrite another bot's file (a hash/path mixup or a
     // cross-bot mistake must fail-closed, not clobber their evidence).
@@ -205,7 +211,7 @@ export function recordFailedStrict(
       throw new Error(`recordFailedStrict owner mismatch: file owned by ${file.ownerLarkAppId}, caller ${ownerLarkAppId}`);
     }
     const prev = file.results[triggerId];
-    if (prev?.status === 'completed') return; // completed is stronger — keep it
+    if (prev?.status === 'completed') return 'already_completed'; // completed is stronger — keep it
     file.ownerLarkAppId = ownerLarkAppId;
     file.results[triggerId] = {
       status: 'failed',
@@ -216,6 +222,7 @@ export function recordFailedStrict(
     };
     if (!file.latestTriggerId) file.latestTriggerId = triggerId;
     saveStrict(sessionId, file); // durable + throws
+    return 'written_failed';
   });
 }
 

@@ -424,4 +424,36 @@ describe('turn-level idempotency — codex #818 P1 regressions', () => {
     expect(ds.idempotentAsyncTurns?.size ?? 0).toBe(0); // fault entry cleared
     expect(mockSendWorkerInput).not.toHaveBeenCalled(); // never re-dispatched
   });
+
+  it('P1-8 TOCTOU: completion landing AFTER pre-read but seen IN-LOCK → reuse completed, not failed', async () => {
+    // The tighter window codex flagged: the retry pre-read sees NOT-completed, but a
+    // completion lands before recordFailedStrict takes the lock. recordFailedStrict
+    // then returns `already_completed` (no-op, completed-wins) — the caller must
+    // resolve completed, NOT unconditionally return failed. We simulate the in-lock
+    // race by having recordFailedStrict itself write the completion then report
+    // already_completed (its real completed-wins behavior).
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    const active = activeWith(ds);
+    const pendSpy = vi.spyOn(asyncTriggerStore, 'recordPending').mockImplementationOnce(() => { throw new Error('injected recordPending fault'); });
+    const failSpy = vi.spyOn(asyncTriggerStore, 'recordFailedStrict').mockImplementationOnce(() => { throw new Error('injected recordFailedStrict fault'); });
+    const first = await triggerSessionTurn(followUpReq('tk-toctou'), { larkAppId: APP, activeSessions: active });
+    pendSpy.mockRestore(); failSpy.mockRestore();
+    expect([...(ds.idempotentAsyncTurns?.values() ?? [])][0]?.postBarrierFault).toBe(true);
+    // Pre-read will see NOT completed; but the NEXT recordFailedStrict call lands the
+    // completion under the lock and returns already_completed (real completed-wins).
+    const realRFS = asyncTriggerStore.recordFailedStrict;
+    const rfsSpy = vi.spyOn(asyncTriggerStore, 'recordFailedStrict').mockImplementationOnce((sid: any, tid: any) => {
+      asyncTriggerStore.recordCompleted(sid, tid, 'raced-in answer', Date.now(), APP);
+      return 'already_completed' as any; // mirrors the in-lock completed-wins no-op
+    });
+    const retry = await triggerSessionTurn(followUpReq('tk-toctou'), { larkAppId: APP, activeSessions: active });
+    rfsSpy.mockRestore();
+    // Completed wins: response must NOT be failed, and durable stays completed.
+    expect(retry.state).not.toBe('failed');
+    expect(retry.idempotent).toBe(true);
+    expect(asyncTriggerStore.lookup(SID, first.triggerId!)?.result.status).toBe('completed');
+    expect(ds.idempotentAsyncTurns?.size ?? 0).toBe(0); // stale fault entry cleared
+    expect(mockSendWorkerInput).not.toHaveBeenCalled();
+    void realRFS;
+  });
 });
