@@ -11546,6 +11546,18 @@
       "sourceFile": "src/core/worker-pool.ts",
       "enclosingFunction": "setupWorkerHandlers",
       "receiverKind": "DaemonSession",
+      "fieldPath": "idempotentAsyncTurn",
+      "operation": "assign",
+      "normalizedAstHash": "5397bcad44954561",
+      "count": 1,
+      "classification": "ephemeral_runtime",
+      "authorityId": "actor-host-runtime",
+      "accessLane": "actor-host-direct"
+    },
+    {
+      "sourceFile": "src/core/worker-pool.ts",
+      "enclosingFunction": "setupWorkerHandlers",
+      "receiverKind": "DaemonSession",
       "fieldPath": "initConfig",
       "operation": "assign",
       "normalizedAstHash": "2a975c6aeb21d8d8",

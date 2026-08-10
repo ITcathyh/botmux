@@ -92,7 +92,14 @@ import type { DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
 import { EventEmitter } from 'node:events';
 
+// The executor runtime keeps a module-level per-session generation floor; a
+// shared sessionId across tests would make later commits non-monotonic. Mint a
+// fresh id per fixture and stamp it on both the ds and its terminal messages.
+let fixtureSeq = 0;
+let currentFixtureSessionId = 'sid-async-settle-0';
+
 function makeDs(): DaemonSession {
+  currentFixtureSessionId = `sid-async-settle-${++fixtureSeq}`;
   const fakeWorker = new EventEmitter() as any;
   fakeWorker.killed = false;
   fakeWorker.send = vi.fn();
@@ -102,7 +109,7 @@ function makeDs(): DaemonSession {
   fakeWorker.stderr = new EventEmitter();
   const ds: DaemonSession = {
     session: {
-      sessionId: 'sid-async-settle',
+      sessionId: currentFixtureSessionId,
       rootMessageId: 'om_root',
       chatId: 'oc_chat',
       title: 'fixture',
@@ -133,7 +140,7 @@ function terminalMsg(
 ): Extract<WorkerToDaemon, { type: 'turn_terminal' }> {
   return {
     type: 'turn_terminal',
-    sessionId: 'sid-async-settle',
+    sessionId: currentFixtureSessionId,
     turnId,
     status: 'completed',
     ...extra,
@@ -167,7 +174,7 @@ describe('async-HTTP settle-on-terminal (daemon turn_terminal handler)', () => {
     });
     // Durable persistence with EMPTY content.
     expect(recordCompletedMock).toHaveBeenCalledWith(
-      'sid-async-settle', 'turn-silent', '', expect.any(Number), 'app_test',
+      currentFixtureSessionId, 'turn-silent', '', expect.any(Number), 'app_test',
     );
     // Worker-exit convergence entry dropped (by triggerId) so a later graceful exit can't retro-fail it.
     expect(ds.idempotentAsyncTurns!.get('turn-silent')).toBeUndefined();

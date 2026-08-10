@@ -66,9 +66,12 @@ const mocks = vi.hoisted(() => {
     }),
     updateSession: vi.fn((session: any) => { sessions.set(session.sessionId, session); }),
     getSessionFresh: vi.fn(),
-    getSessionForOwnerStrict: vi.fn((_ownerLarkAppId: string, sessionId: string) => (
-      sessions.get(sessionId)
-    )),
+    getSessionForOwnerStrict: vi.fn((_ownerLarkAppId: string, sessionId: string) => {
+      // Production reads the row back from disk JSON — undefined-valued keys are
+      // stripped. Mirror that so durable-row equality checks behave like prod.
+      const stored = sessions.get(sessionId);
+      return stored ? JSON.parse(JSON.stringify(stored)) : undefined;
+    }),
     listSessionsForOwnerStrict: vi.fn(() => [...sessions.values()]),
     getSession: vi.fn((sessionId: string) => sessions.get(sessionId)),
     closeSession: vi.fn((sessionId: string) => {
@@ -687,7 +690,8 @@ describe('/rename production routing — must not pre-create a session (review P
       mocks.forkWorker.mock.invocationCallOrder[0]!,
     );
     expect(JSON.stringify(mocks.forkWorker.mock.calls[0]?.[1])).toContain('om_distinct_quoted_message');
-    expect(mocks.createSession).toHaveBeenCalledTimes(1);
+    // C1 openings self-mint the Session (no createSession seam); assert the outcome.
+    expect(activeSessions.get(sessionKey('om_force_topic_quoted_task', APP))).toBeDefined();
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
   });
 
@@ -742,9 +746,13 @@ describe('/rename production routing — must not pre-create a session (review P
 
     const ds = activeSessions.get(sessionKey('om_bare_force_topic_picker', APP));
     expect(ds?.pendingRepo).toBe(true);
-    expect(mocks.createSession).toHaveBeenCalledTimes(1);
+    // C1 openings self-mint the Session (no createSession seam); the repo card
+    // is dispatched as a detached post-commit effect — wait for it.
+    expect(ds).toBeDefined();
     expect(mocks.forkWorker).not.toHaveBeenCalled();
-    expect(mocks.replyMessage).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => {
+      expect(mocks.replyMessage).toHaveBeenCalledTimes(1);
+    }, { timeout: 1_000 });
     expect(mocks.addReaction).not.toHaveBeenCalled();
     expect(mocks.replyMessage.mock.calls[0]?.slice(0, 5)).toEqual([
       APP,
@@ -955,7 +963,8 @@ describe('/rename production routing — must not pre-create a session (review P
       'text',
       true,
     ]);
-    expect(mocks.createSession).toHaveBeenCalledTimes(1);
+    // C1 openings self-mint the Session (no createSession seam); assert the outcome.
+    expect(activeSessions.get(sessionKey('om_force_topic_with_content', APP))).toBeDefined();
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
     expect(mocks.replyMessage.mock.invocationCallOrder[0]).toBeLessThan(
       mocks.forkWorker.mock.invocationCallOrder[0]!,

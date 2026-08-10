@@ -87,6 +87,7 @@ import * as messageQueue from './services/message-queue.js';
 import { emitHookEvent, emitHookEventLocal, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
 import { createImgNumberer, extractPostAtParticipants, parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
+import { buildQuoteHint } from './im/lark/quote-hint.js';
 import { expandMergeForward } from './im/lark/merge-forward.js';
 import { bindResourcesToMessage, composeForwardFollowupContent, mergeMessageMentions } from './im/lark/forward-followup-content.js';
 import { logger } from './utils/logger.js';
@@ -613,6 +614,11 @@ const currentOrdinaryOpeningCreators = new Map<
   }
 >();
 
+// #796: a bare `/t` whose setup falls through to the repo-picker opening still
+// runs the talk-permission recheck in materialization, but topic setup must
+// not consume a message-quota unit. Entries are consumed by the quota effect.
+const quotaExemptOrdinaryTurnIds = new Set<string>();
+
 function currentOrdinaryIngressPort(
   ownerLarkAppId: string,
 ): ReturnType<typeof createCurrentOrdinaryIngressDaemonPort> {
@@ -632,7 +638,10 @@ function currentOrdinaryIngressPort(
         input.sender.unionId,
         input.route.chatType,
         input.sender.kind === 'bot',
-        { listenerAuthorized: input.messageListener !== undefined },
+        {
+          listenerAuthorized: input.messageListener !== undefined,
+          skipCharge: quotaExemptOrdinaryTurnIds.delete(input.turnId),
+        },
       );
       return accepted
         ? { kind: 'ok', value: null }
@@ -657,8 +666,20 @@ function currentOrdinaryIngressPort(
       else beginReforkTurn(current, turn.title);
     },
     addReceivedReaction: async input => {
-      const ds = findActiveBySessionId(input.sessionId);
+      // Resolve from the daemon-owned registry directly — the worker-pool
+      // mirror is only wired after initWorkerPool.
+      let ds: DaemonSession | undefined;
+      for (const candidate of activeSessions.values()) {
+        if (candidate.session.sessionId === input.sessionId) {
+          ds = candidate;
+          break;
+        }
+      }
       if (!ds || ds.larkAppId !== ownerLarkAppId) return { kind: 'ok', value: null };
+      // A turn parked behind repo selection / worktree preparation has not been
+      // received by any CLI turn yet — the picker card or stash notice is the
+      // feedback there, matching the legacy acceptance points.
+      if (ds.pendingRepo) return { kind: 'ok', value: null };
       const reactionId = await addTurnReceivedReaction(
         ds,
         input.turnId,
@@ -978,6 +999,10 @@ function currentOrdinaryOpeningCreator(
       dispatch(effect) {
         const captured = capturePendingOpening(effect);
         if (!captured) {
+          logger.warn(
+            `[${effect.ownerLarkAppId}] Current opening post-commit refused: `
+            + `pending opening ${effect.sessionId.slice(0, 8)} (${effect.mode}) lost its exact Session owner`,
+          );
           return {
             kind: 'refused',
             message: 'Current pending opening no longer has its exact Session owner',
@@ -3839,6 +3864,21 @@ async function maybeSeedCardlessForceTopicTurn(args: {
     // an accepted task. Keep starting the worker if this lightweight reply
     // fails; the final answer can still seed the thread.
     logger.warn(`[/t] Failed to seed card-off topic reply: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/**
+ * Card-off gate for a Session that does not exist yet (new-topic `/t`): the
+ * per-ds gate reduces to bot config there — no forced card, no substitute
+ * reply-target entry can exist before the opening is created.
+ */
+function newTopicStreamingCardDisabled(larkAppId: string, chatId: string): boolean {
+  try {
+    const cfg = getBot(larkAppId).config;
+    return cfg.disableStreamingCard === true
+      || (!!chatId && !!cfg.noCardChats?.includes(chatId));
+  } catch {
+    return false;
   }
 }
 
@@ -17596,6 +17636,99 @@ async function handleNewTopicAdmitted(
       // Pass mention-stripped content so /command argument parsing works.
       await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, commandDeps, larkAppId);
       return;
+    }
+  }
+
+  // #796: a text-only bare `/t` is topic setup, not an empty CLI turn.
+  // `buildQuoteHint` distinguishes a real user quote from parent_id values that
+  // merely point at the current thread root.
+  const isBareForceTopic = forceTopic !== null
+    && forceTopic.prompt === ''
+    && content === ''
+    && resources.length === 0
+    && buildQuoteHint(parsed, scope, anchor, localeForBot(larkAppId)) === ''
+    && !ctx.forwardSeedData
+    && !messageListener;
+  if (forceTopic) {
+    const { pinnedWorkingDir } = await resolvePinnedWorkingDir({
+      scope,
+      anchor,
+      chatId,
+      chatType,
+      larkAppId,
+      listenerWorkingDir: messageListener?.workingDir,
+    });
+    const setupDirs = pinnedWorkingDir
+      ? [pinnedWorkingDir]
+      : getProjectScanDirsForBot(larkAppId);
+    if (isBareForceTopic) {
+      // Preserve the repo-picker path when no cwd is pinned; a pinned cwd needs
+      // no setup owner, so one visible reply can materialize the Lark thread and
+      // the first real task (or `/repo`) will create its Session. Attachments,
+      // quotes, forwarded context, and listener prompts remain real inputs and
+      // must not be dropped.
+      const invalidDirs = invalidWorkingDirs({ workingDirs: setupDirs });
+      if (invalidDirs.length > 0) {
+        await sessionReply(
+          anchor,
+          tr('cmd.repo.working_dir_not_exist', {
+            dirs: invalidDirs.map(d => `\`${d}\``).join(', '),
+          }, localeForBot(larkAppId)),
+          'text',
+          larkAppId,
+        );
+        logger.warn(`[/t] configured workingDir missing: ${invalidDirs.join(', ')}`);
+        return;
+      }
+      if (pinnedWorkingDir) {
+        await sessionReply(
+          anchor,
+          tr('daemon.force_topic_ready', undefined, localeForBot(larkAppId)),
+          'text',
+          larkAppId,
+        );
+        return;
+      }
+      const scanDirs = setupDirs.filter(d => existsSync(d));
+      const prefetchedRepoProjects = scanDirs.length > 0
+        ? scanMultipleProjects(scanDirs, 3, repoPickerScanOptions())
+        : [];
+      if (prefetchedRepoProjects.length === 0) {
+        await sessionReply(
+          anchor,
+          tr('daemon.force_topic_ready', undefined, localeForBot(larkAppId)),
+          'text',
+          larkAppId,
+        );
+        return;
+      }
+      // Fall through: the ordinary opening below resolves the same picker
+      // policy and stages the repo card. Topic setup must not consume a
+      // message-quota unit; the permission recheck still runs in
+      // materialization.
+      quotaExemptOrdinaryTurnIds.add(parsed.messageId);
+    } else if (newTopicStreamingCardDisabled(larkAppId, chatId)) {
+      // Card-off `/t <task>`: seed the thread with a visible receipt before the
+      // worker delivery, mirroring the opening policy's fork-now decision — a
+      // pinned cwd (incl. auto-worktree) or an empty project scan forks
+      // immediately; a repo picker is its own visible feedback.
+      const scanDirs = setupDirs.filter(d => existsSync(d));
+      const willForkImmediately = pinnedWorkingDir !== undefined
+        || scanDirs.length === 0
+        || scanMultipleProjects(scanDirs, 3, repoPickerScanOptions()).length === 0;
+      if (willForkImmediately) {
+        try {
+          await sessionReply(
+            anchor,
+            tr('daemon.force_topic_started', undefined, localeForBot(larkAppId)),
+            'text',
+            larkAppId,
+          );
+        } catch (err) {
+          // UX acknowledgement only — never a reason to drop the accepted task.
+          logger.warn(`[/t] Failed to seed card-off topic reply: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
     }
   }
 
