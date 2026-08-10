@@ -394,18 +394,6 @@ describe('Current ordinary ingress production state precedence', () => {
       },
     },
     {
-      name: 'outstanding tail admission',
-      arrange(ds: DaemonSession) {
-        ds.queuedActivationTailAdmissionsOutstanding = 1;
-      },
-    },
-    {
-      name: 'pending tail release',
-      arrange(ds: DaemonSession) {
-        ds.queuedActivationTailReleasePending = {};
-      },
-    },
-    {
       name: 'exact initial-start claimant',
       arrange(ds: DaemonSession) {
         ds.initialStartClaimToken = 'opening-owner';

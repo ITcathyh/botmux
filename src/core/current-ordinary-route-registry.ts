@@ -695,6 +695,25 @@ export function createCurrentOrdinaryRouteRegistryRuntime(
     outcome.kind === 'ambiguous' ? { ...outcome, idempotent: true } : outcome
   );
 
+  // Terminal provider records mirror the runtime's bounded idempotency ledger:
+  // they serve duplicate replay inside the transport redelivery window, while
+  // the durable seen-message claim dedups beyond it. Cap retention so the map
+  // does not grow by one entry per delivered message for the daemon's lifetime.
+  const TERMINAL_PROVIDER_RECORD_CAP = 1024;
+  const terminalProviderKeys: string[] = [];
+  const retainTerminalProviderRecord = (providerKey: string): void => {
+    terminalProviderKeys.push(providerKey);
+    if (terminalProviderKeys.length <= TERMINAL_PROVIDER_RECORD_CAP) return;
+    const evicted = terminalProviderKeys.splice(
+      0,
+      terminalProviderKeys.length - TERMINAL_PROVIDER_RECORD_CAP,
+    );
+    for (const old of evicted) {
+      const record = providerRecords.get(old);
+      if (record && record.state !== 'received') providerRecords.delete(old);
+    }
+  };
+
   const finish = (
     providerKey: string,
     requestHash: string,
@@ -709,8 +728,10 @@ export function createCurrentOrdinaryRouteRegistryRuntime(
           state: 'inputCommitted',
           sessionId: outcome.sessionId,
         });
+        retainTerminalProviderRecord(providerKey);
       } else if (outcome.kind === 'ambiguous' || outcome.kind === 'quarantined') {
         providerRecords.set(providerKey, { requestHash, state: 'terminal', outcome });
+        retainTerminalProviderRecord(providerKey);
       } else {
         providerRecords.delete(providerKey);
       }

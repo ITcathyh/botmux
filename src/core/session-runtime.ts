@@ -819,6 +819,38 @@ export function createSessionRuntimeHost(options: {
     `${sessionId}\u0000${idempotencyKey}`
   );
 
+  // In the spirit of the bounded dispatch receipts: a terminal idempotency
+  // record serves duplicate replay inside the transport redelivery window, and
+  // the durable seen-message claim dedups beyond it. Cap process-local
+  // retention instead of keeping one record per message for the daemon's
+  // lifetime. Only terminal states are evicted — live attempts and retryable
+  // records keep their entries until they settle.
+  const TERMINAL_IDEMPOTENCY_CAP = 1024;
+  const terminalIdempotencyKeys: string[] = [];
+  const retainTerminalIdempotency = (key: string): void => {
+    terminalIdempotencyKeys.push(key);
+    if (terminalIdempotencyKeys.length <= TERMINAL_IDEMPOTENCY_CAP) return;
+    const evicted = terminalIdempotencyKeys.splice(
+      0,
+      terminalIdempotencyKeys.length - TERMINAL_IDEMPOTENCY_CAP,
+    );
+    for (const old of evicted) {
+      const ordinary = ordinaryInputs.get(old);
+      if (ordinary
+        && (ordinary.state === 'inputCommitted' || ordinary.state === 'commitUnknown')) {
+        ordinaryInputs.delete(old);
+        sessionCommandIdentities.delete(old);
+      }
+      const completion = pendingRepoCompletions.get(old);
+      if (completion
+        && (completion.state === 'committed' || completion.state === 'unknown')
+        && ![...activePendingRepoCompletion.values()].includes(old)) {
+        pendingRepoCompletions.delete(old);
+        sessionCommandIdentities.delete(old);
+      }
+    }
+  };
+
   const createOrdinaryAttempt = (): OrdinaryAttempt => {
     let resolveTerminal!: (outcome: OrdinaryIngressCommandOutcome) => void;
     let settled = false;
@@ -1138,6 +1170,7 @@ export function createSessionRuntimeHost(options: {
         requestHash: step.requestHash,
         state: 'inputCommitted',
       });
+      retainTerminalIdempotency(step.ordinaryKey);
       terminal = {
         kind: 'applied',
         action: 'ordinary.inputCommitted',
@@ -1158,6 +1191,7 @@ export function createSessionRuntimeHost(options: {
         state: 'commitUnknown',
         message: transition.message,
       });
+      retainTerminalIdempotency(step.ordinaryKey);
       terminal = ordinaryAmbiguous(step.sessionId, transition.message, false);
     }
     step.attempt.settle(terminal);
@@ -1182,6 +1216,7 @@ export function createSessionRuntimeHost(options: {
       state: 'commitUnknown',
       message,
     });
+    retainTerminalIdempotency(step.ordinaryKey);
     const terminal: OrdinaryIngressCommandOutcome = { kind: 'quarantined', message };
     step.attempt.settle(terminal);
     return outcome(terminal);
@@ -1229,6 +1264,7 @@ export function createSessionRuntimeHost(options: {
         requestHash: step.requestHash,
         state: 'committed',
       });
+      retainTerminalIdempotency(step.completionKey);
       terminal = {
         kind: 'applied',
         action: 'pendingRepo.firstStartCommitted',
@@ -1255,6 +1291,7 @@ export function createSessionRuntimeHost(options: {
         state: 'unknown',
         message: transition.message,
       });
+      retainTerminalIdempotency(step.completionKey);
       terminal = { kind: 'ambiguous', message: transition.message };
     }
     if (activePendingRepoCompletion.get(step.sessionId) === step.completionKey) {
@@ -1273,6 +1310,7 @@ export function createSessionRuntimeHost(options: {
       state: 'unknown',
       message,
     });
+    retainTerminalIdempotency(step.completionKey);
     if (activePendingRepoCompletion.get(step.sessionId) === step.completionKey) {
       activePendingRepoCompletion.delete(step.sessionId);
     }

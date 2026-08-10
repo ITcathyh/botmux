@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
+  addReaction: vi.fn(async () => 'reaction_1'),
   forkWorker: vi.fn(),
   getAvailableBots: vi.fn(async () => []),
   getChatContext: vi.fn(async (_appId: string, chatId: string) => ({
@@ -47,6 +48,9 @@ vi.mock('../src/im/lark/client.js', async () => {
   const actual = await vi.importActual<any>('../src/im/lark/client.js');
   return {
     ...actual,
+    // The ordinary ingress stamps a ✋ received-reaction on every admitted turn;
+    // without a stub the partial mock would fall through to a real API call.
+    addReaction: mocks.addReaction,
     deleteMessage: mocks.deleteMessage,
     getChatContext: mocks.getChatContext,
     listChatMemberOpenIds: mocks.listChatMemberOpenIds,
@@ -100,8 +104,42 @@ async function loadModules() {
   const sessionStore = await import('../src/services/session-store.js');
   const daemon = await import('../src/daemon.js');
   const types = await import('../src/core/types.js');
-  sessionStore.init();
-  return { daemon, registry, types };
+  return { daemon, registry, sessionStore, types };
+}
+
+/**
+ * Register the bot under test and bind the durable store to ITS owner file.
+ * The Current ordinary route publishes/reads openings through
+ * `sessionStore.getSessionForOwnerStrict(ownerLarkAppId, …)`, which only ever
+ * reads `sessions-<appId>.json`; an owner-less `init()` writes the legacy
+ * `sessions.json`, so every opening would fail its own publication readback.
+ */
+function registerJoinBot(
+  cfg: Parameters<typeof modules.registry.registerBot>[0],
+): ReturnType<typeof modules.registry.registerBot> {
+  const bot = modules.registry.registerBot(cfg);
+  modules.sessionStore.init(cfg.larkAppId);
+  return bot;
+}
+
+/**
+ * Attach a live worker the way a real fork does. reserveWorkerGeneration is the
+ * only way a worker becomes live in production, and it bumps BOTH
+ * `ds.workerGeneration` and `ds.session.workerGeneration`; the ordinary-ingress
+ * live-delivery guard reads that generation, so a generation-less worker is a
+ * shape that cannot exist on a running daemon.
+ */
+function attachLiveWorker(ds: any, worker: any): void {
+  const generation = Math.max(ds.workerGeneration ?? 0, ds.session?.workerGeneration ?? 0) + 1;
+  ds.worker = worker;
+  ds.workerGeneration = generation;
+  if (ds.session) ds.session.workerGeneration = generation;
+}
+
+/** Stand in for a real fork: attach the worker and prove acceptance with `true`. */
+function forkWorkerMockImplementation(ds: any): true {
+  attachLiveWorker(ds, { killed: false, send: vi.fn() });
+  return true;
 }
 
 beforeAll(async () => {
@@ -116,6 +154,10 @@ beforeEach(() => {
   modules.daemon.__testOnly_setAutoStartJoinReadyMaxWaitMs();
   vi.clearAllMocks();
   mocks.forkWorker.mockReset();
+  // Acceptance proof: the real primitive returns a boolean and the ordinary
+  // ingress treats anything else as "no acceptance proof".
+  mocks.forkWorker.mockReturnValue(true);
+  mocks.addReaction.mockResolvedValue('reaction_1');
   mocks.getChatContext.mockImplementation(async (_appId: string, chatId: string) => ({
     chatId,
     name: '【Pippit】【BUG】测试群',
@@ -147,11 +189,11 @@ afterAll(() => {
 
 describe('handleBotAdded — 普通群 shared 路由', () => {
   it('创建一个话题根并复用 chat-scope session', async () => {
-    const { daemon, registry, types } = modules;
+    const { daemon, types } = modules;
     const appId = 'app_join_shared';
     const chatId = 'oc_join_shared';
     const seedId = 'om_join_seed';
-    registry.registerBot({
+    registerJoinBot({
       larkAppId: appId,
       larkAppSecret: 's',
       cliId: 'claude-code',
@@ -206,10 +248,10 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
   });
 
   it('尊重群级 shared 覆盖而不是只读取 bot 默认值', async () => {
-    const { daemon, registry, types } = modules;
+    const { daemon, types } = modules;
     const appId = 'app_join_override';
     const chatId = 'oc_join_override';
-    registry.registerBot({
+    registerJoinBot({
       larkAppId: appId,
       larkAppSecret: 's',
       cliId: 'claude-code',
@@ -235,7 +277,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
   });
 
   it('群元数据读取失败时仍开工，并明确标记 unavailable', async () => {
-    const { daemon, registry } = modules;
+    const { daemon } = modules;
     const appId = 'app_join_context_unavailable';
     const chatId = 'oc_join_context_unavailable';
     mocks.getChatContext.mockResolvedValueOnce({
@@ -245,7 +287,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       mode: 'unknown',
       fetchStatus: 'unavailable',
     });
-    registry.registerBot({
+    registerJoinBot({
       larkAppId: appId,
       larkAppSecret: 's',
       cliId: 'claude-code',
@@ -265,10 +307,10 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
   });
 
   it('chat 模式保持群顶层平铺且不创建话题根', async () => {
-    const { daemon, registry, types } = modules;
+    const { daemon, types } = modules;
     const appId = 'app_join_chat';
     const chatId = 'oc_join_chat';
-    registry.registerBot({
+    registerJoinBot({
       larkAppId: appId,
       larkAppSecret: 's',
       cliId: 'claude-code',
@@ -289,7 +331,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
   });
 
   it('等待仓库选择时把卡片和延迟首轮留在同一个话题', async () => {
-    const { daemon, registry, types } = modules;
+    const { daemon, types } = modules;
     const appId = 'app_join_pending_repo';
     const chatId = 'oc_join_pending_repo';
     const scanDir = tempDir('scan-pending-repo');
@@ -300,7 +342,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       type: 'repo',
       branch: 'master',
     }]);
-    registry.registerBot({
+    registerJoinBot({
       larkAppId: appId,
       larkAppSecret: 's',
       cliId: 'claude-code',
@@ -335,7 +377,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
   });
 
   it('losing registration leaves no shared seed message or orphaned first turn', async () => {
-    const { daemon, registry, types } = modules;
+    const { daemon, types } = modules;
     const appId = 'app_join_shared_race';
     const chatId = 'oc_join_shared_race';
     const key = types.sessionKey(chatId, appId);
@@ -362,7 +404,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       lastMessageAt: Date.now(),
       hasHistory: true,
     } as any;
-    registry.registerBot({
+    registerJoinBot({
       larkAppId: appId,
       larkAppSecret: 's',
       cliId: 'claude-code',
@@ -385,11 +427,11 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
   });
 
   it('rolls back the registered session when the post-CAS shared seed fails', async () => {
-    const { daemon, registry, types } = modules;
+    const { daemon, types } = modules;
     const appId = 'app_join_shared_seed_failure';
     const chatId = 'oc_join_shared_seed_failure';
     const key = types.sessionKey(chatId, appId);
-    registry.registerBot({
+    registerJoinBot({
       larkAppId: appId,
       larkAppSecret: 's',
       cliId: 'claude-code',
@@ -412,7 +454,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
   });
 
   it('serializes a chat turn behind the registered join session initialization', async () => {
-    const { daemon, registry, types } = modules;
+    const { daemon, types } = modules;
     const appId = 'app_join_shared_inbound_race';
     const chatId = 'oc_join_shared_inbound_race';
     const userMessageId = 'om_user_during_join';
@@ -429,10 +471,8 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       seedStarted();
       return await seedPending;
     });
-    mocks.forkWorker.mockImplementation((ds: any) => {
-      ds.worker = { killed: false, send: vi.fn() };
-    });
-    registry.registerBot({
+    mocks.forkWorker.mockImplementation(forkWorkerMockImplementation);
+    registerJoinBot({
       larkAppId: appId,
       larkAppSecret: 's',
       cliId: 'claude-code',
@@ -478,10 +518,11 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
 
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
     const ds = daemon.__testOnly_activeSessions.get(key);
-    expect(ds?.worker?.send).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'message',
-      turnId: userMessageId,
-    }));
+    expect(ds?.worker?.send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'message', turnId: userMessageId }),
+      // Ordinary IM delivery now sends with an IPC receipt callback.
+      expect.any(Function),
+    );
     expect(ds?.session.currentReplyTarget).toMatchObject({
       rootMessageId: userMessageId,
       turnId: userMessageId,
@@ -489,7 +530,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
   });
 
   it('also covers the non-shared post-registration fork window', async () => {
-    const { daemon, registry, types } = modules;
+    const { daemon, types } = modules;
     const appId = 'app_join_chat_inbound_race';
     const chatId = 'oc_join_chat_inbound_race';
     const userMessageId = 'om_user_during_chat_join';
@@ -507,10 +548,8 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       await availableBotsPending;
       return [];
     });
-    mocks.forkWorker.mockImplementation((ds: any) => {
-      ds.worker = { killed: false, send: vi.fn() };
-    });
-    registry.registerBot({
+    mocks.forkWorker.mockImplementation(forkWorkerMockImplementation);
+    registerJoinBot({
       larkAppId: appId,
       larkAppSecret: 's',
       cliId: 'claude-code',
@@ -555,14 +594,15 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
 
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
     const ds = daemon.__testOnly_activeSessions.get(key);
-    expect(ds?.worker?.send).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'message',
-      turnId: userMessageId,
-    }));
+    expect(ds?.worker?.send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'message', turnId: userMessageId }),
+      // Ordinary IM delivery now sends with an IPC receipt callback.
+      expect.any(Function),
+    );
   });
 
   it('yields without re-forking when a non-message entry starts the registered session', async () => {
-    const { daemon, registry, types } = modules;
+    const { daemon, types } = modules;
     const appId = 'app_join_external_fork_race';
     const chatId = 'oc_join_external_fork_race';
     const key = types.sessionKey(chatId, appId);
@@ -579,7 +619,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       await availableBotsPending;
       return [];
     });
-    registry.registerBot({
+    registerJoinBot({
       larkAppId: appId,
       larkAppSecret: 's',
       cliId: 'claude-code',
@@ -594,7 +634,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     await availableBotsStartedPromise;
     const ds = daemon.__testOnly_activeSessions.get(key)!;
     const externalWorker = { killed: false, send: vi.fn(), pid: 4321 } as any;
-    ds.worker = externalWorker;
+    attachLiveWorker(ds, externalWorker);
 
     releaseAvailableBots();
     await joinPromise;
@@ -605,7 +645,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
   });
 
   it('releases a waiting chat turn when shared seed setup rolls back', async () => {
-    const { daemon, registry, types } = modules;
+    const { daemon, types } = modules;
     const appId = 'app_join_shared_inbound_seed_failure';
     const chatId = 'oc_join_shared_inbound_seed_failure';
     const userMessageId = 'om_user_after_join_seed_failure';
@@ -622,10 +662,8 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       seedStarted();
       return await seedPending;
     });
-    mocks.forkWorker.mockImplementation((ds: any) => {
-      ds.worker = { killed: false, send: vi.fn() };
-    });
-    registry.registerBot({
+    mocks.forkWorker.mockImplementation(forkWorkerMockImplementation);
+    registerJoinBot({
       larkAppId: appId,
       larkAppSecret: 's',
       cliId: 'claude-code',
@@ -675,7 +713,9 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     expect(mocks.forkWorker).toHaveBeenCalledWith(
       ds,
       expect.objectContaining({ content: expect.stringContaining('seed 失败后仍需处理') }),
-      { turnId: userMessageId },
+      // Cold-start fork for this exact turn: the ordinary-ingress seam always
+      // spells out the resume decision alongside the turn id.
+      { resume: false, turnId: userMessageId },
     );
     expect(ds?.session.currentReplyTarget).toMatchObject({
       rootMessageId: userMessageId,
@@ -684,7 +724,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
   });
 
   it('cancels a hung bootstrap so the waiting turn can create the authoritative session', async () => {
-    const { daemon, registry, types } = modules;
+    const { daemon, types } = modules;
     const appId = 'app_join_shared_inbound_timeout';
     const chatId = 'oc_join_shared_inbound_timeout';
     const userMessageId = 'om_user_after_join_timeout';
@@ -701,10 +741,8 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       seedStarted();
       return await seedPending;
     });
-    mocks.forkWorker.mockImplementation((ds: any) => {
-      ds.worker = { killed: false, send: vi.fn() };
-    });
-    registry.registerBot({
+    mocks.forkWorker.mockImplementation(forkWorkerMockImplementation);
+    registerJoinBot({
       larkAppId: appId,
       larkAppSecret: 's',
       cliId: 'claude-code',
@@ -752,7 +790,9 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     expect(mocks.forkWorker).toHaveBeenCalledWith(
       ds,
       expect.objectContaining({ content: expect.stringContaining('bootstrap 超时后接管') }),
-      { turnId: userMessageId },
+      // Cold-start fork for this exact turn: the ordinary-ingress seam always
+      // spells out the resume decision alongside the turn id.
+      { resume: false, turnId: userMessageId },
     );
 
     releaseSeed('om_late_join_seed');
@@ -764,7 +804,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
   });
 
   it('does not close a live worker that took over before bootstrap timeout', async () => {
-    const { daemon, registry, types } = modules;
+    const { daemon, types } = modules;
     const appId = 'app_join_shared_timeout_takeover';
     const chatId = 'oc_join_shared_timeout_takeover';
     const userMessageId = 'om_user_after_external_takeover';
@@ -781,7 +821,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       seedStarted();
       return await seedPending;
     });
-    registry.registerBot({
+    registerJoinBot({
       larkAppId: appId,
       larkAppSecret: 's',
       cliId: 'claude-code',
@@ -797,7 +837,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     await seedStartedPromise;
     const ds = daemon.__testOnly_activeSessions.get(key)!;
     const externalWorker = { killed: false, send: vi.fn(), pid: 4321 } as any;
-    ds.worker = externalWorker;
+    attachLiveWorker(ds, externalWorker);
 
     await daemon.__testOnly_handleThreadReply(
       {
@@ -826,10 +866,11 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     expect(ds.session.status).toBe('active');
     expect(ds.worker).toBe(externalWorker);
     expect(mocks.forkWorker).not.toHaveBeenCalled();
-    expect(externalWorker.send).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'message',
-      turnId: userMessageId,
-    }));
+    expect(externalWorker.send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'message', turnId: userMessageId }),
+      // Ordinary IM delivery now sends with an IPC receipt callback.
+      expect.any(Function),
+    );
 
     releaseSeed('om_late_join_seed_after_takeover');
     await joinPromise;
@@ -841,7 +882,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
   });
 
   it('serializes replies to a topic-group join seed by the exact session key', async () => {
-    const { daemon, registry, types } = modules;
+    const { daemon, types } = modules;
     const appId = 'app_join_topic_inbound_race';
     const chatId = 'oc_join_topic_inbound_race';
     const seedId = 'om_join_seed';
@@ -867,10 +908,8 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       await availableBotsPending;
       return [];
     });
-    mocks.forkWorker.mockImplementation((ds: any) => {
-      ds.worker = { killed: false, send: vi.fn() };
-    });
-    registry.registerBot({
+    mocks.forkWorker.mockImplementation(forkWorkerMockImplementation);
+    registerJoinBot({
       larkAppId: appId,
       larkAppSecret: 's',
       cliId: 'claude-code',
@@ -917,10 +956,11 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
 
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
     const ds = daemon.__testOnly_activeSessions.get(key);
-    expect(ds?.worker?.send).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'message',
-      turnId: userMessageId,
-    }));
+    expect(ds?.worker?.send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'message', turnId: userMessageId }),
+      // Ordinary IM delivery now sends with an IPC receipt callback.
+      expect.any(Function),
+    );
   });
 
   it('话题群继续使用 seed 锚定的 thread-scope session', async () => {
@@ -931,10 +971,10 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       mode: 'topic',
       fetchStatus: 'ok',
     }));
-    const { daemon, registry, types } = modules;
+    const { daemon, types } = modules;
     const appId = 'app_join_topic_group';
     const chatId = 'oc_join_topic_group';
-    registry.registerBot({
+    registerJoinBot({
       larkAppId: appId,
       larkAppSecret: 's',
       cliId: 'claude-code',

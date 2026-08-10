@@ -26,14 +26,19 @@ import {
 } from './current-ordinary-im-turn.js';
 import type { CurrentOrdinaryIngressMetadataModule } from './current-ordinary-ingress-metadata.js';
 import {
+  classifyCurrentOrdinaryIngress,
   createCurrentOrdinaryIngressPort,
   type CurrentOrdinaryIngressCommand,
-  type CurrentOrdinaryIngressCommandKind,
   type CurrentOrdinaryIngressCommandResult,
   type CurrentOrdinaryIngressExternalEffectResult,
   type CurrentOrdinaryIngressPreMaterializationModule,
 } from './current-ordinary-ingress.js';
 import { stagePendingRepoSetup } from './pending-repo-journal.js';
+import {
+  publishLastInputFromBotPatch,
+  publishSessionActivityPatch,
+  publishSessionMessagePreviewPatch,
+} from './session-activity.js';
 import type { OrdinaryIngressPort } from './session-runtime.js';
 import {
   activeSessionAnchorId,
@@ -60,6 +65,11 @@ export interface CurrentOrdinaryIngressProductionMaterial {
   /** Bridge candidate selected only when Current is an adopted Session. */
   readonly adoptCliInput: CliTurnPayload;
   readonly turnId: string;
+  /** Completed received-reaction effect; registration stays with the metadata Module. */
+  readonly receivedReaction?: {
+    readonly messageKey: string;
+    readonly reactionId: string;
+  };
 }
 
 export type CurrentOrdinaryIngressProductionExternalEffect = {
@@ -130,6 +140,22 @@ export interface CurrentOrdinaryIngressProductionOptions {
   readonly preMaterialization?: CurrentOrdinaryIngressPreMaterializationModule;
   readonly clock: () => number;
   readonly substituteReplyMode: 'thread' | 'quote';
+  /**
+   * Synchronous per-turn stream-card rotation applied immediately before a
+   * worker delivery attempt. `live` precedes an injection into a running
+   * worker; `refork` precedes a fork replacing a dead/absent worker. Skipped
+   * for the opening fork of a freshly created Session, whose card state is
+   * still empty and whose title is owned by the opening record.
+   */
+  readonly beginTurnCardRotation?: (
+    current: DaemonSession,
+    turn: { readonly title: string; readonly mode: 'live' | 'refork' },
+  ) => void;
+  /**
+   * Fire-and-forget stash notice after a follower turn was parked behind an
+   * existing pending-repo opening ("pick a repo first" / "worktree building").
+   */
+  readonly notifyPendingRepoStash?: (current: DaemonSession) => void;
 }
 
 type FrozenMaterial = Readonly<{
@@ -139,6 +165,7 @@ type FrozenMaterial = Readonly<{
   newTopicCliInput: CliTurnPayload;
   adoptCliInput: CliTurnPayload;
   turnId: string;
+  receivedReaction?: Readonly<{ messageKey: string; reactionId: string }>;
 }>;
 
 type ProductionCommandResult = CurrentOrdinaryIngressCommandResult;
@@ -154,7 +181,9 @@ const MATERIAL_KEYS = new Set([
   'newTopicCliInput',
   'adoptCliInput',
   'turnId',
+  'receivedReaction',
 ]);
+const RECEIVED_REACTION_KEYS = new Set(['messageKey', 'reactionId']);
 const CLI_INPUT_KEYS = new Set(['content', 'codexAppInput', 'codexAppSteerable']);
 const CODEX_INPUT_KEYS = new Set([
   'text',
@@ -287,6 +316,21 @@ function cloneMaterial(value: unknown): FrozenMaterial | undefined {
     const newTopicCliInput = cloneCliInput(value.newTopicCliInput);
     const adoptCliInput = cloneCliInput(value.adoptCliInput);
     if (!cliInput || !newTopicCliInput || !adoptCliInput) return undefined;
+    let receivedReaction: FrozenMaterial['receivedReaction'];
+    if (value.receivedReaction !== undefined) {
+      const evidence = value.receivedReaction;
+      if (!isObject(evidence)
+        || !hasOnlyDataProperties(evidence, RECEIVED_REACTION_KEYS)
+        || typeof evidence.messageKey !== 'string'
+        || typeof evidence.reactionId !== 'string'
+        || evidence.reactionId.length === 0) {
+        return undefined;
+      }
+      receivedReaction = Object.freeze({
+        messageKey: evidence.messageKey,
+        reactionId: evidence.reactionId,
+      });
+    }
     return Object.freeze({
       userPrompt: value.userPrompt,
       newTopicUserPrompt: value.newTopicUserPrompt,
@@ -294,6 +338,7 @@ function cloneMaterial(value: unknown): FrozenMaterial | undefined {
       newTopicCliInput,
       adoptCliInput,
       turnId: value.turnId,
+      ...(receivedReaction ? { receivedReaction } : {}),
     });
   } catch {
     return undefined;
@@ -344,24 +389,6 @@ function resolveCurrent(
     return undefined;
   }
   return current;
-}
-
-function classify(ds: DaemonSession): CurrentOrdinaryIngressCommandKind {
-  const workerIsLive = ds.worker !== null && !ds.worker.killed;
-  const liveTakeoverReady = workerIsLive
-    && !hasQueuedActivationAdmissionGate(ds)
-    && ds.initialStartClaimToken === undefined;
-  const openingFollower = ds.initialStartPending === true && !liveTakeoverReady;
-
-  if (ds.pendingRepo) return 'parkPendingRepoFollower';
-  if (workerIsLive && !liveTakeoverReady) return 'parkOpeningFollower';
-  if (openingFollower) return 'parkOpeningFollower';
-  if (workerIsLive) return 'sendLive';
-  if (ds.session.queuedActivationPending) return 'recoverParkedActivation';
-  if (ds.session.queued && ds.session.queuedPrompt !== undefined) {
-    return 'startQueuedActivation';
-  }
-  return 'startColdReplacement';
 }
 
 function stageActivationJournal(
@@ -630,8 +657,11 @@ export function createCurrentOrdinaryIngressProductionPort(
           materials.delete(command.input.turn);
           return unknown('Current Session identity changed before production-state delivery');
         }
-        if (classify(current) !== command.kind) return { kind: 'stateChanged' };
+        if (classifyCurrentOrdinaryIngress(current) !== command.kind) {
+          return { kind: 'stateChanged' };
+        }
         if (!metadataCommitted.has(command.input.turn)) {
+          const activityAtMs = options.clock();
           const metadata = options.metadata.apply(current, {
             binding: {
               ownerLarkAppId: options.ownerLarkAppId,
@@ -639,10 +669,13 @@ export function createCurrentOrdinaryIngressProductionPort(
               route: command.input.turn.route,
             },
             turn: command.input.turn,
-            activityAtMs: options.clock(),
+            activityAtMs,
             replyMode: command.input.turn.substitute
               ? options.substituteReplyMode
               : 'thread',
+            ...(material.receivedReaction
+              ? { receivedReaction: material.receivedReaction }
+              : {}),
           });
           if (metadata.kind === 'unknown') return unknown(metadata.message);
           if (metadata.kind === 'rejected') {
@@ -651,6 +684,16 @@ export function createCurrentOrdinaryIngressProductionPort(
             return unknown(metadata.message);
           }
           metadataCommitted.add(command.input.turn);
+          // Dashboard SSE patches derived from the metadata the Module just
+          // committed. Pure projection — no store writes belong here, and a
+          // failed publish must not change the turn's outcome.
+          try {
+            publishSessionActivityPatch(current, activityAtMs);
+            publishLastInputFromBotPatch(current);
+            publishSessionMessagePreviewPatch(current);
+          } catch {
+            // Rebuilt on the next full hydrate.
+          }
         }
         const selectedCliInput = current.adoptedFrom
           ? material.adoptCliInput
@@ -669,6 +712,23 @@ export function createCurrentOrdinaryIngressProductionPort(
               cliInput: selectedCliInput,
             });
 
+        const deliverWorker = (
+          workerCommand: CurrentOrdinaryIngressWorkerProcessCommand,
+          dispatchOptions: {
+            readonly durableInput: boolean;
+            readonly restoreTransientGate?: () => void;
+          },
+        ): ProductionCommandResult => {
+          const live = workerCommand.kind === 'sendWorkerInput';
+          if (options.beginTurnCardRotation && (live || command.input.opening !== true)) {
+            options.beginTurnCardRotation(current, {
+              title: command.input.turn.content,
+              mode: live ? 'live' : 'refork',
+            });
+          }
+          return dispatchWorker(options.workerProcesses, workerCommand, dispatchOptions);
+        };
+
         let result: ProductionCommandResult;
         switch (command.kind) {
           case 'sendLive': {
@@ -676,7 +736,7 @@ export function createCurrentOrdinaryIngressProductionPort(
               || command.guard.workerGeneration === undefined) {
               return { kind: 'stateChanged' };
             }
-            result = dispatchWorker(options.workerProcesses, {
+            result = deliverWorker({
               kind: 'sendWorkerInput',
               sessionId: current.session.sessionId,
               turnId: selectedMaterial.turnId,
@@ -687,13 +747,21 @@ export function createCurrentOrdinaryIngressProductionPort(
           }
 
           case 'parkPendingRepoFollower': {
-            result = pendingRepoHasOpening(current)
+            const hasOpening = pendingRepoHasOpening(current);
+            result = hasOpening
               ? (admitTail(current, selectedMaterial) ?? { kind: 'accepted' })
               : stagePendingRepoOpening(current, Object.freeze({
                   ...material,
                   userPrompt: material.newTopicUserPrompt,
                   cliInput: material.newTopicCliInput,
                 }));
+            if (hasOpening && result.kind === 'accepted') {
+              try {
+                options.notifyPendingRepoStash?.(current);
+              } catch {
+                // Auxiliary notice; the parked turn itself is committed.
+              }
+            }
             break;
           }
 
@@ -723,7 +791,7 @@ export function createCurrentOrdinaryIngressProductionPort(
               ? cloneKnownCliInput({ content: recovery.promptInput })
               : cloneKnownCliInput(recovery.promptInput);
             current.quarantinedActivationTailPromotion = undefined;
-            result = dispatchWorker(options.workerProcesses, {
+            result = deliverWorker({
               kind: 'forkWorker',
               sessionId: current.session.sessionId,
               turnId: recovery.resumeOrTurnId.turnId,
@@ -760,7 +828,7 @@ export function createCurrentOrdinaryIngressProductionPort(
             }
             const priorStartPending = current.initialStartPending;
             current.initialStartPending = true;
-            result = dispatchWorker(options.workerProcesses, {
+            result = deliverWorker({
               kind: 'forkWorker',
               sessionId: current.session.sessionId,
               turnId: retainedTurnId,
@@ -811,7 +879,7 @@ export function createCurrentOrdinaryIngressProductionPort(
               result = unknown(staged.message);
               break;
             }
-            result = dispatchWorker(options.workerProcesses, {
+            result = deliverWorker({
               kind: 'forkWorker',
               sessionId: current.session.sessionId,
               turnId: activationTurnId,
@@ -844,7 +912,7 @@ export function createCurrentOrdinaryIngressProductionPort(
                     && !(command.input.opening
                       && !(current.lastCliInput ?? current.session.lastCliInput)),
                 };
-            result = dispatchWorker(options.workerProcesses, workerCommand, {
+            result = deliverWorker(workerCommand, {
               durableInput: false,
               restoreTransientGate: () => { current.initialStartPending = priorStartPending; },
             });

@@ -148,7 +148,7 @@ describe('CurrentSessionExecutorRuntime generation publication', () => {
     expect(() => runtime.commitGeneration(ds)).toThrow('absent or rebound');
   });
 
-  it('quarantines a same-generation response that is not the exact intended row', () => {
+  it('recovers a same-generation lost response once the durable fence matches', () => {
     const { runtime } = runtimeHarness();
     const ds = makeDs(1);
     updateSession.mockImplementationOnce(() => { throw new Error('response lost'); });
@@ -158,9 +158,13 @@ describe('CurrentSessionExecutorRuntime generation publication', () => {
 
     expect(() => runtime.commitGeneration(ds)).toThrow('response lost');
     expect(runtime.isQuarantined(ds)).toBe(true);
+    // Other legitimate writers (per-turn metadata, card state) may republish
+    // the row before the reconcile — the monotonic generation field, not
+    // whole-row equality, decides whether the reservation landed.
     getSessionForOwnerStrict.mockReturnValueOnce(divergent);
-    expect(() => runtime.commitGeneration(ds)).toThrow('unexpected durable generation');
-    expect(updateSession).toHaveBeenCalledTimes(1);
+    expect(runtime.commitGeneration(ds).generation).toBe(3);
+    expect(runtime.isQuarantined(ds)).toBe(false);
+    expect(updateSession).toHaveBeenCalledTimes(2);
   });
 
   it('blocks another reservation while the prior publication outcome is unreadable', () => {
@@ -235,7 +239,7 @@ describe('CurrentSessionExecutorRuntime generation publication', () => {
     expect(ds.session.workerGeneration).toBe(3);
   });
 
-  it('keeps quarantine when readback reveals an unexpected future fence', async () => {
+  it('repairs an unreadable fence once the durable generation covers it', async () => {
     const { registry, runtime } = runtimeHarness();
     const ds = makeDs();
     registerCurrent(registry, ds);
@@ -249,8 +253,11 @@ describe('CurrentSessionExecutorRuntime generation publication', () => {
     expect((await runtime.report(lease, { kind: 'workerExit' }, decision => decision)).kind)
       .toBe('unreadable');
 
+    // A durable generation at/above the intended fence proves an equal or
+    // stronger fence is published; the next reservation adopts it and moves on
+    // instead of quarantining the Session for the daemon's lifetime.
     getSessionForOwnerStrict.mockReturnValueOnce(makeSession(4));
-    expect(() => runtime.commitGeneration(ds)).toThrow('unexpected durable generation');
-    expect(ds.session.workerGeneration).toBe(4);
+    expect(runtime.commitGeneration(ds).generation).toBe(5);
+    expect(ds.session.workerGeneration).toBe(5);
   });
 });

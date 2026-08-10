@@ -30,6 +30,7 @@ import {
   sessionKey,
   type DaemonSession,
 } from './types.js';
+import { hasQueuedActivationAdmissionGate } from './worker-pool.js';
 
 export interface CurrentOrdinaryIngressMaterializeInput {
   readonly sessionId: string;
@@ -208,16 +209,14 @@ function exactPreparedOutputMatches(
   }
 }
 
-function hasQueuedActivationAdmissionGate(ds: DaemonSession): boolean {
-  return ds.session.queuedActivationPending === true
-    || (ds.session.queuedActivationTail?.length ?? 0) > 0
-    || (ds.queuedActivationTailAdmissionsOutstanding ?? 0) > 0
-    || ds.queuedActivationTailReleasePending !== undefined
-    || (ds.initialStartPending === true
-      && ds.session.queuedActivationInput !== undefined);
-}
-
-function classify(ds: DaemonSession): CurrentOrdinaryIngressCommandKind {
+/**
+ * The single Current delivery-state classifier. The staged port owns replay
+ * classification; the production Adapter re-runs this exact function as its
+ * pre-dispatch consistency gate instead of keeping a drift-prone copy.
+ */
+export function classifyCurrentOrdinaryIngress(
+  ds: DaemonSession,
+): CurrentOrdinaryIngressCommandKind {
   const workerIsLive = ds.worker !== null && !ds.worker.killed;
   const liveTakeoverReady = workerIsLive
     && !hasQueuedActivationAdmissionGate(ds)
@@ -551,7 +550,7 @@ export function createCurrentOrdinaryIngressPort(
             message: 'Current Session identity changed before ordinary ingress delivery',
           };
         }
-        const commandKind = classify(current);
+        const commandKind = classifyCurrentOrdinaryIngress(current);
         if (!openingClaimed && canOwnOpening(commandKind)) {
           openingClaimed = claimInitialUserTurn(current);
         }

@@ -112,7 +112,10 @@ interface MaterializationBindingStamp {
 }
 
 const productionAdapters: CurrentPendingRepoCompletionProductionAdapters = {
-  availableBots: sessionManager.getAvailableBots,
+  // Lazy binding: a module-top-level property read would explode at import
+  // time under any partial session-manager mock, even in tests that never
+  // touch the repo-selection path.
+  availableBots: (...args) => sessionManager.getAvailableBots(...args),
   async prepareWorktree(input, assertCurrent) {
     const knownCreated: CurrentPendingRepoWorktreeCleanupTarget[] = [];
     const forgetCreated = (sourcePath: string, worktreePath: string): void => {

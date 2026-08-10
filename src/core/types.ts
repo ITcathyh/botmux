@@ -113,17 +113,6 @@ export interface DaemonSession {
    * refork. Later same-anchor handlers may prepare concurrently, but only this
    * owner may cross the fork boundary; followers buffer behind its gate. */
   initialStartClaimToken?: string;
-  /** Number of activation-tail arrivals that reserved FIFO order before an
-   * asynchronous prompt/sender build and have not yet durably admitted or
-   * failed. An opening ACK must not clear the route while this is non-zero. */
-  queuedActivationTailAdmissionsOutstanding?: number;
-  /** An opening ACK (or ordinary cold-start handoff) observed while an
-   * asynchronous tail admission was outstanding. The final settler replays
-   * this release so a late durable successor cannot be stranded. */
-  queuedActivationTailReleasePending?: { acknowledgedToken?: string };
-  /** Retry timer for an ordinary cold-start handoff whose durable promotion
-   * failed after all asynchronous admissions had settled. */
-  queuedActivationTailReleaseRetryTimer?: ReturnType<typeof setTimeout>;
   repoCardMessageId?: string;    // message_id of the repo selection card — for withdrawal
   /**
    * Repo-select card message ids already consumed by a successful pending→worker

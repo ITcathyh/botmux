@@ -75,6 +75,11 @@ export type LarkOrdinaryIngressAvailableBot = Readonly<{
   openId: string;
 }>;
 
+export interface LarkOrdinaryIngressReceivedReactionInput
+  extends LarkOrdinaryIngressMaterializationContext {
+  readonly substitute: boolean;
+}
+
 /** True-external I/O seam; production and focused-test adapters share it. */
 export interface LarkOrdinaryIngressMaterializationEffects {
   checkQuota(
@@ -90,6 +95,16 @@ export interface LarkOrdinaryIngressMaterializationEffects {
     input: LarkOrdinaryIngressMaterializationContext,
   ): Promise<LarkOrdinaryIngressMaterializationIoResult<
     readonly LarkOrdinaryIngressAvailableBot[]
+  >>;
+  /**
+   * Best-effort received-reaction (✋) on the accepted turn. Gating (card-off,
+   * silent opt-out, dedup) lives behind this seam; `null` means no reaction
+   * was added and the turn proceeds without evidence.
+   */
+  addReceivedReaction?(
+    input: LarkOrdinaryIngressReceivedReactionInput,
+  ): Promise<LarkOrdinaryIngressMaterializationIoResult<
+    { readonly reactionId: string } | null
   >>;
 }
 
@@ -111,6 +126,11 @@ export interface LarkCurrentOrdinaryIngressProductionOptions {
   readonly preMaterialization?: CurrentOrdinaryIngressPreMaterializationModule;
   readonly clock: () => number;
   readonly substituteReplyMode: 'thread' | 'quote';
+  readonly beginTurnCardRotation?: (
+    current: DaemonSession,
+    turn: { readonly title: string; readonly mode: 'live' | 'refork' },
+  ) => void;
+  readonly notifyPendingRepoStash?: (current: DaemonSession) => void;
 }
 
 type MaterializationFailure = Extract<
@@ -390,6 +410,12 @@ export function createLarkCurrentOrdinaryIngressProductionPort(
       : {}),
     clock: options.clock,
     substituteReplyMode: options.substituteReplyMode,
+    ...(options.beginTurnCardRotation
+      ? { beginTurnCardRotation: options.beginTurnCardRotation }
+      : {}),
+    ...(options.notifyPendingRepoStash
+      ? { notifyPendingRepoStash: options.notifyPendingRepoStash }
+      : {}),
     externalEffects: {
       async execute(effect): Promise<CurrentOrdinaryIngressProductionExternalEffectResult> {
         const { sessionId, turn } = effect.input;
@@ -457,8 +483,12 @@ export function createLarkCurrentOrdinaryIngressProductionPort(
               bot.locale,
             );
         const openingTopicContext = !turn.foldedForwardContext
-          && turn.route.scope === 'thread'
-          && turn.messageKey !== turn.route.canonicalAnchor
+          && (
+            (turn.route.scope === 'thread' && turn.messageKey !== turn.route.canonicalAnchor)
+            || (turn.route.scope === 'chat'
+              && turn.replyRootMessageKey !== undefined
+              && turn.replyRootMessageKey !== turn.messageKey)
+          )
           ? buildTopicThreadContext(bot.locale)
           : '';
         const peerBotContext = turn.sender.kind === 'bot'
@@ -509,6 +539,15 @@ export function createLarkCurrentOrdinaryIngressProductionPort(
           ...buildFollowUpCliInput(userPrompt, sessionId, common),
           ...(steerable ? { codexAppSteerable: true as const } : {}),
         };
+        // The topic hint is opening-only and must reach BOTH lanes: the
+        // wrapped prompt above and the codex-app structured sidecar — a
+        // clean-input bot reading only the sidecar would otherwise drop it.
+        const newTopicCommon = openingTopicContext
+          ? {
+              ...common,
+              codexAppMessageContext: (openingTopicContext + messageContext) || undefined,
+            }
+          : common;
         const newTopicCliInput = {
           ...buildNewTopicCliInput(
             newTopicUserPrompt,
@@ -522,7 +561,7 @@ export function createLarkCurrentOrdinaryIngressProductionPort(
             { name: bot.name, openId: bot.openId },
             bot.locale,
             sender,
-            common,
+            newTopicCommon,
           ),
           ...(steerable ? { codexAppSteerable: true as const } : {}),
         };
@@ -537,6 +576,26 @@ export function createLarkCurrentOrdinaryIngressProductionPort(
         if (!bindingIsCurrent(stamp, turn)) {
           return unknown('Current Session identity changed during Lark prompt rendering');
         }
+        let receivedReaction: { messageKey: string; reactionId: string } | undefined;
+        if (options.effects.addReceivedReaction) {
+          // Best-effort: a failed/refused reaction never blocks the turn — the
+          // material simply carries no evidence, matching the legacy behavior
+          // where a lost addReaction skipped the ✋ and delivered anyway.
+          try {
+            const reacted = await options.effects.addReceivedReaction(deepFreeze({
+              ...context,
+              substitute: turn.substitute !== undefined,
+            }));
+            if (reacted.kind === 'ok'
+              && isObject(reacted.value)
+              && typeof reacted.value.reactionId === 'string'
+              && reacted.value.reactionId.length > 0) {
+              receivedReaction = { messageKey: turn.messageKey, reactionId: reacted.value.reactionId };
+            }
+          } catch {
+            // Reaction evidence stays absent; the turn itself is unaffected.
+          }
+        }
         return {
           kind: 'materialized',
           material: deepFreeze({
@@ -546,6 +605,7 @@ export function createLarkCurrentOrdinaryIngressProductionPort(
             newTopicCliInput,
             adoptCliInput,
             turnId: turn.messageKey,
+            ...(receivedReaction ? { receivedReaction } : {}),
           }),
         };
       },

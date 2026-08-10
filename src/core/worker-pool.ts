@@ -6258,8 +6258,6 @@ export function admitQueuedActivationTail(
 export function hasQueuedActivationAdmissionGate(ds: DaemonSession): boolean {
   return ds.session.queuedActivationPending === true
     || (ds.session.queuedActivationTail?.length ?? 0) > 0
-    || (ds.queuedActivationTailAdmissionsOutstanding ?? 0) > 0
-    || ds.queuedActivationTailReleasePending !== undefined
     || (ds.initialStartPending === true
       && ds.session.queuedActivationInput !== undefined);
 }
@@ -7400,7 +7398,6 @@ function setupWorkerHandlers(
   ds.activeReasoningEffort = undefined;
   ds.pendingActiveRuntimeCardRefresh = undefined;
   const handlerSession = ds.session;
-  const handlerAnchor = sessionAnchorId(ds);
   const handlerLarkAppId = ds.larkAppId;
   const executorLease: ExecutorLease = sessionExecutorRuntime.activate(generationCommit, worker);
   activeExecutorLeases.set(ds, executorLease);

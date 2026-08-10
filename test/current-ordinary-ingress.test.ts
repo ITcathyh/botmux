@@ -718,20 +718,6 @@ describe('Current ordinary ingress existing-route policy', () => {
       },
     },
     {
-      id: 'outstanding-admission',
-      name: 'an outstanding tail admission',
-      arrange(ds: DaemonSession) {
-        ds.queuedActivationTailAdmissionsOutstanding = 1;
-      },
-    },
-    {
-      id: 'pending-release',
-      name: 'a pending tail release',
-      arrange(ds: DaemonSession) {
-        ds.queuedActivationTailReleasePending = {};
-      },
-    },
-    {
       id: 'initial-claim',
       name: 'an exact initial-start claimant',
       arrange(ds: DaemonSession) {

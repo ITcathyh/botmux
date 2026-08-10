@@ -35,6 +35,7 @@ import {
   type LarkOrdinaryIngressMaterializationContext,
   type LarkOrdinaryIngressMaterializationIoResult,
   type LarkOrdinaryIngressQuotaInput,
+  type LarkOrdinaryIngressReceivedReactionInput,
 } from './current-ordinary-ingress-production.js';
 
 export interface CurrentOrdinaryIngressDaemonOptions {
@@ -47,6 +48,23 @@ export interface CurrentOrdinaryIngressDaemonOptions {
   readonly notifyDownloadLoginRequired: (
     input: LarkOrdinaryIngressMaterializationContext,
   ) => void | Promise<void>;
+  /**
+   * Per-turn stream-card rotation the daemon still owns: `live` freezes the
+   * previous turn's card before a live-worker injection, `refork` parks it and
+   * clears the card binding so the replacement worker POSTs a fresh card.
+   */
+  readonly beginTurnCardRotation: (
+    current: DaemonSession,
+    turn: { readonly title: string; readonly mode: 'live' | 'refork' },
+  ) => void;
+  /** Best-effort ✋ on the accepted turn; `null` when gating skipped it. */
+  readonly addReceivedReaction: (
+    input: LarkOrdinaryIngressReceivedReactionInput,
+  ) => Promise<LarkOrdinaryIngressMaterializationIoResult<
+    { readonly reactionId: string } | null
+  >>;
+  /** Fire-and-forget "message stashed" notice behind a pending-repo opening. */
+  readonly notifyPendingRepoStash: (current: DaemonSession) => void;
   readonly isPeerBot?: (openId: string) => boolean;
 }
 
@@ -125,6 +143,8 @@ export function createCurrentOrdinaryIngressDaemonPort(
     },
     clock: Date.now,
     substituteReplyMode,
+    beginTurnCardRotation: options.beginTurnCardRotation,
+    notifyPendingRepoStash: options.notifyPendingRepoStash,
     effects: {
       checkQuota: options.checkQuota,
       async downloadResources(input) {
@@ -166,9 +186,26 @@ export function createCurrentOrdinaryIngressDaemonPort(
         return { kind: 'ok', value: sender };
       },
       async listAvailableBots(input) {
+        // The listing feeds only opening prompts. A Session that already took
+        // a real CLI turn can never claim the opening again, so skip the
+        // per-message `listChatBotMembers` fan-out on that hot path (master
+        // parity: only opening turns listed).
+        for (const current of options.activeSessions.values()) {
+          if (current.session.sessionId !== input.sessionId
+            || current.larkAppId !== options.ownerLarkAppId) {
+            continue;
+          }
+          if (current.hasHistory
+            || current.lastCliInput !== undefined
+            || current.session.lastCliInput !== undefined) {
+            return { kind: 'ok', value: [] };
+          }
+          break;
+        }
         const bots = await getAvailableBots(options.ownerLarkAppId, input.route.chatId);
         return { kind: 'ok', value: bots };
       },
+      addReceivedReaction: options.addReceivedReaction,
     },
   });
 }

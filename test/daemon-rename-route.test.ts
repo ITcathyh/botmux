@@ -162,11 +162,12 @@ import {
   __testOnly_onQueuedActivationSubmitted as onQueuedActivationSubmitted,
   __testOnly_prewarmDocCommentSession as prewarmDocCommentSession,
   __testOnly_releaseQueuedActivationReservation as releaseQueuedActivationReservation,
-  __testOnly_reserveAsyncQueuedActivationTailAdmission as reserveAsyncQueuedActivationTailAdmission,
   __testOnly_resetDocCommentClaims as resetDocCommentClaims,
-  __testOnly_settleAsyncQueuedActivationTailAdmission as settleAsyncQueuedActivationTailAdmission,
 } from '../src/daemon.js';
-import { admitQueuedActivationTail } from '../src/core/worker-pool.js';
+import {
+  admitQueuedActivationTail,
+  reserveQueuedActivationTailAdmission,
+} from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { getDocSubscription, putDocSubscription, removeDocSubscription } from '../src/services/doc-subs-store.js';
 import { config } from '../src/config.js';
@@ -1813,12 +1814,8 @@ describe('/rename production routing — must not pre-create a session (review P
       ds.hasHistory = true;
       ds.session.cliId = 'codex-app';
 
-      const reservation = reserveAsyncQueuedActivationTailAdmission(ds);
-      expect(ds.queuedActivationTailAdmissionsOutstanding).toBe(1);
+      const reservation = reserveQueuedActivationTailAdmission(ds);
       bot.config.codexAppCleanInput = laterGate;
-
-      // Model N's ACK landing while N+1 is still awaiting prompt materialization.
-      expect(releaseQueuedActivationReservation(ds, 'opening-token')).toBe(false);
       const sidecar = {
         text: 'FOLLOWER_CLEAN_N1',
         additionalContext: {
@@ -1834,13 +1831,13 @@ describe('/rename production routing — must not pre-create a session (review P
         turnId: 'turn-clean-follower',
         dispatchAttempt: 2,
       }, reservation);
-      settleAsyncQueuedActivationTailAdmission(ds);
+      // The opening ACK hands off directly now — the deferred replay window of
+      // the retired async admission counter no longer exists.
+      onQueuedActivationSubmitted(ds, 'opening-token');
 
       const expectedSidecar = expectsSidecar
         ? { ...sidecar, clientUserMessageId: 'turn-clean-follower' }
         : undefined;
-      expect(ds.queuedActivationTailAdmissionsOutstanding).toBeUndefined();
-      expect(ds.queuedActivationTailReleasePending).toBeUndefined();
       expect(ds.session.queuedActivationTail).toBeUndefined();
       expect(ds.session.queuedActivationInput?.codexAppInput).toEqual(expectedSidecar);
       expect(ds.session.codexAppDispatchLedger?.at(-1)?.codexAppInput)
@@ -1947,16 +1944,16 @@ describe('/rename production routing — must not pre-create a session (review P
     ds.initialStartPending = true;
     ds.worker = { killed: false, send: vi.fn() } as any;
 
-    const reservation = reserveAsyncQueuedActivationTailAdmission(ds);
-    expect(releaseQueuedActivationReservation(ds, 'opening-token')).toBe(false);
-    // N's worker exits after its ACK but before the reserved N+1 finishes.
+    const reservation = reserveQueuedActivationTailAdmission(ds);
+    // N's worker exits after its ACK but before the reserved N+1 lands.
     ds.worker = null;
     admitQueuedActivationTail(ds, {
       userPrompt: 'LATE_N_PLUS_1',
       cliInput: { content: 'LATE_N_PLUS_1' },
       turnId: 'turn-late-n1',
     }, reservation);
-    settleAsyncQueuedActivationTailAdmission(ds);
+    // The ACK release observes the successor already owning the journal.
+    releaseQueuedActivationReservation(ds, 'opening-token');
 
     expect(ds.session).toMatchObject({
       queuedActivationPending: true,
@@ -1964,9 +1961,6 @@ describe('/rename production routing — must not pre-create a session (review P
       queuedActivationTurnId: 'turn-late-n1',
     });
     expect(ds.session.queuedActivationTail).toBeUndefined();
-    expect(ds.initialStartPending).toBe(false);
-    expect(ds.initialStartClaimToken).toBeUndefined();
-    expect(ds.queuedActivationTailReleaseRetryTimer).toBeUndefined();
 
     mocks.forkWorker.mockClear();
     await handleThreadReply(
@@ -1993,30 +1987,25 @@ describe('/rename production routing — must not pre-create a session (review P
     ds.session.cliId = 'claude-code';
     ds.initialStartPending = true;
     ds.worker = { killed: false, send: vi.fn() } as any;
-    const reservation = reserveAsyncQueuedActivationTailAdmission(ds);
-    expect(releaseQueuedActivationReservation(ds, 'opening-token')).toBe(false);
+    const reservation = reserveQueuedActivationTailAdmission(ds);
     mocks.updateSession.mockImplementationOnce(() => {
       throw new Error('tail persistence unavailable');
     });
 
     expect(() => {
-      try {
-        admitQueuedActivationTail(ds, {
-          userPrompt: 'FAILED_N_PLUS_1',
-          cliInput: { content: 'FAILED_N_PLUS_1' },
-          turnId: 'turn-failed-n1',
-        }, reservation);
-      } finally {
-        settleAsyncQueuedActivationTailAdmission(ds);
-      }
+      admitQueuedActivationTail(ds, {
+        userPrompt: 'FAILED_N_PLUS_1',
+        cliInput: { content: 'FAILED_N_PLUS_1' },
+        turnId: 'turn-failed-n1',
+      }, reservation);
     }).toThrow('tail persistence unavailable');
 
     expect(ds.session.queuedActivationTail).toBeUndefined();
-    expect(ds.queuedActivationTailAdmissionsOutstanding).toBeUndefined();
-    expect(ds.queuedActivationTailReleasePending).toBeUndefined();
+    // Route release after a failed admission is the ingress adapter's job now;
+    // the ACK release path still clears the gate for the next inbound.
+    releaseQueuedActivationReservation(ds);
     expect(ds.initialStartPending).toBe(false);
     expect(ds.initialStartClaimToken).toBeUndefined();
-    expect(ds.queuedActivationTailReleaseRetryTimer).toBeUndefined();
   });
 
   it('keeps a response-lost queued start sticky and durably tails a later inbound', async () => {

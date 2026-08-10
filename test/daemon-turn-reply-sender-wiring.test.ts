@@ -14,40 +14,25 @@ describe('daemon per-turn reply sender + participant wiring', () => {
     // initial passthrough (raw command → tri-state is-bot for the label, best-effort name)
     expect(daemonSource).toContain('buildTurnParticipants(larkAppId, senderOpenId, resolvedSenderIsBotTriState, undefined, initialPassthroughSender?.name)');
     expect(daemonSource).toMatch(/participants: initialWindow\.participants, participantsIncomplete: initialWindow\.incomplete/);
-    // new-topic (business message → tri-state sender + parsed.mentions + resolved
-    // name + post @s pre-extracted from current & forward-seed messages)
-    expect(daemonSource).toContain('const newTopicPostAt = collectPostAtMentions(data?.message, ctx.forwardSeedData?.message);');
-    expect(daemonSource).toContain('buildTurnParticipants(larkAppId, senderOpenId, senderIsBotTriState(parsed.senderType, isForeignBotSender), parsed.mentions, newTopicSender?.name, newTopicPostAt)');
-    expect(daemonSource).toMatch(/participants: newTopicWindow\.participants, participantsIncomplete: newTopicWindow\.incomplete/);
-    // existing-session: prepared (race-loser) handoff uses the COMPLETE pre-extracted
-    // set; otherwise extract from this message AND the forward-seed message (a
-    // CAS loser routes back through handleThreadReplyAdmitted without re-passing
-    // prepared.postParticipantMentions, so the seed's post @s must be recovered
-    // from ctx.forwardSeedData here — see the double-race guard test below).
-    expect(daemonSource).toContain('const existingPostAt = prepared?.postParticipantMentions ?? collectPostAtMentions(data?.message, ctx.forwardSeedData?.message);');
-    expect(daemonSource).toContain('buildTurnParticipants(larkAppId, callerOpenId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, undefined, existingPostAt)');
-    expect(daemonSource).toMatch(/participants: existingWindow\.participants, participantsIncomplete: existingWindow\.incomplete/);
-    // auto-create: same prepared-vs-fresh post-@ resolution (also folds forward seed)
-    expect(daemonSource).toContain('const autoCreatePostAt = prepared?.postParticipantMentions ?? collectPostAtMentions(data?.message, ctx.forwardSeedData?.message);');
-    expect(daemonSource).toContain('buildTurnParticipants(larkAppId, senderOId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, autoCreateSender?.name, autoCreatePostAt)');
-    expect(daemonSource).toMatch(/participants: autoCreateWindow\.participants, participantsIncomplete: autoCreateWindow\.incomplete/);
+    // The ordinary business-message lanes (new-topic / existing-session /
+    // auto-create) no longer build a window here: they compile one
+    // NormalizedOrdinaryImTurn and the window is built and bound to the turn in
+    // src/core/current-ordinary-ingress-metadata.ts. That binding is covered
+    // behaviorally by test/current-ordinary-ingress-metadata.test.ts (sender +
+    // mentions + post @s → participants, self app_id-form excluded, unresolved
+    // mention → participantsIncomplete, beginReplyTargetTurn(senderOpenId, …)).
   });
 
-  it('BOTH registration-race loser handoffs preserve the pre-extracted seed+follow-up post @s', () => {
-    // Two CAS-loser handoffs (new-topic loser and the auto-create loser) must EACH
-    // preserve the complete seed's post inline @s, or a double-race drops them.
-    // #597 merge: the losers route back through the canonical owner via
-    // handleThreadReplyAdmitted(data, ctx) rather than passing an explicit
-    // `postParticipantMentions`. That handler recomputes the window from
-    // `prepared?.postParticipantMentions ?? collectPostAtMentions(data, forwardSeed)`,
-    // so it MUST read ctx.forwardSeedData?.message too — otherwise the seed's post
-    // @s vanish on the loser path (the exact double-race #750 guarded). Assert the
-    // recompute in both admitted branches carries the forward seed.
-    expect(daemonSource).toMatch(/postParticipantMentions\?: LarkMention\[\];/);   // on the prepared type
-    // Both admitted recompute points fold the forward-seed message into the post @s.
+  it('every ordinary compile site folds the forward-seed post @s into the turn', () => {
+    // Post rich-text @s live outside message.mentions[]; the ordinary lanes hand
+    // them to the turn compiler as `postParticipantMentions`. A site that reads
+    // only `data` silently drops a forwarded seed's post @s — the exact #750 bug
+    // — so every compile site must fold the seed message in as well.
     expect(
-      daemonSource.match(/collectPostAtMentions\(data\?\.message, ctx\.forwardSeedData\?\.message\)/g),
-    ).toHaveLength(3); // new-topic primary + existing-thread loser + auto-create loser
+      daemonSource.match(
+        /postParticipantMentions: collectPostAtMentions\(\s*data\?\.message,\s*ctx\.forwardSeedData\?\.message,?\s*\)/g,
+      ),
+    ).toHaveLength(3); // new-topic + existing-session + auto-create
   });
 
   it('buildTurnParticipants concats pre-extracted post @s (extractPostAtParticipants) into the window', () => {

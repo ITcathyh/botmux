@@ -306,6 +306,82 @@ describe('Current ordinary route opening production', () => {
     expect(harness.postCommitEffects).toEqual([]);
   });
 
+  it('never assigns a foreign-bot sender as owner while keeping creator/quote provenance', async () => {
+    // Review P1-2 invariant at the new seam: a bot-typed sender must not own
+    // the Session (owner-gated surfaces would @-mention the alert bot back),
+    // but report/quote provenance keeps the raw sender.
+    const harness = createHarness(() => ({
+      ...pinnedPolicy(),
+      ownership: { creatorOpenId: 'ou_alert_bot_sender' },
+    }));
+    const envelope: OrdinaryImTransportEnvelope = {
+      ...turn('om_route_opening_bot_sender', 'alert from a peer bot'),
+      sender: {
+        kind: 'bot',
+        openId: 'ou_alert_bot_sender',
+        unionId: 'on_alert_bot_sender',
+      },
+    };
+
+    await expect(harness.submit(envelope)).resolves.toMatchObject({ kind: 'applied' });
+
+    const [current] = [...harness.activeSessions.values()];
+    expect(current.ownerOpenId).toBeUndefined();
+    expect(current.session.ownerOpenId).toBeUndefined();
+    expect(current.session.ownerUnionId).toBeUndefined();
+    expect(current.session).toMatchObject({
+      creatorOpenId: 'ou_alert_bot_sender',
+      quoteTargetId: envelope.messageKey,
+      quoteTargetSenderOpenId: 'ou_alert_bot_sender',
+      quoteTargetSenderIsBot: true,
+      lastCallerOpenId: 'ou_alert_bot_sender',
+    });
+    expect(sessionStore.getSessionFresh(current.session.sessionId)?.ownerOpenId)
+      .toBeUndefined();
+  });
+
+  it('opens and delivers a chat-scope route whose canonical anchor is the chat id', async () => {
+    const harness = createHarness(() => pinnedPolicy());
+    const envelope: OrdinaryImTransportEnvelope = {
+      ...turn('om_route_opening_chat_scope', 'open the shared chat Session'),
+      route: {
+        scope: 'chat',
+        canonicalAnchor: CHAT_ID,
+        chatId: CHAT_ID,
+        chatType: 'group',
+      },
+    };
+
+    await expect(harness.host.runtime.submit({
+      target: {
+        kind: 'route',
+        route: { kind: 'chat', chatId: CHAT_ID },
+      },
+      idempotencyKey: envelope.messageKey,
+      command: { kind: 'ordinary.ingress', input: { turn: envelope } },
+    })).resolves.toMatchObject({ kind: 'applied', action: 'ordinary.inputCommitted' });
+
+    expect(harness.activeSessions.size).toBe(1);
+    const [current] = [...harness.activeSessions.values()];
+    expect(current).toMatchObject({
+      scope: 'chat',
+      chatId: CHAT_ID,
+      session: {
+        scope: 'chat',
+        chatId: CHAT_ID,
+        status: 'active',
+      },
+    });
+    expect(harness.workerCommands).toEqual([expect.objectContaining({
+      kind: 'forkWorker',
+      sessionId: current.session.sessionId,
+      turnId: envelope.messageKey,
+      input: { content: `opening:${envelope.messageKey}` },
+      resume: false,
+    })]);
+    expect(sessionStore.getSessionFresh(current.session.sessionId)).toEqual(current.session);
+  });
+
   it('stages the exact opening before dispatching an unpinned repo-picker effect', async () => {
     const harness = createHarness(() => pickerPolicy());
     const envelope = turn('om_route_opening_picker', 'choose a repository for this opening');

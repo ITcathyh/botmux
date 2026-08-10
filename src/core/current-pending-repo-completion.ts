@@ -9,6 +9,7 @@ import {
   type PendingRepoCompletionSelection,
   type PendingRepoCompletionTransitionResult,
 } from './session-runtime.js';
+import { publishAttentionPatch } from './session-activity.js';
 import { activeSessionKey, markRepoCardConsumed, type DaemonSession } from './types.js';
 
 export type {
@@ -1052,6 +1053,13 @@ export function createCurrentPendingRepoCompletionPort(
       markRepoCardConsumed(ds, ds.repoCardMessageId);
       ds.repoCardMessageId = undefined;
       clearFoldedRuntimeBuffers(ds);
+      // The needs-you column tracks pendingRepo live; a failed projection
+      // publish must not change the committed completion.
+      try {
+        publishAttentionPatch(ds);
+      } catch {
+        // Rebuilt on the next full hydrate.
+      }
       return { kind: 'committed' };
     },
   };

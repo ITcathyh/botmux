@@ -202,6 +202,13 @@ export function createSessionExecutorRuntime(options: {
           'ExecutorGenerationAuthority.owns',
           () => slot.authority.owns(slot.token, slot.identity),
         )) {
+        // A slot that is still mapped but no longer owned (e.g. the Session
+        // was closed before its worker exited) would otherwise pin the dead
+        // DaemonSession/worker in the map forever — release it. A mapped
+        // replacement stays untouched.
+        if (currentCommitBySessionKey.get(slot.sessionKey) === slot) {
+          currentCommitBySessionKey.delete(slot.sessionKey);
+        }
         const decision: ExecutorObservationDecision = {
           kind: 'retiringExit',
           sessionId: slot.sessionId,
@@ -225,6 +232,10 @@ export function createSessionExecutorRuntime(options: {
         return decision;
       }
       if (fenced.kind === 'unreadable') {
+        // The durable fence quarantine lives in the generation authority; the
+        // mapped slot itself is spent (worker exited) and must not outlive
+        // the Session it pins.
+        currentCommitBySessionKey.delete(slot.sessionKey);
         const decision: ExecutorObservationDecision = {
           kind: 'unreadable',
           sessionId: slot.sessionId,

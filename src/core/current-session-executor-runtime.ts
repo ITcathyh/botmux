@@ -119,10 +119,22 @@ export function createCurrentSessionExecutorRuntime(input: {
       // fence and publishes a still-higher generation in one atomic row write.
       return pending;
     }
-    if ((readback.workerGeneration ?? 0) > pending.intendedGeneration) {
-      ds.workerGeneration = Math.max(ds.workerGeneration ?? 0, readback.workerGeneration ?? 0);
-      ds.session.workerGeneration = Math.max(ds.session.workerGeneration ?? 0, readback.workerGeneration ?? 0);
+    // Whole-row equality is the wrong oracle once other legitimate writers
+    // (per-turn metadata, card state) have republished the row between the
+    // quarantine and this reconcile. The generation field alone is monotonic
+    // and single-writer per owner: at/above the intended fence means the fence
+    // (or a stronger one) is durably published; exactly the previous value
+    // means this fence provably never landed and can be repaired.
+    const fencedbackGeneration = readback.workerGeneration ?? 0;
+    if (fencedbackGeneration >= pending.intendedGeneration) {
+      const adopted = Math.max(fencedbackGeneration, pending.intendedGeneration);
+      ds.workerGeneration = adopted;
+      ds.session.workerGeneration = adopted;
+      ds.session.pid = undefined;
+      pendingExitFences.delete(key);
+      return undefined;
     }
+    if (fencedbackGeneration === pending.previousGeneration) return pending;
     throw new Error('worker-exit generation fence remains quarantined: unexpected durable generation');
   };
 
@@ -155,9 +167,26 @@ export function createCurrentSessionExecutorRuntime(input: {
       pendingReservations.delete(key);
       return;
     }
-    if ((readback.workerGeneration ?? 0) > pending.intendedGeneration) {
-      ds.workerGeneration = Math.max(ds.workerGeneration ?? 0, readback.workerGeneration ?? 0);
-      ds.session.workerGeneration = Math.max(ds.session.workerGeneration ?? 0, readback.workerGeneration ?? 0);
+    // See reconcilePendingExitFence: interleaved legitimate row writers make
+    // whole-row equality unreachable, so fall back to the monotonic generation
+    // field before declaring the reservation permanently quarantined.
+    const readbackGeneration = readback.workerGeneration ?? 0;
+    if (readbackGeneration >= pending.intendedGeneration) {
+      const adopted = Math.max(
+        ds.workerGeneration ?? 0,
+        ds.session.workerGeneration ?? 0,
+        readbackGeneration,
+      );
+      ds.workerGeneration = adopted;
+      ds.session.workerGeneration = adopted;
+      pendingReservations.delete(key);
+      return;
+    }
+    if (readbackGeneration === pending.previousGeneration) {
+      ds.workerGeneration = pending.previousGeneration || undefined;
+      ds.session.workerGeneration = pending.previousGeneration || undefined;
+      pendingReservations.delete(key);
+      return;
     }
     throw new Error('worker generation reservation remains quarantined: unexpected durable generation');
   };

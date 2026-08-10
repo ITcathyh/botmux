@@ -16,6 +16,11 @@ export function markSessionActivity(ds: DaemonSession, at: number = Date.now()):
     ds.session.lastMessageAt = iso;
     sessionStore.updateSession(ds.session);
   }
+  publishSessionActivityPatch(ds, at);
+}
+
+/** Publish only the lastMessageAt patch; truth persistence stays with the caller. */
+export function publishSessionActivityPatch(ds: DaemonSession, at: number): void {
   dashboardEventBus.publish({
     type: 'session.update',
     body: {

@@ -106,14 +106,12 @@ describe('registration loser command handoff', () => {
     );
   });
 
-  it('prepared message handoff skips duplicate resolve, identity-learning, and hook effects', () => {
-    const start = src.indexOf('async function handleThreadReply(');
-    const end = src.indexOf('/**\n * 文档评论入口', start);
-    expect(start).toBeGreaterThanOrEqual(0);
-    expect(end).toBeGreaterThan(start);
-    const region = src.slice(start, end);
-    expect(region).toContain('if (!prepared) await resolveNonsupportMessage(data, larkAppId);');
-    expect(region).toContain('if (!prepared) learnFromMentions(larkAppId, parsed.mentions);');
-    expect(region).toMatch(/if \(!prepared\) \{[\s\S]*emitHookEvent\('thread\.reply'/);
-  });
+  // The `prepared` handoff (a new-topic registration-CAS loser replaying its
+  // already-done resolve/parse/quota work into the routing winner) no longer
+  // exists: the ordinary route resolves its owner inside
+  // src/core/current-ordinary-route-registry.ts BEFORE any materialization, so
+  // there is no ordinary re-entry into handleThreadReplyAdmitted to de-duplicate.
+  // Route ownership/creation is covered behaviorally by
+  // test/current-ordinary-route-registry.test.ts and
+  // test/current-ordinary-route-opening-production.test.ts.
 });

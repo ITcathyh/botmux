@@ -89,7 +89,6 @@ import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.
 import { createImgNumberer, extractPostAtParticipants, parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
 import { expandMergeForward } from './im/lark/merge-forward.js';
 import { bindResourcesToMessage, composeForwardFollowupContent, mergeMessageMentions } from './im/lark/forward-followup-content.js';
-import { buildTopicThreadContext } from './im/lark/topic-root-context.js';
 import { logger } from './utils/logger.js';
 import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { applyAllowedUsersResolve } from './utils/allowed-users-apply.js';
@@ -135,7 +134,6 @@ import { currentDeviceIsolationFreezeLease } from './core/device-isolation-activ
 import { compileLarkOrdinaryImTurn } from './im/lark/ordinary-im-turn-adapter.js';
 import { createCurrentOrdinaryIngressDaemonPort } from './im/lark/current-ordinary-ingress-daemon.js';
 import { stagePendingRepoSetup, persistPendingRepoCardMessageId } from './core/pending-repo-journal.js';
-import { rememberVcMeetingImTurnOrigin } from './core/vc-meeting-im-turn-origin.js';
 import { buildTerminalUrl, setTerminalProxyPort, setTerminalExternalPort } from './core/terminal-url.js';
 import { startTerminalProxy, type TerminalProxyHandle } from './core/terminal-proxy.js';
 import type { CliId } from './adapters/cli/types.js';
@@ -163,7 +161,6 @@ import {
   prepareQueuedActivationRecoveryFork,
   admitQueuedActivationTail,
   reserveQueuedActivationTailAdmission,
-  type QueuedActivationTailReservation,
   codexAppCleanInputAcceptedForSession,
   hasQueuedActivationAdmissionGate,
   sendWorkerSessionInput,
@@ -231,12 +228,8 @@ import {
   getProjectScanDirs,
   getProjectScanDirsForBot,
   expandHome,
-  downloadResources,
-  formatAttachmentsHint,
   buildNewTopicCliInput,
   buildFollowUpCliInput,
-  buildBridgeInputContent,
-  buildReforkCliInput,
   getAvailableBots,
   restoreActiveSessions,
   executeScheduledTask,
@@ -253,8 +246,6 @@ import {
   withBotTurnAdmission,
   withBotTurnMutation,
 } from './core/bot-turn-mutation-gate.js';
-import { claimInitialUserTurn, isInitialUserTurnPending, releaseInitialUserTurn } from './core/initial-user-turn.js';
-import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './core/session-create.js';
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
 import { beginReplyTargetTurn, buildTurnParticipantsFrom, fallbackTurnId, isSubstituteTurn, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
@@ -410,7 +401,6 @@ import { learnFromMentions, resolveSender, flushIdentityCacheSync, type Resolved
 import { normalizeBrand } from './im/lark/lark-hosts.js';
 import { buildDocCommentTurnInput, buildDocWatchWarmupTurnInput } from './core/doc-comment-prompt.js';
 import { advanceDocCommentCursor, docCommentRepliesAfterCursor, latestDocCommentPollCursor } from './core/doc-comment-poller.js';
-import { renderBufferedSenderBlock } from './core/session-manager.js';
 import { shutdownBackendDisposition } from './core/persistent-backend.js';
 import {
   abortRiffShutdownFleet,
@@ -433,8 +423,6 @@ import {
   markSessionActivity,
   announcePendingRepoSession,
   publishAttentionPatch,
-  publishLastInputFromBotPatch,
-  publishSessionMessagePreviewPatch,
   publishClosedSessionPatch,
   clearAgentAttention,
 } from './core/session-activity.js';
@@ -663,6 +651,38 @@ function currentOrdinaryIngressPort(
           `[${ownerLarkAppId}] ordinary ingress download-login notice failed: ${error instanceof Error ? error.message : String(error)}`,
         );
       }
+    },
+    beginTurnCardRotation: (current, turn) => {
+      if (turn.mode === 'live') beginNewTurn(current, turn.title);
+      else beginReforkTurn(current, turn.title);
+    },
+    addReceivedReaction: async input => {
+      const ds = findActiveBySessionId(input.sessionId);
+      if (!ds || ds.larkAppId !== ownerLarkAppId) return { kind: 'ok', value: null };
+      const reactionId = await addTurnReceivedReaction(
+        ds,
+        input.turnId,
+        input.substitute ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined,
+      );
+      return { kind: 'ok', value: reactionId === undefined ? null : { reactionId } };
+    },
+    notifyPendingRepoStash: current => {
+      // Auto-worktree pending (worktreeCreating) has no repo card to point at —
+      // the message IS buffered, so say "hold on, building worktree" instead of
+      // the misleading "pick a repo from the card above".
+      const pendingReplyKey = (current.worktreeCreating || current.pendingRepoCommitInFlight)
+        ? 'daemon.worktree_building_wait'
+        : 'daemon.choose_repo_first';
+      void sessionReply(
+        sessionAnchorId(current),
+        tr(pendingReplyKey, undefined, localeForBot(ownerLarkAppId)),
+        'text',
+        ownerLarkAppId,
+      ).catch(error => {
+        logger.warn(
+          `[${ownerLarkAppId}] pending-repo stash notice failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
     },
     isPeerBot: openId => isKnownPeerBot(config.session.dataDir, ownerLarkAppId, openId),
   });
@@ -3552,28 +3572,50 @@ export async function noteTurnReceived(
   // message — not a worker status edge — means type-ahead / busy-batched messages
   // each get their own ✋. `finishTurnReactions` flips every pending ✋ to ✅ when
   // the worker next goes idle.
-  if (ds.session.vcMeetingReceiver) return;
+  // Gate synchronously so a gated-out call costs the same single microtask as
+  // before — the doc-comment refork path is interleaving-sensitive here.
+  if (!turnReceivedReactionGate(ds, triggerMessageId)) return;
+  const reactionId = await addGatedTurnReceivedReaction(ds, triggerMessageId, receivedReactionEmoji);
+  if (reactionId === undefined) return;
+  (ds.pendingAckReactions ??= []).push({ messageId: triggerMessageId, reactionId });
+}
+
+function turnReceivedReactionGate(ds: DaemonSession, triggerMessageId: string): boolean {
+  if (ds.session.vcMeetingReceiver) return false;
   // Turn-exact card-off check: the reaction ack belongs to THIS message's turn,
   // not to whichever turn most recently overwrote currentReplyTarget.
-  if (!streamingCardDisabledFor(ds, triggerMessageId)) return;
-  if (silentTurnReactionsFor(ds)) return;
+  if (!streamingCardDisabledFor(ds, triggerMessageId)) return false;
+  if (silentTurnReactionsFor(ds)) return false;
   // Only Lark messages carry reactions — doc-comment ids / chat anchors can't.
-  if (!triggerMessageId.startsWith('om_')) return;
-  if ((ds.pendingAckReactions ??= []).some(a => a.messageId === triggerMessageId)) return;
-  // Add the ✋ FIRST, register the entry only after it lands. If we pushed the
-  // entry before awaiting addReaction, a previous turn's idle edge
-  // (finishTurnReactions) could detach this half-formed entry mid-flight —
-  // DONE-ing a message that hasn't even reached the worker yet and orphaning its
-  // reactionId. Callers await this before dispatching the message to the worker,
-  // so a registered entry is always in place before its own turn can go idle.
-  let reactionId: string;
+  if (!triggerMessageId.startsWith('om_')) return false;
+  return !(ds.pendingAckReactions ?? []).some(a => a.messageId === triggerMessageId);
+}
+
+async function addGatedTurnReceivedReaction(
+  ds: DaemonSession,
+  triggerMessageId: string,
+  receivedReactionEmoji?: string,
+): Promise<string | undefined> {
   try {
-    reactionId = await addReaction(ds.larkAppId, triggerMessageId, receivedReactionEmoji ?? receivedReactionEmojiFor(ds));
+    return await addReaction(ds.larkAppId, triggerMessageId, receivedReactionEmoji ?? receivedReactionEmojiFor(ds));
   } catch (err) {
     logger.debug(`[reaction] received add failed for ${triggerMessageId}: ${err instanceof Error ? err.message : String(err)}`);
-    return;
+    return undefined;
   }
-  (ds.pendingAckReactions ??= []).push({ messageId: triggerMessageId, reactionId });
+}
+
+/**
+ * 门控 + 加 ✋ 半边（不注册 pendingAckReactions）。ordinary ingress 走 evidence
+ * 路线：这里在 lane 外完成 Lark 反应，注册由 metadata module 在 lane 内按
+ * messageKey 精确校验后完成——「先加表情、落地后才注册」的不变量因此仍然成立。
+ */
+async function addTurnReceivedReaction(
+  ds: DaemonSession,
+  triggerMessageId: string,
+  receivedReactionEmoji?: string,
+): Promise<string | undefined> {
+  if (!turnReceivedReactionGate(ds, triggerMessageId)) return undefined;
+  return addGatedTurnReceivedReaction(ds, triggerMessageId, receivedReactionEmoji);
 }
 
 async function sessionReply(
@@ -4777,6 +4819,28 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
   ds.currentImageKey = undefined;
   persistStreamCardState(ds);
   void postTurnStartingCard(ds, sessionReply, turnId);
+}
+
+/**
+ * 新一轮到达但 worker 已死/未起（重 fork 前）的卡片重置。beginNewTurn 的冻结步
+ * 以「活 worker」为前提；这里改为把当前卡 park 进 frozenCards（而不是删除）——
+ * 若 fork / worker_ready / POST 失败，用户仍能看到上一张卡。清空 streamCardId
+ * 强制重 fork 后首个 screen_update POST 新卡，而不是 PATCH 上一轮的卡；丢弃
+ * currentImageKey 避免旧截图在新轮卡片上复活。
+ */
+function beginReforkTurn(ds: DaemonSession, title: string): void {
+  if (ds.usageLimitRetryTimer) {
+    clearTimeout(ds.usageLimitRetryTimer);
+    ds.usageLimitRetryTimer = undefined;
+  }
+  ds.usageLimit = undefined;
+  ds.currentTurnTitle = title.substring(0, 50);
+  parkStreamCard(ds);
+  ds.streamCardId = undefined;
+  ds.streamCardNonce = undefined;
+  ds.streamCardPending = true;
+  ds.currentImageKey = undefined;
+  persistStreamCardState(ds);
 }
 
 /**
@@ -16556,80 +16620,13 @@ function clearInitialStartClaim(ds: DaemonSession, token?: string): boolean {
   if (token !== undefined && ds.initialStartClaimToken !== token) return false;
   ds.initialStartClaimToken = undefined;
   ds.initialStartPending = false;
-  if ((ds.queuedActivationTailAdmissionsOutstanding ?? 0) === 0) {
-    ds.queuedActivationTailReleasePending = undefined;
-    if (ds.queuedActivationTailReleaseRetryTimer) {
-      clearTimeout(ds.queuedActivationTailReleaseRetryTimer);
-      ds.queuedActivationTailReleaseRetryTimer = undefined;
-    }
-  }
   return true;
 }
-
-/** Fence an arrival before any sender/prompt await. Besides reserving durable
- * FIFO order, keep the opening route owned until this reservation either lands
- * in the durable tail or fails. */
-function reserveAsyncQueuedActivationTailAdmission(
-  ds: DaemonSession,
-): QueuedActivationTailReservation {
-  const reservation = reserveQueuedActivationTailAdmission(ds);
-  ds.queuedActivationTailAdmissionsOutstanding =
-    (ds.queuedActivationTailAdmissionsOutstanding ?? 0) + 1;
-  return reservation;
-}
-
-function scheduleQueuedActivationTailReleaseRetry(
-  ds: DaemonSession,
-  acknowledgedToken?: string,
-): void {
-  if (!ds.initialStartPending || ds.queuedActivationTailReleaseRetryTimer) return;
-  const timer = setTimeout(() => {
-    if (ds.queuedActivationTailReleaseRetryTimer !== timer) return;
-    ds.queuedActivationTailReleaseRetryTimer = undefined;
-    if (!ds.initialStartPending) return;
-    if (!releaseQueuedActivationReservation(ds, acknowledgedToken)) {
-      scheduleQueuedActivationTailReleaseRetry(ds, acknowledgedToken);
-    }
-  }, 100);
-  timer.unref?.();
-  ds.queuedActivationTailReleaseRetryTimer = timer;
-}
-
-/** Complete one async reservation. If the predecessor ACK arrived during its
- * await, the final settler performs the deferred handoff immediately. */
-function settleAsyncQueuedActivationTailAdmission(ds: DaemonSession): void {
-  const outstanding = Math.max(
-    0,
-    (ds.queuedActivationTailAdmissionsOutstanding ?? 0) - 1,
-  );
-  ds.queuedActivationTailAdmissionsOutstanding = outstanding || undefined;
-  if (outstanding > 0 || !ds.queuedActivationTailReleasePending) return;
-  const pending = ds.queuedActivationTailReleasePending;
-  ds.queuedActivationTailReleasePending = undefined;
-  if (!releaseQueuedActivationReservation(ds, pending.acknowledgedToken)) {
-    scheduleQueuedActivationTailReleaseRetry(ds, pending.acknowledgedToken);
-  }
-}
-
-export const __testOnly_reserveAsyncQueuedActivationTailAdmission =
-  reserveAsyncQueuedActivationTailAdmission;
-export const __testOnly_settleAsyncQueuedActivationTailAdmission =
-  settleAsyncQueuedActivationTailAdmission;
 
 /** Release a queued activation's runtime route reservation only after the
  * worker ACKs actual adapter submission. Turns that arrived meanwhile are sent
  * as one ordered follow-up, never allowed to overtake the opening item. */
 function releaseQueuedActivationReservation(ds: DaemonSession, acknowledgedToken?: string): boolean {
-  if ((ds.queuedActivationTailAdmissionsOutstanding ?? 0) > 0) {
-    // The worker may ACK while N+1 is still awaiting sender/resource prompt
-    // construction. Keep the route gate and replay this release when the last
-    // reserved arrival either persists or fails.
-    ds.queuedActivationTailReleasePending = acknowledgedToken === undefined
-      ? {}
-      : { acknowledgedToken };
-    return false;
-  }
-  ds.queuedActivationTailReleasePending = undefined;
   // A prior callback retry may observe the successor already promoted. That is
   // success for the acknowledged predecessor; never append/send the same tail
   // head a second time while its fresh token owns the journal.
@@ -16802,8 +16799,7 @@ function forkReservedInitialSession(ds: DaemonSession, availableBots: AvailableB
   // adapter-level ACK so a live-worker follower cannot bypass its FIFO tail.
   const waitsForQueuedAck = ds.session.queuedActivationPending === true;
   ds.initialStartPending = waitsForQueuedAck
-    || (ds.session.queuedActivationTail?.length ?? 0) > 0
-    || (ds.queuedActivationTailAdmissionsOutstanding ?? 0) > 0;
+    || (ds.session.queuedActivationTail?.length ?? 0) > 0;
   clearInitialStartBuffers(ds);
   if (!waitsForQueuedAck && ds.initialStartPending) {
     // A follower may have reserved FIFO order while the opening prompt was
@@ -16849,8 +16845,7 @@ function forkReservedInitialRawSession(ds: DaemonSession, availableBots: Availab
   // used by pending-repo raw starts so that successor is released only after
   // both the raw text and Enter have crossed the adapter boundary.
   const armRawActivationAck = !ds.session.queuedActivationPending
-    && ((ds.session.queuedActivationTail?.length ?? 0) > 0
-      || (ds.queuedActivationTailAdmissionsOutstanding ?? 0) > 0);
+    && (ds.session.queuedActivationTail?.length ?? 0) > 0;
   if (armRawActivationAck) ds.session.queued = true;
   try {
     forkWorker(ds, '', false);
@@ -17651,6 +17646,7 @@ async function handleNewTopicAdmitted(
       ownerLarkAppId: larkAppId,
       routeLabel: `${scope}:${scope === 'thread' ? anchor : chatId}`,
       turnId: parsed.messageId,
+      replyAnchor: scope === 'thread' ? anchor : chatId,
     },
   );
   if (runtimeStaging) runtimeStaging.stage(completion);
@@ -18178,6 +18174,8 @@ async function observeOrdinaryIngressOutcome(
     turnId: string;
     sessionId?: string;
     routeLabel?: string;
+    /** Reply target for the non-delivery notice; absent for non-Lark producers. */
+    replyAnchor?: string;
   },
 ): Promise<void> {
   const outcome = await completion;
@@ -18189,12 +18187,29 @@ async function observeOrdinaryIngressOutcome(
       `[${context.ownerLarkAppId}] ordinary ingress ${context.turnId.substring(0, 12)} `
       + `for ${target.substring(0, 24)} settled ${outcome.kind}${detail}`,
     );
-    return;
+  } else {
+    logger.error(
+      `[${context.ownerLarkAppId}] ordinary ingress ${context.turnId.substring(0, 12)} `
+      + `for ${target.substring(0, 24)} settled ${outcome.kind}${detail}`,
+    );
   }
-  logger.error(
-    `[${context.ownerLarkAppId}] ordinary ingress ${context.turnId.substring(0, 12)} `
-    + `for ${target.substring(0, 24)} settled ${outcome.kind}${detail}`,
-  );
+  // rejected 由各 policy 自己的 UX 负责（如 quota 拒绝已单独提示）；其余终态
+  // 意味着 transport 已 ACK 但消息没有送达 CLI——沉默会被读成机器人吞消息，
+  // 必须给用户一条可行动的提示。
+  if (outcome.kind === 'rejected' || !context.replyAnchor) return;
+  try {
+    await sessionReply(
+      context.replyAnchor,
+      tr('daemon.ordinary_ingress_failed', undefined, localeForBot(context.ownerLarkAppId)),
+      'text',
+      context.ownerLarkAppId,
+    );
+  } catch (error) {
+    logger.warn(
+      `[${context.ownerLarkAppId}] ordinary ingress failure notice for ${context.turnId.substring(0, 12)} `
+      + `could not be delivered: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 }
 
 async function handleThreadReply(
@@ -18741,6 +18756,7 @@ async function handleThreadReplyAdmitted(
         ownerLarkAppId: larkAppId,
         sessionId: ds.session.sessionId,
         turnId: parsed.messageId,
+        replyAnchor: sessionAnchorId(ds),
       },
     );
     if (runtimeStaging) runtimeStaging.stage(completion);
@@ -18797,6 +18813,7 @@ async function handleThreadReplyAdmitted(
       ownerLarkAppId: larkAppId,
       routeLabel: `${scope}:${scope === 'thread' ? anchor : ctxChatId}`,
       turnId: parsed.messageId,
+      replyAnchor: scope === 'thread' ? anchor : ctxChatId,
     },
   );
   if (runtimeStaging) runtimeStaging.stage(completion);
@@ -19143,19 +19160,9 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
         return;
       }
 
-      // Worker 挂起 / 已退出 —— resume 重 fork（与 handleThreadReply 同路）。
+      // Worker 挂起 / 已退出 —— resume 重 fork（与 ordinary refork 同路）。
       logger.info(`[${tag(ds)}] Worker not running for doc-comment, re-forking...`);
-      if (ds.usageLimitRetryTimer) { clearTimeout(ds.usageLimitRetryTimer); ds.usageLimitRetryTimer = undefined; }
-      ds.usageLimit = undefined;
-      ds.currentTurnTitle = text.substring(0, 50);
-      parkStreamCard(ds);
-      ds.streamCardId = undefined;
-      ds.streamCardNonce = undefined;
-      ds.streamCardPending = true;
-      ds.streamCardPendingTurnId = turnId;
-      ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
-      ds.currentImageKey = undefined;
-      persistStreamCardState(ds);
+      beginReforkTurn(ds, text);
       // Skip whiteboard ensure for adopted (bridge) sessions on re-fork — mirrors
       // the live-worker branch above (if (!isBridge) ensure…).
       if (!ds.adoptedFrom) ensureSessionWhiteboard(ds);
@@ -19954,18 +19961,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       scheduleDeferredScheduleSettlement(ds, context);
     },
     onCliExit(context) {
-      const ds = findActiveBySessionId(context.sessionId);
-      if (!ds || ds.larkAppId !== cfg.larkAppId) return;
-      // Same idempotent-async convergence as onWorkerExit: the MANAGED CLI can
-      // exit inside a still-live Node worker (persistent-pane / codex-app
-      // auto-restart), in which case onWorkerExit never fires. An incomplete
-      // keyed async turn whose CLI died with no final_output must still converge
-      // to a durable dispatch_unknown, or trigger-result polls `running` and a
-      // same-key retry reuses the dead generation forever (codex #776 round-6
-      // finding #1 — the onCliExit half of that path). Idempotent + generation-
-      // gated: safe under the onCliExit/onWorkerExit double-callback race, and a
-      // no-op once final_output cleared the stamp.
-      failCloseIdempotentTurnIfConvergenceWriteFailed(ds, context.workerGeneration);
+      // VC receipt reconciliation works off durable stores keyed by the exit
+      // context — it must run even when the session was already closed and
+      // removed from activeSessions (e.g. /close raced the exit callback).
       const result = handleVcMeetingWorkerGenerationExit(context, {
         dataDir: config.session.dataDir,
         selfAppId: cfg.larkAppId,
@@ -19976,16 +19974,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           + `session=${context.sessionId.slice(0, 8)} generation=${context.workerGeneration}`,
         );
       }
-    },
-    onWorkerExit(context) {
       const ds = findActiveBySessionId(context.sessionId);
       if (!ds || ds.larkAppId !== cfg.larkAppId) return;
-      // Converge an incomplete idempotent async turn (options.idempotencyKey):
-      // a worker that died with no final_output would otherwise poll `running`
-      // and let a same-key retry `reuse` the dead session forever, until the next
-      // boot reconcile (codex #776 round-6 finding #1). Best-effort + never throws
-      // into the exit handler; a durable-write failure fail-closes the session.
+      // Same idempotent-async convergence as onWorkerExit: the MANAGED CLI can
+      // exit inside a still-live Node worker (persistent-pane / codex-app
+      // auto-restart), in which case onWorkerExit never fires. An incomplete
+      // keyed async turn whose CLI died with no final_output must still converge
+      // to a durable dispatch_unknown, or trigger-result polls `running` and a
+      // same-key retry reuses the dead generation forever (codex #776 round-6
+      // finding #1 — the onCliExit half of that path). Idempotent + generation-
+      // gated: safe under the onCliExit/onWorkerExit double-callback race, and a
+      // no-op once final_output cleared the stamp. A closed session needs no
+      // convergence: its persisted `closed` status already resolves the poller.
       failCloseIdempotentTurnIfConvergenceWriteFailed(ds, context.workerGeneration);
+    },
+    onWorkerExit(context) {
+      // Durable VC reconciliation first — see onCliExit; a /close that removed
+      // the session must not skip the dispatched→ambiguous transition.
       const result = handleVcMeetingWorkerGenerationExit(context, {
         dataDir: config.session.dataDir,
         selfAppId: cfg.larkAppId,
@@ -20005,18 +20010,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           + `session=${context.sessionId.slice(0, 8)} generation=${context.workerGeneration}`,
         );
       }
+      const ds = findActiveBySessionId(context.sessionId);
+      if (!ds || ds.larkAppId !== cfg.larkAppId) return;
+      // Converge an incomplete idempotent async turn (options.idempotencyKey):
+      // a worker that died with no final_output would otherwise poll `running`
+      // and let a same-key retry `reuse` the dead session forever, until the next
+      // boot reconcile (codex #776 round-6 finding #1). Best-effort + never throws
+      // into the exit handler; a durable-write failure fail-closes the session.
+      failCloseIdempotentTurnIfConvergenceWriteFailed(ds, context.workerGeneration);
     },
     onRetiringWorkerExit(context) {
-      const current = findActiveBySessionId(context.sessionId);
-      if (!current || current.larkAppId !== cfg.larkAppId) return;
-      // A superseded generation may settle only its exact path-specific
-      // receipts. It cannot close/kill or publish lifecycle for the current
-      // Session even when that old receipt's convergence write fails.
-      failCloseIdempotentTurnIfConvergenceWriteFailed(
-        current,
-        context.workerGeneration,
-        { closeCurrentOnFailure: false },
-      );
       const result = handleVcMeetingWorkerGenerationExit(context, {
         dataDir: config.session.dataDir,
         selfAppId: cfg.larkAppId,
@@ -20030,6 +20033,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           + `session=${context.sessionId.slice(0, 8)} generation=${context.workerGeneration}`,
         );
       }
+      const current = findActiveBySessionId(context.sessionId);
+      if (!current || current.larkAppId !== cfg.larkAppId) return;
+      // A superseded generation may settle only its exact path-specific
+      // receipts. It cannot close/kill or publish lifecycle for the current
+      // Session even when that old receipt's convergence write fails.
+      failCloseIdempotentTurnIfConvergenceWriteFailed(
+        current,
+        context.workerGeneration,
+        { closeCurrentOnFailure: false },
+      );
     },
     onReceiverResetReady(_ds, context) {
       acknowledgeVcMeetingReceiverRecovery(vcMeetingReceiverRecoveryKey(
