@@ -37,6 +37,9 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
     type: 'streaming',
     readUrl: args[2],
     localCliReady: args[15] === true,
+    // Signature tail after the master merge: 15 localCliReady, 16 usage,
+    // 17 runtimeDisplayName, 18 serviceTierBadge.
+    serviceTierBadge: args[18],
   })),
   buildSessionCard: vi.fn(() => '{"type":"session"}'),
   buildTuiPromptCard: vi.fn(() => '{}'),
@@ -131,6 +134,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 // ─── Imports under test ────────────────────────────────────────────────────
 
 import { CARD_POSTING_SENTINEL, initWorkerPool, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
+import { MessageWithdrawnError } from '../src/im/lark/client.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { getBot } from '../src/bot-registry.js';
 import * as sessionStore from '../src/services/session-store.js';
@@ -222,6 +226,105 @@ describe('Worker ready: set_display_mode re-sync', () => {
       agentName: 'botmux-sid-read',
     });
     expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+  });
+
+  it('patches a static Codex card when executor tier changes without a screen update', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      worker: fakeWorker,
+      workerPort: 9999,
+      streamCardId: 'om_static_card',
+      streamCardPending: false,
+    });
+    ds.session.cliId = 'codex';
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', {
+      type: 'codex_service_tier',
+      snapshot: {
+        model: 'gpt-5.6-sol', serviceTier: 'priority', nonDefault: true,
+      },
+    });
+    await flush();
+    expect(ds.codexServiceTier?.nonDefault).toBe(true);
+    expect(JSON.parse(updateMessageMock.mock.calls.at(-1)![2])).toMatchObject({ serviceTierBadge: '⚡ priority' });
+
+    fakeWorker.emit('message', {
+      type: 'codex_service_tier',
+      snapshot: {
+        model: 'gpt-5.6-sol', serviceTier: 'default', nonDefault: false,
+      },
+    });
+    await flush();
+    expect(ds.codexServiceTier?.nonDefault).toBe(false);
+    expect(JSON.parse(updateMessageMock.mock.calls.at(-1)![2]).serviceTierBadge).toBeUndefined();
+  });
+
+  it('clears tier state at worker-generation setup and ignores stale-worker updates', async () => {
+    const staleWorker = makeFakeWorker();
+    const replacement = makeFakeWorker();
+    const ds = makeDs({
+      worker: staleWorker,
+      workerPort: 9999,
+      streamCardId: 'om_static_card',
+      codexServiceTier: {
+        model: 'gpt-5.6-sol', serviceTier: 'priority', nonDefault: true,
+      },
+    });
+    ds.session.cliId = 'claude-code';
+
+    __testOnly_setupWorkerHandlers(ds, staleWorker);
+    expect(ds.codexServiceTier).toBeUndefined();
+    ds.worker = replacement;
+    staleWorker.emit('message', {
+      type: 'codex_service_tier',
+      snapshot: {
+        model: 'gpt-5.6-sol', serviceTier: 'priority', nonDefault: true,
+      },
+    });
+    await flush();
+
+    expect(ds.codexServiceTier).toBeUndefined();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('does not rewrite a frozen card when teardown clears the live tier', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      worker: fakeWorker,
+      workerPort: 9999,
+      streamCardId: 'om_frozen_card',
+      streamCardNonce: 'nonce_frozen',
+      parkedStreamCardNonce: 'nonce_frozen',
+    });
+    ds.session.cliId = 'codex';
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    updateMessageMock.mockClear();
+    fakeWorker.emit('message', { type: 'codex_service_tier', snapshot: null });
+    await flush();
+
+    expect(ds.codexServiceTier).toBeUndefined();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('does not retain a pending tier refresh when no live card exists', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({ worker: fakeWorker, workerPort: null, streamCardId: undefined });
+    ds.session.cliId = 'codex';
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    ds.pendingCodexTierCardRefresh = true;
+    fakeWorker.emit('message', {
+      type: 'codex_service_tier',
+      snapshot: {
+        model: 'gpt-5.6-sol', serviceTier: 'priority', nonDefault: true,
+      },
+    });
+    await flush();
+
+    expect(ds.pendingCodexTierCardRefresh).toBeUndefined();
+    expect(updateMessageMock).not.toHaveBeenCalled();
   });
 
   it('POST path forwards ready.turnId to sessionReply for initial alias cards', async () => {
@@ -406,6 +509,32 @@ describe('Worker ready: set_display_mode re-sync', () => {
       (args: any[]) => args[0]?.type === 'set_display_mode',
     );
     expect(displayModeCalls).toHaveLength(0);
+  });
+
+  it('preserves worker and pending Codex FIFO when the root is withdrawn during ready POST', async () => {
+    sessionReplyMock.mockRejectedValueOnce(new MessageWithdrawnError('om_root'));
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      streamCardPending: true,
+      streamCardId: undefined,
+      worker: fakeWorker,
+    });
+    ds.session.codexAppDispatchLedger = [{
+      dispatchId: 'dispatch-pending',
+      turnId: 'turn-pending',
+      state: 'prepared',
+      content: 'pending',
+    }];
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', {
+      type: 'ready', port: 9999, token: 'tok_abc', turnId: 'turn-pending',
+    });
+    await flush();
+
+    expect(closeSessionMock).not.toHaveBeenCalled();
+    expect(fakeWorker.kill).not.toHaveBeenCalled();
+    expect(ds.session.codexAppDispatchLedger).toHaveLength(1);
   });
 
   it('PATCH path sends set_display_mode when displayMode is screenshot', async () => {
@@ -659,6 +788,51 @@ describe('Worker ready: set_display_mode re-sync', () => {
     expect(fakeWorker.send).not.toHaveBeenCalledWith(
       expect.objectContaining({ type: 'raw_input' }),
     );
+  });
+
+  it('replays a restored raw opening with its durable token and releases only on the matching ACK', async () => {
+    const submitted = vi.fn(async () => true);
+    initWorkerPool({
+      sessionReply: sessionReplyMock,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: closeSessionMock,
+      onQueuedActivationSubmitted: submitted,
+    });
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      worker: fakeWorker,
+      pendingRawInput: '/goal RESTORED_RAW_N',
+      initialStartPending: true,
+    } as Partial<DaemonSession>);
+    Object.assign(ds.session, {
+      queuedActivationPending: true,
+      queuedActivationToken: 'raw-activation-token',
+      queuedActivationTurnId: 'turn-raw-n',
+      pendingRepoSetup: {
+        mode: 'picker', prompt: '', rawInput: '/goal RESTORED_RAW_N', turnId: 'turn-raw-n',
+      },
+    });
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', { type: 'prompt_ready' });
+    await flush();
+
+    expect(fakeWorker.send).toHaveBeenCalledWith({
+      type: 'raw_input',
+      content: '/goal RESTORED_RAW_N',
+      queuedActivationToken: 'raw-activation-token',
+      turnId: 'turn-raw-n',
+    });
+    expect(submitted).not.toHaveBeenCalled();
+
+    fakeWorker.emit('message', {
+      type: 'queued_activation_submitted',
+      sessionId: ds.session.sessionId,
+      activationToken: 'raw-activation-token',
+    });
+    await flush();
+    expect(submitted).toHaveBeenCalledWith(ds, 'raw-activation-token');
   });
 
   it('prompt_ready bundles the buffered follow-up ONTO the raw_input IPC (single atomic message)', async () => {

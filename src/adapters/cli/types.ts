@@ -1,14 +1,17 @@
 import type { CodexAppTurnInput } from '../../types.js';
 
 export interface PtyHandle {
-  write(data: string): void;
+  /** `false` means the backend rejected the write before it could confirm
+   * delivery. Callers must not silently promote that result to success. */
+  write(data: string): void | boolean;
   /** Send text literally via tmux send-keys -l (tmux mode only).
-   *  Returns `false` when the write was dropped (e.g. send-keys failed while the
-   *  pane is still alive) so callers can surface a non-submission; `void`/`true`
-   *  means the write was issued. Backends that can't tell return void. */
+   *  Returns `false` when the backend could not confirm the write (for example,
+   *  send-keys timed out while the pane stayed alive). Delivery may still have
+   *  occurred, so callers must treat false as ambiguous rather than proof that
+   *  zero bytes landed. `void`/`true` means the write was issued. */
   sendText?(text: string): void | boolean;
   /** Send special keys via tmux send-keys, e.g. 'Enter', 'Escape', 'C-c' (tmux mode only).
-   *  Returns `false` on a dropped write (see sendText). */
+   *  Returns `false` on an unconfirmed write (see sendText). */
   sendSpecialKeys?(...keys: string[]): void | boolean;
   /**
    * Epoch-ms timestamp of the most recent Ctrl+C the backend may have injected.
@@ -36,11 +39,26 @@ export type SubmitRecheckResult = boolean | {
   cliSessionId?: string;
 };
 
+/** What the adapter can prove about a failed runner-protocol write.
+ *
+ * Runner adapters write a framed line and then a newline.  `submitted:false`
+ * alone is insufficient for recovery: the line may be untouched, may have
+ * been flushed as an invalid fragment, or may still be a complete valid frame
+ * waiting in the runner's stdin buffer.  Only the first two dispositions are
+ * safe to cancel/retry in the same generation. */
+export type RunnerSubmissionDisposition =
+  | 'submitted'
+  | 'untouched'
+  | 'flushed_invalid'
+  | 'dirty_unknown';
+
 /** Optional per-input correlation metadata. Adapters that do not need it may
  * ignore it; runner-based adapters use the immutable botmux/Lark turn id to
  * keep protocol ids separate from reply-routing ids. */
 export interface WriteInputContext {
   turnId?: string;
+  /** codex-app only: this turn is authorized to steer into an active turn. */
+  codexAppSteerable?: true;
 }
 
 /** A session discovered on disk that botmux can resume (import) into a topic —
@@ -94,6 +112,12 @@ export interface CliAdapter {
     workingDir?: string;
     /** CLI-native session id used for resume when it differs from botmux's session id. */
     resumeSessionId?: string;
+    /** When true, resume the `resumeSessionId` transcript but write forward into a
+     *  NEW CLI-native session id instead of the resumed one, leaving the source
+     *  transcript untouched — the native "fork/branch a session" primitive
+     *  (Claude `--fork-session`, `codex fork`). Only meaningful with resume=true
+     *  and a resumeSessionId; adapters whose CLI lacks the primitive ignore it. */
+    forkSession?: boolean;
     initialPrompt?: string;
     botName?: string;
     botOpenId?: string;
@@ -217,6 +241,7 @@ export interface CliAdapter {
   ): Promise<void | {
     submitted: boolean;
     cliSessionId?: string;
+    submissionDisposition?: RunnerSubmissionDisposition;
     /** Non-transient reason when the adapter knows submission is impossible
      *  without waiting for transcript confirmation (for example an unsupported
      *  terminal keybinding). Worker surfaces this immediately. */
@@ -236,6 +261,7 @@ export interface CliAdapter {
   ): Promise<void | {
     submitted: boolean;
     cliSessionId?: string;
+    submissionDisposition?: RunnerSubmissionDisposition;
     failureReason?: string;
     recheck?: () => SubmitRecheckResult | Promise<SubmitRecheckResult>;
   }>;
@@ -293,6 +319,11 @@ export interface CliAdapter {
    *  may be no new PTY output: if the current screen does NOT match this marker,
    *  the worker may safely let quiescence mark the session idle. */
   readonly busyPattern?: RegExp;
+
+  /** Opt-in positive marker for an idle→working edge observed in PTY output.
+   *  Kept separate from busyPattern because transcript/full-screen redraws may
+   *  contain old busy text; existing adapters remain opt-out by default. */
+  readonly idleToBusyPattern?: RegExp;
 
   /** Ready marker regex — matches when the CLI's input prompt is rendered and
    *  functional.  When set, the idle detector suppresses quiescence-based idle
@@ -422,6 +453,17 @@ export interface CliAdapter {
    *  Missing/empty → no extra re-expose. */
   sandboxExtraExecPaths?(): readonly string[];
 
+  /** Absolute paths (files or dirs) this adapter needs visible READ-ONLY inside
+   *  the file sandbox — distinct from `authPaths`, which are bound READ-WRITE.
+   *  Use this for host state the CLI only READS (e.g. traex/coco's first-run
+   *  migration done-markers at the ~/.trae root): exposing them read-only lets
+   *  the CLI see them without widening the writable surface to sibling
+   *  hook/plugin/skill code. Wired into the fs-policy `readonlyRoots` channel
+   *  (→ readOnly rule). `~`-expanded + existence-filtered by the worker, so
+   *  listing a path absent on this host is a no-op. Missing/empty → nothing extra
+   *  exposed. Return ONLY paths safe to reveal read-only (never credentials). */
+  sandboxReadonlyPaths?(): readonly string[];
+
   /** Extra env merged into the spawned child's environment. Used by Claude-family
    *  forks to point the CLI at its data root (e.g. Seed's `CLAUDE_CONFIG_DIR`).
    *  Keys placed here are also forwarded through the tmux backend (see
@@ -490,4 +532,4 @@ export interface CliAdapter {
   buildSessionRenameCommand?(title: string): string;
 }
 
-export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'genius' | 'opencode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'kimi' | 'grok' | 'kiro-cli' | 'riff';
+export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'genius' | 'opencode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'kimi' | 'grok' | 'kiro-cli' | 'riff' | 'reasonix';

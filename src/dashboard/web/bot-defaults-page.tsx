@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { createPortal } from 'react-dom';
 import { openBotOnboarding } from './bot-onboarding.js';
 import {
   agentSelectionKey,
@@ -13,6 +14,8 @@ import {
   resolveSubstituteTarget,
   selectedCliOption,
   type BotDefaultsRow,
+  type CliRuntimeConfig,
+  type CliRuntimeUpdateProvider,
   type BotSubstituteMode,
   type BotSubstituteTarget,
   type CliOptionsState,
@@ -32,7 +35,13 @@ import {
   RefreshIconButton,
   dropdownLabel,
 } from './dashboard-components.js';
-import { botAvatarHtml, loadNameMaps, overrideBotAvatar, ui } from './ui.js';
+import { botAvatarHtml, larkConsoleUrl, loadNameMaps, overrideBotAvatar, ui } from './ui.js';
+import {
+  DEFAULT_GRANT_DURATION_MS,
+  DEFAULT_GRANT_QUOTA,
+  GRANT_DURATION_OPTIONS,
+  MAX_GRANT_QUOTA,
+} from '../../services/grant-policy.js';
 
 type StatusMessage = { text: string; ok?: boolean } | null;
 type PatchBot = (appId: string, patch: Partial<BotDefaultsRow> | ((bot: BotDefaultsRow) => BotDefaultsRow)) => void;
@@ -43,6 +52,50 @@ type JsonResponse = {
   status: number;
   body: any;
 };
+
+type RuntimeMode = 'official' | 'legacy' | 'custom';
+type RuntimeDraft = {
+  mode: RuntimeMode;
+  id: string;
+  displayName: string;
+  executable: string;
+  legacyPath: string;
+  updateProvider: CliRuntimeUpdateProvider;
+  packageName: string;
+};
+
+function runtimeDraftFromBot(bot: Pick<BotDefaultsRow, 'cliRuntime' | 'cliPathOverride'>): RuntimeDraft {
+  const runtime = bot.cliRuntime;
+  if (!runtime || typeof runtime !== 'object') {
+    const legacyPath = typeof bot.cliPathOverride === 'string' ? bot.cliPathOverride.trim() : '';
+    return {
+      mode: legacyPath ? 'legacy' : 'official',
+      id: '',
+      displayName: '',
+      // Carry the path into the custom form so migrating a legacy entry does
+      // not require retyping it; the legacy state itself remains read-only.
+      executable: legacyPath,
+      legacyPath,
+      updateProvider: 'auto',
+      packageName: '',
+    };
+  }
+  const provider = runtime.update?.provider;
+  const updateProvider: CliRuntimeUpdateProvider = provider === 'self' || provider === 'npm' || provider === 'none'
+    ? provider
+    : 'auto';
+  return {
+    mode: 'custom',
+    id: typeof runtime.id === 'string' ? runtime.id : '',
+    displayName: typeof runtime.displayName === 'string' ? runtime.displayName : '',
+    executable: typeof runtime.executable === 'string' ? runtime.executable : '',
+    legacyPath: '',
+    updateProvider,
+    packageName: runtime.update?.provider === 'npm' && typeof runtime.update.packageName === 'string'
+      ? runtime.update.packageName
+      : '',
+  };
+}
 
 type BotProfileRoleItem = {
   profileId: string;
@@ -240,7 +293,7 @@ function statusClass(status: StatusMessage, extra = ''): string {
 }
 
 function StatusSpan(props: { status: StatusMessage; attr?: Record<string, string> }) {
-  return <span className={statusClass(props.status)} {...(props.attr ?? {})}>{props.status?.text ?? ''}</span>;
+  return <span role="status" aria-live="polite" className={statusClass(props.status)} {...(props.attr ?? {})}>{props.status?.text ?? ''}</span>;
 }
 
 function InfoTip(props: { children: ReactNode }) {
@@ -299,11 +352,13 @@ function ToggleRow(props: {
   disabled?: boolean;
   title: ReactNode;
   help: ReactNode;
+  description?: ReactNode;
+  className?: string;
   dataAction?: string;
   onChange(checked: boolean): void;
 }) {
   return (
-    <label className="toggle-row">
+    <label className={props.className ? `toggle-row ${props.className}` : 'toggle-row'}>
       <input
         type="checkbox"
         data-action={props.dataAction}
@@ -314,6 +369,7 @@ function ToggleRow(props: {
       <span className="switch" aria-hidden="true" />
       <span className="toggle-tx">
         <strong><FieldTitle help={props.help}>{props.title}</FieldTitle></strong>
+        {props.description ? <small>{props.description}</small> : null}
       </span>
     </label>
   );
@@ -417,11 +473,7 @@ function brandStateLabel(brand: string | null, tr: ReturnType<typeof useT>): str
   return brand.trim() === '' ? tr('botDefaults.brandStateOff') : tr('botDefaults.brandStateCustom');
 }
 
-function quotaStateLabel(quota: number | null, tr: ReturnType<typeof useT>): string {
-  return quota == null
-    ? tr('botDefaults.quotaStateOff')
-    : tr('botDefaults.quotaStateOn', { count: quota });
-}
+const GRANT_DURATION_VALUES = GRANT_DURATION_OPTIONS;
 
 function sessionCapStateLabel(cap: number | null, tr: ReturnType<typeof useT>): string {
   return cap == null
@@ -438,6 +490,8 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     codexAppCleanInput: body.codexAppCleanInput,
     writableTerminalLinkInCard: body.writableTerminalLinkInCard,
     privateCard: body.privateCard,
+    summaryMemory: body.summaryMemory,
+    summaryMemoryPath: body.summaryMemoryPath,
     botToBotSameDir: body.botToBotSameDir,
     autoStartOnGroupJoin: body.autoStartOnGroupJoin,
     autoStartOnGroupJoinPrompt: body.autoStartOnGroupJoinPrompt,
@@ -745,7 +799,7 @@ function BotDefaultsCard(props: {
             </section>
             <section className="bd-tile"><SessionCapSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><StartupCommandsSection bot={bot} patchBot={patchBot} /></section>
-            <section className="bd-tile"><SummaryTriggerSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile"><SummaryTriggerSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
           </BdTabGrid>
         </div>
         <div
@@ -775,7 +829,7 @@ function BotDefaultsCard(props: {
           hidden={props.activeTab !== 'cards'}
         >
           <BdTabGrid>
-            <section className="bd-tile"><CardBehaviorSection bot={bot} putCardPref={putCardPref} /></section>
+            <section className="bd-tile bd-tile-wide"><CardBehaviorSection bot={bot} putCardPref={putCardPref} /></section>
             <section className="bd-tile"><BrandSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
         </div>
@@ -1073,7 +1127,22 @@ function BotProfileIdentity(props: { bot: BotDefaultsRow; cli: string; patchBot:
           <button type="button" data-action="cancel-bot-name" disabled={busy} onClick={() => setEditMode(false)}>{tr('botDefaults.renameCancel')}</button>
         </span>
       )}
-      <code>{bot.larkAppId}</code>
+      <div className="bd-profile-appid-row">
+        <code>{bot.larkAppId}</code>
+        {larkConsoleUrl(bot.larkAppId, bot.brand) ? (
+          <a
+            className="bd-console-link"
+            href={larkConsoleUrl(bot.larkAppId, bot.brand)!}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            {tr('botDefaults.openConsole')}
+            <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M7 17 17 7M9 7h8v8" />
+            </svg>
+          </a>
+        ) : null}
+      </div>
       <small className={statusClass(status, 'bd-name-status')} data-name-status>{status?.text ?? ''}</small>
       <button type="button" className="bd-feishu-login" data-action="feishu-login" hidden={!loginVisible} onClick={() => setLoginOpen(true)}>{tr('feishuLogin.entry')}</button>
       {loginOpen ? (
@@ -1173,7 +1242,17 @@ function FeishuLoginModal(props: { onClose(): void; onSuccess(): void }) {
     };
   }, [begin, stopTimer]);
 
-  return (
+  if (typeof document === 'undefined') return null;
+
+  // Portal 到 body:此弹层内联渲染在头像组件(位于 .page 页面容器)的 DOM 里。
+  // 祖先 .page 有 `animation: dashboard-page-enter … both`,其关键帧动画 transform
+  // (translateY→none);fill-mode:both 下动画结束后持续「填充」,浏览器把 .page 的
+  // computed transform 算成 identity matrix(而非关键字 none)——「非 none 的 transform」
+  // 会为后代 position:fixed 建立包含块,于是弹层不再相对视口、被约束进 .page 的几何
+  // 范围,顶到视口下方,用户得滚动才看得到二维码(与主题无关,light/dark 均复现;
+  // 注意不是 .app-shell 的 overflow:hidden——overflow 不建立 fixed 包含块)。挂到
+  // body 顶层后逃出任何祖先包含块,与 auth-expired-overlay 一致,稳定居中。
+  return createPortal(
     <div
       className="feishu-login-overlay"
       onClick={event => {
@@ -1191,7 +1270,8 @@ function FeishuLoginModal(props: { onClose(): void; onSuccess(): void }) {
           <button type="button" className="primary" data-retry hidden={!retry} onClick={() => void begin()}>{tr('feishuLogin.retry')}</button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -1204,8 +1284,13 @@ export function BotAgentSection(props: {
   const tr = useT();
   const { bot, cliState, patchBot } = props;
   const initialKey = agentSelectionKey(bot, props.sessionFallback);
+  const runtimeConfigKey = JSON.stringify([bot.cliRuntime ?? null, bot.cliPathOverride ?? null]);
   const [cliKey, setCliKey] = useState(initialKey);
+  const [cliSelectionTouched, setCliSelectionTouched] = useState(false);
   const [model, setModel] = useState(typeof bot.model === 'string' ? bot.model : '');
+  const [runtimeDraft, setRuntimeDraft] = useState<RuntimeDraft>(() => runtimeDraftFromBot(bot));
+  const [runtimeTouched, setRuntimeTouched] = useState(false);
+  const [runtimeStatus, setRuntimeStatus] = useState<StatusMessage>(null);
   const [agentStatus, setAgentStatus] = useState<StatusMessage>(null);
   const [agentBusy, setAgentBusy] = useState(false);
   const [skillValue, setSkillValue] = useState(skillInjectionResolved(bot));
@@ -1214,13 +1299,18 @@ export function BotAgentSection(props: {
 
   useEffect(() => {
     setCliKey(agentSelectionKey(bot, props.sessionFallback));
+    setCliSelectionTouched(false);
     setModel(typeof bot.model === 'string' ? bot.model : '');
+    setRuntimeDraft(runtimeDraftFromBot(bot));
+    setRuntimeTouched(false);
     setSkillValue(skillInjectionResolved(bot));
   }, [
     bot.agentSelectionKey,
     bot.cliId,
     bot.larkAppId,
     bot.model,
+    runtimeConfigKey,
+    bot.wrapperCli,
     bot.skillInjection,
     bot.skillInjectionDefault,
     props.sessionFallback,
@@ -1236,7 +1326,16 @@ export function BotAgentSection(props: {
       : tr('botDefaults.agentModelPlaceholder');
 
   function updateCli(nextKey: string): void {
+    const previousKey = cliKey;
     setCliKey(nextKey);
+    setCliSelectionTouched(true);
+    if (nextKey !== previousKey && (nextKey !== 'codex' || previousKey !== 'codex')) {
+      setRuntimeDraft(runtimeDraftFromBot({ cliRuntime: null, cliPathOverride: null }));
+      // If the user leaves Codex and comes back before saving, the visible
+      // Official state is intentional and must clear the old runtime/path.
+      setRuntimeTouched(true);
+      setRuntimeStatus(null);
+    }
     const nextOption = selectedCliOption(cliState.options, nextKey);
     const isTtadk = nextOption?.gateway === 'ttadk';
     const acceptsModel = isTtadk && nextOption.acceptsModel !== false;
@@ -1249,26 +1348,108 @@ export function BotAgentSection(props: {
     }
   }
 
+  function updateRuntimeMode(mode: RuntimeMode): void {
+    setRuntimeDraft(current => ({ ...current, mode }));
+    setRuntimeTouched(true);
+    setRuntimeStatus(null);
+    setAgentStatus(null);
+  }
+
+  function updateRuntimeDraft(patch: Partial<Omit<RuntimeDraft, 'mode'>>): void {
+    setRuntimeDraft(current => ({ ...current, ...patch }));
+    setRuntimeTouched(true);
+    setRuntimeStatus(null);
+    setAgentStatus(null);
+  }
+
   async function saveAgent(): Promise<void> {
     setAgentStatus(null);
+    setRuntimeStatus(null);
+    let cliRuntime: CliRuntimeConfig | null | undefined;
+    if (runtimeTouched) cliRuntime = null;
+    if (runtimeTouched && cliKey === 'codex' && runtimeDraft.mode === 'custom') {
+      const id = runtimeDraft.id.trim();
+      const executable = runtimeDraft.executable.trim();
+      const displayName = runtimeDraft.displayName.trim();
+      const packageName = runtimeDraft.packageName.trim();
+      if (!id || !executable) {
+        const text = tr('botDefaults.runtimeRequired');
+        setAgentStatus({ text });
+        setRuntimeStatus({ text });
+        return;
+      }
+      if (runtimeDraft.updateProvider === 'npm' && !packageName) {
+        const text = tr('botDefaults.runtimePackageRequired');
+        setAgentStatus({ text });
+        setRuntimeStatus({ text });
+        return;
+      }
+      cliRuntime = {
+        id,
+        ...(displayName ? { displayName } : {}),
+        executable,
+        update: runtimeDraft.updateProvider === 'npm'
+          ? { provider: 'npm', packageName }
+          : { provider: runtimeDraft.updateProvider },
+      };
+    }
     setAgentBusy(true);
     try {
-      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, { cliId: cliKey, model });
+      const body = {
+        cliId: cliKey,
+        model,
+        ...(runtimeTouched ? { cliRuntime } : {}),
+      };
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, body);
       if (res.ok && res.body.ok) {
+        const closedCount = Number.isInteger(res.body.closedMismatchedSessions) && res.body.closedMismatchedSessions > 0
+          ? res.body.closedMismatchedSessions as number
+          : 0;
+        const closedText = closedCount > 0
+          ? tr('botDefaults.agentClosedCount', { count: closedCount })
+          : '';
         setAgentStatus(res.body.availabilityWarning
-          ? { text: `⚠️ ${res.body.availabilityWarning}` }
-          : { text: `✓ ${tr('botDefaults.agentSaved')}`, ok: true });
+          ? { text: `⚠️ ${res.body.availabilityWarning}${closedText ? ` · ${closedText}` : ''}` }
+          : { text: `✓ ${closedText || tr('botDefaults.agentSaved')}`, ok: true });
         patchBot(bot.larkAppId, {
           cliId: res.body.cliId,
+          cliRuntime: res.body.cliRuntime === undefined
+            ? runtimeTouched ? cliRuntime ?? null : bot.cliRuntime ?? null
+            : res.body.cliRuntime,
+          cliPathOverride: res.body.cliPathOverride === undefined
+            ? runtimeTouched ? null : bot.cliPathOverride ?? null
+            : res.body.cliPathOverride,
           wrapperCli: res.body.wrapperCli ?? null,
           model: res.body.model ?? '',
           agentSelectionKey: res.body.selectionKey ?? cliKey,
         });
+        setRuntimeTouched(false);
+        if (cliRuntime) {
+          const probe = res.body.runtimeProbe;
+          if (probe && typeof probe.version === 'string') {
+            setRuntimeStatus({
+              text: tr('botDefaults.runtimeProbeOk', {
+                version: probe.version,
+                provider: typeof probe.updateProvider === 'string' ? probe.updateProvider : runtimeDraft.updateProvider,
+              }),
+              ok: true,
+            });
+          } else {
+            setRuntimeStatus({ text: tr('botDefaults.runtimeProbeMissing') });
+          }
+        }
       } else {
-        setAgentStatus({ text: `✗ ${responseErrorText(res)}` });
+        const detail = typeof res.body?.message === 'string' && res.body.message
+          ? res.body.message
+          : responseErrorText(res);
+        const text = `✗ ${detail}`;
+        setAgentStatus({ text });
+        if (cliKey === 'codex' && runtimeDraft.mode === 'custom') setRuntimeStatus({ text });
       }
     } catch (e: any) {
-      setAgentStatus({ text: `✗ ${caughtErrorText(e)}` });
+      const text = `✗ ${caughtErrorText(e)}`;
+      setAgentStatus({ text });
+      if (cliKey === 'codex' && runtimeDraft.mode === 'custom') setRuntimeStatus({ text });
     } finally {
       setAgentBusy(false);
     }
@@ -1288,6 +1469,7 @@ export function BotAgentSection(props: {
       if (res.ok && res.body.ok) {
         patchBot(bot.larkAppId, {
           cliId: res.body.cliId,
+          cliRuntime: res.body.cliRuntime ?? null,
           wrapperCli: res.body.wrapperCli ?? null,
           model: res.body.model ?? '',
           agentSelectionKey: res.body.selectionKey ?? 'riff',
@@ -1322,12 +1504,19 @@ export function BotAgentSection(props: {
   }
 
   const siSupport = bot.skillInjectionSupport === 'dynamic' ? 'dynamic' : bot.skillInjectionSupport === 'global' ? 'global' : 'none';
+  const isRiff = cliKey === 'riff';
+  // Old dashboard payloads can omit agentSelectionKey while still carrying a
+  // legacy wrapperCli. Keep the custom-runtime editor hidden until the user
+  // explicitly selects bare Codex; structured runtimes and wrappers cannot mix.
+  const isBareCodex = cliKey === 'codex' && (!bot.wrapperCli || cliSelectionTouched);
+  const usesAlternativeCodexExecutable = isBareCodex && runtimeDraft.mode !== 'official';
+
   // 与添加机器人弹窗一致：按名称首字母排序，便于在 20+ 个 CLI 里定位。
   const cliOptions = [...cliState.options]
     .sort((a, b) => a.label.localeCompare(b.label, 'en', { sensitivity: 'base' }))
     .map(option => ({
       value: option.id,
-      label: option.available === false
+      label: option.available === false && !(option.id === 'codex' && usesAlternativeCodexExecutable)
         ? tr('botDefaults.agentMissingOption', { label: option.label, command: option.command ?? option.id })
         : `${option.label}（${option.id}）`,
     }));
@@ -1341,8 +1530,12 @@ export function BotAgentSection(props: {
     { value: 'global', label: tr('botDefaults.skillInjectionGlobal') },
     { value: 'off', label: tr('botDefaults.skillInjectionOff') },
   ];
-
-  const isRiff = cliKey === 'riff';
+  const runtimeProviderOptions: DropdownFieldOption<CliRuntimeUpdateProvider>[] = [
+    { value: 'auto', label: tr('botDefaults.runtimeProviderAuto') },
+    { value: 'self', label: tr('botDefaults.runtimeProviderSelf') },
+    { value: 'npm', label: tr('botDefaults.runtimeProviderNpm') },
+    { value: 'none', label: tr('botDefaults.runtimeProviderNone') },
+  ];
 
   return (
     <section className="bd-section">
@@ -1359,13 +1552,129 @@ export function BotAgentSection(props: {
             searchable
             onChange={updateCli}
           />
-          {option?.available === false ? (
+          {option?.available === false && !usesAlternativeCodexExecutable ? (
             <small className="hint-warn">
               {tr('botDefaults.agentMissingHint', { command: option.command ?? cliKey })}
             </small>
           ) : null}
         </div>
       </div>
+      {isBareCodex ? (
+        <div className="bd-codex-runtime" data-codex-runtime="">
+          <div className="bd-runtime-heading">
+            <FieldTitle help={tr('botDefaults.runtimeHelp')}>{tr('botDefaults.runtimeTitle')}</FieldTitle>
+          </div>
+          <div className="bd-runtime-mode" role="group" aria-label={tr('botDefaults.runtimeTitle')}>
+            <button
+              type="button"
+              data-action="runtime-official"
+              aria-pressed={runtimeDraft.mode === 'official'}
+              disabled={agentBusy}
+              onClick={() => updateRuntimeMode('official')}
+            >
+              {tr('botDefaults.runtimeOfficial')}
+            </button>
+            <button
+              type="button"
+              data-action="runtime-custom"
+              aria-pressed={runtimeDraft.mode === 'custom'}
+              disabled={agentBusy}
+              onClick={() => updateRuntimeMode('custom')}
+            >
+              {tr('botDefaults.runtimeCustom')}
+            </button>
+          </div>
+          <input type="hidden" data-input="agentRuntimeMode" value={runtimeDraft.mode} readOnly />
+          <p className="bd-runtime-note">
+            {tr(runtimeDraft.mode === 'official'
+              ? 'botDefaults.runtimeOfficialNote'
+              : runtimeDraft.mode === 'legacy'
+                ? 'botDefaults.runtimeLegacyNote'
+                : 'botDefaults.runtimeCustomNote')}
+          </p>
+          {runtimeDraft.mode === 'legacy' ? (
+            <div className="bd-runtime-fields" data-runtime-legacy="">
+              <label className="bd-runtime-wide">
+                <span>{tr('botDefaults.runtimeLegacyPath')}</span>
+                <input
+                  type="text"
+                  value={runtimeDraft.legacyPath}
+                  readOnly
+                  aria-readonly="true"
+                  data-input="agentRuntimeLegacyPath"
+                />
+              </label>
+            </div>
+          ) : null}
+          {runtimeDraft.mode === 'custom' ? (
+            <div className="bd-runtime-fields">
+              <label>
+                <FieldTitle help={tr('botDefaults.runtimeIdHelp')}>{tr('botDefaults.runtimeId')}</FieldTitle>
+                <input
+                  type="text"
+                  data-input="agentRuntimeId"
+                  value={runtimeDraft.id}
+                  disabled={agentBusy}
+                  autoComplete="off"
+                  onChange={event => updateRuntimeDraft({ id: event.currentTarget.value })}
+                />
+              </label>
+              <label>
+                <span>{tr('botDefaults.runtimeDisplayName')}</span>
+                <input
+                  type="text"
+                  data-input="agentRuntimeDisplayName"
+                  placeholder={tr('botDefaults.runtimeDisplayNamePlaceholder')}
+                  value={runtimeDraft.displayName}
+                  disabled={agentBusy}
+                  autoComplete="off"
+                  onChange={event => updateRuntimeDraft({ displayName: event.currentTarget.value })}
+                />
+              </label>
+              <label className="bd-runtime-wide">
+                <FieldTitle help={tr('botDefaults.runtimeExecutableHelp')}>{tr('botDefaults.runtimeExecutable')}</FieldTitle>
+                <input
+                  type="text"
+                  data-input="agentRuntimeExecutable"
+                  value={runtimeDraft.executable}
+                  disabled={agentBusy}
+                  autoCapitalize="none"
+                  autoComplete="off"
+                  spellCheck={false}
+                  onChange={event => updateRuntimeDraft({ executable: event.currentTarget.value })}
+                />
+              </label>
+              <div className="bd-field">
+                <span>{tr('botDefaults.runtimeUpdateProvider')}</span>
+                <DropdownField
+                  dataInput="agentRuntimeUpdateProvider"
+                  ariaLabel={tr('botDefaults.runtimeUpdateProvider')}
+                  value={runtimeDraft.updateProvider}
+                  disabled={agentBusy}
+                  options={runtimeProviderOptions}
+                  onChange={updateProvider => updateRuntimeDraft({ updateProvider })}
+                />
+              </div>
+              {runtimeDraft.updateProvider === 'npm' ? (
+                <label>
+                  <FieldTitle help={tr('botDefaults.runtimePackageHelp')}>{tr('botDefaults.runtimePackageName')}</FieldTitle>
+                  <input
+                    type="text"
+                    data-input="agentRuntimePackageName"
+                    value={runtimeDraft.packageName}
+                    disabled={agentBusy}
+                    autoCapitalize="none"
+                    autoComplete="off"
+                    spellCheck={false}
+                    onChange={event => updateRuntimeDraft({ packageName: event.currentTarget.value })}
+                  />
+                </label>
+              ) : null}
+            </div>
+          ) : null}
+          <StatusSpan status={runtimeStatus} attr={{ 'data-runtime-status': '' }} />
+        </div>
+      ) : null}
       {!isRiff && (
         <div className="bd-row">
           <label>
@@ -2244,81 +2553,109 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     { value: 'footer', label: tr('botDefaults.usageDisplayFooter') },
     { value: 'off', label: tr('botDefaults.usageDisplayOff') },
   ];
-
   return (
-    <section className="bd-section">
+    <section className="bd-section" aria-busy={busy !== null}>
       <h3 className="bd-section-title">{tr('botDefaults.sectionCard')}</h3>
-      {bot.usageSupported === true && (
-        <div className="bd-row">
-          <div className="bd-field">
-            <FieldTitle help={tr('botDefaults.usageDisplayHelp')}>{tr('botDefaults.usageDisplay')}</FieldTitle>
-            <DropdownField
-              dataInput="usageDisplay"
-              ariaLabel={tr('botDefaults.usageDisplay')}
-              value={usageDisplay}
-              disabled={busy === 'usage'}
-              options={usageDisplayOptions}
-              onChange={next => {
-                const previous = usageDisplay;
-                setUsageDisplay(next);
-                void savePatch(
-                  { usageDisplay: next },
-                  'usage',
-                  () => setUsageDisplay(previous),
-                );
+      <div className="bd-card-settings">
+        <section className="bd-card-setting-group" data-card-feedback-group>
+          <h4 className="bd-card-setting-heading">{tr('botDefaults.cardFeedbackGroup')}</h4>
+          <ToggleRow
+            className="bd-card-primary-toggle"
+            checked={!disableStreaming}
+            disabled={busy !== null}
+            dataAction="toggle-disable-streaming"
+            title={tr('botDefaults.autoStreaming')}
+            description={tr('botDefaults.autoStreamingDescription')}
+            help={tr('botDefaults.autoStreamingHelp')}
+            onChange={checked => {
+              const previous = disableStreaming;
+              const nextDisabled = !checked;
+              setDisableStreaming(nextDisabled);
+              void savePatch({ disableStreamingCard: nextDisabled }, 'streaming', () => setDisableStreaming(previous));
+            }}
+          />
+          <div className="bd-card-dependent" data-card-off-options hidden={!disableStreaming}>
+            <ToggleRow
+              checked={!silentReactions}
+              disabled={busy !== null}
+              dataAction="toggle-silent-reactions"
+              title={tr('botDefaults.silentTurnReactions')}
+              description={tr('botDefaults.silentTurnReactionsDescription')}
+              help={tr('botDefaults.silentTurnReactionsHelp')}
+              onChange={checked => {
+                const previous = silentReactions;
+                const nextSilent = !checked;
+                setSilentReactions(nextSilent);
+                void savePatch({ silentTurnReactions: nextSilent }, 'silent', () => setSilentReactions(previous));
+              }}
+            />
+            <p role="status" data-card-pref-moot className="bd-card-mode-note">{tr('botDefaults.manualCardHint')}</p>
+          </div>
+        </section>
+
+        <section className="bd-card-setting-group" data-card-content-group>
+          <h4 className="bd-card-setting-heading">{tr('botDefaults.cardContentGroup')}</h4>
+          {bot.usageSupported === true && (
+            <div className="bd-row">
+              <div className="bd-field">
+                <FieldTitle help={tr('botDefaults.usageDisplayHelp')}>{tr('botDefaults.usageDisplay')}</FieldTitle>
+                <DropdownField
+                  dataInput="usageDisplay"
+                  ariaLabel={tr('botDefaults.usageDisplay')}
+                  value={usageDisplay}
+                  disabled={busy !== null}
+                  options={usageDisplayOptions}
+                  onChange={next => {
+                    const previous = usageDisplay;
+                    setUsageDisplay(next);
+                    void savePatch(
+                      { usageDisplay: next },
+                      'usage',
+                      () => setUsageDisplay(previous),
+                    );
+                  }}
+                />
+              </div>
+            </div>
+          )}
+          <div className="bd-card-control-list">
+            <ToggleRow
+              checked={writableLink}
+              disabled={busy !== null}
+              dataAction="toggle-writable-link"
+              title={tr('botDefaults.writableLink')}
+              description={tr('botDefaults.writableLinkDescription')}
+              help={tr('botDefaults.writableLinkHelp')}
+              onChange={checked => {
+                const previous = writableLink;
+                setWritableLink(checked);
+                void savePatch({ writableTerminalLinkInCard: checked }, 'writable', () => setWritableLink(previous));
               }}
             />
           </div>
-        </div>
-      )}
-      <div className="bd-toggle-grid bd-card-behavior-grid">
-        <ToggleRow
-          checked={disableStreaming}
-          disabled={busy === 'streaming'}
-          dataAction="toggle-disable-streaming"
-          title={tr('botDefaults.disableStreaming')}
-          help={tr('botDefaults.disableStreamingHelp')}
-          onChange={checked => {
-            setDisableStreaming(checked);
-            void savePatch({ disableStreamingCard: checked }, 'streaming');
-          }}
-        />
-        <ToggleRow
-          checked={silentReactions}
-          disabled={!disableStreaming || busy === 'silent'}
-          dataAction="toggle-silent-reactions"
-          title={tr('botDefaults.silentTurnReactions')}
-          help={tr('botDefaults.silentTurnReactionsHelp')}
-          onChange={checked => {
-            setSilentReactions(checked);
-            void savePatch({ silentTurnReactions: checked }, 'silent');
-          }}
-        />
-        <ToggleRow
-          checked={writableLink}
-          disabled={disableStreaming || busy === 'writable'}
-          dataAction="toggle-writable-link"
-          title={tr('botDefaults.writableLink')}
-          help={tr('botDefaults.writableLinkHelp')}
-          onChange={checked => {
-            setWritableLink(checked);
-            void savePatch({ writableTerminalLinkInCard: checked }, 'writable');
-          }}
-        />
-        <ToggleRow
-          checked={privateCard}
-          disabled={busy === 'private'}
-          dataAction="toggle-private-card"
-          title={tr('botDefaults.privateCard')}
-          help={tr('botDefaults.privateCardHelp')}
-          onChange={checked => {
-            setPrivateCard(checked);
-            void savePatch({ privateCard: checked }, 'private');
-          }}
-        />
+        </section>
+
+        <section className="bd-card-setting-group" data-card-manual-group>
+          <h4 className="bd-card-setting-heading">{tr('botDefaults.cardManualGroup')}</h4>
+          <p className="bd-card-setting-copy">{tr('botDefaults.manualCardIntro')}</p>
+          <div className="bd-card-control-list">
+            <ToggleRow
+              checked={privateCard}
+              disabled={busy !== null}
+              dataAction="toggle-private-card"
+              title={tr('botDefaults.privateCard')}
+              description={tr('botDefaults.privateCardDescription')}
+              help={tr('botDefaults.privateCardHelp')}
+              onChange={checked => {
+                const previous = privateCard;
+                setPrivateCard(checked);
+                void savePatch({ privateCard: checked }, 'private', () => setPrivateCard(previous));
+              }}
+            />
+          </div>
+        </section>
       </div>
       <div className="actions">
-        <small data-card-pref-moot className="hint-warn-inline" hidden={!disableStreaming}>{tr('botDefaults.writableLinkMoot')}</small>
         <StatusSpan status={status} attr={{ 'data-card-pref-status': '' }} />
       </div>
     </section>
@@ -2411,19 +2748,25 @@ function CrossBotSection(props: { bot: BotDefaultsRow; putCardPref(patch: CardPr
   );
 }
 
-function SummaryTriggerSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+function SummaryTriggerSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
   const tr = useT();
   const initial = summaryRange(props.bot);
   const [limit, setLimit] = useState(String(initial.limit));
   const [sinceHours, setSinceHours] = useState(String(initial.sinceHours));
+  const [memoryOn, setMemoryOn] = useState(props.bot.summaryMemory === true);
+  const [memoryPath, setMemoryPath] = useState(summaryMemoryPath(props.bot));
   const [status, setStatus] = useState<StatusMessage>(null);
+  const [memoryStatus, setMemoryStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
+  const [memoryBusy, setMemoryBusy] = useState(false);
 
   useEffect(() => {
     const next = summaryRange(props.bot);
     setLimit(String(next.limit));
     setSinceHours(String(next.sinceHours));
-  }, [props.bot.summaryRange?.limit, props.bot.summaryRange?.sinceHours]);
+    setMemoryOn(props.bot.summaryMemory === true);
+    setMemoryPath(summaryMemoryPath(props.bot));
+  }, [props.bot.summaryRange?.limit, props.bot.summaryRange?.sinceHours, props.bot.summaryMemory, props.bot.summaryMemoryPath]);
 
   async function save(): Promise<void> {
     setStatus(null);
@@ -2456,6 +2799,37 @@ function SummaryTriggerSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
     }
   }
 
+  async function saveMemory(next: boolean, nextPath = memoryPath): Promise<void> {
+    const prev = memoryOn;
+    const prevPath = memoryPath;
+    const normalizedPath = normalizeSummaryMemoryPath(nextPath);
+    setMemoryOn(next);
+    setMemoryPath(normalizedPath);
+    setMemoryStatus(null);
+    setMemoryBusy(true);
+    try {
+      const res = await props.putCardPref({ summaryMemory: next, summaryMemoryPath: normalizedPath });
+      if (res.ok && res.body.ok) {
+        const saved = res.body.summaryMemory === true;
+        const savedPath = summaryMemoryPath({ ...props.bot, summaryMemoryPath: res.body.summaryMemoryPath });
+        setMemoryOn(saved);
+        setMemoryPath(savedPath);
+        props.patchBot(props.bot.larkAppId, { summaryMemory: saved, summaryMemoryPath: savedPath });
+        setMemoryStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        setMemoryOn(prev);
+        setMemoryPath(prevPath);
+        setMemoryStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      setMemoryOn(prev);
+      setMemoryPath(prevPath);
+      setMemoryStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setMemoryBusy(false);
+    }
+  }
+
   return (
     <section className="bd-section">
       <h3 className="bd-section-title"><FieldTitle help={tr('botDefaults.summaryLimitHelp')}>{tr('botDefaults.sectionSummaryTrigger')}</FieldTitle></h3>
@@ -2473,8 +2847,34 @@ function SummaryTriggerSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
         <button type="button" className="primary" data-action="save-summary-trigger" disabled={busy} onClick={() => void save()}>{tr('botDefaults.summarySave')}</button>
         <StatusSpan status={status} attr={{ 'data-summary-trigger-status': '' }} />
       </div>
+      <ToggleRow
+        checked={memoryOn}
+        disabled={memoryBusy}
+        title={tr('botDefaults.summaryMemory')}
+        help={tr('botDefaults.summaryMemoryHelp')}
+        onChange={checked => void saveMemory(checked)}
+      />
+      <div className="bd-row bd-summary-limits">
+        <label>
+          <span>{tr('botDefaults.summaryMemoryPath')}</span>
+          <input type="text" data-input="summaryMemoryPath" value={memoryPath} disabled={memoryBusy} onChange={event => setMemoryPath(event.currentTarget.value)} />
+        </label>
+      </div>
+      <div className="actions">
+        <button type="button" className="primary" data-action="save-summary-memory-path" disabled={memoryBusy} onClick={() => void saveMemory(memoryOn, memoryPath)}>{tr('botDefaults.summaryMemoryPathSave')}</button>
+      </div>
+      <div className="actions"><StatusSpan status={memoryStatus} attr={{ 'data-summary-memory-status': '' }} /></div>
     </section>
   );
+}
+
+function normalizeSummaryMemoryPath(raw: string): string {
+  const value = raw.trim();
+  return value || 'summary.md';
+}
+
+function summaryMemoryPath(bot: Pick<BotDefaultsRow, 'summaryMemoryPath'>): string {
+  return normalizeSummaryMemoryPath(typeof bot.summaryMemoryPath === 'string' ? bot.summaryMemoryPath : '');
 }
 
 function summaryRange(bot: BotDefaultsRow): { limit: number; sinceHours: number } {
@@ -3587,61 +3987,141 @@ function BrandSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   );
 }
 
-function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const [autoCard, setAutoCard] = useState(props.bot.autoGrantRequestCards !== false);
   const [restrict, setRestrict] = useState(props.bot.restrictGrantCommands === true);
+  const [duration, setDuration] = useState(typeof props.bot.grantDefaultDurationMs === 'number' ? props.bot.grantDefaultDurationMs : null);
+  const [durationInput, setDurationInput] = useState(String(props.bot.grantDefaultDurationMs ?? DEFAULT_GRANT_DURATION_MS));
   const [quota, setQuota] = useState(typeof props.bot.messageQuotaDefaultLimit === 'number' ? props.bot.messageQuotaDefaultLimit : null);
-  const [quotaInput, setQuotaInput] = useState(typeof props.bot.messageQuotaDefaultLimit === 'number' ? String(props.bot.messageQuotaDefaultLimit) : '');
+  const [quotaInput, setQuotaInput] = useState(
+    typeof props.bot.messageQuotaDefaultLimit === 'number' ? String(props.bot.messageQuotaDefaultLimit) : '',
+  );
   const [status, setStatus] = useState<StatusMessage>(null);
+  const [quotaError, setQuotaError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
   useEffect(() => {
     setAutoCard(props.bot.autoGrantRequestCards !== false);
+  }, [props.bot.autoGrantRequestCards]);
+
+  useEffect(() => {
     setRestrict(props.bot.restrictGrantCommands === true);
-    const next = typeof props.bot.messageQuotaDefaultLimit === 'number' ? props.bot.messageQuotaDefaultLimit : null;
-    setQuota(next);
-    setQuotaInput(next == null ? '' : String(next));
-  }, [props.bot.autoGrantRequestCards, props.bot.messageQuotaDefaultLimit, props.bot.restrictGrantCommands]);
+  }, [props.bot.restrictGrantCommands]);
+
+  useEffect(() => {
+    const nextDuration = typeof props.bot.grantDefaultDurationMs === 'number' ? props.bot.grantDefaultDurationMs : null;
+    setDuration(nextDuration);
+    setDurationInput(String(nextDuration ?? DEFAULT_GRANT_DURATION_MS));
+  }, [props.bot.grantDefaultDurationMs]);
+
+  useEffect(() => {
+    const nextQuota = typeof props.bot.messageQuotaDefaultLimit === 'number' ? props.bot.messageQuotaDefaultLimit : null;
+    setQuota(nextQuota);
+    setQuotaInput(nextQuota === null ? '' : String(nextQuota));
+  }, [props.bot.messageQuotaDefaultLimit]);
 
   async function savePatch(
-    patch: { autoGrantRequestCards?: boolean; restrictGrantCommands?: boolean; messageQuotaDefaultLimit?: number | null },
+    patch: {
+      autoGrantRequestCards?: boolean;
+      restrictGrantCommands?: boolean;
+      grantDefaultDurationMs?: number | null;
+      messageQuotaDefaultLimit?: number | null;
+    },
     key: string,
+    rollback?: () => void,
   ): Promise<void> {
     setBusy(key);
     setStatus(null);
     try {
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/grant-prefs`, patch);
       if (res.ok && res.body.ok) {
+        const nextDuration = typeof res.body.grantDefaultDurationMs === 'number' ? res.body.grantDefaultDurationMs : null;
         const nextQuota = typeof res.body.messageQuotaDefaultLimit === 'number' ? res.body.messageQuotaDefaultLimit : null;
         setAutoCard(res.body.autoGrantRequestCards !== false);
         setRestrict(res.body.restrictGrantCommands === true);
+        setDuration(nextDuration);
         setQuota(nextQuota);
-        if ('messageQuotaDefaultLimit' in patch) setQuotaInput(nextQuota == null ? '' : String(nextQuota));
+        if ('grantDefaultDurationMs' in patch) setDurationInput(String(nextDuration ?? DEFAULT_GRANT_DURATION_MS));
+        if ('messageQuotaDefaultLimit' in patch) {
+          setQuotaInput(nextQuota === null ? '' : String(nextQuota));
+        }
         props.patchBot(props.bot.larkAppId, {
           autoGrantRequestCards: res.body.autoGrantRequestCards !== false,
           restrictGrantCommands: res.body.restrictGrantCommands === true,
+          grantDefaultDurationMs: nextDuration,
           messageQuotaDefaultLimit: nextQuota,
         });
+        if (key === 'defaults') setQuotaError(null);
         setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
       } else {
+        rollback?.();
         setStatus({ text: `✗ ${responseErrorText(res)}` });
       }
     } catch (e: any) {
+      rollback?.();
       setStatus({ text: `✗ ${caughtErrorText(e)}` });
     } finally {
       setBusy(null);
     }
   }
 
-  function saveQuota(): void {
+  function saveDefaults(): void {
     const parsed = positiveIntegerOrNull(quotaInput);
-    if (parsed === 'invalid') {
-      setStatus({ text: `✗ ${tr('botDefaults.quotaInvalid')}` });
+    const quotaChanged = parsed !== quota;
+    setStatus(null);
+    if (quotaChanged && (parsed === 'invalid'
+      || (typeof parsed === 'number' && parsed > MAX_GRANT_QUOTA))) {
+      setQuotaError(tr('botDefaults.quotaInvalid'));
       return;
     }
-    void savePatch({ messageQuotaDefaultLimit: parsed }, 'quota');
+    setQuotaError(null);
+    const durationMs = Number(durationInput);
+    if (!GRANT_DURATION_VALUES.includes(durationMs as (typeof GRANT_DURATION_VALUES)[number])) {
+      setStatus({ text: `✗ ${tr('botDefaults.grantDurationInvalid')}` });
+      return;
+    }
+    const patch: {
+      grantDefaultDurationMs?: number | null;
+      messageQuotaDefaultLimit?: number | null;
+    } = {};
+    if (durationMs !== (duration ?? DEFAULT_GRANT_DURATION_MS)) {
+      patch.grantDefaultDurationMs = durationMs === DEFAULT_GRANT_DURATION_MS ? null : durationMs;
+    }
+    if (quotaChanged) {
+      patch.messageQuotaDefaultLimit = parsed;
+    }
+    if (Object.keys(patch).length > 0) void savePatch(patch, 'defaults');
   }
+
+  const durationOptions: DropdownFieldOption<string>[] = [
+    { value: String(DEFAULT_GRANT_DURATION_MS), label: tr('botDefaults.grantDuration1Hour') },
+    { value: String(8 * 60 * 60 * 1000), label: tr('botDefaults.grantDuration8Hours') },
+    { value: String(24 * 60 * 60 * 1000), label: tr('botDefaults.grantDuration1Day') },
+    { value: String(7 * 24 * 60 * 60 * 1000), label: tr('botDefaults.grantDuration7Days') },
+  ];
+  const currentDuration = duration ?? DEFAULT_GRANT_DURATION_MS;
+  const currentDurationLabel = currentDuration === DEFAULT_GRANT_DURATION_MS
+    ? tr('botDefaults.grantDuration1HourValue')
+    : String(durationOptions.find(option => option.value === String(currentDuration))?.label ?? '');
+  const parsedQuotaInput = positiveIntegerOrNull(quotaInput);
+  const quotaInputDirty = parsedQuotaInput === 'invalid' || parsedQuotaInput !== quota;
+  const defaultsDirty = durationInput !== String(currentDuration) || quotaInputDirty;
+  const currentState = quota === null
+    ? tr('botDefaults.grantDefaultsCurrentBuiltIn', {
+      duration: currentDurationLabel,
+      count: DEFAULT_GRANT_QUOTA,
+    })
+    : quota > MAX_GRANT_QUOTA
+      ? tr('botDefaults.grantDefaultsCurrentLegacy', {
+        duration: currentDurationLabel,
+        cardCount: MAX_GRANT_QUOTA,
+        oncallCount: quota,
+      })
+      : tr('botDefaults.grantDefaultsCurrentCustom', {
+        duration: currentDurationLabel,
+        count: quota,
+      });
 
   return (
     <section className="bd-section">
@@ -3649,38 +4129,85 @@ function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
       <div className="bd-toggle-grid bd-grant-toggle-grid">
         <ToggleRow
           checked={autoCard}
-          disabled={busy === 'autoGrant'}
+          disabled={busy !== null}
           dataAction="toggle-auto-grant-card"
           title={tr('botDefaults.autoGrantCard')}
           help={tr('botDefaults.autoGrantCardHelp')}
           onChange={checked => {
+            const previous = autoCard;
             setAutoCard(checked);
-            void savePatch({ autoGrantRequestCards: checked }, 'autoGrant');
+            void savePatch({ autoGrantRequestCards: checked }, 'autoGrant', () => setAutoCard(previous));
           }}
         />
         <ToggleRow
           checked={restrict}
-          disabled={busy === 'restrict'}
+          disabled={busy !== null}
           dataAction="toggle-restrict-grant"
           title={tr('botDefaults.restrictGrant')}
           help={tr('botDefaults.restrictGrantHelp')}
           onChange={checked => {
+            const previous = restrict;
             setRestrict(checked);
-            void savePatch({ restrictGrantCommands: checked }, 'restrict');
+            void savePatch({ restrictGrantCommands: checked }, 'restrict', () => setRestrict(previous));
           }}
         />
       </div>
-      <div className="bd-row bd-quota">
-        <label>
-          <FieldTitle help={tr('botDefaults.quotaHelp')}>{tr('botDefaults.quotaDefault')}</FieldTitle>
-          <input type="number" min={1} step={1} data-input="quotaLimit" placeholder={tr('botDefaults.quotaPlaceholder')} value={quotaInput} disabled={busy === 'quota'} onChange={event => setQuotaInput(event.currentTarget.value)} />
-        </label>
-        <small data-quota-state>{quotaStateLabel(quota, tr)}</small>
-      </div>
-      <div className="actions">
-        <button type="button" className="primary" data-action="save-quota" disabled={busy === 'quota'} onClick={saveQuota}>{tr('botDefaults.quotaSave')}</button>
-        <StatusSpan status={status} attr={{ 'data-grant-status': '' }} />
-      </div>
+      <form
+        className="bd-grant-defaults"
+        noValidate
+        onSubmit={event => {
+          event.preventDefault();
+          saveDefaults();
+        }}
+      >
+        <div className="bd-row bd-grant-duration">
+          <div className="bd-field">
+            <FieldTitle help={tr('botDefaults.grantDurationHelp')}>{tr('botDefaults.grantDurationDefault')}</FieldTitle>
+            <DropdownField
+              dataInput="grantDefaultDurationMs"
+              value={durationInput}
+              options={durationOptions}
+              disabled={busy !== null}
+              ariaLabel={tr('botDefaults.grantDurationDefault')}
+              onChange={value => {
+                setDurationInput(value);
+                setStatus(null);
+              }}
+            />
+          </div>
+        </div>
+        <div className="bd-row bd-quota">
+          <label>
+            <FieldTitle help={tr('botDefaults.quotaHelp')}>{tr('botDefaults.quotaDefault')}</FieldTitle>
+            <input
+              type="number"
+              min={1}
+              max={MAX_GRANT_QUOTA}
+              step={1}
+              data-input="quotaLimit"
+              placeholder={tr('botDefaults.quotaPlaceholder')}
+              value={quotaInput}
+              disabled={busy !== null}
+              aria-label={tr('botDefaults.quotaDefault')}
+              aria-invalid={quotaError ? true : undefined}
+              aria-describedby={quotaError ? 'grant-defaults-state grant-default-quota-error' : 'grant-defaults-state'}
+              onChange={event => {
+                setQuotaInput(event.currentTarget.value);
+                setQuotaError(null);
+                setStatus(null);
+              }}
+            />
+          </label>
+          {quotaError ? <small id="grant-default-quota-error" className="bd-field-error" role="alert">{quotaError}</small> : null}
+          <small id="grant-defaults-state" data-grant-defaults-state>{currentState}</small>
+        </div>
+        <div className="actions">
+          <button type="submit" className="primary" data-action="save-grant-defaults" disabled={busy !== null || !defaultsDirty}>
+            {busy === 'defaults' ? tr('botDefaults.grantDefaultsSaving') : tr('botDefaults.grantDefaultsSave')}
+          </button>
+          <StatusSpan status={status} attr={{ 'data-grant-status': '' }} />
+        </div>
+      </form>
     </section>
   );
 }

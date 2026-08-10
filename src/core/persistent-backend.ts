@@ -126,6 +126,14 @@ export function resolvePairedSpawnBackendType(
   );
 }
 
+/** Whether the live/persisted session is frozen onto the remote Riff backend.
+ *  Restart guards must use the session stamp rather than the bot's mutable
+ *  current config: changing a bot later must not make an existing Riff
+ *  generation look locally restartable. */
+export function isRiffBackendSession(ds: DaemonSession): boolean {
+  return (ds.initConfig?.backendType ?? ds.session.backendType) === 'riff';
+}
+
 /**
  * How a session's worker is torn down at daemon shutdown, branched on the
  * session's FROZEN backend (via getSessionPersistentBackendType), NOT live config:
@@ -135,12 +143,11 @@ export function resolvePairedSpawnBackendType(
  * Freezing here stops a live backendType edit from changing how a running session
  * tears down — e.g. detach-preserving a "herdr" session whose real pane is tmux.
  */
-export function shutdownBackendDisposition(ds: DaemonSession): 'detach' | 'close' {
-  // riff：远端任务独立于本地进程存活。daemon shutdown 走 'close' 会经 worker 的
-  // destroySession() 取消远端任务——重启不该杀任务（血缘已持久化，重启后
-  // follow-up 续上，agent 的 botmux send 照常送达）。detach = 仅 SIGTERM worker。
-  const frozen = ds.initConfig?.backendType ?? ds.session.backendType;
-  if (frozen === 'riff') return 'detach';
+export function shutdownBackendDisposition(ds: DaemonSession): 'riff-drain-detach' | 'detach' | 'close' {
+  // Riff 不能落进普通 detach 的直接 SIGTERM：create/follow-up 最长 10s 才返回
+  // task id，而 worker SIGTERM 会立即 exit，丢掉唯一血缘。独立 disposition 迫使
+  // daemon 先走 drain → durable ACK → commit 协议；类型检查防止未来回归。
+  if (isRiffBackendSession(ds)) return 'riff-drain-detach';
   return getSessionPersistentBackendType(ds) ? 'detach' : 'close';
 }
 
@@ -271,26 +278,6 @@ export function probePersistentSessions(
     result.set(name, probePersistentSession(backendType, name));
   }
   return result;
-}
-
-/**
- * Tri-state liveness of the backend's multiplexer SERVER itself (not one
- * session). The restore path consults this when a session probes 'missing' to
- * tell apart a true solo zombie (server up, this one pane gone → close) from a
- * machine reboot (server gone, every pane wiped at once → keep for lazy resume,
- * since the CLI transcript on disk is still resumable). See
- * TmuxBackend.serverState for the full rationale.
- *
- * herdr has no cheap server-liveness probe, so it returns 'unknown' →
- * the restore gate falls back to the prior (close-on-missing) behaviour for it.
- */
-export function probePersistentBackendServer(
-  backendType: PersistentBackendType,
-): 'running' | 'down' | 'unknown' {
-  if (backendType === 'tmux') return TmuxBackend.serverState();
-  if (backendType === 'zellij') return ZellijBackend.serverState();
-  if (backendType === 'zmx') return ZmxBackend.serverState();
-  return 'unknown';
 }
 
 /**

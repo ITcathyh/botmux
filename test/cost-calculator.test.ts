@@ -17,14 +17,40 @@ vi.mock('node:os', async (importOriginal) => ({
 // Mock fs so we never touch real disk
 vi.mock('node:fs', async (importOriginal) => {
   const original = await importOriginal<typeof import('node:fs')>();
+  const readFileSyncMock = vi.fn(() => '');
+  const fdContent = new Map<number, string>();
+  let nextFd = 10_000;
+  const statsForContent = (content: string) => ({
+    dev: 1,
+    ino: 1,
+    size: Buffer.byteLength(content, 'utf8'),
+    mtimeMs: 1,
+    ctimeMs: 1,
+    isFile: () => true,
+  });
   return {
     ...original,
+    closeSync: vi.fn((fd: number) => { fdContent.delete(fd); }),
     existsSync: vi.fn(() => false),
+    fstatSync: vi.fn((fd: number) => statsForContent(fdContent.get(fd) ?? '')),
     lstatSync: vi.fn(() => ({
       isFile: () => true,
       mtimeMs: 0,
     })),
-    readFileSync: vi.fn(() => ''),
+    openSync: vi.fn((path: string) => {
+      const fd = nextFd++;
+      fdContent.set(fd, String(readFileSyncMock(path, 'utf-8') ?? ''));
+      return fd;
+    }),
+    readFileSync: readFileSyncMock,
+    readSync: vi.fn((fd: number, buffer: Buffer, offset: number, length: number, position: number | null) => {
+      const content = Buffer.from(fdContent.get(fd) ?? '', 'utf8');
+      const start = Math.max(0, position ?? 0);
+      const slice = content.subarray(start, start + length);
+      slice.copy(buffer, offset);
+      return slice.length;
+    }),
+    statSync: vi.fn((path: string) => statsForContent(String(readFileSyncMock(path, 'utf-8') ?? ''))),
   };
 });
 
@@ -45,6 +71,10 @@ vi.mock('../src/services/codex-transcript.js', () => ({
 
 vi.mock('../src/services/traex-transcript.js', () => ({
   findTraexRolloutBySessionId: vi.fn(() => undefined),
+}));
+
+vi.mock('../src/services/pi-transcript.js', () => ({
+  findPiTranscriptBySessionId: vi.fn(() => undefined),
 }));
 
 vi.mock('../src/services/aiden-checkpoints.js', () => ({
@@ -82,6 +112,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { findAidenLatestCheckpointByBotmuxSessionId, findAidenLatestCheckpointBySessionId } from '../src/services/aiden-checkpoints.js';
 import { findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId } from '../src/services/codex-transcript.js';
 import { findTraexRolloutBySessionId } from '../src/services/traex-transcript.js';
+import { findPiTranscriptBySessionId } from '../src/services/pi-transcript.js';
 import {
   getSessionJsonlPath,
   getSessionCost,
@@ -133,6 +164,8 @@ beforeEach(() => {
   vi.mocked(findCodexSessionIdByBotmuxSessionId).mockReturnValue(undefined);
   vi.mocked(findTraexRolloutBySessionId).mockReset();
   vi.mocked(findTraexRolloutBySessionId).mockReturnValue(undefined);
+  vi.mocked(findPiTranscriptBySessionId).mockReset();
+  vi.mocked(findPiTranscriptBySessionId).mockReturnValue(undefined);
   vi.mocked(findAidenLatestCheckpointBySessionId).mockReset();
   vi.mocked(findAidenLatestCheckpointBySessionId).mockReturnValue(undefined);
   vi.mocked(findAidenLatestCheckpointByBotmuxSessionId).mockReset();
@@ -835,6 +868,42 @@ describe('getSessionTokenUsage', () => {
       cacheCreateTokens: 5,
     });
     expect(usage!.inputTokens + usage!.cacheReadTokens + usage!.cacheCreateTokens).toBe(usage!.in);
+  });
+
+  it('reports Pi transcript usage in uncached and cache buckets', () => {
+    vi.mocked(findPiTranscriptBySessionId).mockReturnValue('/home/testuser/.pi/agent/sessions/--tmp/2026-08-03_pi-sid.jsonl');
+    setupJsonl(JSON.stringify({
+      type: 'message',
+      message: {
+        id: 'pi-msg-1',
+        role: 'assistant',
+        model: 'claude-sonnet-4-20250514',
+        usage: {
+          input: 100,
+          output: 20,
+          cacheRead: 30,
+          cacheWrite: 10,
+          totalTokens: 160,
+        },
+      },
+    }));
+
+    expect(getSessionTokenUsage({
+      cliId: 'pi',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'pi-sid',
+      cwd: '/tmp',
+    })).toEqual({
+      in: 140,
+      out: 20,
+      inputTokens: 100,
+      outputTokens: 20,
+      cacheReadTokens: 30,
+      cacheCreateTokens: 10,
+      turns: 1,
+      model: 'claude-sonnet-4-20250514',
+    });
+    expect(findPiTranscriptBySessionId).toHaveBeenCalledWith('pi-sid', '/tmp');
   });
 
   it('reports CoCo nested response_meta usage without counting agent_end duplicates', () => {

@@ -10,13 +10,31 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 // Mock @larksuiteoapi/node-sdk — we don't want real Lark connections.
 // The Client constructor just stores whatever it receives.
 vi.mock('@larksuiteoapi/node-sdk', () => {
+  // Mirror the real SDK's separable http instance so the upload-client path is
+  // exercised (create() → own instance + copyable interceptor registry).
+  const makeInstance = (): any => ({
+    defaults: { timeout: 0 },
+    create: (cfg: { timeout?: number }) => {
+      const inst = makeInstance();
+      if (cfg?.timeout !== undefined) inst.defaults.timeout = cfg.timeout;
+      return inst;
+    },
+    interceptors: {
+      request: { handlers: [], use(this: any, f: any, r: any) { this.handlers.push({ fulfilled: f, rejected: r }); } },
+      response: { handlers: [], use(this: any, f: any, r: any) { this.handlers.push({ fulfilled: f, rejected: r }); } },
+    },
+  });
+  const sharedDefault = makeInstance();
   class FakeClient {
     opts: Record<string, unknown>;
+    httpInstance: any;
     constructor(opts: Record<string, unknown>) {
       this.opts = opts;
+      // Real Client: `params.httpInstance || defaultHttpInstance`.
+      this.httpInstance = (opts?.httpInstance as any) ?? sharedDefault;
     }
   }
-  return { Client: FakeClient };
+  return { Client: FakeClient, defaultHttpInstance: sharedDefault };
 });
 
 // Mock node:fs so loadBotConfigs doesn't touch real disk.
@@ -70,6 +88,25 @@ describe('registerBot', () => {
     const client = state.client as unknown as { opts: Record<string, unknown> };
     expect(client.opts.appId).toBe('app_test_001');
     expect(client.opts.appSecret).toBe('secret_001');
+  });
+
+  it('bounds the SDK HTTP transport timeout when the client exposes axios defaults', () => {
+    const client = { httpInstance: { defaults: { timeout: 0 } } };
+    mod.configureLarkClientHttpTimeout(client);
+    expect(client.httpInstance.defaults.timeout).toBe(mod.LARK_REQUEST_TIMEOUT_MS);
+  });
+
+  it('gives media uploads a dedicated http instance with the looser upload timeout', () => {
+    const state = mod.registerBot(makeCfg());
+    const interactive = state.client as unknown as { httpInstance?: { defaults?: { timeout?: number } } };
+    const upload = state.uploadClient as unknown as { httpInstance?: { defaults?: { timeout?: number } } };
+    // Interactive client keeps the tight bound; upload client is separate + looser.
+    expect(interactive.httpInstance?.defaults?.timeout).toBe(mod.LARK_REQUEST_TIMEOUT_MS);
+    expect(upload.httpInstance?.defaults?.timeout).toBe(mod.LARK_UPLOAD_TIMEOUT_MS);
+    expect(state.uploadClient).not.toBe(state.client);
+    expect(mod.getBotUploadClient('app_test_001')).toBe(state.uploadClient);
+    // The shared SDK default must NOT be mutated to the upload bound.
+    expect(mod.LARK_UPLOAD_TIMEOUT_MS).toBeGreaterThan(mod.LARK_REQUEST_TIMEOUT_MS);
   });
 
   it('does NOT construct a Lark Client for an apiOnly bot (empty secret would throw in the real SDK)', () => {
@@ -189,6 +226,118 @@ describe('parseBotConfigsFromText — brand', () => {
       ]));
       expect(c.displayName).toBeUndefined();
     }
+  });
+
+  it('requires a persisted downgrade shadow for cliRuntime configs', () => {
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'runtime-without-shadow-app',
+        larkAppSecret: 's',
+        cliId: 'codex',
+        cliRuntime: {
+          id: 'vendor-codex',
+          executable: 'vendor-codex',
+        },
+      },
+    ]))).toThrow(/cliPathOverride is required as an exact downgrade shadow/);
+  });
+
+  it('normalizes cliRuntime with its persisted legacy path shadow', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'runtime-app',
+        larkAppSecret: 's',
+        cliId: 'codex',
+        cliPathOverride: 'vendor-codex',
+        cliRuntime: {
+          id: 'vendor-codex',
+          displayName: 'VendorCodex',
+          executable: 'vendor-codex',
+          update: { provider: 'auto' },
+        },
+      },
+    ]));
+
+    expect(cfg.cliRuntime).toMatchObject({
+      id: 'vendor-codex',
+      displayName: 'VendorCodex',
+      executable: 'vendor-codex',
+      update: { provider: 'auto' },
+    });
+    expect(cfg.cliPathOverride).toBe('vendor-codex');
+  });
+
+  it('keeps legacy cliPathOverride configs unchanged when cliRuntime is absent', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'legacy-runtime-app',
+        larkAppSecret: 's',
+        cliId: 'codex',
+        cliPathOverride: '/opt/custom/codex',
+      },
+    ]));
+    expect(cfg.cliRuntime).toBeUndefined();
+    expect(cfg.cliPathOverride).toBe('/opt/custom/codex');
+  });
+
+  it('accepts only an exactly-equal persisted downgrade shadow', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'shadowed-runtime-app',
+        larkAppSecret: 's',
+        cliId: 'codex',
+        cliPathOverride: 'vendor-codex',
+        cliRuntime: {
+          id: 'vendor-codex',
+          executable: 'vendor-codex',
+          update: { provider: 'none' },
+        },
+      },
+    ]));
+    expect(cfg.cliRuntime?.id).toBe('vendor-codex');
+    expect(cfg.cliPathOverride).toBe('vendor-codex');
+
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'conflicting-runtime-app',
+        larkAppSecret: 's',
+        cliId: 'codex',
+        cliPathOverride: '/opt/custom/codex',
+        cliRuntime: {
+          id: 'vendor-codex',
+          executable: 'vendor-codex',
+          update: { provider: 'none' },
+        },
+      },
+    ]))).toThrow(/must exactly match cliRuntime\.executable/);
+  });
+
+  it('rejects cliRuntime outside the plain Codex adapter contract', () => {
+    const runtime = { id: 'vendor-codex', executable: 'vendor-codex' };
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'wrong-adapter-runtime-app',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      cliRuntime: runtime,
+    }]))).toThrow(/only for cliId "codex"/);
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'wrapped-runtime-app',
+      larkAppSecret: 's',
+      cliId: 'codex',
+      wrapperCli: 'gateway codex',
+      cliRuntime: runtime,
+    }]))).toThrow(/cannot be combined with wrapperCli/);
+  });
+
+  it('strictly validates a configured cliRuntime instead of silently dropping malformed input', () => {
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'invalid-runtime-app',
+        larkAppSecret: 's',
+        cliId: 'codex',
+        cliRuntime: { id: 'vendor-codex' },
+      },
+    ]))).toThrow(/cliRuntime|executable/);
   });
 
   it('effectiveBotDisplayName prefers displayName > probed botName > larkAppId', () => {
@@ -1606,5 +1755,78 @@ describe('vcMeetingAgentConfigActive — apiOnly bots never attend VC meetings',
   it('apiOnly wins over enabled regardless of field order / extra keys (fail-closed)', () => {
     expect(mod.vcMeetingAgentConfigActive({ vcMeetingAgent: enabledVc, apiOnly: true }))
       .toBeUndefined();
+  });
+});
+
+// ─── bots.json unreadable (sandbox read isolation) ────────────────────────
+
+/**
+ * Regression (2026-08-03, fleet P0): every botmux subcommand died inside a
+ * sandboxed bot with `EPERM: operation not permitted, open '~/.botmux/bots.json'`.
+ *
+ * Shape of the bug: Seatbelt allows the METADATA read but denies the CONTENT
+ * read, so resolveBotConfigPath()'s existsSync() passes (the graceful "no config
+ * file" branch is never taken) and parseBotConfigFile()'s readFileSync throws.
+ * The isolated bot's own identity comes from send-cred.json, so disk returning
+ * nothing is the correct answer there — but ONLY there.
+ */
+describe('loadBotConfigs when bots.json exists but is unreadable', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+  let fs: typeof import('node:fs');
+  const savedEnv = { ...process.env };
+
+  const eperm = () => Object.assign(new Error("EPERM: operation not permitted, open '/h/.botmux/bots.json'"), { code: 'EPERM' });
+
+  beforeEach(async () => {
+    delete process.env.BOTS_CONFIG;      // force the ~/.botmux/bots.json branch
+    delete process.env.BOTMUX_CORE_ONLY; // not the synthesized core-only path
+    mod = await freshImport();
+    fs = await import('node:fs');
+    vi.mocked(fs.existsSync).mockReturnValue(true);       // metadata read allowed
+    vi.mocked(fs.readFileSync).mockImplementation(() => { throw eperm(); }); // content denied
+  });
+
+  afterEach(() => {
+    process.env = { ...savedEnv };
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    vi.mocked(fs.readFileSync).mockReturnValue('' as never);
+  });
+
+  it('degrades to an empty list under read isolation (identity comes from send-cred.json)', () => {
+    process.env.BOTMUX_READ_ISOLATION = '1';
+    expect(mod.loadBotConfigs()).toEqual([]);
+  });
+
+  it('does NOT degrade for an ordinary worker CLI (same env vars, no cred file)', () => {
+    // The regression this guards: an env-only isolation check matches every
+    // worker-spawned CLI, so a genuinely unreadable bots.json on a normal host
+    // would silently become "there are no bots".
+    delete process.env.BOTMUX_READ_ISOLATION;
+    process.env.SESSION_DATA_DIR = '/h/.botmux/data';
+    process.env.BOTMUX_LARK_APP_ID = 'cli_plain';
+    expect(() => mod.loadBotConfigs()).toThrow(/EPERM/);
+  });
+
+  it('still throws OUTSIDE read isolation — an unreadable bots.json is a real fault there', () => {
+    delete process.env.SESSION_DATA_DIR;
+    delete process.env.BOTMUX_LARK_APP_ID;
+    // Swallowing here would silently boot a zero-bot process: no bot answers and
+    // nothing anywhere says why. Crashing loudly is the correct behaviour.
+    expect(() => mod.loadBotConfigs()).toThrow(/EPERM/);
+  });
+
+  it('still throws when only ONE isolation marker is present (half-configured is not isolation)', () => {
+    delete process.env.BOTMUX_READ_ISOLATION;
+    process.env.SESSION_DATA_DIR = '/h/.botmux/data';
+    delete process.env.BOTMUX_LARK_APP_ID;
+    expect(() => mod.loadBotConfigs()).toThrow(/EPERM/);
+  });
+
+  it('still throws for a NON-permission read error even under isolation (only EPERM/EACCES are expected)', () => {
+    process.env.BOTMUX_READ_ISOLATION = '1';
+    vi.mocked(fs.readFileSync).mockImplementation(() => {
+      throw Object.assign(new Error('EIO: i/o error'), { code: 'EIO' });
+    });
+    expect(() => mod.loadBotConfigs()).toThrow(/EIO/);
   });
 });

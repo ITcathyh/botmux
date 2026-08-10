@@ -2,9 +2,14 @@ import * as Lark from '@larksuiteoapi/node-sdk';
 import { readFileSync, existsSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { homedir } from 'node:os';
+import { underReadIsolation } from './adapters/cli/read-isolation.js';
 import type { BackendType } from './adapters/backend/types.js';
 import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
 import type { CliId } from './adapters/cli/types.js';
+import {
+  normalizeCliRuntimeConfig,
+  type CliRuntimeConfig,
+} from './adapters/cli/runtime.js';
 import { logger } from './utils/logger.js';
 import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 import type { VoiceConfig } from './services/voice/types.js';
@@ -16,6 +21,7 @@ import { sanitizePerBotEnv } from './core/per-bot-env.js';
 import { normalizeSubstituteMode } from './services/substitute-mode-normalize.js';
 import { normalizePluginIdList } from './core/plugins/ids.js';
 import { normalizeVcMeetingProfileInstructions } from './services/vc-meeting-profile-instructions.js';
+import { isGrantDurationOption } from './services/grant-policy.js';
 import type {
   VcMeetingConsumerAgentConfig,
   VcMeetingConsumerConfig,
@@ -45,6 +51,72 @@ export type {
   VcMeetingConsumerProfileConfig,
 } from './types.js';
 
+/** Bound every official-SDK HTTP call so one stalled provider request cannot
+ * hold a bot-turn admission or maintenance mutation indefinitely. */
+export const LARK_REQUEST_TIMEOUT_MS = 15_000;
+
+/** Media uploads (image/file) ride the same official-SDK path but move real
+ * bytes: a 30 MB video on a modest uplink legitimately exceeds the interactive
+ * request bound. They also run in the `botmux send` CLI subprocess, which holds
+ * no daemon admission/mutation lock, so the interactive timeout's protective
+ * purpose does not apply to them. Give uploads a far looser ceiling. */
+export const LARK_UPLOAD_TIMEOUT_MS = 120_000;
+
+export function configureLarkClientHttpTimeout(client: unknown): void {
+  const defaults = (client as { httpInstance?: { defaults?: { timeout?: number } } } | null)
+    ?.httpInstance?.defaults;
+  if (defaults) defaults.timeout = LARK_REQUEST_TIMEOUT_MS;
+}
+
+/**
+ * A dedicated SDK http instance for media uploads. The official SDK shares ONE
+ * module-level axios singleton across every `Client` (verified: two clients
+ * report the same `httpInstance`), and its typed `image.create`/`file.create`
+ * expose no per-request timeout hook — so the only knob for uploads is a
+ * separate instance. `defaultHttpInstance.create()` yields an independent axios
+ * (its own `defaults`, not the shared one); we copy the SDK's own request UA and
+ * response-unwrap interceptors so upload responses (`res.data` → `image_key`)
+ * behave identically. Falls back to leaving the client on the shared instance
+ * if the SDK ever stops exporting `defaultHttpInstance`, so a future SDK bump
+ * degrades to "uploads keep the interactive timeout" rather than breaking.
+ */
+let cachedLarkUploadHttpInstance: unknown;
+export function larkUploadHttpInstance(): unknown {
+  if (cachedLarkUploadHttpInstance !== undefined) return cachedLarkUploadHttpInstance;
+  let base: any;
+  try {
+    base = (Lark as unknown as { defaultHttpInstance?: any }).defaultHttpInstance;
+  } catch {
+    // A stripped/mocked SDK namespace may throw on accessing an absent export.
+    base = undefined;
+  }
+  if (!base || typeof base.create !== 'function') {
+    cachedLarkUploadHttpInstance = null;
+    return cachedLarkUploadHttpInstance;
+  }
+  const instance = base.create({ timeout: LARK_UPLOAD_TIMEOUT_MS });
+  try {
+    for (const handler of base.interceptors?.request?.handlers ?? []) {
+      if (handler) {
+        instance.interceptors.request.use(handler.fulfilled, handler.rejected, {
+          synchronous: handler.synchronous,
+        });
+      }
+    }
+    for (const handler of base.interceptors?.response?.handlers ?? []) {
+      if (handler) instance.interceptors.response.use(handler.fulfilled, handler.rejected);
+    }
+  } catch {
+    // A shape change in the SDK's interceptor registry must not brick uploads;
+    // an instance without the response-unwrap interceptor would misread
+    // responses, so fall back to the shared instance (interactive timeout).
+    cachedLarkUploadHttpInstance = null;
+    return cachedLarkUploadHttpInstance;
+  }
+  cachedLarkUploadHttpInstance = instance;
+  return cachedLarkUploadHttpInstance;
+}
+
 export type ChatReplyMode = 'chat' | 'new-topic' | 'shared' | 'chat-topic';
 /** Where a bot shows native Context / Token usage on its Session cards. */
 export type UsageDisplayMode = 'streaming' | 'footer' | 'off';
@@ -69,6 +141,13 @@ export interface MessageListenerConfig {
     mode?: 'all_except_excluded' | 'include_only';
     includeSenderOpenIds?: string[];
     excludeSenderOpenIds?: string[];
+    /**
+     * Persisted sender KIND for each exclude id (open_id → 'user' | 'bot'), so
+     * the runtime fail-close decision (all_except_excluded + unverified bot
+     * sender) can tell a muted human from a muted bot WITHOUT guessing by id
+     * prefix. Absent entries fall back to a conservative "maybe a bot".
+     */
+    excludeSenderKinds?: Record<string, 'user' | 'bot'>;
     includeSenderTypes?: MessageListenerSenderType[];
     excludeSenderTypes?: MessageListenerSenderType[];
     /** Default true. */
@@ -813,6 +892,20 @@ function normalizeMessageListenerStringList(raw: unknown): string[] | undefined 
   return values.length > 0 ? [...new Set(values)] : undefined;
 }
 
+function normalizeMessageListenerSenderKinds(
+  raw: unknown,
+  excludeSenderOpenIds: string[] | undefined,
+): Record<string, 'user' | 'bot'> | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const allowed = excludeSenderOpenIds ? new Set(excludeSenderOpenIds) : undefined;
+  const out: Record<string, 'user' | 'bot'> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!key || (allowed && !allowed.has(key))) continue;
+    if (value === 'user' || value === 'bot') out[key] = value;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 function normalizeMessageListenerSenderTypes(raw: unknown): MessageListenerSenderType[] | undefined {
   if (!Array.isArray(raw)) return undefined;
   const values = raw
@@ -838,11 +931,13 @@ function normalizeMessageListenerConfig(raw: unknown, botIndex: number, chatId: 
   const mode = senderRaw.mode === 'include_only' ? 'include_only' : 'all_except_excluded';
   const includeSenderOpenIds = normalizeMessageListenerStringList(senderRaw.includeSenderOpenIds);
   const excludeSenderOpenIds = normalizeMessageListenerStringList(senderRaw.excludeSenderOpenIds);
+  const excludeSenderKinds = normalizeMessageListenerSenderKinds(senderRaw.excludeSenderKinds, excludeSenderOpenIds);
   const includeSenderTypes = normalizeMessageListenerSenderTypes(senderRaw.includeSenderTypes);
   const excludeSenderTypes = normalizeMessageListenerSenderTypes(senderRaw.excludeSenderTypes);
   if (mode !== 'all_except_excluded') senderPolicy.mode = mode;
   if (includeSenderOpenIds) senderPolicy.includeSenderOpenIds = includeSenderOpenIds;
   if (excludeSenderOpenIds) senderPolicy.excludeSenderOpenIds = excludeSenderOpenIds;
+  if (excludeSenderKinds) senderPolicy.excludeSenderKinds = excludeSenderKinds;
   if (includeSenderTypes) senderPolicy.includeSenderTypes = includeSenderTypes;
   if (excludeSenderTypes) senderPolicy.excludeSenderTypes = excludeSenderTypes;
   if (senderRaw.excludeSelf === false) senderPolicy.excludeSelf = false;
@@ -1017,6 +1112,19 @@ export interface BotConfig {
    */
   displayName?: string;
   cliId: CliId;
+  /**
+   * Optional distribution identity for a CLI that is protocol-compatible with
+   * {@link cliId} but ships as an independent executable/release stream (for
+   * example a Codex-compatible fork). The adapter remains selected by cliId;
+   * this descriptor owns product identity, executable and update provenance.
+   *
+   * `cliPathOverride` remains readable for legacy configs. A configured runtime
+   * is exposed through cliPathOverride in memory as a compatibility shadow so
+   * existing adapter call sites keep launching the selected executable while
+   * the runtime rollout migrates them to the structured descriptor.
+   */
+  cliRuntime?: CliRuntimeConfig;
+  /** @deprecated Prefer cliRuntime.executable for newly configured runtimes. */
   cliPathOverride?: string;
   /**
    * 通用启动前缀（按空格拆 token）：worker spawn 时把启动命令拼成
@@ -1233,6 +1341,11 @@ export interface BotConfig {
    * 仅约束 chatGrants / globalGrants 这类 per-user talk 授权，绝不影响 canOperate。
    */
   messageQuota?: { defaultLimit?: number };
+  /**
+   * 新建 per-user 授权卡的默认有限时长（毫秒）。缺省使用产品默认 1 小时；
+   * 已存在授权和已经生成的 pending 卡不受后续配置变更影响。
+   */
+  grantDefaultDurationMs?: number;
   /**
    * scope-aware 消息额度计数（运行时状态，随授权一起持久化进 bots.json）。
    * key = `chat:${chatId}:${openId}` | `global:${openId}`，value = { limit, used }。
@@ -1502,6 +1615,10 @@ export interface BotConfig {
   docRepoMap?: Record<string, string>;
   /** Per-bot range for explicit `@bot /summary`; defaults to 50 messages / 24h. */
   summaryRange?: SummaryRangeConfig;
+  /** When true, explicit `@bot /summary` records a conservative project-local summary.md. */
+  summaryMemory?: boolean;
+  /** Optional target path for summary memory. Relative paths are resolved by the agent against the current project root; absolute paths are used as configured. */
+  summaryMemoryPath?: string;
   /**
    * Legacy content/keyword trigger config. Kept parseable for config
    * compatibility, but message routing no longer fires non-@ content triggers.
@@ -1526,6 +1643,11 @@ export interface BotState {
    *  SDK a placeholder. Every consumer reaches it via getBotClient (which gates
    *  apiOnly) or getAllBotClients (which filters apiOnly), so the null is unreachable. */
   client: Lark.Client | null;
+  /** Same credentials/domain as `client`, but bound to a dedicated http
+   * instance with the looser upload timeout. Only media uploads use it. NULL for
+   * apiOnly bots for the same reason as `client` (no credential to construct one);
+   * getBotUploadClient gates apiOnly before returning it, so the null is unreachable. */
+  uploadClient: Lark.Client | null;
   botOpenId?: string;
   botName?: string;       // Lark app display name (from /bot/v3/info)
   botAvatarUrl?: string;  // Lark app avatar URL (from /bot/v3/info)
@@ -1541,6 +1663,7 @@ export function __testOnly_resetBotRegistry(): void {
   loadedConfigPath = undefined;
   oncallChatCache = null;
   brandLabelCache = null;
+  cachedLarkUploadHttpInstance = undefined;
   usageDisplayCache = null;
 }
 
@@ -1656,20 +1779,33 @@ export function registerBot(cfg: BotConfig): BotState {
   // empty secret, so constructing it would fatal the whole daemon at boot — the
   // exact failure riff hit in a clean sandbox. An apiOnly bot never uses the client
   // (getBotClient throws LarkTransportDisabledError first; getAllBotClients filters
-  // apiOnly), so leave it null. Zero Feishu transport is the whole contract.
-  const client = cfg.apiOnly === true
-    ? null
-    : new Lark.Client({
-        appId: cfg.larkAppId,
-        appSecret: cfg.larkAppSecret,
-        // brand → SDK domain。缺省走 feishu，国际版租户走 larksuite.com。
-        // 这一行同时修好了所有经由 SDK 的调用（发消息 / 文件 / contact 等）。
-        domain: sdkDomain(normalizeBrand(cfg.brand)),
-        logger: larkLogger,
-      });
+  // apiOnly), so leave both client and uploadClient null. Zero Feishu transport is
+  // the whole contract.
+  let client: Lark.Client | null = null;
+  let uploadClient: Lark.Client | null = null;
+  if (cfg.apiOnly !== true) {
+    const clientParams = {
+      appId: cfg.larkAppId,
+      appSecret: cfg.larkAppSecret,
+      // brand → SDK domain。缺省走 feishu，国际版租户走 larksuite.com。
+      // 这一行同时修好了所有经由 SDK 的调用（发消息 / 文件 / contact 等）。
+      domain: sdkDomain(normalizeBrand(cfg.brand)),
+      logger: larkLogger,
+    };
+    client = new Lark.Client(clientParams);
+    configureLarkClientHttpTimeout(client);
+    // Media uploads reuse the same credentials/domain but ride a dedicated http
+    // instance with the looser upload timeout. When the SDK no longer exposes a
+    // separable instance, fall back to the interactive client (uploads keep 15s).
+    const uploadHttpInstance = larkUploadHttpInstance();
+    uploadClient = uploadHttpInstance
+      ? new Lark.Client({ ...clientParams, httpInstance: uploadHttpInstance as any })
+      : client;
+  }
   const state: BotState = {
     config: cfg,
     client,
+    uploadClient,
     resolvedAllowedUsers: [...(cfg.allowedUsers ?? [])],
     rawAllowedUserResolution: new Map(),
   };
@@ -1711,6 +1847,25 @@ export function getBotClient(larkAppId: string): Lark.Client {
     throw new Error(`Bot ${larkAppId} has no Lark client (apiOnly misconfiguration)`);
   }
   return bot.client;
+}
+
+/** Client bound to the looser upload timeout. Use only for media uploads
+ * (image/file); every other call uses `getBotClient` and its interactive bound. */
+export function getBotUploadClient(larkAppId: string): Lark.Client {
+  const bot = getBot(larkAppId);
+  // Same bot-level transport boundary as getBotClient: apiOnly (core-only) bots
+  // make zero Feishu network calls, so they never have an upload client. Fail
+  // loud rather than NPE deep in an SDK upload call.
+  if (bot.config.apiOnly === true) {
+    throw new LarkTransportDisabledError(larkAppId, 'getBotUploadClient');
+  }
+  // Non-apiOnly bots always have a constructed upload client (registerBot builds
+  // one — the dedicated-instance path or the interactive-client fallback). The
+  // null-guard is defensive against an apiOnly misconfiguration slipping the gate.
+  if (!bot.uploadClient) {
+    throw new Error(`Bot ${larkAppId} has no Lark upload client (apiOnly misconfiguration)`);
+  }
+  return bot.uploadClient;
 }
 
 /** Owner = bot 首个已授权 open_id，与「缺权限警告私信对象」同口径（见 admin 解析）。 */
@@ -2170,7 +2325,27 @@ export function isManagedActivationStartingAtIndex(
 }
 
 function parseBotConfigFile(filePath: string): BotConfig[] {
-  const raw = readFileSync(filePath, 'utf-8');
+  let raw: string;
+  try {
+    raw = readFileSync(filePath, 'utf-8');
+  } catch (err: any) {
+    // A sandboxed CLI is denied bots.json ON PURPOSE (it holds every sibling's
+    // secret). Seatbelt allows the METADATA read but denies the CONTENT read, so
+    // resolveBotConfigPath()'s existsSync() passes and we land here with
+    // EPERM/EACCES — the "no config file" branch that would have degraded
+    // gracefully is never reached. Callers then die with a raw
+    // `EPERM … open '~/.botmux/bots.json'`, which is why EVERY botmux subcommand
+    // (not just send) breaks inside the sandbox.
+    //
+    // Under isolation the bot's identity comes from registerSelfFromCredFile()
+    // instead, so "disk gave us nothing" is the correct, complete answer here.
+    //
+    // Outside isolation an unreadable bots.json is a REAL fault and must still
+    // throw: swallowing it would silently boot a zero-bot process (no bots
+    // respond, no error anywhere) — strictly worse than crashing loudly.
+    if ((err?.code === 'EPERM' || err?.code === 'EACCES') && underReadIsolation()) return [];
+    throw err;
+  }
   try {
     return parseBotConfigsFromText(raw);
   } catch (err: any) {
@@ -2222,6 +2397,27 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       || entry.activationCommitted !== undefined
     ) {
       continue;
+    }
+
+    // cliRuntime is the canonical successor to cliPathOverride. New writers
+    // also persist an exactly-equal path shadow so a rollback to an older
+    // BotMux still launches the same distribution. Any unequal pair would make
+    // old and new versions disagree, so it fails closed below.
+    const entryCliId = entry.cliId ?? 'claude-code';
+    if (entry.cliRuntime !== undefined && entryCliId !== 'codex') {
+      throw new Error(`Bot config [${i}]: cliRuntime is currently supported only for cliId "codex"`);
+    }
+    if (entry.cliRuntime !== undefined && typeof entry.wrapperCli === 'string' && entry.wrapperCli.trim()) {
+      throw new Error(`Bot config [${i}]: cliRuntime cannot be combined with wrapperCli`);
+    }
+    const cliRuntime = entry.cliRuntime === undefined
+      ? undefined
+      : normalizeCliRuntimeConfig(entry.cliRuntime, `Bot config [${i}].cliRuntime`);
+    if (cliRuntime && entry.cliPathOverride === undefined) {
+      throw new Error(`Bot config [${i}]: cliPathOverride is required as an exact downgrade shadow of cliRuntime.executable`);
+    }
+    if (cliRuntime && entry.cliPathOverride !== cliRuntime.executable) {
+      throw new Error(`Bot config [${i}]: cliPathOverride must exactly match cliRuntime.executable`);
     }
 
     // Parse workingDirs from comma-separated workingDir if workingDirs not explicitly set
@@ -2315,6 +2511,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       const d = rawMq.defaultLimit;
       if (typeof d === 'number' && Number.isInteger(d) && d > 0) messageQuota = { defaultLimit: d };
     }
+
+    // 新授权默认有效期：只接受授权卡已有的四个有限选项；非法/缺省回落产品默认 1 小时。
+    const grantDefaultDurationMs = isGrantDurationOption(entry.grantDefaultDurationMs)
+      ? entry.grantDefaultDurationMs
+      : undefined;
 
     // quotaState：scope-aware 计数。逐项校验 key 形如 `chat:*:*` / `global:*`，
     // value 为 { limit, used } 正整数（used 允许 0）。非法项丢弃；全空 → undefined。
@@ -2414,6 +2615,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       ? normalizePluginIdList(entry.plugins) ?? []
       : undefined;
     const summaryRange = normalizeSummaryRange(entry.summaryRange ?? entry.summary);
+    const summaryMemory = entry.summaryMemory === true ? true : undefined;
+    const summaryMemoryPath = normalizeNonEmptyString(entry.summaryMemoryPath);
     const contentTriggers = normalizeContentTriggers(entry.contentTriggers, i);
     const messageListeners = normalizeMessageListeners(entry.messageListeners, i);
     const vcMeetingAgent = normalizeVcMeetingAgentConfig(entry.vcMeetingAgent);
@@ -2450,7 +2653,10 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       brand: entry.brand === 'lark' ? 'lark' : undefined,
       name: typeof entry.name === 'string' && entry.name.trim() ? entry.name.trim() : undefined,
       displayName: typeof entry.displayName === 'string' && entry.displayName.trim() ? entry.displayName.trim() : undefined,
-      cliId: entry.cliId ?? 'claude-code',
+      cliId: entryCliId,
+      cliRuntime,
+      // Compatibility shadow: writers persist it for downgrade safety and the
+      // loader requires an exact match so every accepted config is rollback-safe.
       cliPathOverride: entry.cliPathOverride,
       wrapperCli: typeof entry.wrapperCli === 'string' && entry.wrapperCli.trim()
         ? entry.wrapperCli.trim()
@@ -2512,6 +2718,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // 只落显式 true（undefined = 关），与 restrictGrantCommands 同款，保持 bots.json 干净。
       p2pOpen: entry.p2pOpen === true || undefined,
       messageQuota,
+      grantDefaultDurationMs,
       quotaState,
       grantExpiryState,
       restrictGrantCommands: entry.restrictGrantCommands === true || undefined,
@@ -2595,6 +2802,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
           )
         : undefined,
       summaryRange,
+      summaryMemory,
+      summaryMemoryPath,
       contentTriggers,
       voice,
     });

@@ -17,10 +17,14 @@ import {
   buildSessionClosedCard,
   buildRelayPickerCard,
   buildAdoptSelectCard,
+  adoptLiveKey,
   buildAdoptBlockedCard,
   buildPrivateSnapshotCard,
   buildConfigCard,
+  buildConfigQuotaCard,
+  buildForkPanelCard,
   buildTuiPromptFailedCard,
+  buildSlashListCard,
   getCliDisplayName,
 } from '../src/im/lark/card-builder.js';
 import type { RelayPickerEntry } from '../src/im/lark/card-builder.js';
@@ -82,8 +86,14 @@ function allActions(card: any): any[] {
     .flatMap((e: any) => e.actions ?? []);
 }
 
-describe('buildAdoptSelectCard', () => {
-  it('shows the backend instead of repeating the cwd basename', () => {
+describe('buildAdoptSelectCard (V2 picker)', () => {
+  // Helper: flatten the V2 card body to the markdown text of each session card.
+  const cardTexts = (card: any): string[] =>
+    (card.body?.elements ?? [])
+      .filter((e: any) => e.tag === 'interactive_container')
+      .map((e: any) => (e.elements ?? []).map((x: any) => x.content ?? '').join('\n'));
+
+  it('renders a live session as a card showing CLI / source / path / target, not a dropdown option', () => {
     const card = parse(buildAdoptSelectCard([{
       source: 'herdr',
       herdrSessionName: 'collie',
@@ -93,9 +103,145 @@ describe('buildAdoptSelectCard', () => {
       paneCols: 200,
       paneRows: 50,
     }], 'om_root', 'en'));
-    const option = card.elements[1].actions[0].options[0].text.content;
-    expect(option).toContain('Pi · herdr · collie:w3:p1');
-    expect(option).not.toContain('· botmux ·');
+    // No legacy dropdown any more.
+    const hasSelectStatic = JSON.stringify(card).includes('select_static');
+    expect(hasSelectStatic).toBe(false);
+    const texts = cardTexts(card);
+    expect(texts.length).toBe(1);
+    expect(texts[0]).toContain('Pi');          // CLI name
+    expect(texts[0]).toContain('collie:w3:p1'); // live target label
+  });
+
+  it('renders a resume (history) session card carrying the session id and a resume: key', () => {
+    const card = parse(buildAdoptSelectCard(
+      [],
+      'om_root',
+      'en',
+      [{ cliSessionId: 'codex-rollout-abc123', cwd: '/Users/test/proj', title: 'fix the thing', lastActivityAt: 1_700_000_000_000 }],
+    ));
+    const texts = cardTexts(card);
+    expect(texts.length).toBe(1);
+    expect(texts[0]).toContain('codex-rollout-abc123'); // session id is visible
+    // The selectable container carries a resume: entry_key.
+    const container = card.body.elements.find((e: any) => e.tag === 'interactive_container');
+    expect(container.behaviors[0].value.entry_key).toBe('resume:codex-rollout-abc123');
+  });
+
+  it('uses a configured runtime name for both live and resume rows', () => {
+    const live = {
+      source: 'tmux' as const,
+      tmuxTarget: 'dev:0.0',
+      cliPid: 42,
+      cliId: 'codex' as const,
+      cwd: '/work/live',
+      paneCols: 80,
+      paneRows: 24,
+    };
+    const resume = [{ cliSessionId: 'resume-1', cwd: '/work/resume', title: 'old task', lastActivityAt: 1 }];
+    const card = parse(buildAdoptSelectCard(
+      [live], 'om_root', 'en', resume, undefined, undefined, undefined,
+      'codex', 'Vendor Codex',
+    ));
+
+    const texts = cardTexts(card);
+    expect(texts).toHaveLength(2);
+    expect(texts.every(text => text.includes('Vendor Codex'))).toBe(true);
+    expect(texts.every(text => !text.includes('CLI: Codex\n'))).toBe(true);
+  });
+
+  it('shows the confirm button only after an entry is selected', () => {
+    const entry = { cliSessionId: 'sess-xyz', cwd: '/w', title: 't', lastActivityAt: 1 };
+    const unselected = parse(buildAdoptSelectCard([], 'om_root', 'en', [entry]));
+    const hasConfirmBefore = JSON.stringify(unselected).includes('adopt_confirm');
+    expect(hasConfirmBefore).toBe(false);
+    const selected = parse(buildAdoptSelectCard([], 'om_root', 'en', [entry], { selectedKey: 'resume:sess-xyz' }));
+    const hasConfirmAfter = JSON.stringify(selected).includes('adopt_confirm');
+    expect(hasConfirmAfter).toBe(true);
+  });
+
+  it('filters entries by the search query (matches title / cwd / session id)', () => {
+    const resumable = [
+      { cliSessionId: 'aaa', cwd: '/home/alpha', title: 'fix login', lastActivityAt: 3 },
+      { cliSessionId: 'bbb', cwd: '/home/beta', title: 'add cache', lastActivityAt: 2 },
+    ];
+    const card = parse(buildAdoptSelectCard([], 'om_root', 'en', resumable, { searchQuery: 'beta' }));
+    const containers = card.body.elements.filter((e: any) => e.tag === 'interactive_container');
+    expect(containers.length).toBe(1);
+    expect(containers[0].behaviors[0].value.entry_key).toBe('resume:bbb');
+  });
+
+  it('paginates at 5 per page and renders a paginator when there are more', () => {
+    const resumable = Array.from({ length: 7 }, (_, i) => ({
+      cliSessionId: `s${i}`, cwd: `/w${i}`, title: `t${i}`, lastActivityAt: i,
+    }));
+    const page0 = parse(buildAdoptSelectCard([], 'om_root', 'en', resumable, { page: 0 }));
+    const containers0 = page0.body.elements.filter((e: any) => e.tag === 'interactive_container');
+    expect(containers0.length).toBe(5);
+    // A paginator (column_set with adopt_page callbacks) is present.
+    const hasPager = JSON.stringify(page0).includes('adopt_page');
+    expect(hasPager).toBe(true);
+    // Page 1 shows the remaining 2.
+    const page1 = parse(buildAdoptSelectCard([], 'om_root', 'en', resumable, { page: 1 }));
+    const containers1 = page1.body.elements.filter((e: any) => e.tag === 'interactive_container');
+    expect(containers1.length).toBe(2);
+  });
+
+  it('shows a truncation hint when the resume list hit the cap', () => {
+    const resumable = Array.from({ length: 20 }, (_, i) => ({
+      cliSessionId: `s${i}`, cwd: `/w${i}`, title: `t${i}`, lastActivityAt: i,
+    }));
+    const card = parse(buildAdoptSelectCard([], 'om_root', 'en', resumable, undefined, undefined, 20));
+    // The truncation copy mentions the cap number.
+    const text = JSON.stringify(card);
+    expect(text).toContain('20');
+    expect(text.toLowerCase()).toContain('search'); // en copy points at search
+  });
+
+  it('escapes the echoed search query in the no-match message (defuses ![](url) image injection)', () => {
+    // A malicious query rendered raw into a markdown element would fetch an
+    // external image (tracking beacon / SSRF). The no-match copy must escape it.
+    // Needs ≥1 entry that DOESN'T match, so we reach the empty_filtered branch
+    // (an entirely empty list short-circuits to card.adopt.empty first).
+    const resumable = [{ cliSessionId: 'aaa', cwd: '/home/proj', title: 'unrelated', lastActivityAt: 1 }];
+    const card = parse(buildAdoptSelectCard([], 'om_root', 'en', resumable, { searchQuery: '![x](http://evil/beacon)' }));
+    const md = (card.body.elements ?? [])
+      .filter((e: any) => e.tag === 'markdown')
+      .map((e: any) => e.content).join('\n');
+    // The image/link brackets are backslash-escaped, so Lark parses them as
+    // literal text rather than an <img> / <a> — the external fetch never fires.
+    // Escaped form is "!\[x\](…)"; the unescaped "![x](" must NOT survive.
+    expect(md).toContain('\\[x\\]');
+    expect(md).not.toContain('![x](');
+  });
+});
+
+describe('adoptLiveKey (synthetic confirm key)', () => {
+  // Regression guard for the confirm-path match. The card-handler confirm path
+  // re-discovers live sessions and matches `adoptLiveKey(fresh) === entryKey`,
+  // so the key MUST be stable across whatever legitimately shifts between the
+  // render snapshot and the click.
+  const zellijAt = (cliPid: number) => ({
+    zellijSession: 'mywork', zellijPaneId: 'terminal_1', cliPid,
+    cliId: 'codex' as const, sessionId: 'sess', cwd: '/w', paneCols: 80, paneRows: 24,
+  });
+
+  it('zellij key is pid-AGNOSTIC — same (session,paneId), different pid → SAME key', () => {
+    // This is the crux of fix 57dcbebbb: a zellij pane's resolved CLI pid can
+    // shift (wrapper⇄native collapse, re-fork) between render and confirm.
+    // Baking pid into the key would make the confirm match fail and surface a
+    // false "目标已退出". (session, paneId) alone uniquely identifies the pane.
+    expect(adoptLiveKey(zellijAt(111))).toBe(adoptLiveKey(zellijAt(222)));
+    expect(adoptLiveKey(zellijAt(111))).toBe('live:zellij:mywork/terminal_1');
+    expect(adoptLiveKey(zellijAt(111))).not.toContain(':111');
+  });
+
+  it('tmux key stays pid-SENSITIVE (adoptTargetKey includes pid; confirm fast-path parses it)', () => {
+    const tmuxAt = (cliPid: number) => ({
+      source: 'tmux' as const, tmuxTarget: '0:1.0', cliPid,
+      cliId: 'claude-code' as const, sessionId: 's', cwd: '/w', paneCols: 80, paneRows: 24,
+    });
+    expect(adoptLiveKey(tmuxAt(111))).toBe('live:tmux:0:1.0:111');
+    expect(adoptLiveKey(tmuxAt(111))).not.toBe(adoptLiveKey(tmuxAt(222)));
   });
 });
 
@@ -194,9 +340,34 @@ describe('getCliDisplayName', () => {
   });
 });
 
+describe('buildSlashListCard', () => {
+  it('escapes a runtime display name only in Markdown fields', () => {
+    const displayName = 'Forge *Codex* <at id=all></at>';
+    const card = parse(buildSlashListCard({
+      cliName: displayName,
+      builtin: [],
+      custom: [],
+      discovered: [],
+      workingDir: '/workspace',
+      mcpServers: [],
+      discoverySupported: false,
+    }, 'en'));
+
+    expect(card.header.title).toEqual({
+      tag: 'plain_text',
+      content: `🧩 Slash commands available now (${displayName})`,
+    });
+    const markdown = card.body.elements
+      .filter((element: any) => element.tag === 'markdown')
+      .map((element: any) => element.content)
+      .join('\n');
+    expect(markdown).toContain('Forge \\*Codex\\* \\<at id=all\\>\\</at\\>');
+    expect(markdown).not.toContain('<at id=all></at>');
+  });
+});
+
 describe('buildConfigCard', () => {
-  it('renders card-behaviour toggles', () => {
-    const card = parse(buildConfigCard({
+  const configData = (quota: number | null) => ({
       larkAppId: 'app_cfg',
       botName: 'Config Bot',
       cliId: 'codex',
@@ -211,7 +382,7 @@ describe('buildConfigCard', () => {
       customPassthroughCommands: null,
       startupCommands: null,
       teamRole: null,
-      quota: null,
+      quota,
       admins: 1,
       booleans: [
         { key: 'disableStreamingCard', on: false },
@@ -223,7 +394,10 @@ describe('buildConfigCard', () => {
         { key: 'disableCliBypass', on: false },
         { key: 'restrictGrantCommands', on: false },
       ],
-    }, 'en'));
+    });
+
+  it('renders card-behaviour toggles', () => {
+    const card = parse(buildConfigCard(configData(null), 'en'));
 
     const toggle = allActions(card).find((a: any) => a.value?.field === 'silentTurnReactions');
     expect(toggle).toBeTruthy();
@@ -238,6 +412,99 @@ describe('buildConfigCard', () => {
       (a: any) => a.value?.field === 'usageDisplay' || a.value?.field === 'showUsageInCardFooter',
     );
     expect(usageToggle).toBeFalsy();
+  });
+
+  it('describes the built-in grant-card and Oncall quota defaults', () => {
+    const card = parse(buildConfigCard(configData(null), 'en'));
+    const quotaEdit = allActions(card).find((a: any) => a.value?.action === 'config_quota_open');
+    const text = card.elements
+      .filter((element: any) => element.tag === 'div')
+      .map((element: any) => element.text?.content ?? '')
+      .join('\n');
+
+    expect(quotaEdit.text.content).toBe('Set message quota');
+    expect(text).toContain('Default: grant card 3 / Oncall unlimited');
+    expect(allActions(card).some((a: any) => a.value?.action === 'config_quota')).toBe(false);
+  });
+
+  it.each([3, 12, 1000])('shows the arbitrary current quota %i without a fixed-options select', current => {
+    const card = parse(buildConfigCard(configData(current), 'en'));
+    const text = card.elements
+      .filter((element: any) => element.tag === 'div')
+      .map((element: any) => element.text?.content ?? '')
+      .join('\n');
+
+    expect(text).toContain(`grant cards and Oncall use ${current} messages per person`);
+    expect(allActions(card).some((a: any) => a.value?.action === 'config_quota')).toBe(false);
+  });
+
+  it('explains a legacy quota above the supported range without placing it in a select', () => {
+    const card = parse(buildConfigCard(configData(5000), 'en'));
+    const text = card.elements
+      .filter((element: any) => element.tag === 'div')
+      .map((element: any) => element.text?.content ?? '')
+      .join('\n');
+
+    expect(text).toContain('new grant cards use at most 1000, while Oncall still uses 5000');
+    expect(allActions(card).some((a: any) => a.value?.action === 'config_quota')).toBe(false);
+  });
+
+  it('renders a free-input quota card for the 1–1000 range', () => {
+    const card = parse(buildConfigQuotaCard(configData(12), 'en'));
+    const form = card.elements.find((element: any) => element.tag === 'form');
+    const input = form.elements.find((element: any) => element.tag === 'input');
+    const save = form.elements.find((element: any) => element.value?.action === 'config_quota_save');
+
+    expect(input).toMatchObject({ name: 'messageQuota', default_value: '12' });
+    expect(input.placeholder.content).toContain('1–1000');
+    expect(save.action_type).toBe('form_submit');
+  });
+
+  it('leaves the legacy quota input blank while retaining the compatibility explanation', () => {
+    const card = parse(buildConfigQuotaCard(configData(5000), 'en'));
+    const form = card.elements.find((element: any) => element.tag === 'form');
+    const input = form.elements.find((element: any) => element.tag === 'input');
+    const text = card.elements
+      .filter((element: any) => element.tag === 'div')
+      .map((element: any) => element.text?.content ?? '')
+      .join('\n');
+
+    expect(input.default_value).toBe('');
+    expect(text).toContain('new grant cards use at most 1000, while Oncall still uses 5000');
+  });
+});
+
+describe('buildForkPanelCard', () => {
+  it('renders an actionable row for each child and normalizes multiline tasks', () => {
+    const card = parse(buildForkPanelCard([
+      { instruction: 'investigate\ncleanup', status: 'active', link: 'https://example.test/thread/1' },
+      { instruction: 'ship fix', status: 'closed', link: 'https://example.test/thread/2' },
+    ], 'en'));
+    const table = card.body.elements.find((element: any) => element.tag === 'table');
+
+    expect(table.rows).toEqual([
+      {
+        instruction: 'investigate cleanup',
+        status: '🟢 running',
+        link: '[open](https://example.test/thread/1)',
+      },
+      {
+        instruction: 'ship fix',
+        status: '⚪ closed',
+        link: '[open](https://example.test/thread/2)',
+      },
+    ]);
+  });
+
+  it('renders an explicit empty state for /forklist', () => {
+    const card = parse(buildForkPanelCard([], 'en'));
+
+    expect(card.body.elements).toEqual([
+      {
+        tag: 'markdown',
+        content: 'This session has no forked tasks yet. Use `/fork <task>` to create one.',
+      },
+    ]);
   });
 });
 
@@ -266,10 +533,15 @@ describe('buildSessionCard', () => {
     expect(card.header.title.content).toContain(TITLE);
   });
 
-  it('should escape markdown special characters in title', () => {
-    const card = parse(buildSessionCard(SID, ROOT, URL, 'Fix *bold* and [link]'));
-    expect(card.header.title.content).toContain('\\*bold\\*');
-    expect(card.header.title.content).toContain('\\[link\\]');
+  it('renders a plain_text title literally (no markdown backslashes) and strips <at> tags', () => {
+    // plain_text header is not markdown: markdown specials pass through as-is,
+    // and mention markup is stripped so no raw <at id=...></at> can leak.
+    const card = parse(buildSessionCard(SID, ROOT, URL, 'Fix *bold* <at id=ou_x></at> [link]'));
+    expect(card.header.title.content).toContain('*bold*');
+    expect(card.header.title.content).toContain('[link]');
+    expect(card.header.title.content).not.toContain('\\');
+    expect(card.header.title.content).not.toContain('<at');
+    expect(card.header.title.content).not.toContain('ou_x');
   });
 
   it('should default to "Claude" display name when cliId is omitted', () => {
@@ -354,6 +626,15 @@ describe('buildSessionCard', () => {
         session_id: SID,
         cli_id: 'codex',
       });
+    });
+
+    it('uses a configured runtime name in the header and local-open button', () => {
+      enableLocalCliOpen();
+      const card = parse(buildSessionCard(
+        SID, ROOT, URL, TITLE, 'codex', false, false, 'en', true, 'Vendor Codex',
+      ));
+      expect(card.header.title.content).toContain('Vendor Codex');
+      expect(buttonTexts(findActions(card))).toContain('💻 Open Vendor Codex');
     });
 
     it('includes Open TRAE beside Web Terminal for traex sessions', () => {
@@ -450,6 +731,14 @@ describe('buildSessionCard', () => {
       expect(restartBtn.text.content).toContain('Gemini');
       expect(restartBtn.value.root_id).toBe(ROOT);
       expect(restartBtn.value.session_id).toBe(SID);
+    });
+
+    it('should omit restart for Riff management cards', () => {
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'riff', true));
+      const actions = findActions(card);
+
+      expect(actions.find((a: any) => a.value?.action === 'restart')).toBeUndefined();
+      expect(actions.map((a: any) => a.value?.action ?? 'url')).toEqual(['url', 'close']);
     });
 
     it('should NOT include "get write link" button', () => {
@@ -573,16 +862,113 @@ describe('buildStreamingCard', () => {
       expect(card.header.title.content).toContain('工作中');
     });
 
+    it('shows a red, neutral no-progress label for stalled turns', () => {
+      const zh = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'stalled'));
+      expect(zh.header.template).toBe('red');
+      expect(zh.header.title.content).toContain('长时间无进展');
+
+      const en = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'stalled', undefined, 'hidden',
+        undefined, undefined, false, false, 'en',
+      ));
+      expect(en.header.template).toBe('red');
+      expect(en.header.title.content).toContain('No recent progress');
+    });
+
     it('should show green template and "等待输入" for idle status', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle'));
       expect(card.header.template).toBe('green');
       expect(card.header.title.content).toContain('等待输入');
     });
 
-    it('should include escaped title in header', () => {
-      const card = parse(buildStreamingCard(SID, ROOT, URL, 'Fix *bug*', '', 'idle'));
-      expect(card.header.title.content).toContain('Fix \\*bug\\*');
+    it('renders usage + runtime as one single-line markdown run (tail-joined, no column_set)', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', 'traex', 'hidden',
+        undefined, undefined, false, false, 'en', undefined, undefined, false,
+        {
+          context: { usedTokens: 80_700, windowTokens: 258_400, percentUsed: 31 },
+          tokens: { in: 1_400_000, out: 7_800 },
+          model: 'GPT-5.6-Sol',
+          reasoningEffort: 'xhigh',
+        },
+      ));
+      // Single markdown element: metrics · runtime, one continuous text run.
+      const line = card.elements.find(
+        (element: any) => element.tag === 'markdown' && element.content.includes('GPT-5.6-Sol'),
+      );
+      expect(line).toBeTruthy();
+      expect(line.text_size).toBe('notation_small_v2');
+      expect(line.content).toContain('Context 80.7K/258.4K (31%) · Total ↑1.4M ↓7.8K · **GPT-5.6-Sol**');
+      expect(line.content).toContain('xhigh');
+      // metrics and runtime joined by ' · ' in reading order
+      expect(line.content.indexOf('Total')).toBeLessThan(line.content.indexOf('GPT-5.6-Sol'));      // Not a two-column layout anymore.
+      expect(card.elements.some((element: any) => element.tag === 'column_set'
+        && JSON.stringify(element).includes('GPT-5.6-Sol'))).toBe(false);
+    });
+
+    it('renders metrics alone (no trailing runtime) when there is no model', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', 'traex', 'hidden',
+        undefined, undefined, false, false, 'en', undefined, undefined, false,
+        { context: { usedTokens: 80_700, windowTokens: 258_400, percentUsed: 31 }, tokens: { in: 1_400_000, out: 7_800 } },
+      ));
+      const line = card.elements.find(
+        (element: any) => element.tag === 'markdown' && element.content.includes('Context'),
+      );
+      expect(line.content).toContain('Context 80.7K/258.4K (31%) · Total ↑1.4M ↓7.8K');
+      expect(line.content).not.toContain('·  ·');
+    });
+
+    it('keeps a plain full-width usage markdown when there is no model', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', 'traex', 'hidden',
+        undefined, undefined, false, false, 'en', undefined, undefined, false,
+        {
+          context: { usedTokens: 80_700, windowTokens: 258_400, percentUsed: 31 },
+          tokens: { in: 1_400_000, out: 7_800 },
+        },
+      ));
+      const usage = card.elements.find(
+        (element: any) => element.tag === 'markdown' && element.content.includes('Context'),
+      );
+      expect(usage.content).toContain('Context 80.7K/258.4K (31%) · Total ↑1.4M ↓7.8K');
+      expect(usage.text_size).toBe('notation_small_v2');
+    });
+
+    it('renders a plain_text title without markdown backslashes and strips <at> mention leaks', () => {
+      // plain_text header: NOT markdown, so no backslash-escaping (that leaked as
+      // visible '\\<at' before). A title seeded from a message with an @mention
+      // must not surface the raw <at id=...></at> tag.
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, 'Fix bug <at id=ou_abc123></at> now', '', 'idle',
+      ));
+      expect(card.header.title.content).toContain('Fix bug');
+      expect(card.header.title.content).toContain('now');
+      expect(card.header.title.content).not.toContain('<at');
+      expect(card.header.title.content).not.toContain('</at>');
+      expect(card.header.title.content).not.toContain('ou_abc123');
+      expect(card.header.title.content).not.toContain('\\');
       expect(card.header.title.content).toContain('等待输入');
+    });
+
+    // ── Read-only service-tier badge (19th positional arg) ─────────────────
+    it('omits the tier badge by default', () => {
+      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'working', 'codex'));
+      expect(card.header.title.content).not.toContain('⚡');
+    });
+
+    it('renders the actual tier id after the CLI name (not a hardcoded "Fast")', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'working', 'codex',
+        'hidden', undefined, undefined, false, false, undefined, undefined, undefined, false,
+        undefined, // 17th arg: usage snapshot
+        undefined, // 18th arg: runtimeDisplayName
+        '⚡ priority', // 19th arg: serviceTierBadge
+      ));
+      expect(card.header.title.content).toContain('⚡ priority');
+      // Badge sits between the CLI name and the ` · title` separator.
+      expect(card.header.title.content).toMatch(/Codex ⚡ priority · /);
+      expect(card.header.title.content).not.toContain('Fast');
     });
 
     it('should show red usage-limit status with retry time', () => {
@@ -877,6 +1263,25 @@ describe('buildStreamingCard', () => {
     // The cliName is used internally; verify it doesn't throw and produces valid output
     const json = buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle');
     expect(() => JSON.parse(json)).not.toThrow();
+  });
+
+  it('uses a configured runtime name and escapes it in markdown notices', () => {
+    enableLocalCliOpen();
+    const card = parse(buildStreamingCard(
+      SID, ROOT, URL, TITLE, '', 'limited', 'codex', 'hidden', undefined, undefined,
+      false, false, 'en', {
+        limited: true,
+        kind: 'usage',
+        retryAtMs: Date.now() + 60_000,
+        retryLabel: 'later',
+        retryReady: false,
+      }, undefined, true, undefined, 'Vendor [Codex] <at id=ou_fake></at>',
+    ));
+    expect(card.header.title.content).toContain('Vendor [Codex] <at id=ou_fake></at>');
+    expect(buttonTexts(findActions(card))).toContain('💻 Open Vendor [Codex] <at id=ou_fake></at>');
+    const markdown = card.elements.filter((e: any) => e.tag === 'markdown').map((e: any) => e.content).join('\n');
+    expect(markdown).toContain('Vendor \\[Codex\\] \\<at id=ou\\_fake\\>\\</at\\>');
+    expect(markdown).not.toContain('<at id=ou_fake>');
   });
 });
 
@@ -1242,6 +1647,16 @@ describe('buildSessionClosedCard', () => {
     expect(resumeBtn.value.root_id).toBe('om_root_X');
     expect(resumeBtn.type).toBe('primary');
   });
+
+  it('escapes a configured runtime name in markdown copy', () => {
+    const card = parse(buildSessionClosedCard(
+      'sess-5', 'om_root', '', 'codex', undefined, null, 'en',
+      'Vendor [Codex] <at id=ou_fake></at>',
+    ));
+    const md = findMarkdownContent(card);
+    expect(md).toContain('Vendor \\[Codex\\] \\<at id=ou\\_fake\\>\\</at\\>');
+    expect(md).not.toContain('<at id=ou_fake>');
+  });
 });
 
 describe('buildRelayPickerCard', () => {
@@ -1590,6 +2005,14 @@ describe('buildPrivateSnapshotCard', () => {
     const btns = allButtons(card);
     expect(btns.some((b: any) => b.value?.action === 'open_local_cli')).toBe(false);
     expect(btns.map((b: any) => b.value?.action ?? 'url')).toEqual(['url', 'get_write_link', 'close']);
+  });
+
+  it('uses a configured runtime name in the private snapshot header', () => {
+    const card = parse(buildPrivateSnapshotCard(
+      'https://t.example/ro', 'my session', 'idle', 'codex', undefined, 'hello',
+      'sess-9', 'om_anchor', 'en', undefined, 'Vendor Codex',
+    ));
+    expect(card.header.title.content).toContain('Vendor Codex');
   });
 
   it('keeps the snapshot and close control but hides terminal links when unavailable', () => {

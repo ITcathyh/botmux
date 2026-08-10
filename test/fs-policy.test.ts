@@ -19,6 +19,7 @@ import {
   type FsRule,
 } from '../src/adapters/cli/fs-policy.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
+import { createReasonixAdapter } from '../src/adapters/cli/reasonix.js';
 
 const ctx = (o: Partial<FsPolicyContext> = {}): FsPolicyContext => ({
   platform: 'darwin',
@@ -103,6 +104,27 @@ describe('mergeFsRules + accessForPath (the policy semantics)', () => {
 });
 
 describe('buildFsPolicy', () => {
+  it('reasonix state root is read-write so identity, sessions, leases and skills persist in sandbox', () => {
+    const adapter = createReasonixAdapter('/usr/bin/reasonix');
+    const p = buildFsPolicy(ctx({
+      platform: 'linux',
+      homeDir: '/home/u',
+      botHome: '/home/u/.botmux/bots/cli_self',
+      botmuxHome: '/home/u/.botmux',
+      sessionDataDir: '/home/u/.botmux/data',
+      workingDir: '/home/u/proj',
+      redirectedCliData: false,
+      authPaths: adapter.authPaths?.map(path => path.replace(/^~/, '/home/u')),
+    }));
+    for (const path of [
+      '/home/u/.reasonix/machine-id.key',
+      '/home/u/.reasonix/projects/-home-u-proj/sessions/s.jsonl.lease.json',
+      '/home/u/.reasonix/skills/botmux-send/SKILL.md',
+    ]) {
+      expect(accessForPath(p.rules, path).access).toBe('readWrite');
+    }
+  });
+
   it('darwin baseline: system ro, scratch rw, crown jewels denied, lark-cli store denied', () => {
     const p = buildFsPolicy(ctx());
     expect(accessForPath(p.rules, '/System/Library/Frameworks/x').access).toBe('readOnly');
@@ -116,6 +138,30 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(p.rules, '/Users/u/.botmux/bots.json').access).toBe('none');
     expect(accessForPath(p.rules, '/Users/u/.botmux/bots/cli_other/send-cred.json').access).toBe('none');
     expect(accessForPath(p.rules, '/Users/u/other-project/secret').access).toBe('none');
+  });
+
+  it('readonlyRoots (traex/coco migration markers) expose the marker READ-ONLY without making sibling ~/.trae code writable', () => {
+    // Regression for the traex/coco goal-mode wedge: the first-run migration
+    // prompt is silenced by making ~/.trae/.coco-rollouts-migrated visible, but
+    // via the readOnly channel — NOT by widening authPaths to the whole ~/.trae
+    // (that root holds hooks/plugins/skills/traecli.toml, which authPaths would
+    // bind readWrite and let a chat-driven sandbox mutate code other bots run).
+    const p = buildFsPolicy(ctx({
+      platform: 'linux', homeDir: '/home/u', botHome: '/home/u/.botmux/bots/cli_self',
+      botmuxHome: '/home/u/.botmux', sessionDataDir: '/home/u/.botmux/data', workingDir: '/home/u/proj',
+      authPaths: ['/home/u/.trae/cli'],
+      readonlyRoots: ['/home/u/.trae/.coco-rollouts-migrated', '/home/u/.trae/.coco-migrated'],
+    }));
+    // markers visible read-only (mere existence gates the traecli prompt)
+    expect(accessForPath(p.rules, '/home/u/.trae/.coco-rollouts-migrated').access).toBe('readOnly');
+    expect(accessForPath(p.rules, '/home/u/.trae/.coco-migrated').access).toBe('readOnly');
+    // cli/ stays readWrite (SQLite state/log DBs)
+    expect(accessForPath(p.rules, '/home/u/.trae/cli/state_x.sqlite').access).toBe('readWrite');
+    // sibling executable/config surface stays UNwritable (deny-by-default 'none')
+    expect(accessForPath(p.rules, '/home/u/.trae/hooks/hooks.json').access).toBe('none');
+    expect(accessForPath(p.rules, '/home/u/.trae/plugins/p/hooks.json').access).toBe('none');
+    expect(accessForPath(p.rules, '/home/u/.trae/skills/s/skill.md').access).toBe('none');
+    expect(accessForPath(p.rules, '/home/u/.trae/traecli.toml').access).toBe('none');
   });
 
   it('language toolchains under $HOME are readable so python/perl/rust/go/etc. run; their credential files stay denied', () => {

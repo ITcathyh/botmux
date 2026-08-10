@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { parseBotConfigsFromText, getOwnerOpenId, registerBot } from '../src/bot-registry.js';
+import { GRANT_DURATION_OPTIONS } from '../src/services/grant-policy.js';
 
 describe('bot-registry grant additions', () => {
   it('parseBotConfigsFromText preserves & filters chatReplyModes (four-state incl. chat-topic)', () => {
@@ -109,6 +110,25 @@ describe('bot-registry grant additions', () => {
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'mq2', larkAppSecret: 's' }]))[0].messageQuota).toBeUndefined();
   });
 
+  it('parses grantDefaultDurationMs only from the finite card options', () => {
+    for (const durationMs of GRANT_DURATION_OPTIONS) {
+      const config = parseBotConfigsFromText(JSON.stringify([{
+        larkAppId: `gd${durationMs}`,
+        larkAppSecret: 's',
+        grantDefaultDurationMs: durationMs,
+      }]))[0];
+      expect(config.grantDefaultDurationMs).toBe(durationMs);
+    }
+    for (const bad of [undefined, null, '3600000', 0, -1, 2.5, 2 * 60 * 60 * 1000]) {
+      const config = parseBotConfigsFromText(JSON.stringify([{
+        larkAppId: 'gd_bad',
+        larkAppSecret: 's',
+        grantDefaultDurationMs: bad,
+      }]))[0];
+      expect(config.grantDefaultDurationMs).toBeUndefined();
+    }
+  });
+
   it('parses & sanitizes quotaState (scope-aware keys + positive int limit, used>=0)', () => {
     const cfgs = parseBotConfigsFromText(JSON.stringify([{
       larkAppId: 'qs1', larkAppSecret: 's',
@@ -203,6 +223,25 @@ describe('bot-registry grant additions', () => {
     expect(cfgs[0].summaryRange).toEqual({ limit: 0, sinceHours: 0 });
     expect(cfgs[1].summaryRange).toEqual({ limit: 20, sinceHours: 8 });
     expect(cfgs[2].summaryRange).toBeUndefined();
+  });
+
+  it('parses summaryMemory as a default-off boolean', () => {
+    const cfgs = parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'sm1', larkAppSecret: 's', summaryMemory: true, summaryMemoryPath: 'docs/summary.md' },
+      { larkAppId: 'sm2', larkAppSecret: 's', summaryMemory: false, summaryMemoryPath: '/tmp/botmux-summary.md' },
+      { larkAppId: 'sm3', larkAppSecret: 's', summaryMemory: 'true' },
+      { larkAppId: 'sm4', larkAppSecret: 's', summaryMemory: true, summaryMemoryPath: '   ' },
+      { larkAppId: 'sm5', larkAppSecret: 's', summaryMemory: true, summaryMemoryPath: 123 },
+    ]));
+
+    expect(cfgs[0].summaryMemory).toBe(true);
+    expect(cfgs[0].summaryMemoryPath).toBe('docs/summary.md');
+    expect(cfgs[1].summaryMemory).toBeUndefined();
+    expect(cfgs[1].summaryMemoryPath).toBe('/tmp/botmux-summary.md');
+    expect(cfgs[2].summaryMemory).toBeUndefined();
+    expect(cfgs[2].summaryMemoryPath).toBeUndefined();
+    expect(cfgs[3].summaryMemoryPath).toBeUndefined();
+    expect(cfgs[4].summaryMemoryPath).toBeUndefined();
   });
 
   it('parses legacy contentTriggers and preserves explicit unlimited history settings', () => {

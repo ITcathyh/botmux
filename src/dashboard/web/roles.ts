@@ -33,6 +33,7 @@ export interface RoleData {
   byteLength: number;
   hasRole: boolean;
   injectMode?: RoleInjectMode;
+  dispatchCompletionEnabled?: boolean;
   effectiveContent?: string | null;
   effectiveSource?: string;
   hasEffectiveRole?: boolean;
@@ -48,6 +49,7 @@ export interface MessageListenerData {
     mode?: 'all_except_excluded' | 'include_only';
     includeSenderOpenIds?: string[];
     excludeSenderOpenIds?: string[];
+    excludeSenderKinds?: Record<string, 'user' | 'bot'>;
     includeSenderTypes?: Array<'user' | 'bot'>;
     excludeSenderTypes?: Array<'user' | 'bot'>;
     excludeSelf?: boolean;
@@ -251,11 +253,17 @@ export async function loadRole(larkAppId: string, chatId: string): Promise<RoleD
   return readJson(r) as Promise<RoleData>;
 }
 
-export async function saveRole(larkAppId: string, chatId: string, content: string, injectMode: RoleInjectMode): Promise<boolean> {
+export async function saveRole(
+  larkAppId: string,
+  chatId: string,
+  content: string,
+  injectMode: RoleInjectMode,
+  dispatchCompletionEnabled: boolean,
+): Promise<boolean> {
   const r = await fetch(`/api/roles/${encodeURIComponent(larkAppId)}/${encodeURIComponent(chatId)}`, {
     method: 'PUT',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ content, injectMode }),
+    body: JSON.stringify({ content, injectMode, dispatchCompletionEnabled }),
   });
   return r.ok;
 }
@@ -267,6 +275,19 @@ export async function saveInjectMode(larkAppId: string, chatId: string, injectMo
     method: 'PUT',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ injectMode }),
+  });
+  return r.ok;
+}
+
+export async function saveDispatchCompletionEnabled(
+  larkAppId: string,
+  chatId: string,
+  dispatchCompletionEnabled: boolean,
+): Promise<boolean> {
+  const r = await fetch(`/api/roles/${encodeURIComponent(larkAppId)}/${encodeURIComponent(chatId)}`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ dispatchCompletionEnabled }),
   });
   return r.ok;
 }

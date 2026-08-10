@@ -10,8 +10,9 @@ import { codexHome as configuredCodexHome } from './codex-paths.js';
 import { cocoEventsPathForSession } from './coco-transcript.js';
 import { findCursorTranscriptByChatId } from './cursor-transcript.js';
 import { findTraexRolloutBySessionId } from './traex-transcript.js';
+import { findPiTranscriptBySessionId } from './pi-transcript.js';
 
-export type TranscriptKind = 'claude' | 'codex' | 'coco' | 'cursor' | 'traex' | 'antigravity';
+export type TranscriptKind = 'claude' | 'codex' | 'coco' | 'cursor' | 'traex' | 'pi' | 'antigravity';
 
 export interface TranscriptPathQuery {
   cliId?: CliId | 'unknown';
@@ -323,6 +324,10 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
     case 'traex': {
       const path = cachedTranscriptPathLookup(`traex:${sid}`, null, () => findTraexRolloutBySessionId(sid) ?? null, { retryMiss: q.fresh });
       return path ? { path, kind: 'traex' } : null;
+    }
+    case 'pi': {
+      const path = cachedTranscriptPathLookup(`pi:${sid}:${q.cwd ?? ''}`, null, () => findPiTranscriptBySessionId(sid, q.cwd) ?? null, { retryMiss: q.fresh });
+      return path ? { path, kind: 'pi' } : null;
     }
     case 'antigravity': {
       // Validate the CLI session id before interpolating it into a path (every
