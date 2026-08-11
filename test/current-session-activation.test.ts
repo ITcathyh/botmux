@@ -79,6 +79,48 @@ describe('Current Session activation Adapter', () => {
     expect(fork).toHaveBeenCalledTimes(2);
   });
 
+  it('keeps an unknown backend binding quarantined until an explicit re-probe', async () => {
+    const ds = session();
+    const registry = new Map([[activeSessionKey(ds), ds]]);
+    const fork = vi.fn(() => {
+      ds.worker = { killed: false } as DaemonSession['worker'];
+      return true;
+    });
+    const port = createCurrentSessionActivationPort({
+      ownerLarkAppId: 'cli_owner',
+      activeSessions: registry,
+      forkWorker: fork,
+    });
+
+    expect(port.begin(request('unknown'))).toEqual({
+      kind: 'quarantined',
+      message: 'persistent backend observation is unknown',
+    });
+    expect(port.begin({
+      sessionId: 'session-1',
+      requestIdentity: 'ordinary-after-unknown',
+      goal: {
+        kind: 'ensure',
+        cause: 'ordinary',
+        input: { promptInput: 'must not fork', resumeOrTurnId: true },
+      },
+    })).toEqual({
+      kind: 'quarantined',
+      message: 'persistent backend binding is quarantined pending an explicit re-probe',
+    });
+    expect(fork).not.toHaveBeenCalled();
+
+    const reprobe = port.begin(request('exists'));
+    expect(reprobe.kind).toBe('effect');
+    if (reprobe.kind !== 'effect') throw new Error('expected effect');
+    const value = await port.execute(reprobe.intent);
+    expect(port.resume(reprobe.continuation, { kind: 'returned', value })).toEqual({
+      kind: 'active',
+      action: 'reattached',
+    });
+    expect(fork).toHaveBeenCalledTimes(1);
+  });
+
   it('passes adapter-specific activation input unchanged and fences replacement', async () => {
     const ds = session();
     const registry = new Map([[activeSessionKey(ds), ds]]);

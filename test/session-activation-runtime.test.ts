@@ -61,6 +61,43 @@ describe('SessionActivation runtime', () => {
       state: 'joined',
       outcome: { kind: 'active', action: 'activated' },
     });
+
+    await expect(runtime.ensure(request)).resolves.toEqual({
+      kind: 'duplicate',
+      state: 'completed',
+      outcome: { kind: 'active', action: 'activated' },
+    });
+  });
+
+  it('retries a transient terminal with the same request identity', async () => {
+    let begins = 0;
+    const port: SessionActivationPort = {
+      begin: () => {
+        begins += 1;
+        return begins === 1
+          ? { kind: 'retryable', message: 'worker admission is temporarily unavailable' }
+          : { kind: 'active', action: 'activated' };
+      },
+      execute: async () => undefined,
+      resume: () => ({ kind: 'quarantined', message: 'unreachable' }),
+      retire: () => ({ kind: 'retired', action: 'alreadyRetired' }),
+    };
+    const { runtime } = harness(port);
+    const request = {
+      sessionId: 's1',
+      requestIdentity: 'terminal:s1:7',
+      goal: { kind: 'ensure' as const, cause: 'terminal' as const },
+    };
+
+    await expect(runtime.ensure(request)).resolves.toEqual({
+      kind: 'retryable',
+      message: 'worker admission is temporarily unavailable',
+    });
+    await expect(runtime.ensure(request)).resolves.toEqual({
+      kind: 'active',
+      action: 'activated',
+    });
+    expect(begins).toBe(2);
   });
 
   it('does not let a slow activation effect block another Session lane', async () => {
@@ -158,6 +195,34 @@ describe('SessionActivation runtime', () => {
       kind: 'stale',
       message: 'activation continuation was superseded by a lifecycle transition',
     });
+  });
+
+  it('starts a new lifecycle attempt after retirement even when the identity is reused', async () => {
+    let begins = 0;
+    const port: SessionActivationPort = {
+      begin: () => {
+        begins += 1;
+        return { kind: 'active', action: 'activated' };
+      },
+      execute: async () => undefined,
+      resume: () => ({ kind: 'quarantined', message: 'unreachable' }),
+      retire: () => ({ kind: 'retired', action: 'retired' }),
+    };
+    const { runtime } = harness(port);
+    const request = {
+      sessionId: 's1',
+      requestIdentity: 'operation-1',
+      goal: { kind: 'ensure' as const, cause: 'dashboard' as const },
+    };
+
+    await expect(runtime.ensure(request)).resolves.toEqual({ kind: 'active', action: 'activated' });
+    await expect(runtime.retire({
+      sessionId: 's1',
+      requestIdentity: 'close-1',
+      reason: 'explicitClose',
+    })).resolves.toEqual({ kind: 'retired', action: 'retired' });
+    await expect(runtime.ensure(request)).resolves.toEqual({ kind: 'active', action: 'activated' });
+    expect(begins).toBe(2);
   });
 
   it('fails closed when an Adapter reports an unknown backend observation', async () => {

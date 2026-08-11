@@ -78,7 +78,6 @@ import { getAttachmentsDir } from './attachment-path.js';
 import { readDeferredTopicBinding, removeDeferredTopicBinding } from './deferred-topic-binding.js';
 import { escapeXmlTagLikeTokens } from '../utils/xml.js';
 import {
-  ensureCurrentSessionActivation,
   reconcileCurrentSessionActivation,
 } from './current-session-activation.js';
 
@@ -1557,6 +1556,9 @@ export async function staggeredRecoveryFork(
 export async function restoreActiveSessions(
   activeSessions: Map<string, DaemonSession>,
   quarantinedSessionIds: ReadonlySet<string> = new Set(),
+  activation: {
+    readonly reconcile: typeof reconcileCurrentSessionActivation;
+  } = { reconcile: reconcileCurrentSessionActivation },
 ): Promise<void> {
   const sessions = sessionStore.listSessions();
   const restorePriority = (session: Session): number => {
@@ -2219,11 +2221,13 @@ export async function restoreActiveSessions(
       // store closed → no lazy recovery). Keep the worker-less active record and
       // let it re-attach on the next message, exactly like the old behaviour.
       const tag = ds.session.sessionId.substring(0, 8);
-      if (hasProtectedSessionMutationOwnership(ds)) {
-        logger.warn(`[${tag}] ${backendType} probe inconclusive with unsettled activation ownership — quarantining instead of treating unknown as missing`);
-        continue;
-      }
-      logger.warn(`[${tag}] ${backendType} backing session "${backendName}" probe inconclusive — keeping active session for lazy recovery`);
+      logger.warn(
+        `[${tag}] ${backendType} backing session "${backendName}" probe inconclusive`
+        + `${hasProtectedSessionMutationOwnership(ds) ? ' with unsettled activation ownership' : ''}`
+        + ' — entering the activation quarantine',
+      );
+      toReattach.push(ds);
+      restoreObservation.set(ds, 'unknown');
       continue;
     }
 
@@ -2266,12 +2270,19 @@ export async function restoreActiveSessions(
       const recoverExactNonCodex = ds.session.queuedActivationPending
         && ds.session.cliId !== 'codex-app'
         && ds.session.queuedActivationInput;
-      const outcome = await reconcileCurrentSessionActivation({
+      const observation = restoreObservation.get(ds);
+      if (!observation) {
+        logger.error(
+          `[${ds.session.sessionId.substring(0, 8)}] Restore activation has no explicit backend observation; quarantining without fork`,
+        );
+        return;
+      }
+      const outcome = await activation.reconcile({
         ownerBotId: getBot(ds.larkAppId).botId,
         ownerLarkAppId: ds.larkAppId,
         sessionId: ds.session.sessionId,
         requestIdentity: `restore:${ds.session.sessionId}`,
-        observation: restoreObservation.get(ds) ?? 'missing',
+        observation,
         promptInput: recoverExactNonCodex || '',
         resumeOrTurnId: recoverExactNonCodex
           ? {
@@ -2348,7 +2359,7 @@ export async function ensureTerminalWorkerPort(ds: DaemonSession): Promise<numbe
     // still fails — waking a blank worker beside an unpromoted tail would wedge
     // the FIFO gate. Report unavailable (the terminal retries / 502s) instead of
     // blocking 10s for a port that will never arrive.
-    const activation = await ensureCurrentSessionActivation({
+    const activation = await reconcileCurrentSessionActivation({
       ownerBotId: getBot(ds.larkAppId).botId,
       ownerLarkAppId: ds.larkAppId,
       sessionId: ds.session.sessionId,
@@ -2356,7 +2367,7 @@ export async function ensureTerminalWorkerPort(ds: DaemonSession): Promise<numbe
       // allowing a later terminal access to re-activate after that worker has
       // exited and the generation fence advanced.
       requestIdentity: `terminal:${ds.session.sessionId}:${ds.session.workerGeneration ?? 0}`,
-      cause: 'terminal',
+      observation: 'exists',
       promptInput: '',
       resumeOrTurnId: true,
     });

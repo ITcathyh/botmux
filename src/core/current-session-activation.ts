@@ -41,6 +41,12 @@ interface CurrentActivationExecution {
   readonly accepted: boolean;
 }
 
+interface CurrentActivationQuarantine {
+  readonly current: DaemonSession;
+  readonly session: DaemonSession['session'];
+  readonly registryKey: string;
+}
+
 function isObject(value: unknown): value is Record<PropertyKey, unknown> {
   return value !== null && typeof value === 'object';
 }
@@ -107,6 +113,7 @@ export function createCurrentSessionActivationPort(options: {
 }): SessionActivationPort {
   const intents = new WeakMap<object, CurrentActivationPlan>();
   const continuations = new WeakMap<object, CurrentActivationPlan>();
+  const quarantines = new Map<string, CurrentActivationQuarantine>();
   const token = (): object => Object.freeze(Object.create(null)) as object;
 
   const bindingStillExact = (plan: CurrentActivationPlan): boolean => {
@@ -134,7 +141,34 @@ export function createCurrentSessionActivationPort(options: {
       if (exact.current.session.status === 'closed') {
         return { kind: 'rejected', reason: 'closed', message: 'Current Session is closed' };
       }
+      const quarantined = quarantines.get(request.sessionId);
+      if (quarantined) {
+        const sameQuarantinedBinding = quarantined.current === exact.current
+          && quarantined.session === exact.current.session
+          && quarantined.registryKey === exact.key;
+        if (!sameQuarantinedBinding) {
+          return {
+            kind: 'quarantined',
+            message: 'persistent backend quarantine is bound to a superseded Current Session',
+          };
+        }
+        if (request.goal.kind !== 'reconcile'
+            || request.goal.observation === 'unknown') {
+          return {
+            kind: 'quarantined',
+            message: 'persistent backend binding is quarantined pending an explicit re-probe',
+          };
+        }
+        // A typed exists/missing observation is the only operation that clears
+        // an unknown probe. It remains fenced to this exact owner binding.
+        quarantines.delete(request.sessionId);
+      }
       if (request.goal.kind === 'reconcile' && request.goal.observation === 'unknown') {
+        quarantines.set(request.sessionId, {
+          current: exact.current,
+          session: exact.current.session,
+          registryKey: exact.key,
+        });
         return { kind: 'quarantined', message: 'persistent backend observation is unknown' };
       }
       const input = activationInput(request.goal);
@@ -210,6 +244,7 @@ export function createCurrentSessionActivationPort(options: {
     },
 
     retire(request): SessionRetirementOutcome {
+      quarantines.delete(request.sessionId);
       const exact = resolveExact(options.activeSessions, options.ownerLarkAppId, request.sessionId);
       if (exact === 'ambiguous') {
         return { kind: 'quarantined', message: 'Current retirement has multiple exact owner bindings' };

@@ -104,7 +104,8 @@ export interface SessionActivationRuntime {
 
 interface ActivationAttempt {
   readonly requestHash: string;
-  readonly terminal: Promise<SessionActivationTerminal>;
+  terminal: Promise<SessionActivationTerminal>;
+  state: 'running' | 'completed';
 }
 
 function exactNonempty(value: string, label: string): void {
@@ -138,8 +139,12 @@ export function createSessionActivationRuntime(options: {
   const attempts = new Map<string, ActivationAttempt>();
   const tails = new Map<string, Promise<void>>();
 
-  const attemptKey = (sessionId: string, requestIdentity: string): string => (
-    `${sessionId}\0${requestIdentity}`
+  const attemptKey = (
+    sessionId: string,
+    lifecycle: number,
+    requestIdentity: string,
+  ): string => (
+    `${sessionId}\0${lifecycle}\0${requestIdentity}`
   );
   const revisionFor = (sessionId: string): number => lifecycleRevision.get(sessionId) ?? 0;
 
@@ -219,7 +224,8 @@ export function createSessionActivationRuntime(options: {
         message: `activation goal is not canonicalizable: ${error instanceof Error ? error.message : String(error)}`,
       };
     }
-    const key = attemptKey(request.sessionId, request.requestIdentity);
+    const lifecycle = revisionFor(request.sessionId);
+    const key = attemptKey(request.sessionId, lifecycle, request.requestIdentity);
     const prior = attempts.get(key);
     if (prior) {
       if (prior.requestHash !== requestHash) {
@@ -229,22 +235,45 @@ export function createSessionActivationRuntime(options: {
           message: 'activation request identity already belongs to a different goal',
         };
       }
+      const duplicateState = prior.state === 'running' ? 'joined' : 'completed';
       const outcome = await prior.terminal;
-      return { kind: 'duplicate', state: 'joined', outcome };
+      return { kind: 'duplicate', state: duplicateState, outcome };
     }
 
     const previousTail = tails.get(request.sessionId);
     let releaseTail!: () => void;
     const nextTail = new Promise<void>((resolve) => { releaseTail = resolve; });
     tails.set(request.sessionId, nextTail);
+    const attempt: ActivationAttempt = {
+      requestHash,
+      state: 'running',
+      terminal: Promise.resolve({
+        kind: 'quarantined',
+        message: 'activation attempt was not initialized',
+      }),
+    };
     const terminal = (previousTail
       ? previousTail.catch(() => undefined).then(() => runAttempt(request))
       : runAttempt(request))
+      .then((result) => {
+        attempt.state = 'completed';
+        // `retryable` promises that no commit is known and the same identity
+        // may be retried. Keeping it in the process-local idempotency cache
+        // would poison that identity for the rest of the daemon lifetime.
+        if (result.kind === 'retryable' && attempts.get(key) === attempt) {
+          attempts.delete(key);
+        }
+        return result;
+      }, (error) => {
+        if (attempts.get(key) === attempt) attempts.delete(key);
+        throw error;
+      })
       .finally(() => {
         releaseTail();
         if (tails.get(request.sessionId) === nextTail) tails.delete(request.sessionId);
       });
-    attempts.set(key, { requestHash, terminal });
+    attempt.terminal = terminal;
+    attempts.set(key, attempt);
     return terminal;
   };
 

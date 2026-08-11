@@ -33,6 +33,9 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { createCurrentSessionActivationPort } from '../src/core/current-session-activation.js';
+import { createSessionActivationRuntime } from '../src/core/session-activation-runtime.js';
+import { createSessionCommandLaneHost } from '../src/core/session-command-lane.js';
 
 let tempDir: string;
 
@@ -79,6 +82,7 @@ const transferState = vi.hoisted(() => ({
   active: new WeakSet<object>(),
   callbacks: new WeakMap<object, Set<() => void>>(),
 }));
+const restoreActivationRequests: Array<{ observation: 'exists' | 'missing' | 'unknown' }> = [];
 
 vi.mock('../src/core/worker-pool.js', () => ({
   forkWorker: vi.fn(),
@@ -294,6 +298,8 @@ beforeEach(() => {
   bot.wrapperCli = undefined;
   vi.mocked(closeSession).mockClear();
   vi.mocked(forkWorker).mockClear();
+  vi.mocked(forkWorker).mockReturnValue(true);
+  restoreActivationRequests.length = 0;
   vi.mocked(announceSessionRow).mockClear();
   vi.mocked(ZmxBackend.probeSessions).mockClear();
   vi.mocked(ZmxBackend.killManagedSession).mockReset();
@@ -318,6 +324,42 @@ function makeActivePersistentSession(rootMessageId: string, backendType: 'tmux' 
   return s; // left active
 }
 
+function restoreSessions(
+  map: Map<string, DaemonSession>,
+  quarantinedSessionIds: ReadonlySet<string> = new Set(),
+): Promise<void> {
+  const lanes = createSessionCommandLaneHost();
+  const runtime = createSessionActivationRuntime({
+    commandLane: lanes.lane,
+    laneAddress: lanes.addressFor,
+    port: createCurrentSessionActivationPort({
+      ownerLarkAppId: 'app_test',
+      activeSessions: map,
+      forkWorker: (current, promptInput, resumeOrTurnId) => (
+        forkWorker(current, promptInput, resumeOrTurnId) as unknown as boolean
+      ),
+    }),
+  });
+  return restoreActiveSessions(map, quarantinedSessionIds, {
+    reconcile(input) {
+      restoreActivationRequests.push({ observation: input.observation });
+      return runtime.ensure({
+        sessionId: input.sessionId,
+        requestIdentity: input.requestIdentity,
+        goal: {
+          kind: 'reconcile',
+          cause: 'restore',
+          observation: input.observation,
+          input: {
+            promptInput: input.promptInput ?? '',
+            resumeOrTurnId: input.resumeOrTurnId ?? true,
+          },
+        },
+      });
+    },
+  });
+}
+
 describe('restoreActiveSessions — persistent-backend zombie-close decision', () => {
   it('shared Herdr restore probes the recorded managed agent, not a derived bmx-* session', async () => {
     const s = makeActivePersistentSession('om_shared_herdr');
@@ -331,7 +373,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
 
-    await restoreActiveSessions(map);
+    await restoreSessions(map);
 
     expect(HerdrBackend.probeAgent).toHaveBeenCalledWith(
       'work',
@@ -350,7 +392,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     vi.mocked(setActiveSessionSafe).mockResolvedValueOnce(false);
     vi.mocked(closeSession).mockRejectedValueOnce(new Error('ownership probe unavailable'));
 
-    await expect(restoreActiveSessions(map)).resolves.toBeUndefined();
+    await expect(restoreSessions(map)).resolves.toBeUndefined();
 
     expect(closeSession).toHaveBeenCalledWith(blocked.sessionId);
     expect(sessionStore.getSession(blocked.sessionId)?.status).toBe('active');
@@ -377,7 +419,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
 
-    await restoreActiveSessions(map);
+    await restoreSessions(map);
 
     expect(announceSessionRow).toHaveBeenCalledTimes(1);
     expect(announceSessionRow).toHaveBeenCalledWith(expect.objectContaining({
@@ -405,7 +447,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
 
-    await restoreActiveSessions(map);
+    await restoreSessions(map);
 
     expect(announceSessionRow).toHaveBeenCalledTimes(1);
     expect(closeSession).not.toHaveBeenCalled();
@@ -422,7 +464,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
 
-    await restoreActiveSessions(map);
+    await restoreSessions(map);
 
     expect(closeSession).not.toHaveBeenCalled();
     expect(map.get(sessionKey('om_zmx_missing', 'app_test'))).toBeDefined();
@@ -436,7 +478,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
 
-    await restoreActiveSessions(map);
+    await restoreSessions(map);
 
     expect(ZmxBackend.probeSessions).toHaveBeenCalledTimes(1);
     expect(sessionStore.getSession(first.sessionId)!.status).toBe('active');
@@ -459,7 +501,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
 
-    await restoreActiveSessions(map);
+    await restoreSessions(map);
 
     expect(announceSessionRow).not.toHaveBeenCalled();
     expect(closeSession).toHaveBeenCalledWith(s.sessionId);
@@ -483,7 +525,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
 
-    await restoreActiveSessions(map);
+    await restoreSessions(map);
 
     expect(closeSession).not.toHaveBeenCalled();
     expect(sessionStore.getSession(s.sessionId)).toMatchObject({
@@ -511,7 +553,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     const off = dashboardEventBus.subscribe(event => events.push(event));
 
     try {
-      await expect(restoreActiveSessions(map)).resolves.toBeUndefined();
+      await expect(restoreSessions(map)).resolves.toBeUndefined();
     } finally {
       off();
     }
@@ -563,7 +605,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
 
-    await expect(restoreActiveSessions(map)).resolves.toBeUndefined();
+    await expect(restoreSessions(map)).resolves.toBeUndefined();
 
     expect(sessionStore.getSession(hidden.sessionId)?.status).toBe('active');
     expect(sessionStore.getSession(hidden.sessionId)?.restoreQuarantinedAt).toEqual(expect.any(String));
@@ -587,7 +629,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
 
-    await restoreActiveSessions(map);
+    await restoreSessions(map);
 
     expect(announceSessionRow).not.toHaveBeenCalled();
     expect(closeSession).toHaveBeenCalledWith(s.sessionId);
@@ -606,7 +648,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
 
-    await restoreActiveSessions(map);
+    await restoreSessions(map);
 
     expect(closeSession).not.toHaveBeenCalled();
     expect(map.get(sessionKey('om_wrapper_match', 'app_test'))).toBeDefined();
@@ -625,7 +667,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
 
-    await restoreActiveSessions(map);
+    await restoreSessions(map);
 
     expect(closeSession).not.toHaveBeenCalled();
     expect(map.get(sessionKey('om_wrapper_legacy', 'app_test'))).toBeDefined();
@@ -640,7 +682,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
 
-    await restoreActiveSessions(map);
+    await restoreSessions(map);
 
     expect(announceSessionRow).toHaveBeenCalledTimes(3);
     expect(closeSession).not.toHaveBeenCalled();
@@ -663,7 +705,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
 
-    await restoreActiveSessions(map);
+    await restoreSessions(map);
 
     expect(closeSession).not.toHaveBeenCalled();
     const ds = map.get(sessionKey('om_cap_suspended', 'app_test'));
@@ -673,20 +715,21 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(forkWorker).not.toHaveBeenCalled();
   });
 
-  it('"unknown" → keeps the active record (no close, no fork) for lazy recovery', async () => {
+  it('"unknown" → enters the activation quarantine without closing or forking', async () => {
     probe.result = 'unknown';
     const s = makeActivePersistentSession('om_unknown');
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
 
-    await restoreActiveSessions(map);
+    await restoreSessions(map);
 
     expect(closeSession).not.toHaveBeenCalled();
     const ds = map.get(sessionKey('om_unknown', 'app_test'));
     expect(ds).toBeDefined();              // active record retained…
-    expect(ds!.worker).toBeNull();         // …worker-less, resumes on next message
+    expect(ds!.worker).toBeNull();         // …worker-less and fenced until a typed re-probe
     expect(sessionStore.getSession(s.sessionId)!.status).toBe('active'); // NOT closed
     expect(forkWorker).not.toHaveBeenCalled();
+    expect(restoreActivationRequests).toEqual([{ observation: 'unknown' }]);
   });
 
   it('"exists" → auto-forks to re-attach, does not close', async () => {
@@ -695,7 +738,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
 
-    await restoreActiveSessions(map);
+    await restoreSessions(map);
 
     expect(closeSession).not.toHaveBeenCalled();
     expect(forkWorker).toHaveBeenCalled();
@@ -715,7 +758,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
 
-    await restoreActiveSessions(map);
+    await restoreSessions(map);
 
     // NOT adopted: no adopt fork, persisted metadata cleared, title normalized
     expect(forkAdoptWorker).not.toHaveBeenCalled();
@@ -733,7 +776,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     const map2 = new Map<string, DaemonSession>();
     wp.registry = map2;
     vi.mocked(closeSession).mockClear();
-    await restoreActiveSessions(map2);
+    await restoreSessions(map2);
     expect(closeSession).not.toHaveBeenCalledWith(s.sessionId);
     expect(map2.get(sessionKey('om_sbx_adopt', 'app_test'))).toBeDefined();
   });
@@ -765,7 +808,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
 
-    await restoreActiveSessions(map);
+    await restoreSessions(map);
 
     const restored = map.get(sessionKey('om_codex_sidecar_restore', 'app_test'))!;
     expect(restored.lastCodexAppInput).toEqual(expected);
@@ -800,7 +843,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
 
-    await expect(restoreActiveSessions(map)).resolves.toBeUndefined();
+    await expect(restoreSessions(map)).resolves.toBeUndefined();
 
     expect(sessionStore.getSession(first.sessionId)?.status).toBe('active');
     expect(sessionStore.getSession(second.sessionId)?.status).toBe('active');

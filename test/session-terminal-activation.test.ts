@@ -30,8 +30,9 @@ describe('terminal activation identity', () => {
     } as ReturnType<typeof botRegistry.getBot>);
     vi.spyOn(persistentBackend, 'probePersistentBackendTarget').mockReturnValue('exists');
     const identities: string[] = [];
-    vi.spyOn(currentActivation, 'ensureCurrentSessionActivation')
+    vi.spyOn(currentActivation, 'reconcileCurrentSessionActivation')
       .mockImplementation(async (input) => {
+        expect(input.observation).toBe('exists');
         identities.push(input.requestIdentity);
         ds.workerPort = 4500 + identities.length;
         return { kind: 'active', action: 'activated' };
