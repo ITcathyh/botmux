@@ -27,7 +27,7 @@ const expectedCoverage = new Map([
   ['scheduler', { targetMilestone: 'C4', disposition: 'remaining' }],
   ['activation-restore', { targetMilestone: 'A4', disposition: 'remaining' }],
   ['path-specific-retained', { targetMilestone: 'Target-A', disposition: 'retained' }],
-  ['projection', { targetMilestone: 'C3', disposition: 'remaining' }],
+  ['projection', { targetMilestone: 'C3', disposition: 'migrated' }],
   ['remaining-bypass', { targetMilestone: 'Target-A', disposition: 'remaining' }],
 ]);
 
@@ -49,6 +49,17 @@ const mandatoryForbiddenCalls = [
 ];
 const mandatoryPureRuntimeSources = ['src/core/session-runtime.ts'];
 const mandatoryForbiddenImports = ['../services/session-store.js', './worker-pool.js'];
+const mandatoryProjectionProductionBinding = {
+  protocolSource: 'src/core/dashboard-projection.ts',
+  eventSource: 'src/core/dashboard-events.ts',
+  sessionRuntimeSource: 'src/core/session-runtime.ts',
+  currentProjectionSource: 'src/core/current-session-runtime.ts',
+  ipcSource: 'src/core/dashboard-ipc-server.ts',
+  aggregatorSource: 'src/dashboard/aggregator.ts',
+  dashboardSource: 'src/dashboard.ts',
+  webStoreSource: 'src/dashboard/web/store.ts',
+  daemonSource: 'src/daemon.ts',
+};
 const executorRuntimeAccessLane = 'session-executor-runtime-adapter';
 const mandatoryExecutorObservationKinds = [
   'inputReceived',
@@ -417,13 +428,30 @@ function validateLedgerSchema(ledger) {
   validateSessionLaneProductionBindingSchema(sessionLane.productionBinding);
   const activation = ledger.coverage.find(entry => entry.id === 'activation-restore');
   validateActivationTailAuthoritySelector(activation.selectors);
+  const projection = ledger.coverage.find(entry => entry.id === 'projection');
+  validateProjectionProductionBindingSchema(projection.productionBinding);
   for (const entry of ledger.coverage) {
     if (entry.id !== 'keyed-trigger-start'
       && entry.id !== 'ordinary-im'
       && entry.id !== 'executor-generation'
-      && entry.id !== 'per-session-command-lane') {
+      && entry.id !== 'per-session-command-lane'
+      && entry.id !== 'projection') {
       assert(entry.productionBinding === undefined, `${entry.id} must not claim a migrated production binding`);
     }
+  }
+}
+
+function validateProjectionProductionBindingSchema(binding) {
+  assert(isPlainObject(binding), 'projection.productionBinding must be an object');
+  assert(
+    sameStringSet(Object.keys(binding), Object.keys(mandatoryProjectionProductionBinding)),
+    'projection.productionBinding must name only the reviewed C3 sources',
+  );
+  for (const [field, expected] of Object.entries(mandatoryProjectionProductionBinding)) {
+    assert(
+      binding[field] === expected,
+      `projection.productionBinding.${field} must be ${expected}`,
+    );
   }
 }
 
@@ -1940,6 +1968,94 @@ function validateSessionLaneProductionBinding(binding) {
   );
 }
 
+function validateProjectionProductionBinding(binding) {
+  const protocol = sourceFile(binding.protocolSource);
+  const nextPosition = findNamedFunction(protocol, 'nextEventPosition');
+  const snapshot = findNamedFunction(protocol, 'snapshot');
+  assert(
+    containsIdentifier(nextPosition, 'cursor'),
+    'C3 Current protocol must advance its process-local cursor',
+  );
+  assert(
+    containsIdentifier(snapshot, 'readiness') && containsIdentifier(snapshot, 'rows'),
+    'C3 snapshot must carry readiness and rows',
+  );
+  for (const forbidden of ['storeEpoch', 'schemaVersion', 'topologyRevision']) {
+    assert(
+      !containsIdentifier(protocol, forbidden),
+      `C3 Current runtime capability must not impersonate Store readiness via ${forbidden}`,
+    );
+  }
+
+  const events = sourceFile(binding.eventSource);
+  const publish = findNamedFunction(events, 'publish');
+  assert(
+    callExpressionsWithin(publish, 'nextEventPosition').length === 1,
+    'C3 EventBus must stamp every Session event through one process position',
+  );
+
+  const runtime = sourceFile(binding.sessionRuntimeSource);
+  assert(
+    containsStringLiteral(runtime, 'dashboardSnapshot'),
+    'C3 SessionProjection query must expose dashboardSnapshot',
+  );
+  const current = sourceFile(binding.currentProjectionSource);
+  assert(
+    callExpressionsWithin(current, 'dashboardProjectionProtocol.snapshot').length === 1,
+    'C3 Current projection must rebuild rows and capture its cursor at one seam',
+  );
+
+  const ipc = sourceFile(binding.ipcSource);
+  const readSnapshot = findNamedFunction(ipc, 'readCurrentDashboardSessionSnapshot');
+  assert(
+    callExpressionsWithin(readSnapshot, 'host.projection.read').length === 1
+      && containsStringLiteral(readSnapshot, 'dashboardSnapshot'),
+    'C3 daemon IPC snapshot must read through SessionProjection exactly once',
+  );
+
+  const aggregator = sourceFile(binding.aggregatorSource);
+  const replace = findNamedFunction(aggregator, 'replaceSessionSnapshot');
+  const applyEvent = findNamedFunction(aggregator, 'applyEvent');
+  assert(
+    callExpressionsWithin(replace, 'sessions.delete').length > 0,
+    'C3 owner-slice replace must delete stale rows',
+  );
+  assert(
+    containsIdentifier(applyEvent, 'projectionEpoch')
+      && containsIdentifier(applyEvent, 'sequence')
+      && containsStringLiteral(applyEvent, 'rebuildRequired'),
+    'C3 incremental projection must detect epoch/sequence gaps',
+  );
+  const subscribe = findNamedFunction(aggregator, 'subscribeDaemon');
+  assert(
+    callExpressionsWithin(subscribe, 'rebuild').length > 0,
+    'C3 daemon subscription must invoke authoritative rebuild on a gap/reconnect',
+  );
+
+  const dashboard = sourceFile(binding.dashboardSource);
+  const replaceDaemon = findNamedFunction(dashboard, 'replaceDaemonSessionSnapshot');
+  assert(
+    callExpressionsWithin(replaceDaemon, 'aggregator.replaceSessionSnapshot').length === 1,
+    'C3 Dashboard must replace, not additively hydrate, an owner Session slice',
+  );
+  const webStore = sourceFile(binding.webStoreSource);
+  const bootstrap = findNamedFunction(webStore, 'bootstrap');
+  assert(
+    containsStringLiteral(bootstrap, 'projection.rebuilt')
+      && callExpressionsWithin(bootstrap, 'reconcileSnapshot').length > 0,
+    'C3 browser projection must reconcile after an authoritative owner-slice rebuild',
+  );
+
+  const daemonText = sourceFile(binding.daemonSource).getFullText();
+  const initialProjection = daemonText.indexOf('await readCurrentDashboardSessionSnapshot()');
+  const runtimeReady = daemonText.indexOf('currentDashboardProjectionProtocol.markReady()', initialProjection);
+  const ipcReady = daemonText.indexOf('markIpcReady()', runtimeReady);
+  assert(
+    initialProjection >= 0 && runtimeReady > initialProjection && ipcReady > runtimeReady,
+    'C3 daemon must build the initial projection before runtime ready and IPC release',
+  );
+}
+
 export function auditSessionRuntimeCoverage({ ledger } = {}) {
   const coverageLedger = ledger ?? JSON.parse(readFileSync(ledgerPath, 'utf8'));
   validateLedgerSchema(coverageLedger);
@@ -2049,6 +2165,8 @@ export function auditSessionRuntimeCoverage({ ledger } = {}) {
   validateExecutorProductionBinding(executor.productionBinding, facts.sites, assigned);
   const sessionLane = coverageLedger.coverage.find(entry => entry.id === 'per-session-command-lane');
   validateSessionLaneProductionBinding(sessionLane.productionBinding);
+  const projection = coverageLedger.coverage.find(entry => entry.id === 'projection');
+  validateProjectionProductionBinding(projection.productionBinding);
   return { summary: entryCounts.join(', ') };
 }
 

@@ -3,6 +3,16 @@ import * as idempotencyStore from '../services/idempotency-store.js';
 import * as sessionStore from '../services/session-store.js';
 import type { Session } from '../types.js';
 import {
+  currentDashboardProjectionProtocol,
+  type CurrentDashboardProjectionProtocol,
+} from './dashboard-projection.js';
+import {
+  composeRowFromActive,
+  composeRowFromClosed,
+  composeRowFromPersistedActive,
+  type SessionRow,
+} from './dashboard-rows.js';
+import {
   activeSessionAnchorId,
   storedActiveSessionAnchorId,
   type DaemonSession,
@@ -389,6 +399,7 @@ class CurrentSessionDirectory implements SessionDirectory {
   constructor(
     private readonly ownerLarkAppId: string,
     private readonly activeSessions: Map<string, DaemonSession>,
+    private readonly dashboardProjectionProtocol: CurrentDashboardProjectionProtocol,
   ) {}
 
   private rows(): SessionDirectoryRow[] {
@@ -425,7 +436,33 @@ class CurrentSessionDirectory implements SessionDirectory {
     return [...rows.values()];
   }
 
+  private dashboardRows(): SessionRow[] {
+    const rows = new Map<string, SessionRow>();
+    for (const ds of this.activeSessions.values()) {
+      if (ds.larkAppId !== this.ownerLarkAppId) continue;
+      rows.set(ds.session.sessionId, composeRowFromActive(ds));
+    }
+    for (const session of sessionStore.listSessionsForOwnerStrict(this.ownerLarkAppId)) {
+      if (rows.has(session.sessionId)) continue;
+      rows.set(
+        session.sessionId,
+        session.status === 'closed'
+          ? composeRowFromClosed(session)
+          : composeRowFromPersistedActive(session),
+      );
+    }
+    return [...rows.values()];
+  }
+
   async read(query: SessionDirectoryQuery): Promise<SessionDirectoryRead> {
+    if (query.kind === 'dashboardSnapshot') {
+      // Row rebuild + cursor capture are one JS run-to-completion segment, so
+      // no published event can be included in the cursor but absent from rows.
+      return {
+        kind: 'dashboardSnapshot',
+        snapshot: this.dashboardProjectionProtocol.snapshot(this.dashboardRows()),
+      };
+    }
     const rows = this.rows();
     if (query.kind === 'list') return { kind: 'list', rows };
     const matches = query.kind === 'byExternalSession'
@@ -557,16 +594,23 @@ export function currentSessionRuntimeHost(options: {
   ordinaryRouteOpeningCreator?: CurrentOrdinaryRouteOpeningCreator;
   /** Staged Current seam for pending-repository first-start completion. */
   pendingRepoCompletion?: PendingRepoCompletionPort;
+  /** Internal FI seam; production shares the process-local Current protocol. */
+  dashboardProjectionProtocol?: CurrentDashboardProjectionProtocol;
 }): CurrentSessionRuntimeHost {
   const runtimeEpoch = options.runtimeEpoch ?? options.ownerBootId;
-  const cacheable = options.keyedTriggerTurns === undefined;
+  const cacheable = options.keyedTriggerTurns === undefined
+    && options.dashboardProjectionProtocol === undefined;
   const createInnerHost = (input: {
     portBindings?: {
       ordinaryIngress?: OrdinaryIngressPort;
       pendingRepoCompletion?: PendingRepoCompletionPort;
     };
   } = {}): CurrentSessionRuntimeHost => createSessionRuntimeHost({
-    directory: new CurrentSessionDirectory(options.ownerLarkAppId, options.activeSessions),
+    directory: new CurrentSessionDirectory(
+      options.ownerLarkAppId,
+      options.activeSessions,
+      options.dashboardProjectionProtocol ?? currentDashboardProjectionProtocol,
+    ),
     keyedTriggers: new CurrentKeyedTriggerAuthority(
       options.ownerLarkAppId,
       options.activeSessions,

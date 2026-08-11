@@ -578,8 +578,8 @@
     {
       "id": "projection",
       "targetMilestone": "C3",
-      "disposition": "remaining",
-      "description": "尚未被具体 caller milestone 覆盖的 Dashboard event projection 写点独立列入 C3；它们不是 Session authority。",
+      "disposition": "migrated",
+      "description": "Dashboard projection 写点统一经过带 process epoch/sequence 的 EventBus；owner-scoped SessionProjection snapshot 可从 Current authority 重建并携带 runtime readiness。它们仍不是 Session authority，也不声明 Store Epoch durability。",
       "selectors": [
         {
           "inventoryRemainder": true,
@@ -592,6 +592,17 @@
         "recordCount": 12,
         "mutationCount": 12,
         "digest": "fa415c886de97f0a9cc2a2286735f1489ee10c87f63f22a05703a942f153d9b2"
+      },
+      "productionBinding": {
+        "protocolSource": "src/core/dashboard-projection.ts",
+        "eventSource": "src/core/dashboard-events.ts",
+        "sessionRuntimeSource": "src/core/session-runtime.ts",
+        "currentProjectionSource": "src/core/current-session-runtime.ts",
+        "ipcSource": "src/core/dashboard-ipc-server.ts",
+        "aggregatorSource": "src/dashboard/aggregator.ts",
+        "dashboardSource": "src/dashboard.ts",
+        "webStoreSource": "src/dashboard/web/store.ts",
+        "daemonSource": "src/daemon.ts"
       }
     },
     {

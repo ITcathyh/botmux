@@ -32,16 +32,17 @@ export function createSessionPresentationCoordinator(
     const sessionId = typeof row.sessionId === 'string' ? row.sessionId : '';
     const workingDir = typeof row.workingDir === 'string' ? row.workingDir.trim() : '';
     if (!sessionId || !workingDir) return;
-    const token = Symbol(sessionId);
-    pending.set(sessionId, token);
+    const pendingKey = `${larkAppId}\u0000${sessionId}`;
+    const token = Symbol(pendingKey);
+    pending.set(pendingKey, token);
 
     const lookup = options.force
       ? resolveGit(workingDir, { force: true })
       : resolveGit(workingDir);
     void lookup.then((info) => {
-      if (pending.get(sessionId) !== token) return;
-      const current = aggregator.getSession(sessionId);
-      if (!current || current.larkAppId !== larkAppId || current.workingDir !== workingDir) return;
+      if (pending.get(pendingKey) !== token) return;
+      const current = aggregator.getSessionForOwner(larkAppId, sessionId);
+      if (!current || current.workingDir !== workingDir) return;
       const repoName = info?.repoName ?? null;
       const gitBranch = info?.branch ?? null;
       if (
@@ -57,7 +58,7 @@ export function createSessionPresentationCoordinator(
     }).catch(() => {
       // Presentation enrichment is best-effort; the canonical row remains valid.
     }).finally(() => {
-      if (pending.get(sessionId) === token) pending.delete(sessionId);
+      if (pending.get(pendingKey) === token) pending.delete(pendingKey);
     });
   };
 
@@ -79,7 +80,7 @@ export function createSessionPresentationCoordinator(
         const atTurnBoundary = event.body.patch.status === 'idle'
           || event.body.patch.status === 'limited';
         if (!workingDirChanged && !atTurnBoundary) return;
-        const current = aggregator.getSession(event.body.sessionId);
+        const current = aggregator.getSessionForOwner(event.larkAppId, event.body.sessionId);
         if (current) schedule(event.larkAppId, current, { force: atTurnBoundary });
       }
     },

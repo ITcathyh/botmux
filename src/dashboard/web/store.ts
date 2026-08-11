@@ -103,23 +103,6 @@ export async function bootstrap() {
   // authoritative snapshot is installed.
   const buffered: Array<{ type: string; body: any }> = [];
   let snapshotReady = false;
-  const es = new EventSource('/events');
-  const types = [
-    'session.spawned', 'session.update', 'session.exited',
-    'schedule.created', 'schedule.updated', 'schedule.deleted',
-    'schedule.fired', 'schedule.timezone', 'bots.changed', 'heartbeat',
-  ];
-  for (const type of types) {
-    es.addEventListener(type, e => {
-      try {
-        const data = JSON.parse((e as MessageEvent).data);
-        const body = data.body ?? data;
-        if (snapshotReady) store.applySse(type, body);
-        else buffered.push({ type, body });
-      } catch { /* skip malformed */ }
-    });
-  }
-
   let syncInFlight: Promise<void> | null = null;
   let requestedReconcile = 0;
   let completedReconcile = 0;
@@ -153,6 +136,33 @@ export async function bootstrap() {
     });
     return syncInFlight;
   };
+
+  const es = new EventSource('/events');
+  const types = [
+    'session.spawned', 'session.update', 'session.exited',
+    'schedule.created', 'schedule.updated', 'schedule.deleted',
+    'schedule.fired', 'schedule.timezone', 'projection.rebuilt',
+    'bots.changed', 'heartbeat',
+  ];
+  for (const type of types) {
+    es.addEventListener(type, e => {
+      try {
+        const data = JSON.parse((e as MessageEvent).data);
+        if (type === 'projection.rebuilt') {
+          // The Dashboard server authoritatively replaced one daemon's owner
+          // slice after an epoch/sequence repair. Re-read the aggregate instead
+          // of trying to reconstruct deletions from a lossy delta.
+          void reconcileSnapshot().catch(() => {
+            // The next projection repair or stream reconnect retries.
+          });
+          return;
+        }
+        const body = data.body ?? data;
+        if (snapshotReady) store.applySse(type, body);
+        else buffered.push({ type, body });
+      } catch { /* skip malformed */ }
+    });
+  }
 
   es.onerror = () => store.setOnline(false);
   es.onopen = () => {

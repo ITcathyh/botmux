@@ -1,7 +1,7 @@
 # Session Actor Core 实施设计（第一步：A0→A3 + C1）
 
 > 本文是 Session Actor 演进提案的**实施摘要**：只保留与已落地代码直接对应的设计决策与改动内容，
-> 供 reviewer 与后续步骤（C2/C3/C4/A4、Target-B）的实施者对照代码阅读。
+> 供 reviewer 与后续步骤（C2/C4/A4、Target-B）的实施者对照代码阅读。
 > 概念调研、术语校准、方案比较与 ROI 论证过程不在本文范围。
 
 ## 1. 目标与本步边界
@@ -18,7 +18,7 @@ Botmux 的 Session 天然具备 Virtual Actor 的全部特征：稳定逻辑身�
 | 步骤 | 内容 | 状态 |
 |---|---|---|
 | 第一步（本次） | A0 census → A1 runtime shell → A2 代际围栏 → A3 per-Session lane → C1 普通 IM 消息一刀切换 | ✅ 本 PR |
-| 第二步 | C2 Dashboard 命令、C4 scheduler producer、C3 projection/readiness、A4 activation/restore 生命周期按各自 ROI gate 迁入同一入口 | 后续 |
+| 第二步 | C2 Dashboard 命令、C4 scheduler producer、C3 projection/readiness、A4 activation/restore 生命周期按各自 ROI gate 迁入同一入口 | C3 ✅；其余后续 |
 | 第三步 | per-bot SQLite durable store 离线演练与单向 cutover（Target-B），届时才把 ACK 升级为崩溃可恢复的 durable 承诺 | 后续 |
 
 本步明确**不做**：不改变 durability 承诺（所有 outcome 标注 `processLocal`）、不引入 SQLite、
@@ -53,6 +53,22 @@ Botmux 的 Session 天然具备 Virtual Actor 的全部特征：稳定逻辑身�
 授权第二步继续把任意字段塞进 Current row。本节的 Stage-1 snapshot 保持历史不变；第二步迁移导致
 machine ledger/digest 变化时必须同步台账并重跑审计与合同测试，完成后新增独立的 Stage-2 baseline，
 不得回写本节来伪装第一步从未变化；只有证明本节对第一步事实记录有误时才更正并留下显式说明。
+
+### 1.2 第二步增量：C3 projection/readiness
+
+C3 在不改变 Current authority/durability 的前提下建立一个 owner-scoped、可丢弃重建的 Dashboard
+read model：`SessionProjection.read({ kind: 'dashboardSnapshot' })` 返回
+`{ projectionEpoch, cursor, rows, readiness }`；snapshot 的 row rebuild 与 cursor capture 在同一
+JS run-to-completion 段完成。Session event 由单一 EventBus 添加 process-local epoch/sequence，
+Dashboard 遇到重复、乱序、gap 或 epoch 变化即丢弃增量并 authoritative replace 该 owner slice，
+replace 同时删除该 owner 已消失的 stale row，并通知已连接的浏览器 projection 重取 aggregate
+snapshot，而不是让它从不完整 delta 猜删除。
+
+聚合缓存以 owner + sessionId 为内部 key；当既有 bare-sessionId consumer 遇到跨 owner collision
+时 fail closed，不返回任一冲突 row 或 mutation route。worker exit 只投影为 `dormant`，daemon/SSE
+heartbeat 失效只把 runtime 标为 `stale`，均不反向写 `closed`。daemon 在 restore 完成后先成功构建
+初始 projection，再从 `restoring` 切为 `ready` 并释放 IPC mutation gate；`Current/v1` capability
+明确不携带 Store Epoch/schema/topology，后者仍属于 Target-B。
 
 ## 2. 对实现有直接约束的设计原则
 
@@ -212,9 +228,10 @@ coverage 台账 `remaining-bypass` 如实列出。并存期间的绑定校验让
 
 ## 8. 后续步骤接口
 
-第二步把 C2（Dashboard 命令）、C4（scheduler 只算 due/run ID 后 `submit`）、C3（projection 可
-重建 + `online/restoring/ready`）、A4（singleflight activation、reattach/cold-resume/quarantine）
-迁入同一入口；I1 把 owner binding 提升为不可变 BotId。第三步（Target-B）在同一 Interface 后用
+第二步余项把 C2（Dashboard 命令）、C4（scheduler 只算 due/run ID 后 `submit`）、A4
+（singleflight activation、reattach/cold-resume/quarantine）迁入同一入口；C3 已提供可重建
+projection 与 `online/restoring/ready` Current runtime capability，I1 再把 owner binding 提升为不可变
+BotId。第三步（Target-B）在同一 Interface 后用
 per-bot SQLite 替换 production Adapter：短事务提交 accepted turn / mailbox / effect receipt，
 commit 后才对需要 durable admission 的 ingress ACK。届时调用方与全部行为测试不动，`current-*`
 绑定层整体删除。

@@ -93,7 +93,7 @@ describe('daemon close barrier used by botmux delete', () => {
         && event.body.sessionId === session.sessionId
         && event.body.patch.status === 'closed'
       );
-      expect(closePatch).toEqual({
+      expect(closePatch).toMatchObject({
         type: 'session.update',
         body: {
           sessionId: session.sessionId,

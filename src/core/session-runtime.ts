@@ -10,6 +10,7 @@
 import { types as nodeUtilTypes } from 'node:util';
 
 import { computeInputHash } from '../utils/canonical-input-hash.js';
+import type { DashboardSessionSnapshot } from './dashboard-projection.js';
 import type { ExternalTriggerBusinessInput } from './external-trigger-envelope.js';
 import {
   normalizeOrdinaryImTurn,
@@ -67,11 +68,13 @@ export interface SessionDirectoryRow {
 export type SessionDirectoryQuery =
   | { kind: 'byRoute'; route: SessionRoute }
   | { kind: 'byExternalSession'; sessionId: string }
-  | { kind: 'list' };
+  | { kind: 'list' }
+  | { kind: 'dashboardSnapshot' };
 
 export type SessionDirectoryRead =
   | { kind: 'one'; row: SessionDirectoryRow }
   | { kind: 'list'; rows: SessionDirectoryRow[] }
+  | { kind: 'dashboardSnapshot'; snapshot: DashboardSessionSnapshot }
   | { kind: 'notFound' }
   | { kind: 'notReady'; message: string };
 
@@ -91,6 +94,7 @@ export interface SessionView {
 export type ProjectionResult =
   | { kind: 'one'; session: SessionView }
   | { kind: 'list'; sessions: SessionView[] }
+  | { kind: 'dashboardSnapshot'; snapshot: DashboardSessionSnapshot }
   | { kind: 'notFound' }
   | { kind: 'notReady'; message: string };
 
@@ -1083,6 +1087,7 @@ export function createSessionRuntimeHost(options: {
       }
       if (result.kind === 'one') return { kind: 'one', session: view(result.row) };
       if (result.kind === 'list') return { kind: 'list', sessions: result.rows.map(view) };
+      if (result.kind === 'dashboardSnapshot') return result;
       return result;
     },
   };

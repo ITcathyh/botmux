@@ -3,6 +3,8 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { currentSessionRuntimeHost } from '../src/core/current-session-runtime.js';
+import { DashboardEventBus } from '../src/core/dashboard-events.js';
+import { CurrentDashboardProjectionProtocol } from '../src/core/dashboard-projection.js';
 import { createCurrentOrdinaryImTurnPreparationPort } from '../src/core/current-ordinary-im-turn.js';
 import { createCurrentOrdinaryIngressPort } from '../src/core/current-ordinary-ingress.js';
 import type { CurrentOrdinaryRouteOpeningRollbackToken } from '../src/core/current-ordinary-route-registry.js';
@@ -199,6 +201,50 @@ describe('Current SessionRuntime projection adapter', () => {
     ds.worker.killed = true;
     const killed = await host.projection.read({ kind: 'byExternalSession', sessionId: session.sessionId });
     expect(killed.kind === 'one' && killed.session.executorStatus).toBe('dormant');
+  });
+
+  it('projects an authoritative owner-scoped dashboard snapshot with Current readiness', async () => {
+    const session = sessionStore.createSession('oc_dashboard', 'om_dashboard', 'dashboard', 'group');
+    session.larkAppId = APP;
+    session.scope = 'thread';
+    sessionStore.updateSession(session);
+    const ds = {
+      session,
+      worker: null,
+      larkAppId: APP,
+      chatId: session.chatId,
+      chatType: 'group',
+    } as DaemonSession;
+    const protocol = new CurrentDashboardProjectionProtocol();
+    const bus = new DashboardEventBus(protocol);
+    bus.publish({
+      type: 'session.update',
+      body: { sessionId: session.sessionId, patch: { status: 'idle' } },
+    });
+    const host = currentSessionRuntimeHost({
+      ownerLarkAppId: APP,
+      activeSessions: new Map([[activeSessionKey(ds), ds]]),
+      ownerBootId: 'boot-dashboard-snapshot',
+      keyedTriggerAdmissionBlocked: () => false,
+      dashboardProjectionProtocol: protocol,
+    });
+
+    const restoring = await host.projection.read({ kind: 'dashboardSnapshot' });
+    expect(restoring.kind).toBe('dashboardSnapshot');
+    if (restoring.kind !== 'dashboardSnapshot') throw new Error('expected dashboard snapshot');
+    expect(restoring.snapshot).toMatchObject({
+      cursor: 1,
+      readiness: { contract: 'Current/v1', state: 'restoring', online: true },
+      rows: [{ sessionId: session.sessionId, larkAppId: APP, status: 'dormant' }],
+    });
+
+    protocol.markReady();
+    const ready = await host.projection.read({ kind: 'dashboardSnapshot' });
+    expect(ready.kind === 'dashboardSnapshot' && ready.snapshot).toMatchObject({
+      projectionEpoch: restoring.snapshot.projectionEpoch,
+      cursor: 1,
+      readiness: { contract: 'Current/v1', state: 'ready', online: true },
+    });
   });
 
   it('reports a corrupt owner projection as notReady rather than notFound', async () => {

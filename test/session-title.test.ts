@@ -142,7 +142,7 @@ describe('updateSessionTitle', () => {
     expect(session.nativeSessionTitleUserDefined).toBe(true);
     expect(session.nativeSessionTitleAwaitingContent).toBeUndefined();
     expect(sessionStore.updateSession).toHaveBeenCalledWith(session);
-    expect(events).toEqual([{
+    expect(events).toEqual([expect.objectContaining({
       type: 'session.update',
       body: {
         sessionId: 'session-1',
@@ -152,7 +152,7 @@ describe('updateSessionTitle', () => {
           titleSource: 'agent',
         },
       },
-    }]);
+    })]);
   });
 
   it('rejects an empty title without mutating or publishing', () => {

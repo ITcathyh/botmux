@@ -29,4 +29,29 @@ describe('DashboardEventBus', () => {
     expect(() => bus.publish({ type: 'heartbeat', body: { ts: 3 } })).not.toThrow();
     expect(ok).toHaveBeenCalledOnce();
   });
+
+  it('stamps session events with one process epoch and a contiguous sequence', () => {
+    const bus = new DashboardEventBus();
+    const seen: DashboardEvent[] = [];
+    bus.subscribe(event => seen.push(event));
+
+    bus.publish({
+      type: 'session.spawned',
+      body: { session: { sessionId: 's1' } },
+    });
+    bus.publish({
+      type: 'session.update',
+      body: { sessionId: 's1', patch: { status: 'idle' } },
+    });
+
+    expect(seen[0]).toMatchObject({ sequence: 1 });
+    expect(seen[1]).toMatchObject({
+      projectionEpoch: (seen[0] as any).projectionEpoch,
+      sequence: 2,
+    });
+    expect(bus.position()).toEqual({
+      projectionEpoch: (seen[0] as any).projectionEpoch,
+      cursor: 2,
+    });
+  });
 });

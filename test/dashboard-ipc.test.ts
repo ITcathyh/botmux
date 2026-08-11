@@ -171,6 +171,39 @@ describe('dashboard IPC server', () => {
     expect(mutations).toBe(1);
   });
 
+  it('reports Current restoring state without opening the Session snapshot gate', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    let releaseReady!: () => void;
+    const ready = new Promise<void>(resolve => { releaseReady = resolve; });
+    handle = await startIpcServer({
+      port: 0,
+      host: '127.0.0.1',
+      authRequired: true,
+      ready,
+    });
+    const statusPath = '/api/runtime-status';
+    const status = await fetch(`http://127.0.0.1:${handle.port}${statusPath}`, {
+      headers: trustedHostHeaders('GET', statusPath, handle.port),
+    });
+    expect(status.status).toBe(200);
+    expect(await status.json()).toMatchObject({
+      readiness: { contract: 'Current/v1', state: 'restoring', online: true },
+    });
+
+    let snapshotSettled = false;
+    const snapshotPath = '/api/sessions';
+    const pendingSnapshot = fetch(`http://127.0.0.1:${handle.port}${snapshotPath}`, {
+      headers: trustedHostHeaders('GET', snapshotPath, handle.port),
+    }).then(response => {
+      snapshotSettled = true;
+      return response;
+    });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(snapshotSettled).toBe(false);
+    releaseReady();
+    expect((await pendingSnapshot).status).toBe(200);
+  });
+
   it('denies sandbox-like loopback reads and mutations but accepts route-bound trusted-host calls', async () => {
     setIpcAuthSecret(TEST_IPC_SECRET);
     let mutations = 0;
@@ -1159,12 +1192,17 @@ describe('POST /api/grants/chat', () => {
 });
 
 describe('GET /api/sessions', () => {
-  it('returns array shape (sessions: Row[])', async () => {
+  it('returns the authoritative Current projection snapshot shape', async () => {
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions`);
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(Array.isArray(body.sessions)).toBe(true);
+    expect(body).toMatchObject({
+      projectionEpoch: expect.any(String),
+      cursor: expect.any(Number),
+      readiness: { contract: 'Current/v1', online: true },
+    });
+    expect(Array.isArray(body.rows)).toBe(true);
   });
 
   it('shows an unregistered quarantined active row as dormant in list and detail', async () => {
@@ -1174,6 +1212,7 @@ describe('GET /api/sessions', () => {
     try {
       config.session.dataDir = dataDir;
       sessionStore.init('cli_quarantined');
+      setLarkAppId('cli_quarantined');
       workerPool.setActiveSessionsRegistry(registry);
 
       const session = sessionStore.createSession('oc_quarantined', 'om_quarantined', '待确认清理', 'group');
@@ -1188,7 +1227,7 @@ describe('GET /api/sessions', () => {
       const base = `http://127.0.0.1:${handle.port}`;
       const listRes = await fetch(`${base}/api/sessions`);
       expect(listRes.status).toBe(200);
-      const listed = (await listRes.json()).sessions.find((row: any) => row.sessionId === session.sessionId);
+      const listed = (await listRes.json()).rows.find((row: any) => row.sessionId === session.sessionId);
       expect(listed).toMatchObject({
         sessionId: session.sessionId,
         status: 'dormant',
@@ -1352,7 +1391,7 @@ describe('POST /api/sessions/:sessionId/rename', () => {
         nativeSessionTitleUserDefined: true,
       });
       expect(send).toHaveBeenCalledWith({ type: 'rename_session', title: 'New Title' });
-      expect(events).toContainEqual({
+      expect(events).toContainEqual(expect.objectContaining({
         type: 'session.update',
         body: {
           sessionId: session.sessionId,
@@ -1362,7 +1401,7 @@ describe('POST /api/sessions/:sessionId/rename', () => {
             titleSource: 'dashboard',
           },
         },
-      });
+      }));
     } finally {
       findSpy?.mockRestore();
       off();
@@ -1410,10 +1449,10 @@ describe('POST /api/sessions/:sessionId/lock', () => {
       expect(lockRes.status).toBe(200);
       expect(await lockRes.json()).toEqual({ ok: true, locked: true });
       expect(sessionStore.getSession(session.sessionId)?.locked).toBe(true);
-      expect(seen).toContainEqual({
+      expect(seen).toContainEqual(expect.objectContaining({
         type: 'session.update',
         body: { sessionId: session.sessionId, patch: { locked: true } },
-      });
+      }));
 
       const unlockRes = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${session.sessionId}/lock`, {
         method: 'POST',
@@ -2286,68 +2325,51 @@ describe('POST /api/sessions/:sessionId/resume', () => {
 });
 
 describe('GET /api/events', () => {
-  it('replays current active sessions as session.spawned on connect (snapshot-on-connect)', async () => {
-    // Guards the descriptor→restore race: a dashboard that subscribes AFTER an
-    // empty hydrate (or after a restore-time announce it missed) must still learn
-    // every active row. The SSE handler subscribes then replays the live registry.
-    const registry = new Map<string, any>();
-    workerPool.setActiveSessionsRegistry(registry);
-    try {
-      registry.set(sessionKey('om_snap', 'cli_app'), {
-        session: {
-          sessionId: 'snap-1', chatId: 'oc_snap', rootMessageId: 'om_snap',
-          title: 't', status: 'active', createdAt: new Date(1000).toISOString(),
-          scope: 'thread', cliId: 'codex',
-        },
-        worker: null, workerPort: null, workerToken: null,
-        larkAppId: 'cli_app', chatId: 'oc_snap', chatType: 'group', scope: 'thread',
-        spawnedAt: 1000, cliVersion: 'test', lastMessageAt: 1000, hasHistory: true,
-      });
-
-      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-      const ev = await readSseEvent(
+  it('streams live session events with projection epoch and sequence', async () => {
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const event = readSseEvent(
         `http://127.0.0.1:${handle.port}/api/events`,
-        e => e.type === 'session.spawned' && e.body?.session?.sessionId === 'snap-1',
-      );
-      expect(ev).not.toBeNull();
-      expect(ev!.body.session.status).toBe('dormant'); // restored worker:null → lazily resumes on next input
-      expect(ev!.body.session.hasHistory).toBe(true);
-    } finally {
-      workerPool.setActiveSessionsRegistry(new Map());
-    }
+        e => e.type === 'session.spawned' && e.body?.session?.sessionId === 'live-1',
+    );
+    await new Promise(resolve => setTimeout(resolve, 25));
+    dashboardEventBus.publish({
+      type: 'session.spawned',
+      body: { session: { sessionId: 'live-1', larkAppId: 'cli_app', status: 'idle' } },
+    });
+
+    const ev = await event;
+    expect(ev).not.toBeNull();
+    expect(ev!.body).toMatchObject({
+      session: { sessionId: 'live-1', status: 'idle' },
+      projectionEpoch: expect.any(String),
+      sequence: expect.any(Number),
+    });
   });
 
-  it('replays this-run closed sessions as session.spawned (zombie-close visibility)', async () => {
-    // A restore-time zombie is registered, announced, then immediately
-    // closeSession()'d (evicted from the active Map) — all before a racing
-    // dashboard's SSE subscription exists. By connect time it's gone from the Map,
-    // so the active-only replay can't surface it. The closed-since-process-start
-    // replay must still deliver it as a closed row so the dashboard doesn't lose
-    // it (or keep a stale active entry).
+  it('includes a restore-time closed row in the authoritative snapshot', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-sse-closed-'));
     const prevDataDir = process.env.SESSION_DATA_DIR;
     const prevConfigDataDir = config.session.dataDir;
     const registry = new Map<string, any>();
     try {
       config.session.dataDir = dataDir;
-      sessionStore.init();
+      sessionStore.init('cli_zombie');
+      setLarkAppId('cli_zombie');
       workerPool.setActiveSessionsRegistry(registry); // empty — zombie already evicted
 
       const session = sessionStore.createSession('oc_zombie', 'om_zombie', 'zombie topic', 'group');
-      session.larkAppId = '';
+      session.larkAppId = 'cli_zombie';
       session.scope = 'thread';
       session.cliId = 'codex' as any;
       sessionStore.updateSession(session);
-      sessionStore.closeSession(session.sessionId); // closedAt = now ≥ PROCESS_START_MS
+      sessionStore.closeSession(session.sessionId);
 
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-      const ev = await readSseEvent(
-        `http://127.0.0.1:${handle.port}/api/events`,
-        e => e.type === 'session.spawned' && e.body?.session?.sessionId === session.sessionId,
-      );
-      expect(ev).not.toBeNull();
-      expect(ev!.body.session.status).toBe('closed');
-      expect(typeof ev!.body.session.closedAt).toBe('number');
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/sessions`);
+      const snapshot = await response.json();
+      const row = snapshot.rows.find((candidate: any) => candidate.sessionId === session.sessionId);
+      expect(row).toMatchObject({ sessionId: session.sessionId, status: 'closed' });
+      expect(typeof row.closedAt).toBe('number');
     } finally {
       workerPool.setActiveSessionsRegistry(new Map());
       sessionStore.init();

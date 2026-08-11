@@ -165,14 +165,14 @@ describe('attention signals', () => {
     publishLastInputFromBotPatch(ds);
 
     expect(seen).toEqual([
-      {
+      expect.objectContaining({
         type: 'session.update',
         body: { sessionId: 'sess-1', patch: { lastInputFromBot: true } },
-      },
-      {
+      }),
+      expect.objectContaining({
         type: 'session.update',
         body: { sessionId: 'sess-1', patch: { lastInputFromBot: false } },
-      },
+      }),
     ]);
   });
 
@@ -191,7 +191,7 @@ describe('attention signals', () => {
 
       publishSessionMessagePreviewPatch(makeDs());
 
-      expect(seen).toEqual([{
+      expect(seen).toEqual([expect.objectContaining({
         type: 'session.update',
         body: {
           sessionId: 'sess-1',
@@ -201,7 +201,7 @@ describe('attention signals', () => {
             previewBotState: 'waiting',
           }),
         },
-      }]);
+      })]);
     } finally {
       rmSync(dataDir, { recursive: true, force: true });
       if (previousDataDir === undefined) delete process.env.SESSION_DATA_DIR;
@@ -214,7 +214,7 @@ describe('attention signals', () => {
 
     publishClosedSessionPatch('sess-1', 2_000, { tokenUsage: null });
 
-    expect(seen).toEqual([{
+    expect(seen).toEqual([expect.objectContaining({
       type: 'session.update',
       body: {
         sessionId: 'sess-1',
@@ -231,7 +231,7 @@ describe('attention signals', () => {
           previewBotState: null,
         },
       },
-    }]);
+    })]);
   });
 
   it('composeRowFromActive exposes backend metadata for external session bridges', () => {
@@ -311,7 +311,7 @@ describe('attention signals', () => {
     const seen = collectEvents();
     publishAttentionPatch(makeDs({ tuiPromptCardId: 'om_card' }));
     expect(seen).toHaveLength(1);
-    expect(seen[0]).toEqual({
+    expect(seen[0]).toMatchObject({
       type: 'session.update',
       body: {
         sessionId: 'sess-1',

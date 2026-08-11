@@ -33,13 +33,13 @@ describe('repinSessionWorkingDir', () => {
     expect(ds.session.workingDir).toBe('/repo/new');
     expect(ds.session.riffRepoDirs).toBeUndefined();
     expect(updateSession).toHaveBeenCalledWith(ds.session);
-    expect(events).toContainEqual({
+    expect(events).toContainEqual(expect.objectContaining({
       type: 'session.update',
       body: {
         sessionId: 'session-one',
         patch: { workingDir: '/repo/new' },
       },
-    });
+    }));
   });
 
   it('does not publish an in-memory cwd when persistence fails', () => {

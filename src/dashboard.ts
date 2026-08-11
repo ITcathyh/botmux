@@ -1441,44 +1441,72 @@ function runGlobalInstall(plan: GlobalInstallPlan): Promise<void> {
   });
 }
 
-/**
- * Attach to one daemon: hydrate its sessions/schedules into the aggregator,
- * THEN open the SSE subscription. Order matters — hydrating after subscribe
- * would let snapshot data clobber events that arrived between subscribe and
- * the snapshot fetch.
- *
- * Idempotent: a second call for the same daemon while one is in flight is a
- * no-op; a call after attach finished re-hydrates (useful when a daemon
- * restarts and we want to refresh its slice of the cache).
- */
+async function replaceDaemonSessionSnapshot(
+  d: import('./dashboard/registry.js').DaemonInfo,
+): Promise<void> {
+  const response = await fetchDaemonIpc(d.ipcPort, '/api/sessions');
+  if (!response.ok) throw new Error(`session snapshot returned ${response.status}`);
+  const snapshot = await response.json() as {
+    projectionEpoch?: unknown;
+    cursor?: unknown;
+    readiness?: unknown;
+    rows?: unknown;
+  };
+  if (typeof snapshot.projectionEpoch !== 'string'
+      || !Number.isSafeInteger(snapshot.cursor)
+      || !Array.isArray(snapshot.rows)
+      || !snapshot.readiness
+      || typeof snapshot.readiness !== 'object') {
+    throw new Error('malformed Current session projection snapshot');
+  }
+  const rows = snapshot.rows.map((row: any) => (
+    d.botAvatarUrl ? { ...row, botAvatarUrl: d.botAvatarUrl } : row
+  ));
+  aggregator.replaceSessionSnapshot(d.larkAppId, {
+    projectionEpoch: snapshot.projectionEpoch,
+    cursor: snapshot.cursor as number,
+    readiness: snapshot.readiness as any,
+    rows,
+  });
+  for (const row of rows) sessionPresentation.schedule(d.larkAppId, row);
+}
+
+async function observeDaemonRuntimeStatus(
+  d: import('./dashboard/registry.js').DaemonInfo,
+): Promise<void> {
+  const response = await fetchDaemonIpc(d.ipcPort, '/api/runtime-status');
+  if (!response.ok) throw new Error(`runtime status returned ${response.status}`);
+  const body = await response.json() as { readiness?: unknown };
+  if (!body.readiness || typeof body.readiness !== 'object') {
+    throw new Error('malformed Current runtime status');
+  }
+  aggregator.observeRuntimeStatus(d.larkAppId, body.readiness as any);
+}
+
+/** Attach one daemon to its authoritative snapshot plus checked event tail. */
 async function attachDaemon(d: import('./dashboard/registry.js').DaemonInfo): Promise<void> {
   if (attaching.has(d.larkAppId)) return;
   attaching.add(d.larkAppId);
   try {
-    // 1. Hydrate snapshot (blocking — completes before we wire SSE)
+    try { await observeDaemonRuntimeStatus(d); } catch { /* snapshot below is authoritative */ }
     try {
-      const [sRes, schRes] = await Promise.all([
-        fetchDaemonIpc(d.ipcPort, '/api/sessions'),
-        fetchDaemonIpc(d.ipcPort, '/api/schedules'),
-      ]);
-      const s = await sRes.json() as { sessions: any[] };
+      const schRes = await fetchDaemonIpc(d.ipcPort, '/api/schedules');
       const sch = await schRes.json() as { schedules: any[] };
-      const rows = (s.sessions ?? []).map((row) => (
-        d.botAvatarUrl ? { ...row, botAvatarUrl: d.botAvatarUrl } : row
-      ));
-      aggregator.hydrateSessions(d.larkAppId, rows);
-      for (const row of rows) sessionPresentation.schedule(d.larkAppId, row);
+      await replaceDaemonSessionSnapshot(d);
       aggregator.hydrateSchedules(sch.schedules ?? []);
     } catch (e: any) {
       logger.warn(`[dashboard] hydrate ${d.larkAppId}: ${e.message ?? e}`);
+      try { await observeDaemonRuntimeStatus(d); } catch { /* retried by SSE reconnect */ }
     }
-    // 2. Open SSE subscription if not already (idempotent)
     if (!subs.has(d.larkAppId)) {
       subs.set(
         d.larkAppId,
-        subscribeDaemon(d, aggregator, e =>
-          logger.warn(`[aggregator] ${d.larkAppId}: ${e.message}`),
+        subscribeDaemon(d, aggregator, e => {
+          aggregator.markRuntimeStale(d.larkAppId);
+          logger.warn(`[aggregator] ${d.larkAppId}: ${e.message}`);
+        },
           (_url, init) => fetchDaemonIpc(d.ipcPort, '/api/events', init),
+          () => replaceDaemonSessionSnapshot(d),
         ),
       );
     }
@@ -1512,7 +1540,11 @@ function syncSubscriptions(): void {
   // intentionally retained — the user may still want to see the last-known
   // state of those sessions/schedules in the dashboard.
   for (const [id, off] of subs) {
-    if (!online.has(id)) { off(); subs.delete(id); }
+    if (!online.has(id)) {
+      off();
+      subs.delete(id);
+      aggregator.markRuntimeStale(id);
+    }
   }
 }
 
@@ -2748,11 +2780,11 @@ async function liveDashboardSummary(): Promise<ReturnType<typeof buildDashboardS
       throw new Error('daemon_snapshot_http_error');
     }
     const [sessionsBody, schedulesBody] = await Promise.all([
-      sessionsResponse.json() as Promise<{ sessions?: unknown }>,
+      sessionsResponse.json() as Promise<{ rows?: unknown }>,
       schedulesResponse.json() as Promise<{ schedules?: unknown }>,
     ]);
     return parseDashboardSummaryRows({
-      sessions: sessionsBody.sessions,
+      sessions: sessionsBody.rows,
       schedules: schedulesBody.schedules,
     });
   }));
@@ -4830,13 +4862,21 @@ const server = createServer(async (req, res) => {
         .map(b => ({ ...b, brand: brandByAppId.get(b.larkAppId) }))
         .sort((a, b) => a.botIndex - b.botIndex);
       const out = await Promise.all(onlineBots.map(async d => {
+        const withRuntimeReadiness = (payload: Record<string, unknown>) => ({
+          ...payload,
+          runtimeReadiness: aggregator.runtimeStatusOf(d.larkAppId) ?? {
+            contract: 'Current/v1',
+            state: 'restoring',
+            online: true,
+          },
+        });
         try {
           const r = await fetchDaemonIpc(d.ipcPort, '/api/bot-default-oncall');
           if (!r.ok) {
-            return botDefaultsPayload(d, undefined, `http_${r.status}`);
+            return withRuntimeReadiness(botDefaultsPayload(d, undefined, `http_${r.status}`));
           }
           const j = await r.json() as any;
-          return botDefaultsPayload({
+          return withRuntimeReadiness(botDefaultsPayload({
             ...d,
             botName: d.botName ?? j.botName,
             cliId: j.cliId || d.cliId,
@@ -4851,9 +4891,9 @@ const server = createServer(async (req, res) => {
               : d.cliPathOverride,
             wrapperCli: j.wrapperCli || d.wrapperCli,
             model: j.model || d.model,
-          }, j);
+          }, j));
         } catch (e: any) {
-          return botDefaultsPayload(d, undefined, e?.message ?? String(e));
+          return withRuntimeReadiness(botDefaultsPayload(d, undefined, e?.message ?? String(e)));
         }
       }));
       return jsonRes(res, 200, { bots: out });

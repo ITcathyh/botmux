@@ -126,6 +126,14 @@ describe('SessionRuntime coverage ledger', () => {
       .toThrow(/projection.*session_owned_persisted/i);
   });
 
+  it('pins migrated C3 to the reviewed projection/readiness production seams', () => {
+    const ledger = cloneLedger();
+    const projection = ledger.coverage.find((entry: any) => entry.id === 'projection');
+    projection.productionBinding.aggregatorSource = 'src/dashboard/registry.ts';
+    expect(() => auditSessionRuntimeCoverage({ ledger }))
+      .toThrow(/projection\.productionBinding\.aggregatorSource/);
+  });
+
   it('rejects a selector whose named production symbol disappeared', () => {
     const ledger = cloneLedger();
     const control = ledger.coverage.find((entry: any) => entry.id === 'control');

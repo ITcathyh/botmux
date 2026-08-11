@@ -78,7 +78,7 @@ import { readGlobalConfig } from '../global-config.js';
 import { normalizeChatReplyMode, setChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, getDaemonBootId, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isSuspendableBackendType } from './persistent-backend.js';
@@ -92,6 +92,8 @@ import { sessionConfiguredRuntimeDisplayName } from './cli-runtime-display.js';
 import { locateLimiter } from './dashboard-locate.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { dashboardEventBus } from './dashboard-events.js';
+import { currentDashboardProjectionProtocol } from './dashboard-projection.js';
+import { currentSessionRuntimeHost } from './current-session-runtime.js';
 import { validateWorkingDir } from './working-dir.js';
 import { isValidRoleChatId, resolveRole, resolveRoleFile, writeRoleFile, deleteRoleFile, readRoleInjectMode, writeRoleInjectMode, deleteRoleMeta, readRoleDispatchCompletionEnabled, writeRoleDispatchCompletionEnabled, type RoleInjectMode } from './role-resolver.js';
 import {
@@ -211,12 +213,6 @@ import {
   releaseDeviceIsolationActivation,
   type DeviceIsolationDaemonResult,
 } from './device-isolation-daemon.js';
-
-// Daemon process start (module load ≈ daemon boot). Used by the SSE snapshot
-// replay to bound the "recently closed" set to sessions that flipped
-// active→closed during THIS run — i.e. restore-time zombies — without replaying
-// the entire closed-session history on every connect.
-const PROCESS_START_MS = Date.now();
 
 export interface IpcServerHandle {
   port: number;
@@ -889,17 +885,27 @@ export { composeRowFromActive, composeRowFromClosed, composeRowFromPersistedActi
 // holder.
 export function setBotName(name: string): void { setRowsBotName(name); }
 
-function composeDashboardSessionRows(): SessionRow[] {
-  const active = listActiveSessions().map((ds) => composeRowFromActive(ds));
-  const activeIds = new Set(active.map(row => row.sessionId));
-  const persisted = sessionStore.listSessions();
-  const unregisteredActive = persisted
-    .filter(session => session.status === 'active' && !activeIds.has(session.sessionId))
-    .map(composeRowFromPersistedActive);
-  const closed = persisted
-    .filter(session => session.status === 'closed' && !activeIds.has(session.sessionId))
-    .map(composeRowFromClosed);
-  return [...active, ...unregisteredActive, ...closed];
+export async function readCurrentDashboardSessionSnapshot() {
+  if (!cachedLarkAppId) return currentDashboardProjectionProtocol.snapshot([]);
+  const activeSessions = getActiveSessionsRegistry();
+  if (!activeSessions) {
+    throw new Error('Current Session registry is not connected');
+  }
+  const host = currentSessionRuntimeHost({
+    ownerLarkAppId: cachedLarkAppId,
+    activeSessions,
+    ownerBootId: getDaemonBootId(),
+    keyedTriggerAdmissionBlocked: () => false,
+  });
+  const projected = await host.projection.read({ kind: 'dashboardSnapshot' });
+  if (projected.kind !== 'dashboardSnapshot') {
+    throw new Error(
+      projected.kind === 'notReady'
+        ? projected.message
+        : `Current dashboard projection returned ${projected.kind}`,
+    );
+  }
+  return projected.snapshot;
 }
 
 // The daemon's own larkAppId, primed at startup. Required for the groups
@@ -978,25 +984,37 @@ ipcRoute('POST', '/api/asks/answer', async (req, res) => {
   return jsonRes(res, 200, { ok: true, outcome });
 });
 
-ipcRoute('GET', '/api/sessions', (_req, res) => {
-  // Runtime active first, then persisted active rows that restore deliberately
-  // left detached, then closed history. Persisted-active must never be projected
-  // through composeRowFromClosed: teardown uncertainty is not a close.
-  jsonRes(res, 200, { sessions: composeDashboardSessionRows() });
-});
-
-ipcRoute('GET', '/api/sessions/:sessionId', (_req, res, params) => {
-  const ds = findActiveBySessionId(params.sessionId);
-  if (ds) return jsonRes(res, 200, { session: composeRowFromActive(ds) });
-  const persisted = sessionStore.listSessions().find(s => s.sessionId === params.sessionId);
-  if (persisted) {
-    return jsonRes(res, 200, {
-      session: persisted.status === 'active'
-        ? composeRowFromPersistedActive(persisted)
-        : composeRowFromClosed(persisted),
+ipcRoute('GET', '/api/sessions', async (_req, res) => {
+  try {
+    jsonRes(res, 200, await readCurrentDashboardSessionSnapshot());
+  } catch (error) {
+    jsonRes(res, 503, {
+      error: 'projection_not_ready',
+      message: error instanceof Error ? error.message : String(error),
     });
   }
-  jsonRes(res, 404, { error: 'not_found' });
+});
+
+ipcRoute('GET', '/api/runtime-status', (_req, res) => {
+  jsonRes(res, 200, {
+    ...currentDashboardProjectionProtocol.position(),
+    readiness: currentDashboardProjectionProtocol.status(),
+  });
+});
+
+ipcRoute('GET', '/api/sessions/:sessionId', async (_req, res, params) => {
+  try {
+    const snapshot = await readCurrentDashboardSessionSnapshot();
+    const row = snapshot.rows.find(candidate => candidate.sessionId === params.sessionId);
+    return row
+      ? jsonRes(res, 200, { session: row })
+      : jsonRes(res, 404, { error: 'not_found' });
+  } catch (error) {
+    return jsonRes(res, 503, {
+      error: 'projection_not_ready',
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
 });
 
 /** Low-frequency card-display read used by `botmux send`. Keeping the
@@ -1950,7 +1968,7 @@ ipcRoute('GET', '/api/sessions/:sessionId/insight/turn/:turnIndex', (req, res, p
 ipcRoute('GET', '/api/insights/summary', async (req, res) => {
   const url = new URL(req.url ?? '/', 'http://localhost');
   const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') ?? '200', 10) || 200, 1), 500);
-  const rows = composeDashboardSessionRows();
+  const rows = (await readCurrentDashboardSessionSnapshot()).rows;
   const overview = await buildSafeInsightOverview(rows.map(row => {
     const session = findSessionRecord(row.sessionId);
     return {
@@ -4772,61 +4790,16 @@ ipcRoute('GET', '/api/events', (_req, res) => {
   // Initial flush so the client sees the connection alive immediately.
   res.write('retry: 5000\n\n');
 
-  // Subscribe BEFORE snapshotting so no event published in the gap is missed.
   const off = dashboardEventBus.subscribe(ev => {
-    res.write(`event: ${ev.type}\ndata: ${JSON.stringify(ev.body)}\n\n`);
+    const body = 'sequence' in ev
+      ? {
+          ...ev.body,
+          projectionEpoch: ev.projectionEpoch,
+          sequence: ev.sequence,
+        }
+      : ev.body;
+    res.write(`event: ${ev.type}\ndata: ${JSON.stringify(body)}\n\n`);
   });
-
-  // Replay the current active sessions as `session.spawned` right after
-  // subscribing. `DashboardEventBus` has no buffer/replay, and the daemon
-  // publishes its discovery descriptor BEFORE restoreActiveSessions() runs
-  // (daemon.ts) — so a dashboard that hydrates (GET /api/sessions) during the
-  // descriptor→restore window gets an EMPTY snapshot, and any restore-time
-  // `announceSessionRow()` that fires before THIS subscription is established is
-  // dropped. Without this replay the aggregator would then have neither a
-  // snapshot row nor a spawned row, and later session.update/close patches would
-  // be discarded as unknown-row. Replaying here makes SSE attach deterministic:
-  // a row registered before subscribe arrives via this snapshot; one registered
-  // after arrives via the live subscription above. Idempotent — both the
-  // aggregator and the browser store upsert by sessionId, so any row also
-  // delivered live just refreshes the same entry.
-  try {
-    const activeIds = new Set<string>();
-    for (const ds of listActiveSessions()) {
-      activeIds.add(ds.session.sessionId);
-      res.write(`event: session.spawned\ndata: ${JSON.stringify({ session: composeRowFromActive(ds) })}\n\n`);
-    }
-    // Persisted active rows may be intentionally absent from the runtime Map
-    // after an inconclusive exact-backend teardown. Replay them as dormant
-    // upserts so SSE reconnects retain the same truthful state as GET
-    // /api/sessions and never synthesize a closed row.
-    for (const s of sessionStore.listSessions()) {
-      if (s.status !== 'active' || activeIds.has(s.sessionId)) continue;
-      res.write(`event: session.spawned\ndata: ${JSON.stringify({ session: composeRowFromPersistedActive(s) })}\n\n`);
-    }
-    // Also replay sessions CLOSED during this run as `session.spawned` carrying a
-    // closed row. The active-only replay above can't cover a restore-time zombie:
-    // restoreActiveSessions registers it, announces it, then immediately probes it
-    // 'missing' and closeSession()s it (evicting it from the active Map) — all
-    // before a racing dashboard's SSE subscription exists. By connect time it is
-    // neither in the active Map nor was it a closed row at the dashboard's early
-    // (pre-restore) hydrate, so without this it stays invisible (or, if the
-    // dashboard cached it active from before the restart, lingers as a stale
-    // active row — hydrateSessions only upserts, never deletes absent rows).
-    // Bounded to closedAt >= PROCESS_START_MS so we replay only this run's
-    // closures (the full closed history is already served by GET /api/sessions
-    // on hydrate). `session.spawned` (not session.update) because the row may be
-    // unknown to the client — both consumers upsert by sessionId, and the closed
-    // row's status:'closed' overwrites any stale active entry.
-    for (const s of sessionStore.listSessions()) {
-      if (s.status !== 'closed' || activeIds.has(s.sessionId)) continue;
-      const closedMs = s.closedAt ? Date.parse(s.closedAt) : NaN;
-      if (!Number.isFinite(closedMs) || closedMs < PROCESS_START_MS) continue;
-      res.write(`event: session.spawned\ndata: ${JSON.stringify({ session: composeRowFromClosed(s) })}\n\n`);
-    }
-  } catch (err) {
-    logger.warn(`[dashboard-ipc] /api/events snapshot replay failed: ${err}`);
-  }
 
   const hb = setInterval(() => {
     res.write(`event: heartbeat\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`);
@@ -4885,7 +4858,8 @@ export function startIpcServer(opts: {
           return jsonRes(res, 401, { ok: false, error: 'unauthorized', reason: auth.reason });
         }
       }
-      if (!publicRoute && opts.ready) await opts.ready;
+      const runtimeStatusProbe = method === 'GET' && url.pathname === '/api/runtime-status';
+      if (!publicRoute && opts.ready && !runtimeStatusProbe) await opts.ready;
       for (const r of routes) {
         if (r.method !== req.method) continue;
         const m = r.pattern.exec(url.pathname);
