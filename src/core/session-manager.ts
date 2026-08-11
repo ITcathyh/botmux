@@ -2272,6 +2272,7 @@ export async function restoreActiveSessions(
         && ds.session.cliId !== 'codex-app'
         && ds.session.queuedActivationInput;
       const outcome = await reconcileCurrentSessionActivation({
+        ownerBotId: getBot(ds.larkAppId).botId,
         ownerLarkAppId: ds.larkAppId,
         sessionId: ds.session.sessionId,
         requestIdentity: `restore:${ds.session.sessionId}`,
@@ -2353,6 +2354,7 @@ export async function ensureTerminalWorkerPort(ds: DaemonSession): Promise<numbe
     // the FIFO gate. Report unavailable (the terminal retries / 502s) instead of
     // blocking 10s for a port that will never arrive.
     const activation = await ensureCurrentSessionActivation({
+      ownerBotId: getBot(ds.larkAppId).botId,
       ownerLarkAppId: ds.larkAppId,
       sessionId: ds.session.sessionId,
       requestIdentity: `terminal:${ds.session.sessionId}`,

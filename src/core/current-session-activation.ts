@@ -2,6 +2,7 @@
 
 import { randomUUID } from 'node:crypto';
 import type { CliTurnPayload } from '../types.js';
+import { parseBotId, type BotId } from './bot-identity.js';
 import {
   createSessionActivationRuntime,
   type SessionActivationOutcome,
@@ -223,14 +224,32 @@ const hostsByRegistry = new WeakMap<
   Map<string, DaemonSession>,
   Map<string, ReturnType<typeof createSessionActivationRuntime>>
 >();
+const adapterBotIdsByRegistry = new WeakMap<
+  Map<string, DaemonSession>,
+  Map<string, BotId>
+>();
 const CURRENT_ACTIVATION_RUNTIME_EPOCH = randomUUID();
 
 function currentActivationRuntime(
+  ownerBotId: BotId | undefined,
   ownerLarkAppId: string,
   activeSessionsOverride?: Map<string, DaemonSession>,
 ) {
   const activeSessions = activeSessionsOverride ?? getActiveSessionsRegistry();
   if (!activeSessions) return undefined;
+  let stableOwnerBotId = ownerBotId;
+  if (!stableOwnerBotId) {
+    let byOwner = adapterBotIdsByRegistry.get(activeSessions);
+    if (!byOwner) {
+      byOwner = new Map();
+      adapterBotIdsByRegistry.set(activeSessions, byOwner);
+    }
+    stableOwnerBotId = byOwner.get(ownerLarkAppId);
+    if (!stableOwnerBotId) {
+      stableOwnerBotId = parseBotId(`bot_${randomUUID().replaceAll('-', '')}`);
+      byOwner.set(ownerLarkAppId, stableOwnerBotId);
+    }
+  }
   let byOwner = hostsByRegistry.get(activeSessions);
   if (!byOwner) {
     byOwner = new Map();
@@ -243,7 +262,7 @@ function currentActivationRuntime(
       commandLane: currentSessionCommandLane,
       laneAddress: sessionId => currentSessionLaneAddress(
         runtimeEpoch,
-        ownerLarkAppId,
+        stableOwnerBotId,
         sessionId,
       ),
       port: createCurrentSessionActivationPort({ ownerLarkAppId, activeSessions }),
@@ -254,6 +273,7 @@ function currentActivationRuntime(
 }
 
 export async function ensureCurrentSessionActivation(input: {
+  readonly ownerBotId?: BotId;
   readonly ownerLarkAppId: string;
   readonly sessionId: string;
   readonly requestIdentity: string;
@@ -263,7 +283,11 @@ export async function ensureCurrentSessionActivation(input: {
   /** Current composition/tests may provide the exact owner registry explicitly. */
   readonly activeSessions?: Map<string, DaemonSession>;
 }): Promise<SessionActivationOutcome> {
-  const runtime = currentActivationRuntime(input.ownerLarkAppId, input.activeSessions);
+  const runtime = currentActivationRuntime(
+    input.ownerBotId,
+    input.ownerLarkAppId,
+    input.activeSessions,
+  );
   if (!runtime) {
     return { kind: 'retryable', message: 'Current active Session registry is not ready' };
   }
@@ -282,6 +306,7 @@ export async function ensureCurrentSessionActivation(input: {
 }
 
 export async function reconcileCurrentSessionActivation(input: {
+  readonly ownerBotId?: BotId;
   readonly ownerLarkAppId: string;
   readonly sessionId: string;
   readonly requestIdentity: string;
@@ -290,7 +315,11 @@ export async function reconcileCurrentSessionActivation(input: {
   readonly resumeOrTurnId?: ForkResumeOrTurnId;
   readonly activeSessions?: Map<string, DaemonSession>;
 }): Promise<SessionActivationOutcome> {
-  const runtime = currentActivationRuntime(input.ownerLarkAppId, input.activeSessions);
+  const runtime = currentActivationRuntime(
+    input.ownerBotId,
+    input.ownerLarkAppId,
+    input.activeSessions,
+  );
   if (!runtime) {
     return { kind: 'retryable', message: 'Current active Session registry is not ready' };
   }
@@ -310,12 +339,13 @@ export async function reconcileCurrentSessionActivation(input: {
 }
 
 export async function retireCurrentSessionActivation(input: {
+  readonly ownerBotId?: BotId;
   readonly ownerLarkAppId: string;
   readonly sessionId: string;
   readonly requestIdentity: string;
   readonly reason: SessionRetirementReason;
 }): Promise<SessionRetirementOutcome> {
-  const runtime = currentActivationRuntime(input.ownerLarkAppId);
+  const runtime = currentActivationRuntime(input.ownerBotId, input.ownerLarkAppId);
   if (!runtime) {
     return { kind: 'retryable', message: 'Current active Session registry is not ready' };
   }

@@ -189,7 +189,7 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, getBotOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
+import { getBotBrand, getBot, getBotOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, requireBotId, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { normalizeKanbanColumn, normalizeKanbanPosition, normalizeSessionTitle } from './session-board.js';
 import { validateSlashInjection } from './slash-inject.js';
 import { validateRoleLibraryPath } from './role-library.js';
@@ -892,6 +892,7 @@ export async function readCurrentDashboardSessionSnapshot() {
     throw new Error('Current Session registry is not connected');
   }
   const host = currentSessionRuntimeHost({
+    ownerBotId: requireBotId(cachedLarkAppId),
     ownerLarkAppId: cachedLarkAppId,
     activeSessions,
     ownerBootId: getDaemonBootId(),
