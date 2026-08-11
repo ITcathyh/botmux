@@ -304,7 +304,7 @@ describe('triggerSessionTurn — idempotency dispatch (real stores)', () => {
       expect(idempotencyStore.lookup(APP, 'k-order')?.state).toBe('attempting');
       expect(asyncTriggerStore.lookup(ds.session.sessionId, forkArg.turnId)?.result.status).toBe('pending');
       expect(ds.asyncTriggerResults?.get(forkArg.turnId)?.status).toBe('pending');
-      expect(ds.idempotentAsyncTurn).toMatchObject({ key: 'k-order', triggerId: forkArg.turnId });
+      expect(ds.idempotentAsyncTurns?.get(forkArg.turnId)).toMatchObject({ key: 'k-order', kind: 'fresh' });
     };
 
     const result = await triggerSessionTurn(freshAsyncReq('k-order'), {
@@ -518,7 +518,7 @@ describe('triggerSessionTurn — idempotency dispatch (real stores)', () => {
   });
 
   // ── codex #776 round-6 finding #1: worker exits with NO final_output. The
-  //    dispatched turn stamps ds.idempotentAsyncTurn; the worker-exit handler
+  //    dispatched turn stamps ds.idempotentAsyncTurns; the worker-exit handler
   //    must converge it to a durable dispatch_unknown so a same-key retry AND
   //    trigger-result both resolve `failed`, never re-forking / polling forever.
   it('worker exit with no final_output → durable dispatch_unknown; retry + poll both failed, no 2nd fork', async () => {

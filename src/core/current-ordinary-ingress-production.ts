@@ -144,8 +144,9 @@ export interface CurrentOrdinaryIngressProductionOptions {
    * Synchronous per-turn stream-card rotation applied immediately before a
    * worker delivery attempt. `live` precedes an injection into a running
    * worker; `refork` precedes a fork replacing a dead/absent worker. Skipped
-   * for the opening fork of a freshly created Session, whose card state is
-   * still empty and whose title is owned by the opening record.
+   * only for an opening fork with NO existing card binding (a genuinely fresh
+   * Session, whose title is owned by the opening record) — an opening turn on
+   * an empty-started session that already POSTed a card still rotates.
    */
   readonly beginTurnCardRotation?: (
     current: DaemonSession,
@@ -720,7 +721,17 @@ export function createCurrentOrdinaryIngressProductionPort(
           },
         ): ProductionCommandResult => {
           const live = workerCommand.kind === 'sendWorkerInput';
-          if (options.beginTurnCardRotation && (live || command.input.opening !== true)) {
+          // The opening exemption is keyed on CARD state, not the opening flag
+          // alone: `opening` comes from the persisted initialUserTurnPending,
+          // which also covers empty-started sessions (repo picker / mid-session
+          // /repo switch) whose worker_ready already POSTed a real card. A cold
+          // refork of such a session must still park + rotate, or the new turn
+          // PATCHes the stale card and revives its stale image key. Only a
+          // genuinely card-less opening keeps its title/card slot owned by the
+          // opening record.
+          const openingWithoutCard = command.input.opening === true
+            && current.streamCardId === undefined;
+          if (options.beginTurnCardRotation && (live || !openingWithoutCard)) {
             options.beginTurnCardRotation(current, {
               title: command.input.turn.content,
               turnId: workerCommand.turnId,

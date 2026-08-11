@@ -1,4 +1,5 @@
 import * as sessionStore from '../services/session-store.js';
+import { computeInputHash } from '../utils/canonical-input-hash.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import * as idempotencyStore from '../services/idempotency-store.js';
 import * as groupsStore from '../services/groups-store.js';
@@ -965,6 +966,7 @@ async function triggerSessionTurnAdmitted(
       idempotencyKey,
     };
   }
+  const ownerBootId = getDaemonBootId();
   // ── Turn-level idempotency (follow-up async append; validator guarantees the
   // shape: target.sessionId set, asyncReturnSessionId, no wait/dryRun, and
   // mutually exclusive with the fresh-session idempotencyKey above) ──

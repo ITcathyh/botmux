@@ -3,7 +3,7 @@
   "purpose": "Target-A 可执行覆盖台账：由源码和 A0 authority inventory 证明已迁移边界与 remaining bypass，不声明 Target-B durability。",
   "authorityInventory": {
     "path": "docs/architecture/session-authority-inventory.json",
-    "sha256": "1a3fa7e561d51323365a00fb7ffc91b2ecc450cb3c9df48c2f224e5111927bde"
+    "sha256": "7d8ff6cc8c6a305f92d6880fac631b48ed74eafd9557c5877f96f3786363c004"
   },
   "coverage": [
     {
@@ -17,9 +17,9 @@
         }
       ],
       "authoritySites": {
-        "recordCount": 20,
-        "mutationCount": 20,
-        "digest": "d22d09b3c0a1389d80844f94982b1421ae67f1f1c8dfab12184acb53cc6aae2e"
+        "recordCount": 21,
+        "mutationCount": 21,
+        "digest": "07372dd51f43d9e1646c07a729799f65d8ffb942e10fc8c80f26c58ecdbb62ee"
       },
       "productionBinding": {
         "sourceFile": "src/core/trigger-session.ts",
@@ -299,9 +299,9 @@
         }
       ],
       "authoritySites": {
-        "recordCount": 124,
-        "mutationCount": 125,
-        "digest": "80c68a3dde8fe1890673090caf2669fad3acae458b3e0af4a9c007324b70bc0d"
+        "recordCount": 126,
+        "mutationCount": 128,
+        "digest": "da770479a68b23dfe281a39031801056c0922c197c74d159800a7644fbfd6873"
       }
     },
     {
@@ -365,7 +365,7 @@
       "authoritySites": {
         "recordCount": 62,
         "mutationCount": 62,
-        "digest": "3ebb4ed89c6efd6eb1a98a921d71cf6136281c717f7cddf81ba96c4bf077c1d9"
+        "digest": "9d083a11a000b4fa8827a282864b63ca1473ec17e3f88c19d4aa51bc70699e9c"
       },
       "productionBinding": {
         "workerSource": "src/core/worker-pool.ts",
@@ -605,9 +605,9 @@
         }
       ],
       "authoritySites": {
-        "recordCount": 660,
-        "mutationCount": 663,
-        "digest": "3d54fcfcd7d62465cfb04a318e6f651c026337dbfaa5d33fae90cfca8752e4d1"
+        "recordCount": 674,
+        "mutationCount": 677,
+        "digest": "574b806c3b1aac4f9c0ab5681aa15b89f835ad0c87997591265fa7e666e1df41"
       },
       "rawPublisherSelectors": [
         {

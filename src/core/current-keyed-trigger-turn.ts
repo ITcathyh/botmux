@@ -204,12 +204,12 @@ export function createCurrentKeyedTriggerTurnPort(options: {
         ds.workerGeneration ?? 0,
         ds.session.workerGeneration ?? 0,
       ) + 1;
-      ds.idempotentAsyncTurn = {
+      (ds.idempotentAsyncTurns ??= new Map()).set(prepared.triggerId, {
         ownerLarkAppId: options.ownerLarkAppId,
         key: context.key,
-        triggerId: prepared.triggerId,
+        kind: 'fresh',
         workerGeneration: dispatchedGeneration,
-      };
+      });
 
       const accepted = forkWorker(ds, promptInput, {
         turnId: prepared.triggerId,

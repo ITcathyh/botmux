@@ -349,7 +349,7 @@ class CurrentKeyedTriggerAuthority implements KeyedTriggerAuthority {
         this.ownerLarkAppId,
         'dispatch_unknown',
       );
-      return { kind: terminal };
+      return { kind: terminal === 'already_completed' ? 'completed' : 'failed' };
     } catch (error) {
       return {
         kind: 'unreadable',

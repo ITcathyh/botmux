@@ -155,11 +155,16 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 }));
 
 // Real durable writes are asserted through this seam by the unfenced-exit
-// async-pending regression; nothing else in this file touches the store.
-vi.mock('../src/services/async-trigger-store.js', () => ({
-  lookup: vi.fn(() => undefined),
-  recordFailedStrict: vi.fn(),
-}));
+// async-pending regression. Every other export stays real (the codex-app
+// recovery fence calls lookupStrict against the temp data dir).
+vi.mock('../src/services/async-trigger-store.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/services/async-trigger-store.js')>();
+  return {
+    ...actual,
+    lookup: vi.fn(() => undefined),
+    recordFailedStrict: vi.fn(() => 'written_failed' as const),
+  };
+});
 
 import { __testOnly_resetSessionLifecycleHooks } from '../src/services/session-lifecycle-hooks.js';
 import {
@@ -2374,14 +2379,15 @@ describe('session.start lifecycle integration', () => {
     // next daemon boot reconcile. Wires the REAL exit-convergence used by the
     // daemon callback; only the durable store behind it is a seam.
     const ds = makeDs();
-    ds.idempotentAsyncTurn = {
+    (ds.idempotentAsyncTurns ??= new Map()).set('trig-unfenced-1', {
       ownerLarkAppId: 'app_test',
       key: 'idem-key-1',
-      triggerId: 'trig-unfenced-1',
+      kind: 'fresh',
       workerGeneration: 1,
-    };
+    });
+    const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
-      sessionReply: vi.fn(async () => 'om_reply'),
+      sessionReply,
       getSessionWorkingDir: () => '/repo',
       getActiveCount: () => 1,
       closeSession: vi.fn(),
@@ -2397,6 +2403,8 @@ describe('session.start lifecycle integration', () => {
     vi.mocked(sessionStore.getSessionForOwnerStrict).mockReturnValue(
       structuredClone(makeDs().session),
     );
+    vi.mocked(dashboardEventBus.publish).mockClear();
+    sessionReply.mockClear();
 
     worker.emit('exit', 1, null);
     await Promise.resolve();
@@ -2408,7 +2416,16 @@ describe('session.start lifecycle integration', () => {
       'app_test',
       'dispatch_unknown',
     );
-    expect(ds.idempotentAsyncTurn).toBeUndefined();
+    expect(ds.idempotentAsyncTurns?.has('trig-unfenced-1')).toBe(false);
+    // Anchor the unfenced classification itself: had the fence been proven,
+    // publishExit would have fired. Startup-notice suppression is pinned via
+    // sessionReply (startupState.ready is false here, so an unfenced-notify
+    // regression would send the failure notice).
+    expect(ds.exitEventEmitted).not.toBe(true);
+    expect(dashboardEventBus.publish).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.exited',
+    }));
+    expect(sessionReply).not.toHaveBeenCalled();
   });
 
   it('delivers the exact-generation exit context VC receipt reconciliation requires on an unfenced worker exit', async () => {
@@ -2446,6 +2463,12 @@ describe('session.start lifecycle integration', () => {
       code: 143,
       signal: 'SIGTERM',
     });
+    // Anchor the unfenced classification: a proven fence would have published
+    // session.exited and stamped exitEventEmitted.
+    expect(ds.exitEventEmitted).not.toBe(true);
+    expect(dashboardEventBus.publish).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.exited',
+    }));
   });
 
   it('accepts a lost exit-fence response when strict owner readback proves publication', async () => {
