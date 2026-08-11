@@ -96,12 +96,29 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 
 /** Runtime shape guard for one persisted result. The strict lookup must not read
  *  a `null` / malformed / invalid-status entry as a usable terminal — nor fold it
- *  into "absent". Present-but-malformed → THROWS (fail-closed). */
+ *  into "absent". Present-but-malformed → THROWS (fail-closed).
+ *
+ *  Validates the STATUS-CONDITIONAL fields too (codex #818 strict-schema): a
+ *  `failed` result the store writes ALWAYS carries `reason:'dispatch_unknown'` +
+ *  `errorCode:'no_output'` (recordFailedStrict is the sole writer and hard-codes
+ *  both). A `failed` hit with a missing/other `reason` is therefore CORRUPT — and
+ *  must throw here rather than pass `status`/`createdAt` only, because a
+ *  downstream reader that gates on `reason==='dispatch_unknown'` (the recovery
+ *  fence) would otherwise silently treat it as "not the terminal I care about"
+ *  and fail-OPEN (replay the turn) instead of fail-closed. `completed` timestamp
+ *  fields are likewise type-checked when present. */
 function isValidPersistedResult(value: unknown): value is PersistedAsyncTriggerResult {
   if (!isPlainObject(value)) return false;
   const status = value.status;
   if (status !== 'pending' && status !== 'completed' && status !== 'failed') return false;
   if (typeof value.createdAt !== 'number') return false;
+  if (status === 'failed') {
+    // The only shape recordFailedStrict ever persists. Anything else is corrupt.
+    if (value.reason !== 'dispatch_unknown') return false;
+    if (value.errorCode !== 'no_output') return false;
+    if (typeof value.failedAt !== 'number') return false;
+  }
+  if (status === 'completed' && typeof value.completedAt !== 'number') return false;
   return true;
 }
 

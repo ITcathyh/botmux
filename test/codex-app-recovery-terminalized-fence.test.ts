@@ -290,4 +290,43 @@ describe('codex-app recovery fence — fail-closed on ambiguity (PR #818)', () =
     expect(updateSessionMock).not.toHaveBeenCalled();
     expect(session.session.codexAppDispatchLedger!.map(e => e.turnId)).toContain('turn-bad-result');
   });
+
+  it('a `failed` hit with a bad/absent `reason` → THROWS (discriminated validation; not silently un-retired and replayed)', () => {
+    // codex #818 strict-schema: recordFailedStrict is the SOLE writer of a `failed`
+    // result and always stamps reason:'dispatch_unknown' + errorCode:'no_output' +
+    // failedAt. A `failed` with any other/absent reason is corrupt. If the strict
+    // read only checked status/createdAt, this would pass, then the fence's
+    // `reason==='dispatch_unknown'` sub-gate would skip it → the accepted entry
+    // re-enters the recovery snapshot and REPLAYS (the original P1, reopened).
+    // Fail-closed: discriminated validation throws.
+    const term = accepted('turn-bad-reason');
+    const session = ds([term]);
+    writeRawAsyncTriggerFile(
+      JSON.stringify({
+        ownerLarkAppId: APP,
+        latestTriggerId: term.turnId,
+        results: { [term.turnId]: { status: 'failed', createdAt: 1, reason: 'not_dispatch_unknown', errorCode: 'no_output', failedAt: 2 } },
+      }),
+    );
+
+    expect(() => retireFence(session)).toThrow(/invalid shape|corrupt/i);
+    // Not retired, not persisted, not replayed — preserved for a later seam.
+    expect(updateSessionMock).not.toHaveBeenCalled();
+    expect(session.session.codexAppDispatchLedger!.map(e => e.turnId)).toContain('turn-bad-reason');
+  });
+
+  it('a `failed` hit MISSING failedAt → THROWS (all three failed-conditional fields required)', () => {
+    const term = accepted('turn-failed-no-failedat');
+    const session = ds([term]);
+    writeRawAsyncTriggerFile(
+      JSON.stringify({
+        ownerLarkAppId: APP,
+        latestTriggerId: term.turnId,
+        results: { [term.turnId]: { status: 'failed', createdAt: 1, reason: 'dispatch_unknown', errorCode: 'no_output' } },
+      }),
+    );
+
+    expect(() => retireFence(session)).toThrow(/invalid shape|corrupt/i);
+    expect(updateSessionMock).not.toHaveBeenCalled();
+  });
 });

@@ -5223,13 +5223,17 @@ function rollbackAcceptedCodexAppDispatch(
  *
  * Fence: for each `accepted` (NEVER `prepared`) ledger entry whose OWNER-MATCHED
  * async terminal is already `failed(dispatch_unknown)`, durably retire the entry
- * via cancelCodexAppDispatch (rejects if a prepared successor exists → left for
- * the generation fence) + persist. Idempotent and re-run at EVERY recovery seam,
- * so it also covers the window where the durable failed was written but a crash
- * hit before the exit-time retirement (the durable async truth is authoritative,
+ * via cancelCodexAppDispatch. The retirement is TRANSACTIONAL: if any candidate
+ * cannot be exact-cancelled (a prepared successor pins the FIFO, or the entry
+ * vanished), the whole batch is rolled back in-memory and the fence THROWS before
+ * any persist — never a partial retire, never a fork past a still-live
+ * terminalized `accepted`. Idempotent and re-run at EVERY recovery seam, so it
+ * also covers the window where the durable failed was written but a crash hit
+ * before the exit-time retirement (the durable async truth is authoritative,
  * re-checked here). A `prepared` entry is never cancelled without proof — the
- * runner may have crossed the write boundary; those stay on the existing
- * generation fence. Owner-scoped: only THIS bot's failed evidence counts, so a
+ * runner may have crossed the write boundary; the fence only ever targets
+ * `accepted`, and a prepared frame blocking an accepted retirement aborts the
+ * fork (above). Owner-scoped: only THIS bot's failed evidence counts, so a
  * foreign/unstamped async record never retires our accepted entry.
  *
  * FAIL-CLOSED (codex #818 recovery-seam round-2). At-most-once forbids replaying
@@ -6466,14 +6470,6 @@ export function forkWorker(
     if (migrated) sessionStore.updateSession(ds.session);
   }
 
-  // Snapshot the prior durable FIFO before accepting this fork's new prompt.
-  // A pure reattach receives the full snapshot; a refork carrying N+1 restores
-  // old N first and reserves N+1 through the normal worker write path.
-  // FIRST fence out any keyed turn already terminalized to a durable
-  // failed(dispatch_unknown): the turn-level idempotency lease (PR #818) leaves
-  // the shared session open, so without this the recovery path would replay an
-  // at-most-once turn the caller was already told failed (the ledger is the third
-  // replay channel `noReplay` does not reach). Idempotent + re-checked here.
   // Snapshot the prior durable FIFO before accepting this fork's new prompt.
   // A pure reattach receives the full snapshot; a refork carrying N+1 restores
   // old N first and reserves N+1 through the normal worker write path.
