@@ -128,7 +128,7 @@ export interface LarkCurrentOrdinaryIngressProductionOptions {
   readonly substituteReplyMode: 'thread' | 'quote';
   readonly beginTurnCardRotation?: (
     current: DaemonSession,
-    turn: { readonly title: string; readonly mode: 'live' | 'refork' },
+    turn: { readonly title: string; readonly turnId: string; readonly mode: 'live' | 'refork' },
   ) => void;
   readonly notifyPendingRepoStash?: (current: DaemonSession) => void;
 }

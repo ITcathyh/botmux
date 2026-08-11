@@ -662,8 +662,8 @@ function currentOrdinaryIngressPort(
       }
     },
     beginTurnCardRotation: (current, turn) => {
-      if (turn.mode === 'live') beginNewTurn(current, turn.title);
-      else beginReforkTurn(current, turn.title);
+      if (turn.mode === 'live') beginNewTurn(current, turn.title, turn.turnId);
+      else beginReforkTurn(current, turn.title, turn.turnId);
     },
     addReceivedReaction: async input => {
       // Resolve from the daemon-owned registry directly — the worker-pool
@@ -4868,7 +4868,7 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
  * 强制重 fork 后首个 screen_update POST 新卡，而不是 PATCH 上一轮的卡；丢弃
  * currentImageKey 避免旧截图在新轮卡片上复活。
  */
-function beginReforkTurn(ds: DaemonSession, title: string): void {
+function beginReforkTurn(ds: DaemonSession, title: string, turnId: string): void {
   if (ds.usageLimitRetryTimer) {
     clearTimeout(ds.usageLimitRetryTimer);
     ds.usageLimitRetryTimer = undefined;
@@ -4879,6 +4879,8 @@ function beginReforkTurn(ds: DaemonSession, title: string): void {
   ds.streamCardId = undefined;
   ds.streamCardNonce = undefined;
   ds.streamCardPending = true;
+  ds.streamCardPendingTurnId = turnId;
+  ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
   ds.currentImageKey = undefined;
   persistStreamCardState(ds);
 }
@@ -19306,7 +19308,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
 
       // Worker 挂起 / 已退出 —— resume 重 fork（与 ordinary refork 同路）。
       logger.info(`[${tag(ds)}] Worker not running for doc-comment, re-forking...`);
-      beginReforkTurn(ds, text);
+      beginReforkTurn(ds, text, turnId);
       // Skip whiteboard ensure for adopted (bridge) sessions on re-fork — mirrors
       // the live-worker branch above (if (!isBridge) ensure…).
       if (!ds.adoptedFrom) ensureSessionWhiteboard(ds);

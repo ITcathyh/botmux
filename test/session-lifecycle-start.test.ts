@@ -154,6 +154,13 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
   LoggerLevel: { info: 2 },
 }));
 
+// Real durable writes are asserted through this seam by the unfenced-exit
+// async-pending regression; nothing else in this file touches the store.
+vi.mock('../src/services/async-trigger-store.js', () => ({
+  lookup: vi.fn(() => undefined),
+  recordFailedStrict: vi.fn(),
+}));
+
 import { __testOnly_resetSessionLifecycleHooks } from '../src/services/session-lifecycle-hooks.js';
 import {
   __testOnly_resetOrdinaryImDeliveries,
@@ -169,6 +176,8 @@ import {
 } from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 import * as sessionStore from '../src/services/session-store.js';
+import * as asyncTriggerStore from '../src/services/async-trigger-store.js';
+import { convergeIdempotentAsyncTurnOnWorkerExit } from '../src/core/trigger-session.js';
 import { getBot } from '../src/bot-registry.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import { retireCodexAppDispatchAfterBackingMissing } from '../src/utils/codex-app-dispatch-ledger.js';
@@ -2317,7 +2326,7 @@ describe('session.start lifecycle integration', () => {
     expect(emitHookEventMock).not.toHaveBeenCalledWith('session.exit', expect.anything());
   });
 
-  it('quarantines current exit effects when the generation fence is proven unpublished', async () => {
+  it('still reconciles the exact generation via onWorkerExit when the fence is proven unpublished, suppressing only durable projections', async () => {
     const onWorkerExit = vi.fn();
     initWorkerPool({
       sessionReply: vi.fn(async () => 'om_reply'),
@@ -2335,17 +2344,108 @@ describe('session.start lifecycle integration', () => {
     });
     vi.mocked(sessionStore.getSessionForOwnerStrict).mockReturnValue(persistedBeforeExit);
     vi.mocked(dashboardEventBus.publish).mockClear();
+    emitHookEventMock.mockClear();
 
     worker.emit('exit', 1, null);
     await Promise.resolve();
 
     expect(ds.worker).toBeNull();
     expect(ds.session.workerGeneration).toBe(2);
-    expect(onWorkerExit).not.toHaveBeenCalled();
+    // The unproven fence quarantines only the projections that REQUIRE a
+    // durable fence (session.exited / lifecycle hook). The exact-generation
+    // onWorkerExit convergence still runs: keyed async dispatch_unknown and
+    // VC receipt reconciliation hang exclusively off this callback.
+    expect(onWorkerExit).toHaveBeenCalledTimes(1);
+    expect(onWorkerExit).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: ds.session.sessionId,
+      workerGeneration: 1,
+    }));
     expect(ds.exitEventEmitted).not.toBe(true);
     expect(dashboardEventBus.publish).not.toHaveBeenCalledWith(expect.objectContaining({
       type: 'session.exited',
     }));
+    expect(emitHookEventMock).not.toHaveBeenCalledWith('session.exit', expect.anything());
+  });
+
+  it('converges a pending keyed async turn to durable dispatch_unknown on an unfenced worker exit', async () => {
+    // Regression (review blocker): before the fix, an unprovable fence write
+    // skipped onWorkerExit entirely, so an incomplete keyed async turn kept
+    // polling `running` and a same-key retry reused the dead session until the
+    // next daemon boot reconcile. Wires the REAL exit-convergence used by the
+    // daemon callback; only the durable store behind it is a seam.
+    const ds = makeDs();
+    ds.idempotentAsyncTurn = {
+      ownerLarkAppId: 'app_test',
+      key: 'idem-key-1',
+      triggerId: 'trig-unfenced-1',
+      workerGeneration: 1,
+    };
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onWorkerExit: context => {
+        convergeIdempotentAsyncTurnOnWorkerExit(ds, context.workerGeneration);
+      },
+    });
+    forkWorker(ds, 'first', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    vi.mocked(sessionStore.updateSession).mockImplementationOnce(() => {
+      throw new Error('fence write lost');
+    });
+    vi.mocked(sessionStore.getSessionForOwnerStrict).mockReturnValue(
+      structuredClone(makeDs().session),
+    );
+
+    worker.emit('exit', 1, null);
+    await Promise.resolve();
+
+    expect(asyncTriggerStore.recordFailedStrict).toHaveBeenCalledWith(
+      ds.session.sessionId,
+      'trig-unfenced-1',
+      expect.any(Number),
+      'app_test',
+      'dispatch_unknown',
+    );
+    expect(ds.idempotentAsyncTurn).toBeUndefined();
+  });
+
+  it('delivers the exact-generation exit context VC receipt reconciliation requires on an unfenced worker exit', async () => {
+    // Regression (review blocker): VC receipts move dispatched→ambiguous and
+    // arm lease recovery inside the daemon's onWorkerExit, keyed strictly by
+    // {sessionId, workerGeneration}. Suppressing the callback on an unproven
+    // fence left receipts waiting on the 15-minute watchdog or a daemon
+    // restart. The context must carry the DYING generation (1), not the fenced
+    // replacement (2), or the exact-generation receipt match silently no-ops.
+    const onWorkerExit = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onWorkerExit,
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'first', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    vi.mocked(sessionStore.updateSession).mockImplementationOnce(() => {
+      throw new Error('fence write lost');
+    });
+    vi.mocked(sessionStore.getSessionForOwnerStrict).mockReturnValue(
+      structuredClone(makeDs().session),
+    );
+
+    worker.emit('exit', 143, 'SIGTERM');
+    await Promise.resolve();
+
+    expect(onWorkerExit).toHaveBeenCalledTimes(1);
+    expect(onWorkerExit).toHaveBeenCalledWith({
+      sessionId: ds.session.sessionId,
+      workerGeneration: 1,
+      code: 143,
+      signal: 'SIGTERM',
+    });
   });
 
   it('accepts a lost exit-fence response when strict owner readback proves publication', async () => {

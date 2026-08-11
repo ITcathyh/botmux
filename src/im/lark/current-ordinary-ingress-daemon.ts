@@ -55,7 +55,7 @@ export interface CurrentOrdinaryIngressDaemonOptions {
    */
   readonly beginTurnCardRotation: (
     current: DaemonSession,
-    turn: { readonly title: string; readonly mode: 'live' | 'refork' },
+    turn: { readonly title: string; readonly turnId: string; readonly mode: 'live' | 'refork' },
   ) => void;
   /** Best-effort ✋ on the accepted turn; `null` when gating skipped it. */
   readonly addReceivedReaction: (

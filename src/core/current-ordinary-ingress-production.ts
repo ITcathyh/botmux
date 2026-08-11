@@ -149,7 +149,7 @@ export interface CurrentOrdinaryIngressProductionOptions {
    */
   readonly beginTurnCardRotation?: (
     current: DaemonSession,
-    turn: { readonly title: string; readonly mode: 'live' | 'refork' },
+    turn: { readonly title: string; readonly turnId: string; readonly mode: 'live' | 'refork' },
   ) => void;
   /**
    * Fire-and-forget stash notice after a follower turn was parked behind an
@@ -723,6 +723,7 @@ export function createCurrentOrdinaryIngressProductionPort(
           if (options.beginTurnCardRotation && (live || command.input.opening !== true)) {
             options.beginTurnCardRotation(current, {
               title: command.input.turn.content,
+              turnId: workerCommand.turnId,
               mode: live ? 'live' : 'refork',
             });
           }

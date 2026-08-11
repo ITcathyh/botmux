@@ -9870,6 +9870,7 @@ function setupWorkerHandlers(
         return Object.freeze({
           exitReport,
           currentExit,
+          currentExitUnfenced,
           retiringExit,
           transferRetirement,
           notifyStartup,
@@ -9887,7 +9888,16 @@ function setupWorkerHandlers(
         const reason = tr('worker.start_exited_early', { code: code ?? 'null' }, loc);
         void notifyStartupFailure(reason, startupState.initTurnId, startupState.initDispatchAttempt);
       }
-      if (!plan.transferRetirement && plan.currentExit) {
+      // An unprovable fence write (`currentExitUnfenced`) suppresses only the
+      // projections that REQUIRE a durable fence (session.exited / lifecycle
+      // hook / startup notice); the exact-generation onWorkerExit convergence
+      // must still run: it writes the keyed async turn's durable
+      // dispatch_unknown (or trigger-result polls `running` and a same-key
+      // retry reuses the dead session until the next boot reconcile) and moves
+      // VC receipts dispatched→ambiguous + arms lease recovery (or delivery
+      // waits on the 15-minute watchdog). Both consumers are idempotent and
+      // generation-gated, so an unproven fence cannot corrupt the replacement.
+      if (!plan.transferRetirement && (plan.currentExit || plan.currentExitUnfenced)) {
         try {
           const notified = cb.onWorkerExit?.({
             sessionId: exitReport.sessionId,
