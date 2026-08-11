@@ -24,6 +24,36 @@ Botmux 的 Session 天然具备 Virtual Actor 的全部特征：稳定逻辑身�
 本步明确**不做**：不改变 durability 承诺（所有 outcome 标注 `processLocal`）、不引入 SQLite、
 不迁移 C2/C4 调用方、不分配独立 BotId（I1）。
 
+### 1.1 第一步 baseline 锁定（2026-08-11）
+
+本节是第二步分支的可复现起点，也是第一步口径冲突的最终解释。第二步必须从**包含本节的提交**
+切出。未跟踪的长篇提案继续承载 Target 推导、contract、AC/FI，PR 草稿只承载交付文案；两者都
+不是第一步事实或分支基线。
+
+- upstream base：`abe84a62777991f4a9423f445c02c92a16a5e4fc`；第一步实现锚点：
+  `f4a1f7cd57d1fcc81b0a93ede33a8ce938241eba`。重放后的 15 个 feature patch 经 `range-diff`
+  全部为 `=`，没有因 rebase 改写第一步语义。
+- authority inventory：23 个 authority、1,393 条记录、1,401 个 mutation，文件 SHA-256 为
+  `7d8ff6cc8c6a305f92d6880fac631b48ed74eafd9557c5877f96f3786363c004`。
+- runtime coverage：已迁移 A1 keyed-trigger 21、C1 ordinary 93、A2 executor 62 个 mutation；
+  第二步候选仍为 C2 128、C3 12、C4 33、A4 343，另有 retained 32 与
+  `remaining-bypass` 677（合计 1,401）；I1 是独立 identity gate，不计入 mutation partition。
+  coverage 文件 SHA-256 为
+  `8dc3371be0f15f023298f34de0ee52474244496d79c7c6a178f1acf03ea493fb`。
+
+“保持 Current persistence”锁定的是 **authority、ACK 与 durability contract**，不是禁止为行为等价
+而扩展 Current schema。第一步只允许以下两个已落地、受 A0 台账覆盖的窄扩展：
+
+1. `PendingRepoSetup.cliInput`：在既有 pending-repo/activation path-specific authority 内保存精确
+   opening payload，确保暂存后仍投递同一个 C1 输入；它不是通用 mailbox。
+2. `Session.lastInboundPreview`：供 Dashboard 重建消息预览的 presentation evidence；它不参与
+   admission、lifecycle 或 executor truth。
+
+两者都不创建新 authority，不改变 transport ACK 时点，不新增 replay/crash-durability 承诺，也不
+授权第二步继续把任意字段塞进 Current row。本节的 Stage-1 snapshot 保持历史不变；第二步迁移导致
+machine ledger/digest 变化时必须同步台账并重跑审计与合同测试，完成后新增独立的 Stage-2 baseline，
+不得回写本节来伪装第一步从未变化；只有证明本节对第一步事实记录有误时才更正并留下显式说明。
+
 ## 2. 对实现有直接约束的设计原则
 
 1. **引入 Virtual Actor 语义，不引入 Actor 平台**。Session 是唯一核心 Actor；不因某模块有后台行为就把它也建模成 Actor。
@@ -31,7 +61,8 @@ Botmux 的 Session 天然具备 Virtual Actor 的全部特征：稳定逻辑身�
 3. **未知状态不是失败，也不是不存在**。ownership、backend、effect 不确定时进入 `ambiguous/quarantined`，禁止抢占和盲重放；不能用 `false`/throw 抹平 provider outcome unknown。
 4. **Projection 不拥有 lifecycle truth**。Dashboard/IM 卡片可以延迟、重复或重建；worker/heartbeat 消失不写 `closed`。
 5. **mutation 与 query 各穿过一个深 Interface**。调用方只依赖 `SessionRuntime`/`SessionProjection`；store、lane、activation、代际、backend probe 都是内部实现。
-6. **Actor Core 与 durable store 分层验收**。本步保持 Current（JSON store）的持久化语义等价，不冒充 crash-durable。
+6. **Actor Core 与 durable store 分层验收**。本步保持 Current authority topology、ACK point 与
+   durability guarantee，只允许 §1.1 的 scoped evidence 白名单，不冒充 crash-durable。
 
 ## 3. 模块结构与代码映射
 
@@ -63,7 +94,8 @@ Botmux 的 Session 天然具备 Virtual Actor 的全部特征：稳定逻辑身�
   推导比对，未分类或漂移即失败（`--update` 后需人工分类）。
 - `docs/architecture/session-runtime-coverage.json`：Target-A 可执行覆盖台账。按 coverage 条目
   钉住已迁移边界的写点 digest 与 production binding（含 forbidden-calls 扫描），`remaining-bypass`
-  条目如实列出尚未迁移的直写点（本 commit 时点 663，作为 C2/C3/C4/A4 的工作清单而非隐藏债务）。
+  条目如实列出尚未归入具体 milestone 的 Target-A shared/direct-writer remainder（本 baseline 为
+  674 条记录 / 677 个 mutation）；C2/C3/C4/A4 各自另有独立 bucket，不能与它重复计数。
   `pnpm audit:session-runtime` 构建期校验。
 - 两份台账均有变异测试防腐化（oracle 测试篡改源码后断言审计必须报警）。
 
@@ -136,8 +168,9 @@ daemon 拥有的投递点副作用改为显式注入点（`beginTurnCardRotation
 - 流式卡按轮轮转：live 注入前 `beginNewTurn`（含按 turn 受理即创建状态卡）、worker-null refork 前
   park 旧卡并强制新卡 POST（`beginReforkTurn`）；opening 首开跳过；
 - card-off 会话 ✋→✅ 受理 reaction（metadata 模块 `receivedReaction` evidence 契约）；
-- dashboard SSE 增量（activity / lastInputFromBot / 消息预览，纯投影不触 store）与 pendingRepo
-  暂存提示、选仓完成后的 attention patch 清除；
+- dashboard SSE 的 activity / lastInputFromBot 是 process-local projection；消息预览另以白名单内的
+  `lastInboundPreview` presentation evidence 持久化。二者都不拥有 lifecycle truth；
+- pendingRepo 暂存提示、选仓完成后的 attention patch 清除；
 - opening 话题历史 hint 双 lane（包装 prompt + codex-app sidecar）。
 
 ### 5.3 失败面显式化
