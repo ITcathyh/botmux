@@ -82,6 +82,10 @@ import { beginReplyTargetTurn } from './reply-target.js';
 import { readDeferredTopicBinding, removeDeferredTopicBinding } from './deferred-topic-binding.js';
 import { escapeXmlTagLikeTokens } from '../utils/xml.js';
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
+import {
+  ensureCurrentSessionActivation,
+  reconcileCurrentSessionActivation,
+} from './current-session-activation.js';
 
 export { getAttachmentsDir } from './attachment-path.js';
 
@@ -1526,7 +1530,7 @@ const RECOVERY_FORK_DELAY_MS = config.daemon.recoveryForkDelayMs ?? 250;
  */
 export async function staggeredRecoveryFork(
   sessions: readonly DaemonSession[],
-  fork: (ds: DaemonSession) => void,
+  fork: (ds: DaemonSession) => void | Promise<void>,
   batchSize: number = RECOVERY_FORK_BATCH_SIZE,
   delayMs: number = RECOVERY_FORK_DELAY_MS,
   stillOwned: (ds: DaemonSession) => boolean = ds => ds.session.status === 'active',
@@ -1537,7 +1541,7 @@ export async function staggeredRecoveryFork(
     // exact object while we sleep. Never resurrect a closed or orphaned ds.
     if (ds.worker || ds.session.status !== 'active' || !stillOwned(ds)) continue;
     try {
-      fork(ds);
+      await fork(ds);
     } catch (err) {
       // One malformed/stale pane or synchronous init-IPC failure must not
       // abort recovery for every later durable owner. forkWorker compensates
@@ -2099,6 +2103,7 @@ export async function restoreActiveSessions(
   // actual re-fork is deferred into `toReattach` and staggered below so a box
   // with dozens of surviving sessions doesn't spike on restart.
   const toReattach: DaemonSession[] = [];
+  const restoreObservation = new Map<DaemonSession, SessionProbe>();
   const restoreCandidates: Array<{
     ds: DaemonSession;
     backendType: PersistentBackendType;
@@ -2126,6 +2131,7 @@ export async function restoreActiveSessions(
       if (hasProtectedSessionMutationOwnership(ds)) {
         logger.warn(`[${ds.session.sessionId.substring(0, 8)}] non-persistent backend has durable activation ownership — scheduling eager recovery`);
         toReattach.push(ds);
+        restoreObservation.set(ds, 'missing');
       }
       continue;
     }
@@ -2167,6 +2173,7 @@ export async function restoreActiveSessions(
       if (ds.session.queuedActivationPending) {
         logger.warn(`[${tag}] ${backendType} backing is missing with a tokened activation — scheduling fresh exact recovery`);
         toReattach.push(ds);
+        restoreObservation.set(ds, 'missing');
         continue;
       }
       // A missing pane is not disposable session metadata when a backend-neutral
@@ -2175,6 +2182,7 @@ export async function restoreActiveSessions(
       if (hasProtectedSessionMutationOwnership(ds)) {
         logger.warn(`[${tag}] ${backendType} backing is missing with durable activation ownership — scheduling fresh resume recovery`);
         toReattach.push(ds);
+        restoreObservation.set(ds, 'missing');
         continue;
       }
       // A missing backing pane is NEVER an auto-close trigger for a managed
@@ -2217,8 +2225,7 @@ export async function restoreActiveSessions(
       // let it re-attach on the next message, exactly like the old behaviour.
       const tag = ds.session.sessionId.substring(0, 8);
       if (hasProtectedSessionMutationOwnership(ds)) {
-        logger.warn(`[${tag}] ${backendType} probe inconclusive with unsettled Codex App ownership — scheduling bounded eager recovery`);
-        toReattach.push(ds);
+        logger.warn(`[${tag}] ${backendType} probe inconclusive with unsettled activation ownership — quarantining instead of treating unknown as missing`);
         continue;
       }
       logger.warn(`[${tag}] ${backendType} backing session "${backendName}" probe inconclusive — keeping active session for lazy recovery`);
@@ -2244,13 +2251,14 @@ export async function restoreActiveSessions(
     const tag = ds.session.sessionId.substring(0, 8);
     logger.info(`[${tag}] ${backendType} session alive, queued for re-attach`);
     toReattach.push(ds);
+    restoreObservation.set(ds, 'exists');
   }
 
   // Staggered re-fork (see staggeredRecoveryFork): empty prompt = re-attach
   // only, no new turn — same as the old per-session eager fork.
   await staggeredRecoveryFork(
     toReattach,
-    (ds) => {
+    async (ds) => {
       // A quarantined tail-only owner (restore promotion failed transiently) is
       // handled by the CENTRAL guard inside forkWorker: this blank fork retries
       // the old head's promotion first and, if it still fails, refuses to fork
@@ -2263,17 +2271,31 @@ export async function restoreActiveSessions(
       const recoverExactNonCodex = ds.session.queuedActivationPending
         && ds.session.cliId !== 'codex-app'
         && ds.session.queuedActivationInput;
-      forkWorker(
-        ds,
-        recoverExactNonCodex || '',
-        recoverExactNonCodex
+      const outcome = await reconcileCurrentSessionActivation({
+        ownerLarkAppId: ds.larkAppId,
+        sessionId: ds.session.sessionId,
+        requestIdentity: `restore:${ds.session.sessionId}`,
+        observation: restoreObservation.get(ds) ?? 'missing',
+        promptInput: recoverExactNonCodex || '',
+        resumeOrTurnId: recoverExactNonCodex
           ? {
               resume: ds.session.queuedActivationResume ?? ds.hasHistory,
               turnId: ds.session.queuedActivationTurnId,
               dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
             }
           : true,
-      );
+        activeSessions,
+      });
+      if (outcome.kind === 'quarantined'
+          || outcome.kind === 'ambiguous'
+          || outcome.kind === 'retryable'
+          || outcome.kind === 'rejected'
+          || outcome.kind === 'stale') {
+        logger.warn(
+          `[${ds.session.sessionId.substring(0, 8)}] Current restore activation settled ${outcome.kind}: `
+          + `${'message' in outcome ? outcome.message : 'activation was not accepted'}`,
+        );
+      }
     },
     RECOVERY_FORK_BATCH_SIZE,
     RECOVERY_FORK_DELAY_MS,
@@ -2330,7 +2352,16 @@ export async function ensureTerminalWorkerPort(ds: DaemonSession): Promise<numbe
     // still fails — waking a blank worker beside an unpromoted tail would wedge
     // the FIFO gate. Report unavailable (the terminal retries / 502s) instead of
     // blocking 10s for a port that will never arrive.
-    if (!forkWorker(ds, '', true)) {
+    const activation = await ensureCurrentSessionActivation({
+      ownerLarkAppId: ds.larkAppId,
+      sessionId: ds.session.sessionId,
+      requestIdentity: `terminal:${ds.session.sessionId}`,
+      cause: 'terminal',
+      promptInput: '',
+      resumeOrTurnId: true,
+    });
+    if (activation.kind !== 'active'
+        && !(activation.kind === 'duplicate' && activation.outcome.kind === 'active')) {
       logger.warn(`[${ds.session.sessionId.substring(0, 8)}] terminal wake refused (quarantined tail-only owner); serving unavailable`);
       return undefined;
     }
