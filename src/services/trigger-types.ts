@@ -250,6 +250,16 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
   if (options.reasoningEffort !== undefined && !['low', 'medium', 'high', 'xhigh'].includes(options.reasoningEffort as string)) {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.reasoningEffort must be one of low|medium|high|xhigh' } };
   }
+  // Mutual exclusion FIRST, before either key's scope-lock: the two keys have
+  // different scopes (fresh-session vs follow-up) with opposite target shapes, so
+  // whichever scope check ran first would otherwise mask the "both present" case
+  // with its own scope message (e.g. a request carrying BOTH + target.sessionId
+  // trips idempotencyKey's no-sessionId scope-lock before reaching this check).
+  // Hoisting it makes the precise mutual-exclusion 400 always reachable when both
+  // are supplied, regardless of target shape (riff #818 canary validation).
+  if (options.idempotencyKey !== undefined && options.turnIdempotencyKey !== undefined) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.turnIdempotencyKey and options.idempotencyKey are mutually exclusive' } };
+  }
   if (options.idempotencyKey !== undefined) {
     if (typeof options.idempotencyKey !== 'string' || options.idempotencyKey.trim().length === 0 || options.idempotencyKey.length > 200) {
       return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.idempotencyKey must be a non-empty string (<=200 chars)' } };
@@ -284,13 +294,7 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
     if (typeof options.turnIdempotencyKey !== 'string' || options.turnIdempotencyKey.trim().length === 0 || options.turnIdempotencyKey.length > 200) {
       return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.turnIdempotencyKey must be a non-empty string (<=200 chars)' } };
     }
-    // Mutually exclusive with the fresh-session `idempotencyKey`: the two key
-    // spaces have different scopes (per-bot fresh dispatch vs per-session turn)
-    // and different validity gates. Allowing both would be ambiguous about which
-    // lease governs the dispatch, so reject up-front rather than pick one.
-    if (options.idempotencyKey !== undefined) {
-      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.turnIdempotencyKey and options.idempotencyKey are mutually exclusive' } };
-    }
+    // (Mutual exclusion with idempotencyKey is checked up-front, above.)
     // Scope lock (follow-up turn only): the turn-level lease is implemented solely
     // on the existing-session async-return append seam. It REQUIRES target.sessionId
     // (that is the session whose turn is keyed) and asyncReturnSessionId, and must

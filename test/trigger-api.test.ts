@@ -228,7 +228,21 @@ describe('trigger request contract', () => {
     req.options = { asyncReturnSessionId: true, turnIdempotencyKey: 'tk', idempotencyKey: 'k' } as any;
     const v = validateTriggerRequest(req);
     expect(v.ok).toBe(false);
-    if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
+    if (!v.ok) {
+      expect(v.body.errorCode).toBe('bad_request');
+      // The PRECISE mutual-exclusion message must be reachable even WITH sessionId
+      // present — the check is hoisted above idempotencyKey's fresh-scope-lock so
+      // the latter can't mask it (riff #818 canary validation).
+      expect(v.body.error).toContain('mutually exclusive');
+    }
+    // Also holds with NO sessionId (idempotencyKey's shape is fine there, so only
+    // the mutual-exclusion check can reject).
+    const req2 = request();
+    req2.target = { kind: 'turn', botId: 'app1' };
+    req2.options = { asyncReturnSessionId: true, turnIdempotencyKey: 'tk', idempotencyKey: 'k' } as any;
+    const v2 = validateTriggerRequest(req2);
+    expect(v2.ok).toBe(false);
+    if (!v2.ok) expect(v2.body.error).toContain('mutually exclusive');
   });
 
   it('rejects turnIdempotencyKey WITHOUT target.sessionId (follow-up scope requires an existing session)', () => {
