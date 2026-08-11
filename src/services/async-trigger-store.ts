@@ -85,12 +85,36 @@ function load(sessionId: string): AsyncTriggerFile {
   }
 }
 
+/** True for a real plain object (rejects arrays and null — both pass a bare
+ *  `typeof x === 'object'`). Used by the strict loader/lookup so a JSON file that
+ *  is syntactically valid but structurally wrong (`results: []`, a non-object
+ *  result) is treated as CORRUPT and throws, rather than silently read as
+ *  "no such trigger" and driving a fail-open action (codex #818 strict-shape). */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Runtime shape guard for one persisted result. The strict lookup must not read
+ *  a `null` / malformed / invalid-status entry as a usable terminal — nor fold it
+ *  into "absent". Present-but-malformed → THROWS (fail-closed). */
+function isValidPersistedResult(value: unknown): value is PersistedAsyncTriggerResult {
+  if (!isPlainObject(value)) return false;
+  const status = value.status;
+  if (status !== 'pending' && status !== 'completed' && status !== 'failed') return false;
+  if (typeof value.createdAt !== 'number') return false;
+  return true;
+}
+
 /** STRICT loader for the authoritative failed-evidence RMW: ONLY a genuinely
  *  absent file (ENOENT) is treated as empty. A present-but-unreadable file
  *  (EIO/EACCES), corrupt JSON, or invalid shape THROWS — the soft `load()` would
  *  fold these into `{results:{}}`, and recordFailedStrict would then durably
  *  OVERWRITE a file that might hold a `completed` proof or another owner's data
- *  (finding: strict write over a soft read defeats completed-wins/owner-proof). */
+ *  (finding: strict write over a soft read defeats completed-wins/owner-proof).
+ *  Shape check is strict about PLAIN objects: `results: []` (an array — also
+ *  `typeof === 'object'`) or a non-string owner/latest is corrupt, not empty
+ *  (codex #818 strict-shape: an array `results` slipped through the bare
+ *  `typeof` gate and was misread as "no trigger"). */
 function loadStrict(sessionId: string): AsyncTriggerFile {
   const fp = getFilePath(sessionId);
   try { readFileSync(fp, 'utf-8'); }
@@ -99,8 +123,14 @@ function loadStrict(sessionId: string): AsyncTriggerFile {
     throw err; // EIO/EACCES/… — do NOT treat as empty
   }
   const data = JSON.parse(readFileSync(fp, 'utf-8')) as AsyncTriggerFile; // corrupt → throw
-  if (!data || typeof data !== 'object' || typeof data.results !== 'object') {
+  if (!isPlainObject(data) || !isPlainObject(data.results)) {
     throw new Error(`corrupt async-trigger file (invalid shape): ${fp}`);
+  }
+  if (data.ownerLarkAppId !== undefined && typeof data.ownerLarkAppId !== 'string') {
+    throw new Error(`corrupt async-trigger file (invalid ownerLarkAppId): ${fp}`);
+  }
+  if (data.latestTriggerId !== undefined && typeof data.latestTriggerId !== 'string') {
+    throw new Error(`corrupt async-trigger file (invalid latestTriggerId): ${fp}`);
   }
   return { ownerLarkAppId: data.ownerLarkAppId, latestTriggerId: data.latestTriggerId, results: data.results ?? {} };
 }
@@ -257,11 +287,16 @@ export function lookupStrict(sessionId: string, triggerId?: string): {
   result: PersistedAsyncTriggerResult;
   ownerLarkAppId?: string;
 } | undefined {
-  const file = loadStrict(sessionId); // ENOENT → empty; present-but-unreadable/corrupt → throws
+  const file = loadStrict(sessionId); // ENOENT → empty; present-but-unreadable/corrupt/bad-shape → throws
   const resolved = triggerId || file.latestTriggerId;
   if (!resolved) return undefined;
   const result = file.results[resolved];
-  if (!result) return undefined;
+  if (result === undefined) return undefined; // plain-object file with no such trigger → genuine absent
+  // Present BUT malformed (null / non-object / invalid status) is NOT "absent":
+  // reading it as "no terminal" would fail-open and replay. Fail-closed → throw.
+  if (!isValidPersistedResult(result)) {
+    throw new Error(`corrupt async-trigger result (invalid shape) for ${sessionId}/${resolved}`);
+  }
   return { triggerId: resolved, result, ownerLarkAppId: file.ownerLarkAppId };
 }
 

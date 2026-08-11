@@ -5269,27 +5269,50 @@ function retireTerminalizedCodexAppLedgerEntriesForRecovery(ds: DaemonSession): 
         && rec.result.reason === 'dispatch_unknown';
     })());
   if (toRetire.length === 0) return;
+  // TRANSACTIONAL retirement (codex #818 exact-retirement fail-open). All work is
+  // done against an in-memory working copy; nothing is persisted until EVERY
+  // owner-matched terminal candidate has been exact-cancelled. If ANY candidate
+  // cannot be cancelled — `prepared_successor_exists` (a later prepared frame
+  // pins the FIFO) or `dispatch_not_found` (the ledger changed under us) — we
+  // restore the in-memory ledger to `priorLedger` and THROW *before* any persist,
+  // aborting this fork fail-closed. A `continue`-and-fork would leave that
+  // terminalized `accepted` entry to be replayed as `recoveredAcceptedInputs`
+  // (the generation fence only constrains `prepared`, never re-adds noReplay to a
+  // surviving `accepted`), and a partial persist could retire some while forking
+  // the rest. All-or-nothing + fail-closed is the only safe shape.
   const priorLedger = ds.session.codexAppDispatchLedger;
-  let mutated = false;
+  let workingLedger = [...(ds.session.codexAppDispatchLedger ?? [])];
+  const retiredTurnIds: string[] = [];
   for (const entry of toRetire) {
-    const cancelled = cancelCodexAppDispatch(ds.session.codexAppDispatchLedger ?? [], {
+    const cancelled = cancelCodexAppDispatch(workingLedger, {
       dispatchId: entry.dispatchId,
       turnId: entry.turnId,
       ...(entry.dispatchAttempt !== undefined ? { dispatchAttempt: entry.dispatchAttempt } : {}),
     });
-    // prepared_successor_exists / dispatch_not_found → leave it for the generation
-    // fence; never force-remove past a prepared frame.
-    if (!cancelled.ok) continue;
-    ds.session.codexAppDispatchLedger = cancelled.ledger;
-    mutated = true;
-    logger.warn(
-      `[${ds.session.sessionId.slice(0, 8)}] Recovery fence retired at-most-once terminalized `
-      + `Codex App dispatch turn=${entry.turnId.slice(0, 12)} (durable failed:dispatch_unknown; not replayed)`,
-    );
+    if (!cancelled.ok) {
+      // Cannot exact-cancel a terminalized accepted entry (prepared successor /
+      // vanished). Abort the whole retirement + fork fail-closed; a later seam
+      // re-attempts once the blocking prepared frame settles or the ledger
+      // stabilizes. NEVER fall through to fork with a live terminalized accepted.
+      ds.session.codexAppDispatchLedger = priorLedger;
+      throw new Error(
+        `recovery fence could not exact-retire terminalized Codex App dispatch `
+        + `turn=${entry.turnId} (${cancelled.error}); aborting fork (fail-closed)`,
+      );
+    }
+    workingLedger = cancelled.ledger;
+    retiredTurnIds.push(entry.turnId);
   }
-  if (!mutated) return;
+  // Every candidate retired on the working copy — commit ONCE.
+  ds.session.codexAppDispatchLedger = workingLedger;
   try {
     sessionStore.updateSession(ds.session);
+    for (const turnId of retiredTurnIds) {
+      logger.warn(
+        `[${ds.session.sessionId.slice(0, 8)}] Recovery fence retired at-most-once terminalized `
+        + `Codex App dispatch turn=${turnId.slice(0, 12)} (durable failed:dispatch_unknown; not replayed)`,
+      );
+    }
     if (!hasUnsettledCodexAppDispatch(ds.session.codexAppDispatchLedger)) {
       void Promise.resolve(callbacks?.onCodexAppLedgerDrained?.(ds)).catch(err => {
         logger.error(
@@ -6451,27 +6474,30 @@ export function forkWorker(
   // the shared session open, so without this the recovery path would replay an
   // at-most-once turn the caller was already told failed (the ledger is the third
   // replay channel `noReplay` does not reach). Idempotent + re-checked here.
+  // Snapshot the prior durable FIFO before accepting this fork's new prompt.
+  // A pure reattach receives the full snapshot; a refork carrying N+1 restores
+  // old N first and reserves N+1 through the normal worker write path.
+  // FIRST fence out any keyed turn already terminalized to a durable
+  // failed(dispatch_unknown): the turn-level idempotency lease (PR #818) leaves
+  // the shared session open, so without this the recovery path would replay an
+  // at-most-once turn the caller was already told failed (the ledger is the third
+  // replay channel `noReplay` does not reach). Idempotent + re-checked here.
+  //
+  // FAIL-CLOSED via THROW (codex #818 recovery-seam round-3): if the fence cannot
+  // PROVE it is safe to build the recovery snapshot — unreadable/corrupt
+  // authoritative async terminal, a terminalized accepted entry that cannot be
+  // exact-cancelled, or a retirement persist failure — it THROWS. We deliberately
+  // do NOT catch-and-`return false` here: `forkWorker`'s bool return is widely
+  // IGNORED by callers (the keyed `/api/trigger` dormant path forks and then
+  // unconditionally returns `queued`, so a swallowed false would strand the turn
+  // `running`), and a `return false` would also bypass the outer
+  // `rollbackWorkerForkPreInit` that restores the queued-activation journal
+  // mutated above. Letting it throw routes through forkWorker's existing outer
+  // catch (pre-init rollback + rethrow) and then the keyed trigger's post-barrier
+  // convergence, which durably terminalizes the turn to `failed` (observable,
+  // at-most-once) — the correct contract for every fork-failure path.
   if (agentCfg.cliId === 'codex-app') {
-    try {
-      retireTerminalizedCodexAppLedgerEntriesForRecovery(ds);
-    } catch (err) {
-      // FAIL-CLOSED: the fence could not PROVE it is safe to build the recovery
-      // snapshot (authoritative async terminal unreadable, or the retirement
-      // could not be durably persisted). Refuse this fork rather than risk
-      // replaying an at-most-once turn the caller was already told failed. This
-      // mirrors the quarantine-guard / canForkRegisteredSession refuse contract
-      // above (return false, side-effect free: only a monotonic generation bump
-      // has happened, no worker/port allocated yet). staggeredRecoveryFork (boot
-      // eager re-attach) retains the row for a later retry; a direct caller sees
-      // the same "not forked" signal it already handles. The durable ledger +
-      // async truth stay intact for the next seam (codex #818 recovery-seam
-      // round-2: two fail-open points → both must fail-closed).
-      logger.error(
-        `[${tag(ds)}] Refusing fork: Codex App recovery fence could not verify at-most-once `
-        + `(deferring to next seam): ${err instanceof Error ? err.message : String(err)}`,
-      );
-      return false;
-    }
+    retireTerminalizedCodexAppLedgerEntriesForRecovery(ds);
   }
   const codexAppRecoveredDispatches = agentCfg.cliId === 'codex-app'
     ? (ds.session.codexAppDispatchLedger ?? []).map(entry => ({ ...entry }))

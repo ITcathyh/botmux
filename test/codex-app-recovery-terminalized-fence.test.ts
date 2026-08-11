@@ -24,7 +24,7 @@
  * Run:  pnpm vitest run test/codex-app-recovery-terminalized-fence.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { DaemonSession } from '../src/core/types.js';
@@ -67,6 +67,14 @@ function ds(ledger: CodexAppDispatchLedgerEntry[], larkAppId = APP): DaemonSessi
     chatId: 'oc_x', chatType: 'group', scope: 'chat', spawnedAt: 1, cliVersion: 'test',
     lastMessageAt: 1, hasHistory: true, workingDir: '/tmp',
   } as unknown as DaemonSession;
+}
+
+/** Write a raw (possibly malformed) async-trigger file for SID, ensuring the
+ *  store directory exists first (the store's own ensureDir hasn't run yet when
+ *  we bypass recordFailedStrict to inject a corrupt shape). */
+function writeRawAsyncTriggerFile(contents: string): void {
+  mkdirSync(join(tempDir, 'async-triggers'), { recursive: true });
+  writeFileSync(join(tempDir, 'async-triggers', `${SID}.json`), contents, 'utf-8');
 }
 
 beforeEach(() => {
@@ -137,19 +145,42 @@ describe('codex-app recovery fence — terminalized keyed turn is not replayed (
     expect(updateSessionMock).not.toHaveBeenCalled();
   });
 
-  it('does NOT retire past a prepared successor (cancelCodexAppDispatch refuses; entry survives for the generation fence)', () => {
-    // accepted head is terminalized, but a later PREPARED frame exists → removing
-    // the head would reorder the FIFO under a live prepared frame. The fence must
-    // leave it (cancel refuses prepared_successor_exists).
+  it('THROWS (fail-closed, no partial retire) when a terminalized accepted head cannot be exact-cancelled due to a prepared successor', () => {
+    // accepted head is terminalized(failed), but a later PREPARED frame pins the
+    // FIFO → cancelCodexAppDispatch refuses (prepared_successor_exists). The
+    // generation fence only constrains the PREPARED frame; it never re-adds
+    // noReplay to the surviving `accepted`, so a `continue`-and-fork would let the
+    // worker replay the terminalized head as recoveredAcceptedInputs. Transactional
+    // + fail-closed: abort the whole fork and leave the ledger intact for a later
+    // seam (once the prepared frame settles).
     const head = accepted('turn-terminalized-head');
     const succ = prepared('turn-prepared-successor');
     const session = ds([head, succ]);
     asyncTriggerStore.recordFailedStrict(SID, head.turnId, Date.now(), APP, 'dispatch_unknown');
 
-    retireFence(session);
-
+    expect(() => retireFence(session)).toThrow(/exact-retire|prepared_successor_exists/);
+    // Ledger untouched (nothing retired, nothing persisted) — the terminalized
+    // head is NOT force-removed past the prepared frame, and the fork is aborted.
     expect(session.session.codexAppDispatchLedger!.map(e => e.turnId))
       .toEqual(['turn-terminalized-head', 'turn-prepared-successor']);
+    expect(updateSessionMock).not.toHaveBeenCalled();
+  });
+
+  it('THROWS all-or-nothing when ONE of several terminalized candidates cannot be cancelled (no partial persist)', () => {
+    // Two terminalized accepted turns; the SECOND is blocked by a prepared frame
+    // after it. A per-item `continue` would persist the first retirement then fork
+    // with the second still live. Transactional: NEITHER is persisted; abort.
+    const a = accepted('turn-batch-a');
+    const b = accepted('turn-batch-b');
+    const blocker = prepared('turn-batch-blocker');
+    const session = ds([a, b, blocker]);
+    asyncTriggerStore.recordFailedStrict(SID, a.turnId, Date.now(), APP, 'dispatch_unknown');
+    asyncTriggerStore.recordFailedStrict(SID, b.turnId, Date.now(), APP, 'dispatch_unknown');
+
+    expect(() => retireFence(session)).toThrow();
+    // ALL entries survive — no partial retirement was committed.
+    expect(session.session.codexAppDispatchLedger!.map(e => e.turnId))
+      .toEqual(['turn-batch-a', 'turn-batch-b', 'turn-batch-blocker']);
     expect(updateSessionMock).not.toHaveBeenCalled();
   });
 
@@ -208,7 +239,7 @@ describe('codex-app recovery fence — fail-closed on ambiguity (PR #818)', () =
     // lookup would fold this into "no terminal" and let the accepted entry
     // re-enter the recovery snapshot; the strict read must throw instead.
     asyncTriggerStore.recordFailedStrict(SID, term.turnId, Date.now(), APP, 'dispatch_unknown');
-    writeFileSync(join(tempDir, 'async-triggers', `${SID}.json`), '{ this is not valid json', 'utf-8');
+    writeRawAsyncTriggerFile('{ this is not valid json');
 
     expect(() => retireFence(session)).toThrow();
     // Nothing retired, nothing persisted — the entry is preserved for a later
@@ -227,5 +258,36 @@ describe('codex-app recovery fence — fail-closed on ambiguity (PR #818)', () =
     expect(() => retireFence(session)).not.toThrow();
     expect(session.session.codexAppDispatchLedger!.map(e => e.turnId)).toContain('turn-no-terminal-yet');
     expect(updateSessionMock).not.toHaveBeenCalled();
+  });
+
+  it('syntactically-valid JSON with a NON-plain-object `results` (array) → THROWS (not misread as "absent trigger")', () => {
+    // codex #818 strict-shape: `results: []` is valid JSON and `typeof [] ===
+    // "object"`, so a bare typeof gate lets it through; the precise trigger lookup
+    // then yields undefined and would be read as "no terminal" → fail-open replay.
+    // The strict shape check must reject a non-plain-object results and THROW.
+    const term = accepted('turn-array-results');
+    const session = ds([term]);
+    writeRawAsyncTriggerFile(
+      JSON.stringify({ ownerLarkAppId: APP, latestTriggerId: term.turnId, results: [] }),
+    );
+
+    expect(() => retireFence(session)).toThrow(/invalid shape|corrupt/i);
+    expect(updateSessionMock).not.toHaveBeenCalled();
+    expect(session.session.codexAppDispatchLedger!.map(e => e.turnId)).toContain('turn-array-results');
+  });
+
+  it('present-but-malformed hit result (null / invalid status) → THROWS (never read as a usable/absent terminal)', () => {
+    // A plain-object file whose specific result entry is malformed (null, or an
+    // invalid status). Reading it as "no terminal" (or trusting a bad status)
+    // would fail-open; the runtime result-shape guard must throw.
+    const term = accepted('turn-bad-result');
+    const session = ds([term]);
+    writeRawAsyncTriggerFile(
+      JSON.stringify({ ownerLarkAppId: APP, latestTriggerId: term.turnId, results: { [term.turnId]: null } }),
+    );
+
+    expect(() => retireFence(session)).toThrow(/invalid shape|corrupt/i);
+    expect(updateSessionMock).not.toHaveBeenCalled();
+    expect(session.session.codexAppDispatchLedger!.map(e => e.turnId)).toContain('turn-bad-result');
   });
 });
