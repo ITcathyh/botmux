@@ -10727,7 +10727,47 @@ function startScreenUpdates(): void {
   // watermark — there we must capture every tick (see shouldCaptureScreen).
   let lastSnapshotPtyActivity = -1;
   screenUpdateTimer = setInterval(() => {
-    if (awaitingFirstPrompt) return;
+    if (awaitingFirstPrompt) {
+      // First-turn 「工作中」 narrow channel. The async sampler below is fully
+      // gated until the first turn ends (markPromptReady flips awaitingFirstPrompt)
+      // or the 15s soft timeout, so an argv-baked first prompt (Pi et al., which
+      // never goes through flushPending) emits NO screen_update for the whole
+      // turn — the daemon card sits at 'starting' and jumps straight to
+      // 「等待输入」 when the first idle lands, skipping 「工作中」 entirely.
+      // Publish a single 'working' edge when the authoritative viewport actually
+      // shows the CLI's busy marker, so the live card reflects real work mid-turn.
+      //
+      // Pure publisher: it only send()s a status and updates the local
+      // lastSentStatus dedup — it never touches isPromptReady, the idle detector,
+      // or the argv seed flags (spawnArgvInitialPromptBusy / -NeedsWorkingSeed),
+      // so the first-prompt evidence machinery and the end-of-turn working→idle
+      // seed are unchanged. Fail-open on non-authoritative screens (ZMX check
+      // first, before any capture) and a no-op without a busyPattern, so CLIs
+      // that render no detectable marker keep the original bare-return behavior.
+      if (lastSentStatus !== 'working'
+        && backendScreenEvidenceIsAuthoritativeForMutation()
+        && cliAdapter?.busyPattern
+        && backend
+        && canCaptureBusyPatternScreen(backend)) {
+        try {
+          const content = captureBackendScreen(backend);
+          if (content && cliAdapter.busyPattern.test(busyProbeRegion(content))) {
+            lastSentStatus = 'working';
+            send({
+              type: 'screen_update',
+              content,
+              status: 'working',
+              turnId: currentBotmuxTurnId,
+              dispatchAttempt: currentBotmuxDispatchAttempt,
+            });
+            log('First-turn busy marker on authoritative viewport — publishing working before first prompt');
+          }
+        } catch {
+          // Capture failed — preserve the original gate behavior (stay silent).
+        }
+      }
+      return;
+    }
 
     void (async () => {
       const { snapshot, status } = await snapshotWithLatestRuntimeStatus(async () => {

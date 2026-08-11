@@ -250,6 +250,87 @@ setInterval(() => {}, 1_000);
     expect(updates.at(-1)?.status).toBe('idle');
   }, 25_000);
 
+  it('publishes a working card during an argv-baked first turn before it completes', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-pi-first-turn-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    mkdirSync(dataDir, { recursive: true });
+
+    // Argv-baked first prompt (no flushPending). The fake stays on Working...
+    // for the whole first turn, then clears the marker so the turn settles idle.
+    // The window must span at least a couple of SCREEN_UPDATE_INTERVAL_MS ticks
+    // so the first-turn narrow channel gets a chance to sample the busy marker.
+    const fakePi = join(root, 'fake-pi');
+    writeFileSync(fakePi, `#!/usr/bin/env node
+process.stdout.write('Working...\\n');
+setTimeout(() => process.stdout.write('\\x1b[2J\\x1b[HDone without transcript final\\n'), 6_000);
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakePi, 0o755);
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: 'sid-worker-pi-first-turn',
+        LARK_APP_ID: 'app_test',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-worker-pi-first-turn',
+      chatId: 'oc_test',
+      rootMessageId: 'om_root',
+      workingDir: dataDir,
+      cliId: 'pi',
+      cliPathOverride: fakePi,
+      backendType: 'pty',
+      prompt: 'hello from argv',
+      larkAppId: 'app_test',
+      larkAppSecret: 'secret',
+      turnId: 'om_turn',
+    } satisfies DaemonToWorker);
+
+    // The narrow channel must publish `working` WHILE the first turn is still
+    // running — i.e. before prompt_ready. This log line is the proof it fired
+    // through the first-turn gate (the async sampler stays gated until then).
+    await waitForLog(child, logs, 'First-turn busy marker on authoritative viewport');
+
+    // A working screen_update reached the daemon before the turn ended, and no
+    // prompt_ready has escaped yet. (Without the fix the whole first turn is
+    // silent — the card would sit at `starting` until the terminal idle.)
+    const preReady = messages.filter(
+      (message): message is Extract<WorkerToDaemon, { type: 'screen_update' }> =>
+        message.type === 'screen_update',
+    );
+    expect(preReady.some(message => message.status === 'working'), JSON.stringify(messages)).toBe(true);
+    expect(messages.some(message => message.type === 'prompt_ready'), JSON.stringify(messages)).toBe(false);
+    // Dedup: the narrow channel sends `working` at most once per first turn even
+    // though it samples every tick (lastSentStatus guard). Count the working
+    // updates emitted before the first prompt_ready lands.
+    await waitForPromptReady(child, messages, logs);
+    const readyIdx = messages.findIndex(message => message.type === 'prompt_ready');
+    const workingBeforeReady = messages
+      .slice(0, readyIdx)
+      .filter(message => message.type === 'screen_update' && message.status === 'working');
+    expect(workingBeforeReady.length, JSON.stringify(messages)).toBe(1);
+
+    // Once the fake clears Working..., the turn settles idle as usual.
+    const updates = await waitForScreenUpdates(child, messages, 1, logs);
+    expect(updates.at(-1)?.status).toBe('idle');
+  }, 25_000);
+
   it.skipIf(!tmuxAvailable)('keeps an adopted Pi pane working until its viewport loses Working...', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-pi-adopt-busy-'));
     tempDirs.add(root);

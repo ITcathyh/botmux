@@ -511,6 +511,43 @@ describe('worker structured-turn status wiring', () => {
     expect(probe).toContain('if (!backendScreenEvidenceIsAuthoritativeForMutation()) return;');
   });
 
+  it('publishes first-turn working only on an authoritative viewport with a busy marker, as a pure publisher', () => {
+    const startScreen = functionSlice('startScreenUpdates', 'stopScreenUpdates');
+    const gate = startScreen.indexOf('if (awaitingFirstPrompt) {');
+    const gateEnd = startScreen.indexOf('void (async () => {', gate);
+    expect(gate).toBeGreaterThanOrEqual(0);
+    expect(gateEnd).toBeGreaterThan(gate);
+    const channel = startScreen.slice(gate, gateEnd);
+
+    // B: the authoritative-screen check (ZMX fail-open) must precede any capture,
+    // and a busyPattern is required — a CLI without a marker keeps the bare
+    // return and never captures. Ordering: authoritative gate < capture call.
+    const authGate = channel.indexOf('backendScreenEvidenceIsAuthoritativeForMutation()');
+    const busyRequired = channel.indexOf('cliAdapter?.busyPattern');
+    const capture = channel.indexOf('captureBackendScreen(backend)');
+    expect(authGate).toBeGreaterThanOrEqual(0);
+    expect(busyRequired).toBeGreaterThan(authGate);
+    expect(capture).toBeGreaterThan(busyRequired);
+    // The busy marker itself gates the send, and the channel still ends in the
+    // original bare `return` so the async sampler stays gated during turn one.
+    expect(channel).toContain('cliAdapter.busyPattern.test(busyProbeRegion(content))');
+    expect(channel).toContain("status: 'working'");
+    // The channel still ends in the original bare `return;` (last statement
+    // before the gate block closes) so the async sampler stays gated during
+    // turn one exactly as before.
+    expect(/return;\s*}\s*$/.test(channel.trimEnd())).toBe(true);
+
+    // Pure publisher: dedup via the local lastSentStatus only; it must NOT touch
+    // isPromptReady, the idle detector, or the argv seed flags — otherwise it
+    // would perturb the first-prompt evidence machinery / end-of-turn seed.
+    expect(channel).toContain("lastSentStatus !== 'working'");
+    expect(channel).toContain("lastSentStatus = 'working'");
+    expect(channel).not.toContain('isPromptReady =');
+    expect(channel).not.toContain('idleDetector');
+    expect(channel).not.toContain('spawnArgvInitialPromptBusy =');
+    expect(channel).not.toContain('spawnArgvNeedsWorkingSeed =');
+  });
+
   it('carries the structured mark through adopt submit confirmation and exception cleanup', () => {
     const adopt = functionSlice('writeAdoptMessage', 'isWorkflowWorker');
     const handler = source.slice(source.indexOf("case 'message':"), source.indexOf("case 'raw_input':"));
