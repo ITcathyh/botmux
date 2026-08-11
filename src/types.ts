@@ -653,6 +653,9 @@ export type ScheduleExecutionPosition = 'top-level' | 'topic' | 'new-topic';
 
 export interface ScheduledTask {
   id: string;
+  /** Monotonic version of the executable schedule definition. Runtime
+   *  timestamps/status do not advance it. */
+  definitionRevision: number;
   name: string;
   /** Raw user input (e.g. "每日17:50" or "30m" or "0 9 * * *") */
   schedule: string;
@@ -692,6 +695,15 @@ export interface ScheduledTask {
   lastStatus?: 'ok' | 'error';
   lastError?: string;
   lastDeliveryError?: string;
+  /** Durable producer request, not a firing settlement. The owning daemon
+   *  consumes it into a manual ScheduledFireIdentity; Target-A still has no
+   *  crash-durable Executor acceptance receipt. */
+  pendingManualRun?: {
+    version: 1;
+    manualRequestId: string;
+    definitionRevision: number;
+    requestedAt: string;
+  };
   /** Repeat counter — times=null means forever; times>0 auto-removes after N runs */
   repeat?: { times: number | null; completed: number };
   /** Delivery target:

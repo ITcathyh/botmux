@@ -1164,7 +1164,7 @@ describe('executeScheduledTask — workerless owner semantics', () => {
     expect(active.get(sessionKey(ROOT, APP))).toBe(ds);
     expect(forkWorkerMock).toHaveBeenCalledWith(ds, expect.anything(), expect.objectContaining({
       resume: true,
-      turnId: expect.stringMatching(/^schedule:schedule-owner-test:/),
+      turnId: expect.stringMatching(/^schedule-run:v1:manual:schedule-owner-test:1:/),
     }));
     expect(closeWorkerSessionMock).not.toHaveBeenCalled();
   });

@@ -1,13 +1,23 @@
 import { Cron } from 'croner';
+import { randomUUID } from 'node:crypto';
 import * as scheduleStore from '../services/schedule-store.js';
 import { scheduleTimeZone, zonedTomorrowAt } from '../utils/timezone.js';
 import { emitHookEvent } from '../services/hook-runner.js';
 import { logger } from '../utils/logger.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition } from '../types.js';
+import {
+  createDeadlineScheduledFireIdentity,
+  createManualScheduledFireIdentity,
+  createScheduledFireEnvelope,
+  type ScheduledFireEnvelope,
+  type ScheduledFireSubmitOutcome,
+} from './scheduled-fire.js';
 
-// Callback set by daemon to execute a scheduled task
-let executeCallback: ((task: ScheduledTask) => Promise<void>) | null = null;
+// Owner-daemon submission seam. The scheduler never creates/mutates Session.
+let submitCallback: ((fire: ScheduledFireEnvelope) => Promise<ScheduledFireSubmitOutcome>) | null = null;
+const settledLogicalRuns = new Set<string>();
+const settledLogicalRunOrder: string[] = [];
 let tickTimer: NodeJS.Timeout | null = null;
 // Last effective schedule timezone seen by the tick loop. When it changes
 // (dashboard config / env / host), enabled CRON tasks' persisted nextRunAt was
@@ -42,8 +52,84 @@ function emitScheduleFiredHook(task: ScheduledTask, status: 'ok' | 'error', erro
   });
 }
 
-export function setExecuteCallback(cb: (task: ScheduledTask) => Promise<void>): void {
-  executeCallback = cb;
+export function setSubmitCallback(
+  cb: ((fire: ScheduledFireEnvelope) => Promise<ScheduledFireSubmitOutcome>) | null,
+): void {
+  submitCallback = cb;
+  if (cb === null) {
+    settledLogicalRuns.clear();
+    settledLogicalRunOrder.length = 0;
+  }
+}
+
+/** @deprecated Production callers submit a ScheduledFireEnvelope. */
+export const setExecuteCallback = setSubmitCallback;
+
+function outcomeMessage(outcome: Exclude<ScheduledFireSubmitOutcome, {
+  readonly kind: 'applied' | 'duplicate';
+}>): string {
+  return outcome.message;
+}
+
+function claimLogicalRunSettlement(runId: string): boolean {
+  if (settledLogicalRuns.has(runId)) return false;
+  settledLogicalRuns.add(runId);
+  settledLogicalRunOrder.push(runId);
+  while (settledLogicalRunOrder.length > 1024) {
+    const evicted = settledLogicalRunOrder.shift();
+    if (evicted) settledLogicalRuns.delete(evicted);
+  }
+  return true;
+}
+
+function settleSubmittedFire(
+  task: ScheduledTask,
+  runId: string,
+  outcome: ScheduledFireSubmitOutcome,
+): void {
+  if (outcome.kind === 'duplicate') return;
+  if (!claimLogicalRunSettlement(runId)) return;
+  if (outcome.kind === 'applied') {
+    scheduleStore.markRun(task.id, true, undefined, undefined, task.definitionRevision);
+    dashboardEventBus.publish({
+      type: 'schedule.fired',
+      body: { id: task.id, runAt: Date.now(), status: 'ok' },
+    });
+    emitScheduleFiredHook(task, 'ok');
+    return;
+  }
+  const error = outcomeMessage(outcome);
+  scheduleStore.markRun(task.id, false, error, undefined, task.definitionRevision);
+  dashboardEventBus.publish({
+    type: 'schedule.fired',
+    body: { id: task.id, runAt: Date.now(), status: 'error', error },
+  });
+  emitScheduleFiredHook(task, 'error', new Error(error));
+}
+
+function submitScheduledFire(task: ScheduledTask, fire: ScheduledFireEnvelope): boolean {
+  if (!submitCallback) return false;
+  void Promise.resolve().then(() => submitCallback!(fire)).then(
+    outcome => settleSubmittedFire(task, fire.runId, outcome),
+    error => {
+      const message = error instanceof Error ? error.message : String(error);
+      logger.error(`[scheduler] Task "${task.name}" failed: ${message}`);
+      if (!claimLogicalRunSettlement(fire.runId)) return;
+      scheduleStore.markRun(
+        task.id,
+        false,
+        message,
+        undefined,
+        task.definitionRevision,
+      );
+      dashboardEventBus.publish({
+        type: 'schedule.fired',
+        body: { id: task.id, runAt: Date.now(), status: 'error', error: message },
+      });
+      emitScheduleFiredHook(task, 'error', error);
+    },
+  );
+  return true;
 }
 
 /**
@@ -420,8 +506,48 @@ async function tick(): Promise<void> {
   lastTickTz = tz;
 
   for (const task of tasks) {
-    if (!task.enabled) continue;
     if (!taskBelongsToThisDaemon(task)) continue;
+
+    // A manual producer request has its own identity namespace and must never
+    // be rewritten into a synthetic deadline. Consume it before normal due
+    // evaluation so one tick cannot dispatch both identities for one request.
+    if (task.pendingManualRun) {
+      if (!submitCallback) continue;
+      const pending = task.pendingManualRun;
+      if (pending.definitionRevision !== task.definitionRevision) {
+        scheduleStore.updateTask(task.id, { pendingManualRun: undefined });
+        dashboardEventBus.publish({
+          type: 'schedule.fired',
+          body: {
+            id: task.id,
+            runAt: Date.now(),
+            status: 'error',
+            error: 'definition_superseded',
+          },
+        });
+        logger.warn(
+          `[scheduler] Discarded manual request ${pending.manualRequestId} for "${task.name}" `
+          + `because definition ${pending.definitionRevision} was superseded by ${task.definitionRevision}`,
+        );
+        continue;
+      }
+      const nowIso = new Date().toISOString();
+      const next = computeNextRun(task.parsed, nowIso);
+      scheduleStore.updateTask(task.id, {
+        pendingManualRun: undefined,
+        lastRunAt: nowIso,
+        nextRunAt: next ?? undefined,
+      });
+      const identity = createManualScheduledFireIdentity({
+        scheduleId: task.id,
+        definitionRevision: pending.definitionRevision,
+        manualRequestId: pending.manualRequestId,
+      });
+      submitScheduledFire(task, createScheduledFireEnvelope(identity, task));
+      continue;
+    }
+
+    if (!task.enabled) continue;
 
     let nextRunAt = task.nextRunAt;
     if (!nextRunAt) {
@@ -458,31 +584,14 @@ async function tick(): Promise<void> {
     logger.info(`[scheduler] Task "${task.name}" (${task.id}) triggered (kind=${task.parsed.kind})`);
     scheduleStore.updateTask(task.id, { lastRunAt: new Date().toISOString() });
 
-    if (executeCallback) {
-      const taskId = task.id;
-      executeCallback(task)
-        .then(() => {
-          scheduleStore.markRun(taskId, true);
-          dashboardEventBus.publish({
-            type: 'schedule.fired',
-            body: { id: taskId, runAt: Date.now(), status: 'ok' },
-          });
-          emitScheduleFiredHook(task, 'ok');
-        })
-        .catch(err => {
-          logger.error(`[scheduler] Task "${task.name}" failed: ${err.message}`);
-          scheduleStore.markRun(taskId, false, err.message);
-          dashboardEventBus.publish({
-            type: 'schedule.fired',
-            body: {
-              id: taskId,
-              runAt: Date.now(),
-              status: 'error',
-              error: err instanceof Error ? err.message : String(err),
-            },
-          });
-          emitScheduleFiredHook(task, 'error', err);
-        });
+    if (submitCallback) {
+      const identity = createDeadlineScheduledFireIdentity({
+        scheduleId: task.id,
+        definitionRevision: task.definitionRevision ?? 1,
+        scheduledFor: nextRunAt,
+      });
+      const fire = createScheduledFireEnvelope(identity, task);
+      submitScheduledFire(task, fire);
     }
   }
 }
@@ -647,26 +756,29 @@ export function enableTask(id: string): boolean {
   const task = scheduleStore.getTask(id);
   if (!task) return false;
   const next = computeNextRun(task.parsed);
-  scheduleStore.updateTask(id, { enabled: true, nextRunAt: next ?? undefined });
+  scheduleStore.updateTaskDefinition(id, { enabled: true, nextRunAt: next ?? undefined });
   return true;
 }
 
 export function disableTask(id: string): boolean {
   const task = scheduleStore.getTask(id);
   if (!task) return false;
-  scheduleStore.updateTask(id, { enabled: false });
+  scheduleStore.updateTaskDefinition(id, { enabled: false });
   return true;
 }
 
 export function runTaskNow(id: string): boolean {
   const task = scheduleStore.getTask(id);
   if (!task) return false;
-  // Ask the owning daemon to execute ASAP by advancing nextRunAt.  Its tick
-  // (< 30s) will pick it up.  Previously we invoked executeCallback inline,
-  // which was wrong in multi-bot setups — the callback on this daemon may
-  // not even be the right bot for this task.
-  logger.info(`[scheduler] Marked "${task.name}" (${task.id}) for immediate run`);
-  scheduleStore.updateTask(id, { nextRunAt: new Date().toISOString() });
+  if (submitCallback && taskBelongsToThisDaemon(task)) return runNow(id).ok;
+  const pendingManualRun = task.pendingManualRun ?? {
+    version: 1 as const,
+    manualRequestId: randomUUID(),
+    definitionRevision: task.definitionRevision,
+    requestedAt: new Date().toISOString(),
+  };
+  logger.info(`[scheduler] Queued manual run for "${task.name}" (${task.id})`);
+  scheduleStore.updateTask(id, { pendingManualRun });
   return true;
 }
 
@@ -689,7 +801,7 @@ export function getNextRun(id: string): Date | null {
 export function runNow(id: string): { ok: boolean; error?: string } {
   const task = scheduleStore.getTask(id);
   if (!task) return { ok: false, error: 'not_found' };
-  if (!executeCallback) return { ok: false, error: 'not_initialised' };
+  if (!submitCallback) return { ok: false, error: 'not_initialised' };
   // Bump lastRunAt + nextRunAt synchronously so the upcoming 30s tick won't
   // re-fire the same task while this manual run is still in flight.
   const nowIso = new Date().toISOString();
@@ -698,28 +810,16 @@ export function runNow(id: string): { ok: boolean; error?: string } {
     lastRunAt: nowIso,
     nextRunAt: next ?? undefined,
   });
-  // Don't block the caller — fire on next tick. `Promise.resolve().then`
-  // coerces a synchronous throw from executeCallback into a rejection so the
-  // error path always runs and we don't leak a 500 to the IPC client.
-  void Promise.resolve().then(() => executeCallback!(task)).then(
-    () => {
-      scheduleStore.markRun(task.id, true);
-      dashboardEventBus.publish({
-        type: 'schedule.fired',
-        body: { id, runAt: Date.now(), status: 'ok' },
-      });
-      emitScheduleFiredHook(task, 'ok');
-    },
-    err => {
-      const msg = err instanceof Error ? err.message : String(err);
-      scheduleStore.markRun(task.id, false, msg);
-      dashboardEventBus.publish({
-        type: 'schedule.fired',
-        body: { id, runAt: Date.now(), status: 'error', error: msg },
-      });
-      emitScheduleFiredHook(task, 'error', err);
-    },
-  );
+  // Don't block the caller. The Runtime outcome remains process-local in
+  // Target-A; markRun is a projection/status update, not a durable dispatch
+  // receipt.
+  const identity = createManualScheduledFireIdentity({
+    scheduleId: task.id,
+    definitionRevision: task.definitionRevision ?? 1,
+    manualRequestId: randomUUID(),
+  });
+  const fire = createScheduledFireEnvelope(identity, task);
+  submitScheduledFire(task, fire);
   return { ok: true };
 }
 
@@ -734,9 +834,9 @@ export function setEnabled(id: string, enabled: boolean): { ok: boolean; error?:
   if (task.enabled === enabled) return { ok: true }; // no-op
   if (enabled) {
     const next = computeNextRun(task.parsed);
-    scheduleStore.updateTask(id, { enabled: true, nextRunAt: next ?? undefined });
+    scheduleStore.updateTaskDefinition(id, { enabled: true, nextRunAt: next ?? undefined });
   } else {
-    scheduleStore.updateTask(id, { enabled: false });
+    scheduleStore.updateTaskDefinition(id, { enabled: false });
   }
   dashboardEventBus.publish({
     type: 'schedule.updated',
@@ -767,7 +867,7 @@ export function toggleDelivery(id: string): {
   else executionPosition = task.rootMessageId ? 'topic' : 'top-level';
   if (executionPosition === current) return { ok: false, error: 'topic_root_required' };
   const scope: 'chat' | 'thread' = executionPosition === 'topic' ? 'thread' : 'chat';
-  scheduleStore.updateTask(id, { scope, executionPosition });
+  scheduleStore.updateTaskDefinition(id, { scope, executionPosition });
   const deliver = executionPosition === 'new-topic' ? 'new-topic' : 'origin';
   dashboardEventBus.publish({
     type: 'schedule.updated',
@@ -801,7 +901,7 @@ export function updateTask(
   const task = scheduleStore.getTask(id);
   if (!task) return { ok: false, error: 'not_found' };
 
-  const patch: Record<string, unknown> = {};
+  const patch: scheduleStore.ScheduledTaskDefinitionPatch = {};
   const eventPatch: Record<string, unknown> = {};
   if (updates.name !== undefined) patch.name = updates.name;
   if (updates.prompt !== undefined) patch.prompt = updates.prompt;
@@ -845,7 +945,7 @@ export function updateTask(
     patch.nextRunAt = next ?? undefined;
   }
 
-  scheduleStore.updateTask(id, patch);
+  scheduleStore.updateTaskDefinition(id, patch);
   dashboardEventBus.publish({
     type: 'schedule.updated',
     body: { id, patch: { ...patch, ...eventPatch } },

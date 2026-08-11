@@ -612,6 +612,9 @@ function classificationFor(receiverKind, fieldPath = '*') {
 }
 
 function accessLaneFor(receiverKind, path, operation) {
+  if (path === 'src/core/current-scheduled-fire.ts') {
+    return 'session-runtime-scheduled-adapter';
+  }
   if (receiverKind === 'DaemonSession') return 'actor-host-direct';
   if (receiverKind === 'DaemonSessionMap') {
     return path === 'src/core/riff-shutdown-detach.ts'

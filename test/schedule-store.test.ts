@@ -108,6 +108,7 @@ describe('schedule-store', () => {
       expect(task.workingDir).toBe(TASK_PARAMS.workingDir);
       expect(task.chatId).toBe(TASK_PARAMS.chatId);
       expect(task.enabled).toBe(true);
+      expect(task.definitionRevision).toBe(1);
       expect(task.createdAt).toBeTypeOf('string');
       // createdAt should be a valid ISO string
       expect(new Date(task.createdAt).toISOString()).toBe(task.createdAt);
@@ -229,12 +230,54 @@ describe('schedule-store', () => {
   });
 
   describe('updateTask', () => {
+    it('increments the definition revision only for semantic edits', async () => {
+      const { createTask, updateTask, updateTaskDefinition, getTask } = await freshImport();
+      const task = createTask(TASK_PARAMS);
+
+      updateTask(task.id, { lastRunAt: '2026-08-11T01:00:00.000Z' });
+      expect(getTask(task.id)?.definitionRevision).toBe(1);
+
+      const updated = updateTaskDefinition(task.id, { prompt: 'Run the release pipeline' });
+      expect(updated?.definitionRevision).toBe(2);
+      expect(updated?.prompt).toBe('Run the release pipeline');
+
+      const unchanged = updateTaskDefinition(task.id, {
+        prompt: 'Run the release pipeline',
+        nextRunAt: '2026-08-11T02:00:00.000Z',
+      });
+      expect(unchanged?.definitionRevision).toBe(2);
+      expect(unchanged?.nextRunAt).toBe('2026-08-11T02:00:00.000Z');
+
+      const reloaded = await freshImport();
+      expect(reloaded.getTask(task.id)?.definitionRevision).toBe(2);
+    });
+
+    it('does not settle an old logical run onto an edited definition', async () => {
+      const {
+        createTask, updateTaskDefinition, markRun, getTask,
+      } = await freshImport();
+      const task = createTask({
+        ...TASK_PARAMS,
+        repeat: { times: 2, completed: 0 },
+      });
+      updateTaskDefinition(task.id, { prompt: 'new definition' });
+
+      expect(markRun(task.id, true, undefined, undefined, 1)).toBe('superseded');
+      expect(getTask(task.id)).toMatchObject({
+        definitionRevision: 2,
+        prompt: 'new definition',
+        enabled: true,
+        repeat: { times: 2, completed: 0 },
+      });
+      expect(getTask(task.id)?.lastStatus).toBeUndefined();
+    });
+
     it('should update the enabled flag', async () => {
-      const { createTask, updateTask, getTask } = await freshImport();
+      const { createTask, updateTaskDefinition, getTask } = await freshImport();
       const task = createTask(TASK_PARAMS);
       expect(task.enabled).toBe(true);
 
-      updateTask(task.id, { enabled: false });
+      updateTaskDefinition(task.id, { enabled: false });
       const updated = getTask(task.id);
       expect(updated!.enabled).toBe(false);
     });
@@ -251,21 +294,21 @@ describe('schedule-store', () => {
     });
 
     it('should be a no-op for a non-existent task', async () => {
-      const { updateTask, listTasks } = await freshImport();
+      const { updateTaskDefinition, listTasks } = await freshImport();
       // Should not throw
-      updateTask('nonexistent', { enabled: false });
+      updateTaskDefinition('nonexistent', { enabled: false });
       expect(listTasks()).toHaveLength(0);
     });
 
     it('normalizes a legacy new-topic update to origin', async () => {
-      const { createTask, updateTask, getTask } = await freshImport();
+      const { createTask, updateTaskDefinition, getTask } = await freshImport();
       const task = createTask({ ...TASK_PARAMS, deliver: 'origin' });
       expect(task.deliver).toBe('origin');
 
-      updateTask(task.id, { deliver: 'new-topic' });
+      updateTaskDefinition(task.id, { deliver: 'new-topic' });
       expect(getTask(task.id)!.deliver).toBe('origin');
 
-      updateTask(task.id, { deliver: 'origin' });
+      updateTaskDefinition(task.id, { deliver: 'origin' });
       expect(getTask(task.id)!.deliver).toBe('origin');
     });
 
@@ -300,9 +343,9 @@ describe('schedule-store', () => {
     });
 
     it('should persist updates to disk', async () => {
-      const { createTask, updateTask } = await freshImport();
+      const { createTask, updateTaskDefinition } = await freshImport();
       const task = createTask(TASK_PARAMS);
-      updateTask(task.id, { enabled: false });
+      updateTaskDefinition(task.id, { enabled: false });
 
       const fp = storeFp();
       const data = JSON.parse(readFileSync(fp, 'utf-8'));
@@ -364,7 +407,8 @@ describe('schedule-store', () => {
     it('should persist updates across reloads', async () => {
       const store1 = await freshImport();
       const task = store1.createTask(TASK_PARAMS);
-      store1.updateTask(task.id, { enabled: false, lastRunAt: '2026-01-01T00:00:00.000Z' });
+      store1.updateTaskDefinition(task.id, { enabled: false });
+      store1.updateTask(task.id, { lastRunAt: '2026-01-01T00:00:00.000Z' });
 
       const store2 = await freshImport();
       const reloaded = store2.getTask(task.id);
@@ -418,6 +462,7 @@ describe('schedule-store', () => {
       const normalized = JSON.parse(readFileSync(fp, 'utf-8'));
       expect(normalized['legacy-scope'].scope).toBe('chat');
       expect(normalized['legacy-scope'].parsed.kind).toBe('cron');
+      expect(normalized['legacy-scope'].definitionRevision).toBe(1);
     });
 
     it('rolls back memory and disk when persistence fails before rename', async () => {
@@ -429,7 +474,7 @@ describe('schedule-store', () => {
       store.__setScheduleStoreBeforeRenameTestHook(() => {
         throw new Error('injected persistence failure');
       });
-      expect(() => store.updateTask(original.id, { enabled: false })).toThrow(
+      expect(() => store.updateTaskDefinition(original.id, { enabled: false })).toThrow(
         'injected persistence failure',
       );
       store.__setScheduleStoreBeforeRenameTestHook(undefined);
@@ -439,7 +484,7 @@ describe('schedule-store', () => {
       expect(readdirSync(tempDir).filter(name => name.includes('.tmp.'))).toEqual([]);
 
       // The store remains usable after the failed transaction.
-      store.updateTask(original.id, { enabled: false });
+      store.updateTaskDefinition(original.id, { enabled: false });
       expect(store.getTask(original.id)?.enabled).toBe(false);
     });
 

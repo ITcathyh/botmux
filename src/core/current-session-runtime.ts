@@ -39,6 +39,7 @@ import {
   type KeyedTriggerSettlementResult,
   type OrdinaryIngressPort,
   type PendingRepoCompletionPort,
+  type ScheduledFirePort,
   type SessionDirectory,
   type SessionDirectoryQuery,
   type SessionDirectoryRead,
@@ -503,9 +504,11 @@ interface CachedCurrentSessionRuntimeHost {
   ordinaryIngress?: OrdinaryIngressPort;
   ordinaryRouteOpeningCreator?: CurrentOrdinaryRouteOpeningCreator;
   pendingRepoCompletion?: PendingRepoCompletionPort;
+  scheduledFire?: ScheduledFirePort;
   portBindings: {
     ordinaryIngress?: OrdinaryIngressPort;
     pendingRepoCompletion?: PendingRepoCompletionPort;
+    scheduledFire?: ScheduledFirePort;
   };
   innerHost: CurrentSessionRuntimeHost;
   routeHost?: CurrentSessionRuntimeHost;
@@ -624,6 +627,8 @@ export function currentSessionRuntimeHost(options: {
   pendingRepoCompletion?: PendingRepoCompletionPort;
   /** Internal FI seam; production shares the process-local Current protocol. */
   dashboardProjectionProtocol?: CurrentDashboardProjectionProtocol;
+  /** Staged Current seam for scheduled execution. */
+  scheduledFire?: ScheduledFirePort;
 }): CurrentSessionRuntimeHost {
   const runtimeEpoch = options.runtimeEpoch ?? options.ownerBootId;
   // Pre-I1 JavaScript tests can omit the compile-time-required binding. Their
@@ -635,6 +640,7 @@ export function currentSessionRuntimeHost(options: {
     portBindings?: {
       ordinaryIngress?: OrdinaryIngressPort;
       pendingRepoCompletion?: PendingRepoCompletionPort;
+      scheduledFire?: ScheduledFirePort;
     };
   } = {}): CurrentSessionRuntimeHost => createSessionRuntimeHost({
     ownerBotId: stableOwnerKey,
@@ -658,6 +664,7 @@ export function currentSessionRuntimeHost(options: {
       : {
           ordinaryIngress: options.ordinaryIngress,
           pendingRepoCompletion: options.pendingRepoCompletion,
+          scheduledFire: options.scheduledFire,
         }),
     sessionStore: sessionStore.createCurrentSessionStore({
       ownerLarkAppId: options.ownerLarkAppId,
@@ -710,7 +717,10 @@ export function currentSessionRuntimeHost(options: {
       || cached.ordinaryRouteOpeningCreator === options.ordinaryRouteOpeningCreator;
     const pendingRepoCompatible = options.pendingRepoCompletion === undefined
       || cached.pendingRepoCompletion === options.pendingRepoCompletion;
-    if (ordinaryCompatible && routeCreatorCompatible && pendingRepoCompatible) {
+    const scheduledFireCompatible = options.scheduledFire === undefined
+      || cached.scheduledFire === options.scheduledFire;
+    if (ordinaryCompatible && routeCreatorCompatible && pendingRepoCompatible
+        && scheduledFireCompatible) {
       return cached.host;
     }
     if (!ordinaryCompatible && cached.ordinaryIngress !== undefined) {
@@ -718,6 +728,9 @@ export function currentSessionRuntimeHost(options: {
     }
     if (!pendingRepoCompatible && cached.pendingRepoCompletion !== undefined) {
       throw new Error('Current SessionRuntime owner epoch already has a different pending-repo completion port');
+    }
+    if (!scheduledFireCompatible && cached.scheduledFire !== undefined) {
+      throw new Error('Current SessionRuntime owner epoch already has a different scheduled-fire port');
     }
     if (!routeCreatorCompatible && cached.ordinaryRouteOpeningCreator !== undefined) {
       throw new Error('Current SessionRuntime owner epoch already has a different ordinary route opening creator');
@@ -727,6 +740,7 @@ export function currentSessionRuntimeHost(options: {
       ?? cached.ordinaryRouteOpeningCreator;
     const pendingRepoCompletion = options.pendingRepoCompletion
       ?? cached.pendingRepoCompletion;
+    const scheduledFire = options.scheduledFire ?? cached.scheduledFire;
     const routeHost = cached.routeHost ?? composeRouteHost(
       cached.innerHost,
       ordinaryIngress,
@@ -734,6 +748,7 @@ export function currentSessionRuntimeHost(options: {
     );
     cached.portBindings.ordinaryIngress = ordinaryIngress;
     cached.portBindings.pendingRepoCompletion = pendingRepoCompletion;
+    cached.portBindings.scheduledFire = scheduledFire;
     const composedHost = routeHost ?? cached.innerHost;
     const lease = { active: true };
     const host = leaseCurrentSessionRuntimeHost(composedHost, lease);
@@ -743,6 +758,7 @@ export function currentSessionRuntimeHost(options: {
       ordinaryIngress,
       ordinaryRouteOpeningCreator,
       pendingRepoCompletion,
+      scheduledFire,
       portBindings: cached.portBindings,
       innerHost: cached.innerHost,
       routeHost,
@@ -755,6 +771,7 @@ export function currentSessionRuntimeHost(options: {
   const portBindings = {
     ordinaryIngress: options.ordinaryIngress,
     pendingRepoCompletion: options.pendingRepoCompletion,
+    scheduledFire: options.scheduledFire,
   };
   const innerHost = createInnerHost({ portBindings });
   const routeHost = composeRouteHost(
@@ -770,6 +787,7 @@ export function currentSessionRuntimeHost(options: {
     ordinaryIngress: options.ordinaryIngress,
     ordinaryRouteOpeningCreator: options.ordinaryRouteOpeningCreator,
     pendingRepoCompletion: options.pendingRepoCompletion,
+    scheduledFire: options.scheduledFire,
     portBindings,
     innerHost,
     routeHost,

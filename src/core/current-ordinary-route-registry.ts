@@ -30,6 +30,10 @@ import {
   storedActiveSessionAnchorId,
   type DaemonSession,
 } from './types.js';
+import {
+  currentRouteAdmissionKey,
+  reserveCurrentRouteAdmission,
+} from './current-route-admission.js';
 
 declare const currentOrdinaryRouteOpeningPostCommitTokenBrand: unique symbol;
 declare const currentOrdinaryRouteOpeningRollbackTokenBrand: unique symbol;
@@ -177,6 +181,7 @@ function routeMatchesTurn(
   turn: NormalizedOrdinaryImTurn,
 ): boolean {
   return route.kind !== 'idempotency'
+    && route.kind !== 'schedule'
     && route.kind === turn.route.scope
     && (route.kind === 'thread'
       ? route.anchorId === turn.route.canonicalAnchor
@@ -603,43 +608,16 @@ export function createCurrentOrdinaryRouteRegistryRuntime(
   const postCommitKey = (sessionId: string, providerKey: string): string => (
     `${sessionId}\u0000${providerKey}`
   );
-  interface RouteAdmissionQueue {
-    tail: Promise<void>;
-    depth: number;
-  }
-  const routeAdmissions = new Map<string, RouteAdmissionQueue>();
   const routeUnknowns = new Map<string, string>();
   const routeAdmissionKey = (turn: NormalizedOrdinaryImTurn): string => (
-    `${turn.route.scope}\u0000${turn.route.canonicalAnchor}`
-      + `\u0000${turn.route.chatId}\u0000${turn.route.chatType}`
+    currentRouteAdmissionKey({
+      ownerLarkAppId: options.ownerLarkAppId,
+      scope: turn.route.scope,
+      canonicalAnchor: turn.route.canonicalAnchor,
+      chatId: turn.route.chatId,
+      chatType: turn.route.chatType,
+    })
   );
-  const reserveRouteAdmission = (turn: NormalizedOrdinaryImTurn): {
-    readonly ready: Promise<void>;
-    release(): void;
-  } => {
-    const key = routeAdmissionKey(turn);
-    let queue = routeAdmissions.get(key);
-    if (!queue) {
-      queue = { tail: Promise.resolve(), depth: 0 };
-      routeAdmissions.set(key, queue);
-    }
-    const ready = queue.tail;
-    let releaseTail!: () => void;
-    const tail = new Promise<void>((resolve) => { releaseTail = resolve; });
-    queue.tail = tail;
-    queue.depth += 1;
-    let released = false;
-    return {
-      ready,
-      release() {
-        if (released) return;
-        released = true;
-        releaseTail();
-        queue!.depth -= 1;
-        if (queue!.depth === 0 && queue!.tail === tail) routeAdmissions.delete(key);
-      },
-    };
-  };
 
   const rollbackOpening = (
     token: CurrentOrdinaryRouteOpeningRollbackToken,
@@ -799,7 +777,7 @@ export function createCurrentOrdinaryRouteRegistryRuntime(
 
     const attempt = createAttempt();
     providerRecords.set(providerKey, { requestHash, state: 'received', attempt });
-    const routeAdmission = reserveRouteAdmission(turn);
+    const routeAdmission = reserveCurrentRouteAdmission(routeAdmissionKey(turn));
     await routeAdmission.ready;
     const admissionKey = routeAdmissionKey(turn);
     let pendingPostCommitKey: string | undefined;

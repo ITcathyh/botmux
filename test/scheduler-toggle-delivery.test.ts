@@ -11,6 +11,12 @@ vi.mock('../src/services/schedule-store.js', () => ({
     const t = store.get(id);
     if (t) Object.assign(t, updates);
   },
+  updateTaskDefinition: (id: string, updates: Partial<ScheduledTask>) => {
+    const t = store.get(id);
+    if (t) Object.assign(t, updates, {
+      definitionRevision: t.definitionRevision + 1,
+    });
+  },
 }));
 
 vi.mock('../src/core/dashboard-events.js', () => ({
@@ -25,6 +31,7 @@ function seed(deliver?: ScheduledTask['deliver'], overrides: Partial<ScheduledTa
   const id = 'task-1';
   store.set(id, {
     id,
+    definitionRevision: 1,
     name: 'demo',
     schedule: '0 9 * * *',
     parsed: { kind: 'cron', expr: '0 9 * * *', display: '0 9 * * *' },

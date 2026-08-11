@@ -157,6 +157,50 @@ describe('SessionRuntime coverage ledger', () => {
       .toThrow(/forbidden.*currentSessionRuntimeHost/i);
   });
 
+  it('locks C4 scheduler authority to 20 migrated mutations and 13 retained projections', () => {
+    const ledger = cloneLedger();
+    const migrated = ledger.coverage.find((entry: any) => entry.id === 'scheduler');
+    const retained = ledger.coverage.find(
+      (entry: any) => entry.id === 'scheduler-retained-projection',
+    );
+
+    expect(migrated).toMatchObject({
+      targetMilestone: 'C4',
+      disposition: 'migrated',
+      authoritySites: { recordCount: 20, mutationCount: 20 },
+      productionBinding: {
+        commandKind: 'scheduled.fire',
+        durability: 'processLocal',
+      },
+    });
+    expect(retained).toMatchObject({
+      targetMilestone: 'C4',
+      disposition: 'retained',
+      authoritySites: { recordCount: 13, mutationCount: 13 },
+    });
+    expect(() => auditSessionRuntimeCoverage({ ledger })).not.toThrow();
+  });
+
+  it('rejects weakening the C4 scheduler direct-Session capability fence', () => {
+    const ledger = cloneLedger();
+    const scheduler = ledger.coverage.find((entry: any) => entry.id === 'scheduler');
+    scheduler.productionBinding.forbiddenProducerCalls =
+      scheduler.productionBinding.forbiddenProducerCalls
+        .filter((call: string) => call !== 'sessionStore.updateSession');
+
+    expect(() => auditSessionRuntimeCoverage({ ledger }))
+      .toThrow(/forbiddenProducerCalls.*exact direct Session capabilities/i);
+  });
+
+  it('rejects weakening the C4 scheduled.fire production binding', () => {
+    const ledger = cloneLedger();
+    const scheduler = ledger.coverage.find((entry: any) => entry.id === 'scheduler');
+    scheduler.productionBinding.commandKind = 'legacy.schedule.execute';
+
+    expect(() => auditSessionRuntimeCoverage({ ledger }))
+      .toThrow(/scheduler\.productionBinding\.commandKind must be scheduled\.fire/i);
+  });
+
   it('does not let migrated executor coverage swallow the rest of setupWorkerHandlers', () => {
     const ledger = cloneLedger();
     const executor = ledger.coverage.find((entry: any) => entry.id === 'executor-generation');

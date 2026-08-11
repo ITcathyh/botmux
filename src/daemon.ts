@@ -129,6 +129,10 @@ import {
 } from './core/types.js';
 import { currentSessionRuntimeHost } from './core/current-session-runtime.js';
 import {
+  createCurrentScheduledFireAdapter,
+  toSchedulerSubmitOutcome,
+} from './core/current-scheduled-fire.js';
+import {
   createCurrentOrdinaryRouteOpeningProduction,
   type CurrentOrdinaryRouteOpeningPolicyFacts,
   type CurrentOrdinaryRouteOpeningPostCommitEffect,
@@ -241,7 +245,6 @@ import {
   buildFollowUpCliInput,
   getAvailableBots,
   restoreActiveSessions,
-  executeScheduledTask,
   persistStreamCardState,
   rememberLastCliInput,
   ensureTerminalWorkerPort,
@@ -619,6 +622,15 @@ const currentOrdinaryOpeningCreators = new Map<
   {
     ownerBootId: string;
     creator: ReturnType<typeof createCurrentOrdinaryRouteOpeningProduction>;
+  }
+>();
+const currentScheduledFireAdapters = new Map<
+  string,
+  {
+    ownerBootId: string;
+    adapter: ReturnType<typeof createCurrentScheduledFireAdapter>;
+    downstream?: ReturnType<typeof currentSessionRuntimeHost>;
+    wrapped?: ReturnType<typeof currentSessionRuntimeHost>;
   }
 >();
 
@@ -1033,6 +1045,21 @@ function currentOrdinaryOpeningCreator(
 
 function currentDaemonSessionRuntimeHost(ownerLarkAppId: string) {
   const ownerBootId = getDaemonBootId();
+  let scheduled = currentScheduledFireAdapters.get(ownerLarkAppId);
+  if (!scheduled || scheduled.ownerBootId !== ownerBootId) {
+    scheduled = {
+      ownerBootId,
+      adapter: createCurrentScheduledFireAdapter({
+        ownerLarkAppId,
+        activeSessions,
+        refreshCliVersion,
+        readDefinitionRevision: scheduleId => (
+          scheduleStore.getTask(scheduleId)?.definitionRevision
+        ),
+      }),
+    };
+    currentScheduledFireAdapters.set(ownerLarkAppId, scheduled);
+  }
   return currentSessionRuntimeHost({
     // startDaemon binds the durable identity before any route can reach this
     // composition. Pre-start unit adapters may carry no BotState identity;
@@ -1052,7 +1079,21 @@ function currentDaemonSessionRuntimeHost(ownerLarkAppId: string) {
       activeSessions,
       ownerBootId,
     }),
+    scheduledFire: scheduled.adapter.port,
   });
+}
+
+function currentDaemonScheduledFireRuntimeHost(ownerLarkAppId: string) {
+  const base = currentDaemonSessionRuntimeHost(ownerLarkAppId);
+  const scheduled = currentScheduledFireAdapters.get(ownerLarkAppId)!;
+  if (scheduled.downstream === base && scheduled.wrapped) return scheduled.wrapped;
+  const wrapped = {
+    projection: base.projection,
+    runtime: scheduled.adapter.wrapRuntime(base),
+  };
+  scheduled.downstream = base;
+  scheduled.wrapped = wrapped;
+  return wrapped;
 }
 /** False until restoreActiveSessions() finishes. During the startup window the
  *  IPC server is already listening but activeSessions is empty, so a reconnecting
@@ -20833,9 +20874,19 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // each filters to only execute tasks whose `larkAppId` matches its bot
   // (unmatched tasks are handled by the owning bot's daemon instead; a
   // missing larkAppId falls through to bot-0 as a legacy fallback).
-  scheduler.setExecuteCallback((task) => withBotTurnAdmission(
-    task.larkAppId ?? cfg.larkAppId,
-    () => executeScheduledTask(task, activeSessions, refreshCliVersion),
+  scheduler.setSubmitCallback((fire) => withBotTurnAdmission(
+    fire.task.larkAppId ?? cfg.larkAppId,
+    async () => {
+      const host = currentDaemonScheduledFireRuntimeHost(
+        fire.task.larkAppId ?? cfg.larkAppId,
+      );
+      const outcome = await host.runtime.submit({
+        target: { kind: 'route', route: { kind: 'schedule', runId: fire.runId } },
+        idempotencyKey: fire.runId,
+        command: { kind: 'scheduled.fire', input: fire },
+      });
+      return toSchedulerSubmitOutcome(outcome);
+    },
   ));
   scheduler.setOwnerFilter(cfg.larkAppId, idx === 0);
   scheduler.startScheduler();

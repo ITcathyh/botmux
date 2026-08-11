@@ -7637,7 +7637,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
         let task = scheduleStore.getTask(id);
         if (!task && retargetIfElsewhere()) task = scheduleStore.getTask(id);
         if (!task) { console.error(`未找到任务 ${id}`); process.exit(1); }
-        scheduleStore.updateTask(id, { nextRunAt: new Date().toISOString() });
+        scheduler.runTaskNow(id);
         console.log(`已标记任务 ${id} 下次 tick 立即执行（< 30s）`);
       }
       break;

@@ -37,6 +37,10 @@ import {
   type SessionCommandLane,
   type SessionLaneAddress,
 } from './session-command-lane.js';
+import {
+  scheduledRunId,
+  type ScheduledFireEnvelope,
+} from './scheduled-fire.js';
 
 declare const sessionAddressBrand: unique symbol;
 declare const executorAddressBrand: unique symbol;
@@ -58,7 +62,9 @@ export type SessionRoute =
 /** Private exact transport binding; SessionProjection never exposes it. */
 export type OrdinaryIngressRouteBinding = NormalizedOrdinaryImTurn['route'];
 
-export type SessionCommandRoute = SessionRoute | { kind: 'idempotency'; key: string };
+export type SessionCommandRoute = SessionRoute
+  | { kind: 'idempotency'; key: string }
+  | { kind: 'schedule'; runId: string };
 
 export interface SessionDirectoryRow {
   /** Stable only inside the bound Host; never exposed by SessionProjection. */
@@ -238,6 +244,33 @@ export interface OrdinaryIngressPort {
   ): OrdinaryIngressTransitionResult;
 }
 
+export type ScheduledFireTransitionResult =
+  | { readonly kind: 'committed' }
+  | {
+      readonly kind: 'rejected';
+      readonly reason: 'routeBusy' | 'definitionSuperseded';
+      readonly message: string;
+    }
+  | { readonly kind: 'retryable'; readonly message: string }
+  | { readonly kind: 'unknown'; readonly message: string }
+  | { readonly kind: 'effect'; readonly intent: unknown; readonly continuation: unknown };
+
+export type ScheduledFireEffectSettlement = OrdinaryIngressEffectSettlement;
+
+/** Current scheduled execution seam. Long Lark/Agent CLI/filesystem effects
+ * execute through `execute`, outside the owner-scoped Session lane. */
+export interface ScheduledFirePort {
+  begin(input: {
+    readonly sessionId: string;
+    readonly fire: ScheduledFireEnvelope;
+  }): ScheduledFireTransitionResult;
+  execute(intent: unknown): Promise<unknown>;
+  resume(
+    continuation: unknown,
+    settlement: ScheduledFireEffectSettlement,
+  ): ScheduledFireTransitionResult;
+}
+
 export type PendingRepoCompletionSelection =
   | {
       readonly kind: 'directory';
@@ -331,6 +364,11 @@ export type OrdinaryIngressCommand = {
   input: OrdinaryIngressInput;
 };
 
+export type ScheduledFireCommand = {
+  kind: 'scheduled.fire';
+  input: ScheduledFireEnvelope;
+};
+
 export type PendingRepoCompletionCommand = {
   kind: 'pendingRepo.complete';
   input: PendingRepoCompletionInput;
@@ -361,6 +399,7 @@ export type ExecutorInputCommittedCommand = {
 export type SessionCommand =
   | KeyedTriggerCommand
   | OrdinaryIngressCommand
+  | ScheduledFireCommand
   | PendingRepoCompletionCommand
   | ControlRenameCommand
   | ExecutorInputCommittedCommand;
@@ -432,6 +471,41 @@ export type OrdinaryIngressCommandOutcome =
   | { kind: 'rejected'; reason: 'idempotencyConflict' | 'invalidCommand'; message: string }
   | { kind: 'staleAddress' }
   | { kind: 'notWired'; command: 'ordinary.ingress'; message: string }
+  | { kind: 'retryable'; message: string }
+  | { kind: 'quarantined'; message: string };
+
+export type ScheduledFireCommandOutcome =
+  | {
+      kind: 'applied';
+      action: 'scheduled.inputAccepted';
+      policy: 'scheduled-process-local';
+      durability: 'processLocal';
+      sessionId: string;
+    }
+  | {
+      kind: 'duplicate';
+      state: 'inFlight' | 'inputAccepted';
+      policy: 'scheduled-process-local';
+      durability: 'processLocal';
+      sessionId: string;
+      message: string;
+    }
+  | {
+      kind: 'ambiguous';
+      state: 'dispatchUnknown';
+      policy: 'scheduled-process-local';
+      durability: 'processLocal';
+      sessionId: string;
+      message: string;
+      idempotent: boolean;
+    }
+  | {
+      kind: 'rejected';
+      reason: 'idempotencyConflict' | 'invalidCommand' | 'routeBusy' | 'definitionSuperseded';
+      message: string;
+    }
+  | { kind: 'staleAddress' }
+  | { kind: 'notWired'; command: 'scheduled.fire'; message: string }
   | { kind: 'retryable'; message: string }
   | { kind: 'quarantined'; message: string };
 
@@ -534,6 +608,7 @@ export type ExecutorInputCommittedCommandOutcome =
 export type CommandOutcome =
   | KeyedTriggerCommandOutcome
   | OrdinaryIngressCommandOutcome
+  | ScheduledFireCommandOutcome
   | PendingRepoCompletionCommandOutcome
   | ControlRenameCommandOutcome
   | ExecutorInputCommittedCommandOutcome;
@@ -543,6 +618,8 @@ export type CommandOutcomeFor<C extends SessionCommand> =
     ? KeyedTriggerCommandOutcome
     : C extends OrdinaryIngressCommand
       ? OrdinaryIngressCommandOutcome
+      : C extends ScheduledFireCommand
+        ? ScheduledFireCommandOutcome
       : C extends PendingRepoCompletionCommand
         ? PendingRepoCompletionCommandOutcome
       : C extends ControlRenameCommand
@@ -739,10 +816,12 @@ export function createSessionRuntimeHost(options: {
   keyedTriggers: KeyedTriggerAuthority;
   keyedTriggerTurns: KeyedTriggerTurnPort;
   ordinaryIngress?: OrdinaryIngressPort;
+  scheduledFire?: ScheduledFirePort;
   pendingRepoCompletion?: PendingRepoCompletionPort;
   /** Owner/epoch-stable optional ports used by a composition Host upgrade. */
   portBindings?: {
     ordinaryIngress?: OrdinaryIngressPort;
+    scheduledFire?: ScheduledFirePort;
     pendingRepoCompletion?: PendingRepoCompletionPort;
   };
   sessionStore?: SessionStore;
@@ -755,11 +834,15 @@ export function createSessionRuntimeHost(options: {
 }): { runtime: SessionRuntime; projection: SessionProjection } {
   if (options.portBindings
       && (options.ordinaryIngress !== undefined
+        || options.scheduledFire !== undefined
         || options.pendingRepoCompletion !== undefined)) {
     throw new Error('SessionRuntime optional ports must use direct options or one binding slot');
   }
   const ordinaryIngressPort = (): OrdinaryIngressPort | undefined => (
     options.portBindings?.ordinaryIngress ?? options.ordinaryIngress
+  );
+  const scheduledFirePort = (): ScheduledFirePort | undefined => (
+    options.portBindings?.scheduledFire ?? options.scheduledFire
   );
   const pendingRepoCompletionPort = (): PendingRepoCompletionPort | undefined => (
     options.portBindings?.pendingRepoCompletion ?? options.pendingRepoCompletion
@@ -804,6 +887,15 @@ export function createSessionRuntimeHost(options: {
         message: string;
       };
   const ordinaryInputs = new Map<string, OrdinaryInputRecord>();
+  interface ScheduledAttempt {
+    readonly terminal: Promise<ScheduledFireCommandOutcome>;
+    settle(outcome: ScheduledFireCommandOutcome): void;
+  }
+  type ScheduledFireRecord =
+    | { requestHash: string; state: 'received'; attempt: ScheduledAttempt }
+    | { requestHash: string; state: 'inputAccepted' }
+    | { requestHash: string; state: 'dispatchUnknown'; message: string };
+  const scheduledFires = new Map<string, ScheduledFireRecord>();
   interface PendingRepoAttempt {
     readonly terminal: Promise<PendingRepoCompletionCommandOutcome>;
     settle(outcome: PendingRepoCompletionCommandOutcome): void;
@@ -825,7 +917,7 @@ export function createSessionRuntimeHost(options: {
     executor: ExecutorAddress;
   }>();
   const sessionCommandIdentities = new Map<string, {
-    kind: OrdinaryIngressCommand['kind'] | PendingRepoCompletionCommand['kind'] | ControlRenameCommand['kind'] | ExecutorInputCommittedCommand['kind'];
+    kind: OrdinaryIngressCommand['kind'] | ScheduledFireCommand['kind'] | PendingRepoCompletionCommand['kind'] | ControlRenameCommand['kind'] | ExecutorInputCommittedCommand['kind'];
     requestHash: string;
   }>();
   const scopedCommandKey = (sessionId: string, idempotencyKey: string): string => (
@@ -854,6 +946,12 @@ export function createSessionRuntimeHost(options: {
         ordinaryInputs.delete(old);
         sessionCommandIdentities.delete(old);
       }
+      const scheduled = scheduledFires.get(old);
+      if (scheduled
+          && (scheduled.state === 'inputAccepted' || scheduled.state === 'dispatchUnknown')) {
+        scheduledFires.delete(old);
+        sessionCommandIdentities.delete(old);
+      }
       const completion = pendingRepoCompletions.get(old);
       if (completion
         && (completion.state === 'committed' || completion.state === 'unknown')
@@ -868,6 +966,22 @@ export function createSessionRuntimeHost(options: {
     let resolveTerminal!: (outcome: OrdinaryIngressCommandOutcome) => void;
     let settled = false;
     const terminal = new Promise<OrdinaryIngressCommandOutcome>((resolve) => {
+      resolveTerminal = resolve;
+    });
+    return {
+      terminal,
+      settle(outcome) {
+        if (settled) return;
+        settled = true;
+        resolveTerminal(outcome);
+      },
+    };
+  };
+
+  const createScheduledAttempt = (): ScheduledAttempt => {
+    let resolveTerminal!: (outcome: ScheduledFireCommandOutcome) => void;
+    let settled = false;
+    const terminal = new Promise<ScheduledFireCommandOutcome>((resolve) => {
       resolveTerminal = resolve;
     });
     return {
@@ -1114,6 +1228,16 @@ export function createSessionRuntimeHost(options: {
     readonly continuation: unknown;
   }
 
+  interface ScheduledEffectStep {
+    readonly kind: 'scheduledEffect';
+    readonly sessionId: string;
+    readonly scheduledKey: string;
+    readonly requestHash: string;
+    readonly attempt: ScheduledAttempt;
+    readonly intent: unknown;
+    readonly continuation: unknown;
+  }
+
   interface PendingRepoEffectStep {
     readonly kind: 'pendingRepoEffect';
     readonly sessionId: string;
@@ -1127,11 +1251,17 @@ export function createSessionRuntimeHost(options: {
   type CriticalResult =
     | { kind: 'outcome'; outcome: CommandOutcome }
     | OrdinaryEffectStep
+    | ScheduledEffectStep
     | PendingRepoEffectStep
     | {
         kind: 'ordinaryJoin';
         sessionId: string;
         attempt: OrdinaryAttempt;
+      }
+    | {
+        kind: 'scheduledJoin';
+        sessionId: string;
+        attempt: ScheduledAttempt;
       }
     | {
         kind: 'ordinaryRetryable';
@@ -1267,6 +1397,121 @@ export function createSessionRuntimeHost(options: {
       return quarantineOrdinaryAttempt(
         step,
         `ordinary ingress transition could not be inspected: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  };
+
+  const scheduledAmbiguous = (
+    sessionId: string,
+    message: string,
+    idempotent: boolean,
+  ): ScheduledFireCommandOutcome => ({
+    kind: 'ambiguous',
+    state: 'dispatchUnknown',
+    policy: 'scheduled-process-local',
+    durability: 'processLocal',
+    sessionId,
+    message,
+    idempotent,
+  });
+
+  const scheduledDuplicate = (sessionId: string): ScheduledFireCommandOutcome => ({
+    kind: 'duplicate',
+    state: 'inputAccepted',
+    policy: 'scheduled-process-local',
+    durability: 'processLocal',
+    sessionId,
+    message: 'scheduled input was already accepted in this runtime epoch',
+  });
+
+  const settleScheduledTransition = (
+    step: Pick<ScheduledEffectStep, 'sessionId' | 'scheduledKey' | 'requestHash' | 'attempt'>,
+    transition: Exclude<ScheduledFireTransitionResult, { kind: 'effect' }>,
+  ): CriticalResult => {
+    let terminal: ScheduledFireCommandOutcome;
+    if (transition.kind === 'committed') {
+      scheduledFires.set(step.scheduledKey, {
+        requestHash: step.requestHash,
+        state: 'inputAccepted',
+      });
+      retainTerminalIdempotency(step.scheduledKey);
+      terminal = {
+        kind: 'applied',
+        action: 'scheduled.inputAccepted',
+        policy: 'scheduled-process-local',
+        durability: 'processLocal',
+        sessionId: step.sessionId,
+      };
+    } else if (transition.kind === 'rejected') {
+      scheduledFires.delete(step.scheduledKey);
+      sessionCommandIdentities.delete(step.scheduledKey);
+      terminal = {
+        kind: 'rejected',
+        reason: transition.reason,
+        message: transition.message,
+      };
+    } else if (transition.kind === 'retryable') {
+      scheduledFires.delete(step.scheduledKey);
+      sessionCommandIdentities.delete(step.scheduledKey);
+      terminal = { kind: 'retryable', message: transition.message };
+    } else {
+      scheduledFires.set(step.scheduledKey, {
+        requestHash: step.requestHash,
+        state: 'dispatchUnknown',
+        message: transition.message,
+      });
+      retainTerminalIdempotency(step.scheduledKey);
+      terminal = scheduledAmbiguous(step.sessionId, transition.message, false);
+    }
+    step.attempt.settle(terminal);
+    return outcome(terminal);
+  };
+
+  const quarantineScheduledAttempt = (
+    step: Pick<ScheduledEffectStep, 'sessionId' | 'scheduledKey' | 'requestHash' | 'attempt'>,
+    message: string,
+  ): CriticalResult => {
+    scheduledFires.set(step.scheduledKey, {
+      requestHash: step.requestHash,
+      state: 'dispatchUnknown',
+      message,
+    });
+    retainTerminalIdempotency(step.scheduledKey);
+    const terminal: ScheduledFireCommandOutcome = { kind: 'quarantined', message };
+    step.attempt.settle(terminal);
+    return outcome(terminal);
+  };
+
+  const transitionScheduledAttempt = (
+    step: Pick<ScheduledEffectStep, 'sessionId' | 'scheduledKey' | 'requestHash' | 'attempt'>,
+    transition: ScheduledFireTransitionResult,
+  ): CriticalResult => {
+    try {
+      if (!transition || typeof transition !== 'object') {
+        return quarantineScheduledAttempt(step, 'scheduled fire transition is invalid');
+      }
+      if (transition.kind === 'effect') {
+        return {
+          ...step,
+          kind: 'scheduledEffect',
+          intent: transition.intent,
+          continuation: transition.continuation,
+        };
+      }
+      if (transition.kind === 'committed') {
+        return settleScheduledTransition(step, transition);
+      }
+      if ((transition.kind === 'rejected'
+          || transition.kind === 'retryable'
+          || transition.kind === 'unknown')
+          && typeof transition.message === 'string') {
+        return settleScheduledTransition(step, transition);
+      }
+      return quarantineScheduledAttempt(step, 'scheduled fire transition is invalid');
+    } catch (error) {
+      return quarantineScheduledAttempt(
+        step,
+        `scheduled fire transition could not be inspected: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
   };
@@ -2064,6 +2309,109 @@ export function createSessionRuntimeHost(options: {
       }
       return transitionPendingRepoAttempt(step, transition);
     }
+    if (request.command.kind === 'scheduled.fire') {
+      if (request.target.kind !== 'session') {
+        return outcome({
+          kind: 'rejected',
+          reason: 'invalidCommand',
+          message: 'scheduled fire requires an address resolved by this SessionRuntime epoch',
+        });
+      }
+      const slot = addressSlots.get(request.target.address)!;
+      const fire = request.command.input;
+      let canonicalRunId: string;
+      try {
+        canonicalRunId = scheduledRunId(fire.identity);
+      } catch (error) {
+        return outcome({
+          kind: 'rejected',
+          reason: 'invalidCommand',
+          message: `scheduled identity is invalid: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
+      if (request.idempotencyKey !== fire.runId || fire.runId !== canonicalRunId) {
+        return outcome({
+          kind: 'rejected',
+          reason: 'invalidCommand',
+          message: 'scheduled idempotency key must equal the unchanged logical run id',
+        });
+      }
+      if (fire.task.id !== fire.identity.scheduleId) {
+        return outcome({
+          kind: 'rejected',
+          reason: 'invalidCommand',
+          message: 'scheduled task snapshot does not match the logical run identity',
+        });
+      }
+      const port = scheduledFirePort();
+      if (!port) {
+        return outcome({
+          kind: 'notWired',
+          command: 'scheduled.fire',
+          message: 'scheduled execution is not connected to this Current SessionRuntime host',
+        });
+      }
+      let requestHash: string;
+      try {
+        requestHash = computeInputHash(fire);
+      } catch (error) {
+        return outcome({
+          kind: 'rejected',
+          reason: 'invalidCommand',
+          message: `scheduled fire is not canonicalizable: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
+      const scheduledKey = scopedCommandKey(slot.sessionId, request.idempotencyKey);
+      const prior = scheduledFires.get(scheduledKey);
+      if (prior) {
+        if (prior.requestHash !== requestHash) {
+          return outcome({
+            kind: 'rejected',
+            reason: 'idempotencyConflict',
+            message: 'logical run id already belongs to a different scheduled fire',
+          });
+        }
+        if (prior.state === 'received') {
+          return { kind: 'scheduledJoin', sessionId: slot.sessionId, attempt: prior.attempt };
+        }
+        if (prior.state === 'dispatchUnknown') {
+          return outcome(scheduledAmbiguous(slot.sessionId, prior.message, true));
+        }
+        return outcome(scheduledDuplicate(slot.sessionId));
+      }
+      const existingIdentity = sessionCommandIdentities.get(scheduledKey);
+      if (existingIdentity
+          && (existingIdentity.kind !== request.command.kind
+            || existingIdentity.requestHash !== requestHash)) {
+        return outcome({
+          kind: 'rejected',
+          reason: 'idempotencyConflict',
+          message: 'Session idempotency key already belongs to a different semantic command',
+        });
+      }
+      if (!existingIdentity) {
+        sessionCommandIdentities.set(scheduledKey, {
+          kind: request.command.kind,
+          requestHash,
+        });
+      }
+      const attempt = createScheduledAttempt();
+      scheduledFires.set(scheduledKey, { requestHash, state: 'received', attempt });
+      const step = { sessionId: slot.sessionId, scheduledKey, requestHash, attempt };
+      let transition: ScheduledFireTransitionResult;
+      try {
+        transition = invokeSynchronousPort(
+          'ScheduledFirePort.begin',
+          () => port.begin({ sessionId: slot.sessionId, fire }),
+        );
+      } catch (error) {
+        return quarantineScheduledAttempt(
+          step,
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+      return transitionScheduledAttempt(step, transition);
+    }
     if (request.command.kind === 'ordinary.ingress') {
       if (request.target.kind !== 'session') {
         return outcome({
@@ -2412,6 +2760,75 @@ export function createSessionRuntimeHost(options: {
     }
   };
 
+  const resumeScheduledAttempt = (
+    step: ScheduledEffectStep,
+    settlement: ScheduledFireEffectSettlement,
+  ): CriticalResult => {
+    const current = scheduledFires.get(step.scheduledKey);
+    if (current?.state !== 'received' || current.attempt !== step.attempt) {
+      const message = 'scheduled fire continuation no longer owns the Current attempt';
+      const terminal: ScheduledFireCommandOutcome = { kind: 'quarantined', message };
+      step.attempt.settle(terminal);
+      return outcome(terminal);
+    }
+    const port = scheduledFirePort();
+    if (!port) {
+      return quarantineScheduledAttempt(
+        step,
+        'scheduled fire port disappeared during an in-flight attempt',
+      );
+    }
+    let transition: ScheduledFireTransitionResult;
+    try {
+      transition = invokeSynchronousPort(
+        'ScheduledFirePort.resume',
+        () => port.resume(step.continuation, settlement),
+      );
+    } catch (error) {
+      return quarantineScheduledAttempt(
+        step,
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+    return transitionScheduledAttempt(step, transition);
+  };
+
+  const runScheduledEffects = async (
+    initial: ScheduledEffectStep,
+  ): Promise<ScheduledFireCommandOutcome> => {
+    let step = initial;
+    for (;;) {
+      const port = scheduledFirePort();
+      if (!port) {
+        return {
+          kind: 'quarantined',
+          message: 'scheduled fire port disappeared during effect execution',
+        };
+      }
+      let settlement: ScheduledFireEffectSettlement;
+      try {
+        settlement = { kind: 'returned', value: await port.execute(step.intent) };
+      } catch (error) {
+        settlement = { kind: 'threw', error };
+      }
+      const resumed = await commandLane.submit(
+        sessionLaneAddress(step.sessionId),
+        () => resumeScheduledAttempt(step, settlement),
+      );
+      if (resumed.kind === 'scheduledEffect') {
+        step = resumed;
+        continue;
+      }
+      if (resumed.kind === 'outcome') {
+        return resumed.outcome as ScheduledFireCommandOutcome;
+      }
+      return {
+        kind: 'quarantined',
+        message: 'scheduled fire continuation produced an invalid Runtime transition',
+      };
+    }
+  };
+
   const joinOrdinaryAttempt = async (
     sessionId: string,
     attempt: OrdinaryAttempt,
@@ -2532,11 +2949,24 @@ export function createSessionRuntimeHost(options: {
     if (result.kind === 'ordinaryEffect') {
       return await runOrdinaryEffects(result) as CommandOutcomeFor<C>;
     }
+    if (result.kind === 'scheduledEffect') {
+      return await runScheduledEffects(result) as CommandOutcomeFor<C>;
+    }
     if (result.kind === 'pendingRepoEffect') {
       return await runPendingRepoEffects(result) as CommandOutcomeFor<C>;
     }
     if (result.kind === 'ordinaryJoin') {
       return await joinOrdinaryAttempt(result.sessionId, result.attempt) as CommandOutcomeFor<C>;
+    }
+    if (result.kind === 'scheduledJoin') {
+      const terminal = await result.attempt.terminal;
+      if (terminal.kind === 'applied') {
+        return scheduledDuplicate(result.sessionId) as CommandOutcomeFor<C>;
+      }
+      if (terminal.kind === 'ambiguous') {
+        return { ...terminal, idempotent: true } as CommandOutcomeFor<C>;
+      }
+      return terminal as CommandOutcomeFor<C>;
     }
     if (result.kind === 'pendingRepoJoin') {
       return await joinPendingRepoAttempt(result.sessionId, result.attempt) as CommandOutcomeFor<C>;

@@ -200,7 +200,7 @@ describe('executeScheduledTask — silent thread fire', () => {
 
     const ds = active.get(sessionKey(ROOT, APP))!;
     expect(ds).toBeTruthy();
-    expect(forkedTurnId()).toMatch(/^schedule:task0001:/);
+    expect(forkedTurnId()).toMatch(/^schedule-run:v1:manual:task0001:1:/);
     expect(ds.silentScheduledTurns?.has(forkedTurnId())).toBe(true);
     expect(ds.session.rootMessageId).toBe(ROOT);
 
@@ -219,7 +219,7 @@ describe('executeScheduledTask — silent thread fire', () => {
     expect(replyMessageMock).toHaveBeenCalledTimes(1);
     const ds = active.get(sessionKey(ROOT, APP))!;
     expect(ds.silentScheduledTurns).toBeUndefined();
-    expect(forkedTurnId()).toMatch(/^schedule:task0001:/);
+    expect(forkedTurnId()).toMatch(/^schedule-run:v1:manual:task0001:1:/);
     expect(forkedCliInput()).not.toContain('<botmux_silent_schedule');
   });
 });
@@ -266,7 +266,7 @@ describe('executeScheduledTask — fresh-topic execution', () => {
     expect(active.size).toBe(1);
     expect(forkWorkerMock).toHaveBeenCalledTimes(1);
     const [[key, ds]] = [...active.entries()];
-    expect(key).toMatch(/^schedule-run:task0001:[^:]+::cli_app_test$/);
+    expect(key).toMatch(/^schedule-run:schedule-run%3Av1%3Amanual%3Atask0001%3A1%3A[^:]+::cli_app_test$/);
     expect(ds.scope).toBe('chat');
     expect(ds.session.rootMessageId).toBe(ds.session.deferredScheduleRun?.routingAnchor);
     expect(ds.session.deferredScheduleRun).toMatchObject({
@@ -502,7 +502,7 @@ describe('executeScheduledTask — live-session injection', () => {
     expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
     expect(forkWorkerMock).not.toHaveBeenCalled();
     const turnId = sendWorkerInputMock.mock.calls[0][2];
-    expect(turnId).toMatch(/^schedule:task0001:/);
+    expect(turnId).toMatch(/^schedule-run:v1:manual:task0001:1:/);
     expect(existing.silentScheduledTurns?.has(turnId)).toBe(true);
     const injected = sendWorkerInputMock.mock.calls[0][1];
     const content = typeof injected === 'string' ? injected : injected.content;
@@ -545,7 +545,7 @@ describe('executeScheduledTask — live-session injection', () => {
     expect(typeof input === 'string' ? input : input.content).toContain('检查服务状态，挂了才报警');
     expect(options).toMatchObject({
       resume: true,
-      turnId: expect.stringMatching(/^schedule:task0001:/),
+      turnId: expect.stringMatching(/^schedule-run:v1:manual:task0001:1:/),
     });
     expect(existing.silentScheduledTurns?.has(options.turnId)).toBe(true);
   });
@@ -569,7 +569,7 @@ describe('executeScheduledTask — live-session injection', () => {
     const [, , options] = forkWorkerMock.mock.calls[0];
     expect(options).toMatchObject({
       resume: true,
-      turnId: expect.stringMatching(/^schedule:task0001:/),
+      turnId: expect.stringMatching(/^schedule-run:v1:manual:task0001:1:/),
     });
     expect(existing.silentScheduledTurns?.has(options.turnId)).toBe(true);
   });

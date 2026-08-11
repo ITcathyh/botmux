@@ -239,8 +239,28 @@ function migrate(raw: any): ScheduledTask | null {
         ? 'new-topic'
         : undefined;
 
+  const pendingManualRun = raw.pendingManualRun
+    && raw.pendingManualRun.version === 1
+    && typeof raw.pendingManualRun.manualRequestId === 'string'
+    && raw.pendingManualRun.manualRequestId.length > 0
+    && Number.isSafeInteger(raw.pendingManualRun.definitionRevision)
+    && raw.pendingManualRun.definitionRevision > 0
+    && typeof raw.pendingManualRun.requestedAt === 'string'
+    && Number.isFinite(Date.parse(raw.pendingManualRun.requestedAt))
+    ? {
+        version: 1 as const,
+        manualRequestId: raw.pendingManualRun.manualRequestId,
+        definitionRevision: raw.pendingManualRun.definitionRevision,
+        requestedAt: raw.pendingManualRun.requestedAt,
+      }
+    : undefined;
+
   return {
     id: raw.id,
+    definitionRevision: Number.isSafeInteger(raw.definitionRevision)
+      && raw.definitionRevision > 0
+      ? raw.definitionRevision
+      : 1,
     name: raw.name,
     schedule: raw.schedule,
     parsed,
@@ -265,6 +285,7 @@ function migrate(raw: any): ScheduledTask | null {
     lastStatus: raw.lastStatus,
     lastError: raw.lastError,
     lastDeliveryError: raw.lastDeliveryError,
+    pendingManualRun,
     repeat: raw.repeat,
     deliver: raw.deliver === 'local' ? 'local' : 'origin',
     silent: raw.silent === true ? true : undefined,
@@ -290,7 +311,11 @@ function readDiskSnapshot(fp: string, strict: boolean): DiskSnapshot {
       const migrated = migrate(raw);
       if (migrated) {
         map.set(id, migrated);
-        if (!(raw as any).parsed) migratedCount++;
+        if (!(raw as any).parsed
+            || !Number.isSafeInteger((raw as any).definitionRevision)
+            || (raw as any).definitionRevision < 1) {
+          migratedCount++;
+        }
       }
     }
     return { map, migratedCount };
@@ -508,6 +533,7 @@ export function createTask(params: {
     while (!params.id && working.has(id)) id = randomUUID().substring(0, 8);
     const task: ScheduledTask = {
       id,
+      definitionRevision: 1,
       name: params.name,
       schedule: params.schedule,
       parsed: params.parsed,
@@ -554,18 +580,97 @@ export function removeTask(id: string, appId?: string): boolean {
 export function updateTask(
   id: string,
   updates: Partial<Pick<ScheduledTask,
-    'enabled' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir'
+    'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'pendingManualRun'
   >>,
   appId?: string,
 ): void {
   mutateTasks(working => {
     const task = working.get(id);
     if (!task) return { result: undefined, changed: false };
-    Object.assign(
-      task,
-      updates.deliver === 'new-topic' ? { ...updates, deliver: 'origin' as const } : updates,
+    const runtimeFields = [
+      'lastRunAt',
+      'nextRunAt',
+      'lastStatus',
+      'lastError',
+      'lastDeliveryError',
+      'repeat',
+      'pendingManualRun',
+    ] as const;
+    let changed = false;
+    for (const field of runtimeFields) {
+      if (!Object.prototype.hasOwnProperty.call(updates, field)) continue;
+      task[field] = updates[field] as never;
+      changed = true;
+    }
+    return { result: undefined, changed };
+  }, appId);
+}
+
+export type ScheduledTaskDefinitionPatch = Partial<Pick<ScheduledTask,
+  | 'enabled'
+  | 'rootMessageId'
+  | 'scope'
+  | 'executionPosition'
+  | 'topicTitle'
+  | 'chatType'
+  | 'deliver'
+  | 'name'
+  | 'prompt'
+  | 'schedule'
+  | 'parsed'
+  | 'silent'
+  | 'workingDir'
+  | 'nextRunAt'
+>>;
+
+/**
+ * Atomically change executable schedule intent and advance its logical
+ * revision. Deadline/status updates intentionally stay on `updateTask` so a
+ * scheduler tick cannot manufacture a new definition identity.
+ */
+export function updateTaskDefinition(
+  id: string,
+  updates: ScheduledTaskDefinitionPatch,
+  appId?: string,
+): ScheduledTask | undefined {
+  return mutateTasks(working => {
+    const task = working.get(id);
+    if (!task) return { result: undefined, changed: false };
+    const normalized = updates.deliver === 'new-topic'
+      ? { ...updates, deliver: 'origin' as const }
+      : updates;
+    const semanticFields = [
+      'enabled',
+      'rootMessageId',
+      'scope',
+      'executionPosition',
+      'topicTitle',
+      'chatType',
+      'deliver',
+      'name',
+      'prompt',
+      'schedule',
+      'parsed',
+      'silent',
+      'workingDir',
+    ] as const;
+    const sameValue = (left: unknown, right: unknown): boolean => (
+      computeInputHash({ value: left }) === computeInputHash({ value: right })
     );
-    return { result: undefined, changed: true };
+    const semanticChanged = semanticFields.some(field => (
+      Object.prototype.hasOwnProperty.call(normalized, field)
+        && !sameValue(task[field], normalized[field])
+    ));
+    const nextRunChanged = Object.prototype.hasOwnProperty.call(normalized, 'nextRunAt')
+      && task.nextRunAt !== normalized.nextRunAt;
+    if (!semanticChanged && !nextRunChanged) {
+      return { result: task, changed: false };
+    }
+    Object.assign(task, normalized);
+    if (semanticChanged) {
+      task.definitionRevision = (task.definitionRevision ?? 1) + 1;
+    }
+    return { result: task, changed: true };
   }, appId);
 }
 
@@ -573,10 +678,24 @@ export function updateTask(
  * Record a run outcome and auto-manage repeat counter.  If the task has a
  * finite repeat count and we've hit it, the task is removed.
  */
-export function markRun(id: string, success: boolean, error?: string, deliveryError?: string): void {
-  const completedRepeat = mutateTasks(working => {
+export function markRun(
+  id: string,
+  success: boolean,
+  error?: string,
+  deliveryError?: string,
+  expectedDefinitionRevision?: number,
+): 'applied' | 'superseded' | 'missing' {
+  type MarkRunOutcome = {
+    status: 'applied' | 'superseded' | 'missing';
+    completedRepeat?: number;
+  };
+  const outcome = mutateTasks<MarkRunOutcome>(working => {
     const task = working.get(id);
-    if (!task) return { result: undefined, changed: false };
+    if (!task) return { result: { status: 'missing' as const }, changed: false };
+    if (expectedDefinitionRevision !== undefined
+        && task.definitionRevision !== expectedDefinitionRevision) {
+      return { result: { status: 'superseded' as const }, changed: false };
+    }
 
     const now = new Date().toISOString();
     task.lastRunAt = now;
@@ -590,7 +709,10 @@ export function markRun(id: string, success: boolean, error?: string, deliveryEr
       const times = task.repeat.times;
       if (times !== null && times !== undefined && times > 0 && task.repeat.completed >= times) {
         working.delete(id);
-        return { result: times, changed: true };
+        return {
+          result: { status: 'applied' as const, completedRepeat: times },
+          changed: true,
+        };
       }
     }
 
@@ -599,11 +721,12 @@ export function markRun(id: string, success: boolean, error?: string, deliveryEr
       task.enabled = false;
       task.nextRunAt = undefined;
     }
-    return { result: undefined, changed: true };
+    return { result: { status: 'applied' as const }, changed: true };
   });
-  if (completedRepeat !== undefined) {
-    logger.info(`[schedule-store] Task ${id} removed after completing ${completedRepeat} runs`);
+  if (outcome.completedRepeat !== undefined) {
+    logger.info(`[schedule-store] Task ${id} removed after completing ${outcome.completedRepeat} runs`);
   }
+  return outcome.status;
 }
 
 export function listTasks(appId?: string): ScheduledTask[] {

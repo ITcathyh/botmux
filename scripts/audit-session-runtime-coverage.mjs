@@ -24,7 +24,8 @@ const expectedCoverage = new Map([
   ['control', { targetMilestone: 'C2', disposition: 'remaining' }],
   ['executor-generation', { targetMilestone: 'A2', disposition: 'migrated' }],
   ['per-session-command-lane', { targetMilestone: 'A3', disposition: 'migrated' }],
-  ['scheduler', { targetMilestone: 'C4', disposition: 'remaining' }],
+  ['scheduler', { targetMilestone: 'C4', disposition: 'migrated' }],
+  ['scheduler-retained-projection', { targetMilestone: 'C4', disposition: 'retained' }],
   ['activation-restore', { targetMilestone: 'A4', disposition: 'remaining' }],
   ['path-specific-retained', { targetMilestone: 'Target-A', disposition: 'retained' }],
   ['projection', { targetMilestone: 'C3', disposition: 'migrated' }],
@@ -140,6 +141,36 @@ const mandatoryOrdinaryProductionBinding = Object.freeze({
   ordinaryQueuedActivationRecoveryFunction: 'apply',
   queuedActivationRecoveryFunction: 'prepareQueuedActivationRecoveryFork',
 });
+
+const mandatorySchedulerProductionBinding = Object.freeze({
+  producerSource: 'src/core/scheduler.ts',
+  submitSetter: 'setSubmitCallback',
+  deadlineProducer: 'tick',
+  manualProducer: 'runNow',
+  identitySource: 'src/core/scheduled-fire.ts',
+  daemonSource: 'src/daemon.ts',
+  daemonFunction: 'startDaemon',
+  daemonHostFactory: 'currentDaemonScheduledFireRuntimeHost',
+  runtimeSource: 'src/core/session-runtime.ts',
+  runtimeFactory: 'createSessionRuntimeHost',
+  currentRuntimeSource: 'src/core/current-session-runtime.ts',
+  currentRuntimeFactory: 'currentSessionRuntimeHost',
+  adapterSource: 'src/core/current-scheduled-fire.ts',
+  adapterFactory: 'createCurrentScheduledFireAdapter',
+  legacyBridgeSource: 'src/core/session-manager.ts',
+  legacyBridgeFunction: 'executeScheduledTask',
+  commandKind: 'scheduled.fire',
+  durability: 'processLocal',
+});
+
+const mandatorySchedulerForbiddenProducerCalls = [
+  'sessionStore.createSession',
+  'sessionStore.updateSession',
+  'activeSessions.set',
+  'activeSessions.delete',
+  'forkWorker',
+  'sendWorkerInput',
+];
 
 const mandatoryOrdinaryAuthoritySelectors = new Map([
   ['src/core/current-ordinary-ingress-metadata.ts', ['apply']],
@@ -426,6 +457,8 @@ function validateLedgerSchema(ledger) {
   validateExecutorProductionBindingSchema(executor.productionBinding);
   const sessionLane = ledger.coverage.find(entry => entry.id === 'per-session-command-lane');
   validateSessionLaneProductionBindingSchema(sessionLane.productionBinding);
+  const scheduler = ledger.coverage.find(entry => entry.id === 'scheduler');
+  validateSchedulerProductionBindingSchema(scheduler.productionBinding);
   const activation = ledger.coverage.find(entry => entry.id === 'activation-restore');
   validateActivationTailAuthoritySelector(activation.selectors);
   const projection = ledger.coverage.find(entry => entry.id === 'projection');
@@ -435,7 +468,8 @@ function validateLedgerSchema(ledger) {
       && entry.id !== 'ordinary-im'
       && entry.id !== 'executor-generation'
       && entry.id !== 'per-session-command-lane'
-      && entry.id !== 'projection') {
+      && entry.id !== 'projection'
+      && entry.id !== 'scheduler') {
       assert(entry.productionBinding === undefined, `${entry.id} must not claim a migrated production binding`);
     }
   }
@@ -453,6 +487,34 @@ function validateProjectionProductionBindingSchema(binding) {
       `projection.productionBinding.${field} must be ${expected}`,
     );
   }
+}
+
+function validateSchedulerProductionBindingSchema(binding) {
+  assert(isPlainObject(binding), 'scheduler.productionBinding must be an object');
+  const allowedKeys = new Set([
+    ...Object.keys(mandatorySchedulerProductionBinding),
+    'forbiddenProducerCalls',
+  ]);
+  for (const key of Object.keys(binding)) {
+    assert(allowedKeys.has(key), `scheduler.productionBinding has unsupported field: ${key}`);
+  }
+  for (const [field, expected] of Object.entries(mandatorySchedulerProductionBinding)) {
+    assert(
+      binding[field] === expected,
+      `scheduler.productionBinding.${field} must be ${expected}`,
+    );
+  }
+  validateStringArray(
+    binding.forbiddenProducerCalls,
+    'scheduler.productionBinding.forbiddenProducerCalls',
+  );
+  assert(
+    sameStringSet(
+      binding.forbiddenProducerCalls,
+      mandatorySchedulerForbiddenProducerCalls,
+    ),
+    'scheduler.productionBinding.forbiddenProducerCalls must cover the exact direct Session capabilities',
+  );
 }
 
 function validateRawPublisherSelectorSchema(selector, entryId) {
@@ -976,11 +1038,11 @@ function selectRawPublishers(selector, writers, assigned, authorityClassificatio
 }
 
 function validateAuthorityDisposition(entry, selected) {
-  if (entry.id === 'projection') {
+  if (entry.id === 'projection' || entry.id === 'scheduler-retained-projection') {
     for (const site of selected) {
       assert(
         site.classification === 'projection',
-        `projection coverage cannot include ${siteIdentity(site)} (classification ${site.classification})`,
+        `${entry.id} coverage cannot include ${siteIdentity(site)} (classification ${site.classification})`,
       );
     }
     return;
@@ -1238,6 +1300,115 @@ function validateMigratedProductionBinding(binding, authoritySites) {
       assert(!imports.includes(forbidden), `migrated runtime core ${path} imports forbidden direct-write capability ${forbidden}`);
     }
   }
+}
+
+function validateSchedulerProductionBinding(binding, authoritySites) {
+  const producer = sourceFile(binding.producerSource);
+  const setter = findNamedFunction(producer, binding.submitSetter);
+  const deadline = findNamedFunction(producer, binding.deadlineProducer);
+  const manual = findNamedFunction(producer, binding.manualProducer);
+  assert(
+    containsIdentifier(setter, 'submitCallback'),
+    'C4 scheduler callback setter must bind the envelope submission seam',
+  );
+  assert(
+    callExpressionsWithin(deadline, 'createDeadlineScheduledFireIdentity').length === 1
+      && callExpressionsWithin(deadline, 'createManualScheduledFireIdentity').length === 1
+      && callExpressionsWithin(deadline, 'createScheduledFireEnvelope').length === 2,
+    'C4 tick producer must mint one deadline and one offline-manual structured envelope path',
+  );
+  assert(
+    callExpressionsWithin(manual, 'createManualScheduledFireIdentity').length === 1
+      && callExpressionsWithin(manual, 'createScheduledFireEnvelope').length === 1,
+    'C4 manual producer must mint exactly one structured manual identity and envelope',
+  );
+  verifyNoForbiddenCalls(producer, binding.forbiddenProducerCalls, 'C4 scheduler producer');
+  assert(
+    !importedModules(producer).includes('./session-manager.js')
+      && !importedModules(producer).includes('./worker-pool.js'),
+    'C4 scheduler producer must not import legacy Session execution capabilities',
+  );
+
+  const identity = sourceFile(binding.identitySource);
+  findNamedFunction(identity, 'scheduledRunId');
+  findNamedFunction(identity, 'createDeadlineScheduledFireIdentity');
+  findNamedFunction(identity, 'createManualScheduledFireIdentity');
+  findNamedFunction(identity, 'createScheduledFireEnvelope');
+
+  const daemon = sourceFile(binding.daemonSource);
+  const daemonFunction = findNamedFunction(daemon, binding.daemonFunction);
+  assert(
+    callExpressionsWithin(daemonFunction, `scheduler.${binding.submitSetter}`).length === 1
+      && containsStringLiteral(daemonFunction, binding.commandKind),
+    'C4 daemon must wire exactly one scheduled.fire Runtime submission callback',
+  );
+  assert(
+    !callsWithin(daemonFunction).some(name => matchesForbiddenCall(name, 'executeScheduledTask')),
+    'C4 daemon must not call the legacy direct scheduled executor',
+  );
+  const daemonHost = findNamedFunction(daemon, binding.daemonHostFactory);
+  assert(
+    callExpressionsWithin(daemonHost, 'adapter.wrapRuntime').length === 1,
+    'C4 daemon Host must wrap the owner Runtime with the scheduled route adapter',
+  );
+
+  const runtime = sourceFile(binding.runtimeSource);
+  const runtimeFactory = findNamedFunction(runtime, binding.runtimeFactory);
+  assert(
+    containsStringLiteral(runtimeFactory, binding.commandKind)
+      && containsIdentifier(runtimeFactory, 'scheduledFirePort'),
+    'C4 Runtime must own the scheduled.fire command and private execution port',
+  );
+  const effectRunner = findNamedFunction(runtime, 'runScheduledEffects');
+  const effectCalls = callExpressionsWithin(effectRunner, 'port.execute');
+  assert(
+    effectCalls.length === 1
+      && !!ancestorWithin(effectCalls[0], effectRunner, ts.isAwaitExpression)
+      && callExpressionsWithin(effectRunner, 'commandLane.submit').length === 1,
+    'C4 scheduled external effect must execute outside the lane and resume through one lane submit',
+  );
+  assert(
+    containsStringLiteral(runtimeFactory, binding.durability),
+    'C4 Runtime outcome must state its process-local durability boundary',
+  );
+
+  const currentRuntime = sourceFile(binding.currentRuntimeSource);
+  const currentRuntimeFactory = findNamedFunction(
+    currentRuntime,
+    binding.currentRuntimeFactory,
+  );
+  assert(
+    containsIdentifier(currentRuntimeFactory, 'scheduledFire'),
+    'C4 Current Host must bind the scheduled execution port by owner epoch',
+  );
+
+  const adapter = sourceFile(binding.adapterSource);
+  const adapterFactory = findNamedFunction(adapter, binding.adapterFactory);
+  assert(
+    callExpressionsWithin(adapterFactory, 'reserveCurrentRouteAdmission').length === 1
+      && callExpressionsWithin(adapterFactory, 'downstream.runtime.submit').length >= 1,
+    'C4 Current adapter must share route admission and submit through the downstream Runtime',
+  );
+
+  const legacy = sourceFile(binding.legacyBridgeSource);
+  const legacyBridge = findNamedFunction(legacy, binding.legacyBridgeFunction);
+  assert(
+    callExpressionsWithin(legacyBridge, 'executeScheduledTaskThroughRuntime').length === 1,
+    'C4 legacy bridge must be a single Runtime delegation',
+  );
+  verifyNoForbiddenCalls(
+    legacyBridge,
+    binding.forbiddenProducerCalls,
+    'C4 legacy bridge',
+  );
+
+  assert(
+    authoritySites.filter(site => (
+      site.sourceFile === binding.adapterSource
+        || site.sourceFile === 'src/core/silent-schedule-turns.ts'
+    )).length === 20,
+    'C4 migrated authority partition must remain exactly 20 records',
+  );
 }
 
 function validateExecutorProductionBinding(binding, authoritySites, assigned) {
@@ -2167,6 +2338,8 @@ export function auditSessionRuntimeCoverage({ ledger } = {}) {
   validateSessionLaneProductionBinding(sessionLane.productionBinding);
   const projection = coverageLedger.coverage.find(entry => entry.id === 'projection');
   validateProjectionProductionBinding(projection.productionBinding);
+  const scheduler = coverageLedger.coverage.find(entry => entry.id === 'scheduler');
+  validateSchedulerProductionBinding(scheduler.productionBinding, facts.sites);
   return { summary: entryCounts.join(', ') };
 }
 

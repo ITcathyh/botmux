@@ -85,12 +85,15 @@ describe('createTask — id provided, task absent', () => {
 
 describe('createTask — id provided, task exists with identical canonical input', () => {
   it('returns existing task without mutating runtime state', async () => {
-    const { createTask, updateTask, getTask } = await freshImport();
+    const {
+      createTask, updateTask, updateTaskDefinition, getTask,
+    } = await freshImport();
     const id = 'wf_returns_existing';
     const first = createTask({ ...BASE_PARAMS, id });
 
-    // Simulate runtime mutation: enable->disable, set lastRunAt
-    updateTask(id, { enabled: false, lastRunAt: '2026-05-19T10:00:00Z', lastStatus: 'ok' });
+    // Definition and runtime state both survive create-or-return-identical.
+    updateTaskDefinition(id, { enabled: false });
+    updateTask(id, { lastRunAt: '2026-05-19T10:00:00Z', lastStatus: 'ok' });
 
     const second = createTask({ ...BASE_PARAMS, id });
     expect(second.id).toBe(id);
