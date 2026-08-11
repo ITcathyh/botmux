@@ -243,6 +243,28 @@ export function lookup(sessionId: string, triggerId?: string): {
   return { triggerId: resolved, result, ownerLarkAppId: file.ownerLarkAppId };
 }
 
+/** STRICT variant of `lookup`: ONLY a genuinely absent file (ENOENT) or an
+ *  absent trigger id yields `undefined`. A present-but-unreadable file
+ *  (EIO/EACCES), corrupt JSON, or invalid shape THROWS. Use this wherever a
+ *  soft "no record" would be misread as "no terminal outcome" and drive a
+ *  fail-OPEN action — e.g. the codex-app recovery fence, which must NOT replay a
+ *  keyed turn just because its durable `failed(dispatch_unknown)` proof happens
+ *  to be transiently unreadable (the soft `load()` folds that into `{}` and the
+ *  accepted ledger entry would re-enter the recovery snapshot). Fail-closed:
+ *  the caller aborts the fork and retries at the next seam. */
+export function lookupStrict(sessionId: string, triggerId?: string): {
+  triggerId: string;
+  result: PersistedAsyncTriggerResult;
+  ownerLarkAppId?: string;
+} | undefined {
+  const file = loadStrict(sessionId); // ENOENT → empty; present-but-unreadable/corrupt → throws
+  const resolved = triggerId || file.latestTriggerId;
+  if (!resolved) return undefined;
+  const result = file.results[resolved];
+  if (!result) return undefined;
+  return { triggerId: resolved, result, ownerLarkAppId: file.ownerLarkAppId };
+}
+
 /** Delete a session's persisted async results (called on session close). */
 export function deleteResults(sessionId: string): void {
   const fp = getFilePath(sessionId);

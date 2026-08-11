@@ -5231,6 +5231,23 @@ function rollbackAcceptedCodexAppDispatch(
  * runner may have crossed the write boundary; those stay on the existing
  * generation fence. Owner-scoped: only THIS bot's failed evidence counts, so a
  * foreign/unstamped async record never retires our accepted entry.
+ *
+ * FAIL-CLOSED (codex #818 recovery-seam round-2). At-most-once forbids replaying
+ * a turn the caller was already told is `failed`, so an ambiguous fence THROWS
+ * rather than proceeding to fork:
+ *   1. Read side uses `asyncTriggerStore.lookupStrict` — a present-but-unreadable
+ *      / corrupt terminal file must NOT fold into "no record" (soft `lookup`),
+ *      which would let the accepted entry re-enter the recovery snapshot and
+ *      replay. ENOENT / absent trigger is a genuine "no terminal" and is fine.
+ *   2. Retire persist failure (updateSession EIO): the in-memory ledger is rolled
+ *      back to `priorLedger` and the error is RETHROWN, aborting this fork before
+ *      the recovery snapshot is taken. `staggeredRecoveryFork` (the boot eager
+ *      re-attach caller) already try/catches each fork, isolates the row, and
+ *      retains it for a later retry — so the durable ledger + async truth stay
+ *      intact and the next seam re-attempts the retirement. Degrading to "replay
+ *      once" (the pre-fix behavior) would itself be the P1 we are closing.
+ * @throws when the authoritative async truth is unreadable, or the retirement
+ *  cannot be durably persisted — the caller (forkWorker) must abort this fork.
  */
 function retireTerminalizedCodexAppLedgerEntriesForRecovery(ds: DaemonSession): void {
   const ledger = ds.session.codexAppDispatchLedger;
@@ -5239,11 +5256,13 @@ function retireTerminalizedCodexAppLedgerEntriesForRecovery(ds: DaemonSession): 
   const toRetire = ledger.filter(entry =>
     entry.state === 'accepted'
     && (() => {
-      const rec = asyncTriggerStore.lookup(ds.session.sessionId, entry.turnId);
-      // ONLY our own durable dispatch_unknown failed counts (async-trigger-store
-      // is keyed by sessionId, so a foreign/unstamped terminal on the same
+      // STRICT read: a present-but-unreadable / corrupt terminal file THROWS
+      // (fail-closed) instead of folding into "no record" and replaying. ONLY
+      // our own durable dispatch_unknown failed counts (async-trigger-store is
+      // keyed by sessionId, so a foreign/unstamped terminal on the same
       // sessionId/triggerId must not retire our accepted entry — mirrors the
       // owner-positive-proof gate used everywhere else in the idempotency path).
+      const rec = asyncTriggerStore.lookupStrict(ds.session.sessionId, entry.turnId);
       return !!rec
         && rec.ownerLarkAppId === ownerLarkAppId
         && rec.result.status === 'failed'
@@ -5280,16 +5299,22 @@ function retireTerminalizedCodexAppLedgerEntriesForRecovery(ds: DaemonSession): 
       });
     }
   } catch (err) {
-    // Persist failed — restore the in-memory ledger so the recovery snapshot below
-    // still carries the entries and a later seam (next fork / boot reconcile)
-    // re-attempts the retirement. Fail-safe: the accepted entry replaying once is
-    // the pre-fix behavior, so a persist failure degrades to it rather than losing
-    // durable state.
+    // Persist failed (EIO/ENOSPC). Roll back the in-memory ledger so the durable
+    // async truth + the on-disk ledger stay consistent, then RETHROW to ABORT
+    // this fork BEFORE the recovery snapshot is taken (fail-closed). Degrading to
+    // "let the accepted entry replay once" is exactly the at-most-once violation
+    // this fence exists to close, so we must NOT proceed to fork. The boot eager
+    // re-attach caller (staggeredRecoveryFork) try/catches each fork, isolates
+    // this row, and retains it for a later retry — so the next seam re-attempts
+    // the retirement against the intact durable state.
     ds.session.codexAppDispatchLedger = priorLedger;
     logger.error(
       `[${ds.session.sessionId.slice(0, 8)}] Recovery fence could not persist retired ledger; `
-      + `deferring to next seam: ${err instanceof Error ? err.message : String(err)}`,
+      + `aborting fork (fail-closed), will retry next seam: ${err instanceof Error ? err.message : String(err)}`,
     );
+    throw err instanceof Error
+      ? err
+      : new Error(`recovery-fence ledger retirement persist failed: ${String(err)}`);
   }
 }
 
@@ -6427,7 +6452,26 @@ export function forkWorker(
   // at-most-once turn the caller was already told failed (the ledger is the third
   // replay channel `noReplay` does not reach). Idempotent + re-checked here.
   if (agentCfg.cliId === 'codex-app') {
-    retireTerminalizedCodexAppLedgerEntriesForRecovery(ds);
+    try {
+      retireTerminalizedCodexAppLedgerEntriesForRecovery(ds);
+    } catch (err) {
+      // FAIL-CLOSED: the fence could not PROVE it is safe to build the recovery
+      // snapshot (authoritative async terminal unreadable, or the retirement
+      // could not be durably persisted). Refuse this fork rather than risk
+      // replaying an at-most-once turn the caller was already told failed. This
+      // mirrors the quarantine-guard / canForkRegisteredSession refuse contract
+      // above (return false, side-effect free: only a monotonic generation bump
+      // has happened, no worker/port allocated yet). staggeredRecoveryFork (boot
+      // eager re-attach) retains the row for a later retry; a direct caller sees
+      // the same "not forked" signal it already handles. The durable ledger +
+      // async truth stay intact for the next seam (codex #818 recovery-seam
+      // round-2: two fail-open points → both must fail-closed).
+      logger.error(
+        `[${tag(ds)}] Refusing fork: Codex App recovery fence could not verify at-most-once `
+        + `(deferring to next seam): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
+    }
   }
   const codexAppRecoveredDispatches = agentCfg.cliId === 'codex-app'
     ? (ds.session.codexAppDispatchLedger ?? []).map(entry => ({ ...entry }))

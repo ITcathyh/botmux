@@ -24,7 +24,7 @@
  * Run:  pnpm vitest run test/codex-app-recovery-terminalized-fence.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { DaemonSession } from '../src/core/types.js';
@@ -179,5 +179,53 @@ describe('codex-app recovery fence — terminalized keyed turn is not replayed (
 
     expect(session.session.codexAppDispatchLedger!.map(e => e.turnId)).not.toContain('turn-window');
     expect(updateSessionMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── FAIL-CLOSED fault injection (codex #818 recovery-seam round-2): an ambiguous
+//    fence must ABORT the fork (throw), never fall back to replaying the turn.
+describe('codex-app recovery fence — fail-closed on ambiguity (PR #818)', () => {
+  it('retire persist failure (updateSession EIO) → THROWS + rolls back the in-memory ledger (no partial retire, next seam retries)', () => {
+    const term = accepted('turn-persist-eio');
+    const session = ds([term]);
+    asyncTriggerStore.recordFailedStrict(SID, term.turnId, Date.now(), APP, 'dispatch_unknown');
+    // Simulate a durable persistence failure at the retire step.
+    updateSessionMock.mockImplementationOnce(() => { throw new Error('simulated EIO on sessions write'); });
+
+    // Fail-closed: the fence throws so forkWorker aborts BEFORE building the
+    // recovery snapshot — degrading to "replay once" would be the very P1 we close.
+    expect(() => retireFence(session)).toThrow(/EIO/);
+    // In-memory ledger rolled back to the pre-retire state so the durable async
+    // truth + the ledger stay consistent; the entry survives for the next seam.
+    expect(session.session.codexAppDispatchLedger!.map(e => e.turnId)).toContain('turn-persist-eio');
+  });
+
+  it('present-but-corrupt authoritative async terminal → THROWS (strict read; never folds corrupt into "no record" and replays)', () => {
+    const term = accepted('turn-corrupt-truth');
+    const session = ds([term]);
+    // Write a genuine durable failed, then CORRUPT the on-disk terminal file
+    // (models a transiently unreadable / damaged async-trigger file). A soft
+    // lookup would fold this into "no terminal" and let the accepted entry
+    // re-enter the recovery snapshot; the strict read must throw instead.
+    asyncTriggerStore.recordFailedStrict(SID, term.turnId, Date.now(), APP, 'dispatch_unknown');
+    writeFileSync(join(tempDir, 'async-triggers', `${SID}.json`), '{ this is not valid json', 'utf-8');
+
+    expect(() => retireFence(session)).toThrow();
+    // Nothing retired, nothing persisted — the entry is preserved for a later
+    // seam once the terminal file is readable again (fail-closed, not fail-open).
+    expect(updateSessionMock).not.toHaveBeenCalled();
+    expect(session.session.codexAppDispatchLedger!.map(e => e.turnId)).toContain('turn-corrupt-truth');
+  });
+
+  it('genuinely ABSENT async terminal (ENOENT / no such trigger) is NOT an error → no retire, fork proceeds', () => {
+    // A keyed accepted entry with NO async record at all (turn never terminalized):
+    // strict read returns undefined for ENOENT / absent trigger, so the fence is a
+    // clean no-op and the fork proceeds normally (only failed:dispatch_unknown retires).
+    const live = accepted('turn-no-terminal-yet');
+    const session = ds([live]);
+    // No recordFailedStrict / recordPending → the async-triggers file for SID does not exist.
+    expect(() => retireFence(session)).not.toThrow();
+    expect(session.session.codexAppDispatchLedger!.map(e => e.turnId)).toContain('turn-no-terminal-yet');
+    expect(updateSessionMock).not.toHaveBeenCalled();
   });
 });
