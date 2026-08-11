@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createCurrentSessionExecutorRuntime } from '../src/core/current-session-executor-runtime.js';
+import { parseBotId } from '../src/core/bot-identity.js';
 import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 import {
   createSessionExact,
@@ -52,7 +53,10 @@ describe('CurrentSessionExecutorRuntime owner-file integration', () => {
     } as DaemonSession;
     const registry = new Map<string, DaemonSession>();
     registry.set(activeSessionKey(ds), ds);
-    const runtime = createCurrentSessionExecutorRuntime({ activeSessions: () => registry });
+    const runtime = createCurrentSessionExecutorRuntime({
+      activeSessions: () => registry,
+      botIdForOwner: () => parseBotId('bot_current_executor'),
+    });
 
     const firstCommit = runtime.commitGeneration(ds);
     const firstWorker = {};

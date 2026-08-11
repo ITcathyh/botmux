@@ -1,6 +1,8 @@
+import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import * as sessionStore from '../services/session-store.js';
 import type { Session } from '../types.js';
+import { parseBotId, type BotId } from './bot-identity.js';
 import {
   currentSessionCommandLane,
   currentSessionLaneAddressForKey,
@@ -48,6 +50,8 @@ export interface CurrentSessionExecutorRuntime {
  */
 export function createCurrentSessionExecutorRuntime(input: {
   activeSessions: () => Map<string, DaemonSession> | undefined;
+  /** Production resolves through BotState; undefined is an adapter/test seam. */
+  botIdForOwner: (ownerLarkAppId: string) => BotId | undefined;
   runtimeEpoch?: string;
 }): CurrentSessionExecutorRuntime {
   const runtimeEpoch = input.runtimeEpoch ?? 'current-session-executor-runtime';
@@ -69,6 +73,18 @@ export function createCurrentSessionExecutorRuntime(input: {
   };
   const pendingExitFences = new Map<string, PendingGenerationWrite>();
   const pendingReservations = new Map<string, PendingGenerationWrite>();
+  const adapterBotIds = new Map<string, BotId>();
+
+  const botIdForOwner = (ownerLarkAppId: string): BotId => {
+    const bound = input.botIdForOwner(ownerLarkAppId);
+    if (bound) return bound;
+    let adapter = adapterBotIds.get(ownerLarkAppId);
+    if (!adapter) {
+      adapter = parseBotId(`bot_${randomUUID().replaceAll('-', '')}`);
+      adapterBotIds.set(ownerLarkAppId, adapter);
+    }
+    return adapter;
+  };
 
   const persistedSnapshot = (session: Session): Session => (
     JSON.parse(JSON.stringify(session)) as Session
@@ -79,7 +95,7 @@ export function createCurrentSessionExecutorRuntime(input: {
   );
 
   const logicalSessionKey = (ownerLarkAppId: string, sessionId: string): string => (
-    `${ownerLarkAppId}\0${sessionId}`
+    `${botIdForOwner(ownerLarkAppId)}\0${sessionId}`
   );
 
   const exactBinding = (

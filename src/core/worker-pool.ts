@@ -85,6 +85,16 @@ const DAEMON_BOOT_ID = randomUUID();
 const restartCoordinator = new RestartCoordinator();
 const createExecutorRuntime = () => createCurrentSessionExecutorRuntime({
   activeSessions: () => activeSessionsRegistry,
+  botIdForOwner: ownerLarkAppId => {
+    try {
+      return getBot(ownerLarkAppId).botId;
+    } catch {
+      // Legacy unit/adapter seams can construct a DaemonSession without the
+      // daemon registry. The Current adapter allocates an opaque process-local
+      // identity; production has already passed the startup identity gate.
+      return undefined;
+    }
+  },
   runtimeEpoch: DAEMON_BOOT_ID,
 });
 let sessionExecutorRuntime = createExecutorRuntime();

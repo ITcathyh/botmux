@@ -24,6 +24,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 
 const mocks = vi.hoisted(() => {
   // Isolate every sessionStore/config read-write under a per-process temp dir
@@ -152,7 +153,15 @@ vi.mock('../src/im/lark/identity-cache.js', async () => {
   return { ...actual, resolveSender: (...args: any[]) => mocks.resolveSender(...args) };
 });
 
-import { registerBot } from '../src/bot-registry.js';
+import { registerBot as registerBotWithIdentity } from '../src/bot-registry.js';
+import { parseBotId } from '../src/core/bot-identity.js';
+
+function registerBot(config: Parameters<typeof registerBotWithIdentity>[0]) {
+  return registerBotWithIdentity(
+    config,
+    parseBotId(`bot_${randomUUID().replaceAll('-', '')}`),
+  );
+}
 import { sessionAnchorId, sessionKey } from '../src/core/types.js';
 import { recordBotUnionId } from '../src/services/bot-union-ids-store.js';
 import {

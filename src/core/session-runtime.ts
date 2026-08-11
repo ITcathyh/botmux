@@ -11,6 +11,11 @@ import { types as nodeUtilTypes } from 'node:util';
 
 import { computeInputHash } from '../utils/canonical-input-hash.js';
 import type { DashboardSessionSnapshot } from './dashboard-projection.js';
+import {
+  sessionActorRef,
+  type ActorRef,
+  type BotId,
+} from './bot-identity.js';
 import type { ExternalTriggerBusinessInput } from './external-trigger-envelope.js';
 import {
   normalizeOrdinaryImTurn,
@@ -85,6 +90,8 @@ export interface SessionDirectory {
 
 export interface SessionView {
   address: SessionAddress;
+  /** Stable cross-restart owner address; present on I1-bound production Hosts. */
+  actorRef?: ActorRef;
   sessionId: string;
   route: SessionRoute;
   recordStatus: SessionDirectoryRow['recordStatus'];
@@ -726,6 +733,8 @@ function ambiguousFor(
 }
 
 export function createSessionRuntimeHost(options: {
+  /** Stable owner identity. Optional only for pre-I1 test/adapter Hosts. */
+  ownerBotId?: BotId;
   directory: SessionDirectory;
   keyedTriggers: KeyedTriggerAuthority;
   keyedTriggerTurns: KeyedTriggerTurnPort;
@@ -1071,6 +1080,9 @@ export function createSessionRuntimeHost(options: {
 
   const view = (row: SessionDirectoryRow): SessionView => ({
     address: addressFor(row),
+    ...(options.ownerBotId === undefined
+      ? {}
+      : { actorRef: sessionActorRef(options.ownerBotId, row.sessionId) }),
     sessionId: row.sessionId,
     route: { ...row.route },
     recordStatus: row.recordStatus,

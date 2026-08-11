@@ -1,4 +1,5 @@
 import { createSessionCommandLaneHost } from './session-command-lane.js';
+import type { BotId } from './bot-identity.js';
 
 /** One process-local lane directory shared by Current Runtime modules. */
 const currentHost = createSessionCommandLaneHost();
@@ -16,11 +17,11 @@ export function currentSessionLaneAddressForKey(
 
 export function currentSessionLaneAddress(
   runtimeEpoch: string,
-  ownerLarkAppId: string,
+  ownerBotId: BotId,
   sessionId: string,
 ) {
   return currentSessionLaneAddressForKey(
     runtimeEpoch,
-    `${ownerLarkAppId}\0${sessionId}`,
+    `${ownerBotId}\0${sessionId}`,
   );
 }

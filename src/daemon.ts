@@ -54,9 +54,12 @@ import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-st
 import {
   loadBotConfigAtIndex,
   loadBotConfigs,
+  getLoadedConfigPath,
+  getLoadedConfigProvenance,
   isManagedActivationStartingAtIndex,
   registerBot,
   getBot,
+  requireBotId,
   getAllBots,
   getOwnerOpenId,
   findOncallChat,
@@ -73,6 +76,10 @@ import {
   type VcMeetingConsumerAgentConfig,
   type VcMeetingConsumerProfileConfig,
 } from './bot-registry.js';
+import {
+  createDaemonBotIdentityControlPlane,
+  requireReadyDaemonBotIdentities,
+} from './core/bot-identity-startup.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
 import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform } from './services/open-platform-rename.js';
@@ -944,6 +951,7 @@ async function runCurrentOrdinaryOpeningPostCommit(
       return;
     }
     const outcome = await submitCurrentPendingRepoCompletion({
+      ownerBotId: requireBotId(effect.ownerLarkAppId),
       ownerLarkAppId: effect.ownerLarkAppId,
       activeSessions,
       sessionId: effect.sessionId,
@@ -1026,6 +1034,10 @@ function currentOrdinaryOpeningCreator(
 function currentDaemonSessionRuntimeHost(ownerLarkAppId: string) {
   const ownerBootId = getDaemonBootId();
   return currentSessionRuntimeHost({
+    // startDaemon binds the durable identity before any route can reach this
+    // composition. Pre-start unit adapters may carry no BotState identity;
+    // Current then allocates an opaque process-local adapter ID.
+    ownerBotId: getBot(ownerLarkAppId).botId!,
     ownerLarkAppId,
     activeSessions,
     ownerBootId,
@@ -2967,7 +2979,11 @@ function vcMeetingDeliveryReceiverDeps(receiverAppId?: string): VcMeetingDeliver
       if (target) target.vcMeetingImTurnOrigin = undefined;
       return triggerSessionTurn(
         request,
-        { larkAppId: selfAppId, activeSessions },
+        {
+          ownerBotId: getBot(selfAppId).botId!,
+          larkAppId: selfAppId,
+          activeSessions,
+        },
         {
           stableTurnId: context.stableTurnId,
           beforeDispatch: context.beforeDispatch,
@@ -3059,6 +3075,7 @@ async function triggerVcMeetingConsumerTurn(
 ): Promise<TriggerResponse> {
   if (vcMeetingConsumerUsesLocalReceiver(agentAppId)) {
     return triggerSessionTurn(req, {
+      ownerBotId: getBot(agentAppId).botId!,
       larkAppId: agentAppId,
       activeSessions,
     });
@@ -19745,7 +19762,18 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   if (botIndex !== undefined) {
     cfg = reloadExactDaemonBotConfig(idx, selectedAppId, loadBotConfigAtIndex);
   }
-  registerBot(cfg);
+  const botIdentityControl = createDaemonBotIdentityControlPlane({
+    dataDir: config.session.dataDir,
+    configPath: getLoadedConfigPath(),
+    configProvenance: getLoadedConfigProvenance(),
+    configs: [cfg],
+  });
+  const botIdentity = requireReadyDaemonBotIdentities(botIdentityControl, [cfg])
+    .get(cfg.larkAppId);
+  if (!botIdentity) {
+    throw new Error(`Stable Bot identity is missing for selected config: ${cfg.larkAppId}`);
+  }
+  registerBot(cfg, botIdentity.botId);
   selfDaemonLarkAppId = cfg.larkAppId;
   // Establish the target-scoped daemon control credential before publishing
   // the daemon descriptor or accepting IPC traffic. Corruption fails startup

@@ -148,6 +148,7 @@ vi.mock('../src/core/current-session-runtime.js', async () => {
 });
 
 import { getBot, registerBot } from '../src/bot-registry.js';
+import { parseBotId } from '../src/core/bot-identity.js';
 import {
   createSessionRuntimeHost,
   type KeyedTriggerAuthority,
@@ -496,7 +497,7 @@ beforeEach(() => {
     larkAppSecret: 'test-secret',
     cliId: 'claude-code',
     allowedUsers: [OWNER],
-  });
+  }, parseBotId('bot_current_one_cut'));
   bot.resolvedAllowedUsers = [OWNER];
   mocks.downloadResources.mockResolvedValue({ attachments: [], needLogin: false });
   mocks.getAvailableBots.mockResolvedValue([]);

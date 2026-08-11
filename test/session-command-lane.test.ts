@@ -5,6 +5,7 @@ import {
   currentSessionLaneAddressForKey,
 } from '../src/core/current-session-command-lane.js';
 import { createSessionCommandLaneHost } from '../src/core/session-command-lane.js';
+import { parseBotId } from '../src/core/bot-identity.js';
 import {
   createSessionExecutorRuntime,
   type ExecutorGenerationAuthority,
@@ -288,13 +289,15 @@ describe('SessionCommandLane', () => {
   });
 
   it('binds Current Session and Executor modules to one behavioral owner/epoch lane', async () => {
-    const sessionAddress = currentSessionLaneAddress('boot-binding', 'owner-a', 'session-1');
+    const ownerA = parseBotId('bot_lane_owner_a');
+    const ownerB = parseBotId('bot_lane_owner_b');
+    const sessionAddress = currentSessionLaneAddress('boot-binding', ownerA, 'session-1');
     const executorAddress = currentSessionLaneAddressForKey(
       'boot-binding',
-      'owner-a\0session-1',
+      `${ownerA}\0session-1`,
     );
-    const foreignOwner = currentSessionLaneAddress('boot-binding', 'owner-b', 'session-1');
-    const foreignEpoch = currentSessionLaneAddress('boot-binding-2', 'owner-a', 'session-1');
+    const foreignOwner = currentSessionLaneAddress('boot-binding', ownerB, 'session-1');
+    const foreignEpoch = currentSessionLaneAddress('boot-binding-2', ownerA, 'session-1');
     expect(sessionAddress).toBe(executorAddress);
     expect(sessionAddress).not.toBe(foreignOwner);
     expect(sessionAddress).not.toBe(foreignEpoch);

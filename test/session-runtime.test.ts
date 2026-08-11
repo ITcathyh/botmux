@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { computeInputHash } from '../src/utils/canonical-input-hash.js';
+import { parseBotId } from '../src/core/bot-identity.js';
 import {
   createSessionRuntimeHost,
   type KeyedTriggerAuthority,
@@ -159,6 +160,7 @@ function host(
     authority,
     turns,
     ...createSessionRuntimeHost({
+      ownerBotId: parseBotId('bot_session_runtime_owner'),
       directory: new TestDirectory([{
         key: 'session-1',
         sessionId: 'session-1',
@@ -219,6 +221,11 @@ describe('SessionRuntime address and projection boundary', () => {
     expect(projection.kind).toBe('one');
     if (projection.kind !== 'one') throw new Error('expected one row');
     expect(Object.keys(projection.session.address)).toEqual([]);
+    expect(projection.session.actorRef).toEqual({
+      botId: 'bot_session_runtime_owner',
+      entityKind: 'session',
+      entityId: 'session-1',
+    });
 
     const second = host();
     const outcome = await second.runtime.submit({

@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { currentSessionRuntimeHost } from '../src/core/current-session-runtime.js';
 import { DashboardEventBus } from '../src/core/dashboard-events.js';
 import { CurrentDashboardProjectionProtocol } from '../src/core/dashboard-projection.js';
+import { parseBotId } from '../src/core/bot-identity.js';
 import { createCurrentOrdinaryImTurnPreparationPort } from '../src/core/current-ordinary-im-turn.js';
 import { createCurrentOrdinaryIngressPort } from '../src/core/current-ordinary-ingress.js';
 import type { CurrentOrdinaryRouteOpeningRollbackToken } from '../src/core/current-ordinary-route-registry.js';
@@ -25,6 +26,7 @@ import type {
 } from '../src/core/session-runtime.js';
 
 const APP = 'cli_runtime_projection';
+const BOT = parseBotId('bot_runtime_projection');
 let dataDir: string;
 let previousDataDir: string | undefined;
 
@@ -157,6 +159,7 @@ describe('Current SessionRuntime projection adapter', () => {
 
     const activeSessions = new Map<string, DaemonSession>();
     const host = currentSessionRuntimeHost({
+      ownerBotId: BOT,
       ownerLarkAppId: APP,
       activeSessions,
       ownerBootId: 'boot-current',
@@ -170,6 +173,13 @@ describe('Current SessionRuntime projection adapter', () => {
     expect(dormant.kind).toBe('one');
     if (dormant.kind !== 'one') throw new Error('expected dormant projection');
     expect(dormant.session.executorStatus).toBe('dormant');
+    expect(dormant.session.actorRef).toEqual({
+      botId: BOT,
+      entityKind: 'session',
+      entityId: session.sessionId,
+    });
+    expect(existsSync(join(dataDir, `sessions-${APP}.json`))).toBe(true);
+    expect(existsSync(join(dataDir, `sessions-${BOT}.json`))).toBe(false);
     expect('larkAppId' in dormant.session).toBe(false);
     expect('worker' in dormant.session).toBe(false);
 
@@ -851,6 +861,26 @@ describe('Current SessionRuntime projection adapter', () => {
       },
     })).resolves.toMatchObject({ kind: 'applied', action: 'control.renamed' });
     expect(sessionStore.getOwnedSession(session.sessionId)?.title).toBe('Rebound title');
+  });
+
+  it('keys the Current Host cache by stable BotId instead of a reusable Lark address', () => {
+    const registry = new Map<string, DaemonSession>();
+    const first = currentSessionRuntimeHost({
+      ownerBotId: parseBotId('bot_cache_owner_first'),
+      ownerLarkAppId: APP,
+      activeSessions: registry,
+      ownerBootId: 'boot-cache-owner',
+      keyedTriggerAdmissionBlocked: () => false,
+    });
+    const replacement = currentSessionRuntimeHost({
+      ownerBotId: parseBotId('bot_cache_owner_replacement'),
+      ownerLarkAppId: APP,
+      activeSessions: registry,
+      ownerBootId: 'boot-cache-owner',
+      keyedTriggerAdmissionBlocked: () => false,
+    });
+
+    expect(replacement).not.toBe(first);
   });
 
   it('does not borrow liveness or chat identity from a foreign owner with the same sessionId', async () => {

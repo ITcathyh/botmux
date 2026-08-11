@@ -481,6 +481,7 @@ export async function commitRepoSelection(
     const cardToWithdraw = cardMessageId ?? ds.repoCardMessageId;
     const submit = ctx.submitPendingRepoCompletion ?? submitCurrentPendingRepoCompletion;
     const completion = await submit({
+      ownerBotId: getBot(ds.larkAppId).botId!,
       ownerLarkAppId: ds.larkAppId,
       activeSessions,
       sessionId: ds.session.sessionId,
@@ -685,6 +686,7 @@ export async function runAutoWorktreeCommit(deps: {
   const submit = deps.submitPendingRepoCompletion ?? submitCurrentPendingRepoCompletion;
   try {
     const completion = await submit({
+      ownerBotId: getBot(larkAppId).botId!,
       ownerLarkAppId: larkAppId,
       activeSessions,
       sessionId: ds.session.sessionId,
@@ -3301,6 +3303,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const submit = deps.submitPendingRepoCompletion ?? submitCurrentPendingRepoCompletion;
       const cardToWithdraw = cardMessageId ?? targetDs.repoCardMessageId;
       const completion = submit({
+        ownerBotId: getBot(targetDs.larkAppId).botId!,
         ownerLarkAppId: targetDs.larkAppId,
         activeSessions,
         sessionId: targetDs.session.sessionId,

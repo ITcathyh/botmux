@@ -1581,6 +1581,7 @@ export async function handleCommand(
           const cardToWithdraw = current.repoCardMessageId;
           const submit = deps.submitPendingRepoCompletion ?? submitCurrentPendingRepoCompletion;
           const completion = await submit({
+            ownerBotId: getBot(current.larkAppId).botId!,
             ownerLarkAppId: current.larkAppId,
             activeSessions,
             sessionId: current.session.sessionId,

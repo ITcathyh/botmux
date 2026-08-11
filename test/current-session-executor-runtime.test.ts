@@ -11,6 +11,7 @@ vi.mock('../src/services/session-store.js', () => ({
 }));
 
 import { createCurrentSessionExecutorRuntime } from '../src/core/current-session-executor-runtime.js';
+import { parseBotId } from '../src/core/bot-identity.js';
 import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 import type { Session } from '../src/types.js';
 
@@ -46,7 +47,10 @@ function runtimeHarness() {
   const registry = new Map<string, DaemonSession>();
   return {
     registry,
-    runtime: createCurrentSessionExecutorRuntime({ activeSessions: () => registry }),
+    runtime: createCurrentSessionExecutorRuntime({
+      activeSessions: () => registry,
+      botIdForOwner: () => parseBotId('bot_current_executor'),
+    }),
   };
 }
 

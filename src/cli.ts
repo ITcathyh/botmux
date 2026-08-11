@@ -14,6 +14,7 @@
  *     of a pre-protocol fleet after independently confirming all Session/Riff work is idle
  *   botmux logs [--lines] — view daemon logs
  *   botmux status         — show daemon status
+ *   botmux identity status|report|apply|repair|rollback — manage stable Bot identity promotion
  *   botmux upgrade|update — upgrade to latest version
  *   botmux device enroll|status|logout — manage the host desktop device credential
  *   botmux list           — interactive session picker (TUI), attach to managed tmux/ZMX sessions
@@ -11997,6 +11998,47 @@ async function cmdPreset(sub: string, rest: string[]): Promise<void> {
   }
 }
 
+async function cmdIdentity(args: string[]): Promise<void> {
+  const dataDir = resolveDataDir();
+  process.env.SESSION_DATA_DIR ??= dataDir;
+  const registry = await import('./bot-registry.js');
+  let configs: ReturnType<typeof registry.loadBotConfigs> = [];
+  let configPath: string | undefined;
+  let configProvenance: ReturnType<typeof registry.getLoadedConfigProvenance>;
+  try {
+    configs = registry.loadBotConfigs();
+    configPath = registry.getLoadedConfigPath();
+    configProvenance = registry.getLoadedConfigProvenance();
+  } catch (error) {
+    if (process.env.BOTMUX_CORE_ONLY === '1') throw error;
+    const { resolveBotsConfigFile } = await import('./core/config-dir.js');
+    configPath = resolveBotsConfigFile();
+    configProvenance = 'loaded';
+  }
+  const { createDaemonBotIdentityControlPlane } = await import('./core/bot-identity-startup.js');
+  const { runBotIdentityCommand } = await import('./cli/bot-identity-command.js');
+  const control = createDaemonBotIdentityControlPlane({
+    dataDir,
+    configPath,
+    configProvenance,
+    configs,
+  });
+  const result = runBotIdentityCommand(args, {
+    control,
+    assertMutationSafe() {
+      const online = listOnlineDaemons();
+      if (online.length > 0) {
+        throw new Error(
+          `identity mutation refused while ${online.length} daemon(s) are online; run \`botmux stop\` first`,
+        );
+      }
+    },
+  });
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+  process.exitCode = result.code;
+}
+
 /**
  * `botmux preset export <bot> [--from-chat <chatId>] [--out <file>] [--yes]`
  *
@@ -12975,6 +13017,7 @@ switch (command) {
   case 'restart': await cmdRestart(); break;
   case 'logs':    cmdLogs(); break;
   case 'status':  cmdStatus(); break;
+  case 'identity': await cmdIdentity(process.argv.slice(3)); break;
   case 'upgrade':
   case 'update':  cmdUpgrade(); break;
   case 'dashboard': await cmdDashboard(process.argv.slice(3)); break;

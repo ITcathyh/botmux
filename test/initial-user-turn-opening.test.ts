@@ -115,6 +115,9 @@ vi.mock('../src/global-config.js', async () => {
 });
 
 import { registerBot } from '../src/bot-registry.js';
+import { parseBotId } from '../src/core/bot-identity.js';
+
+const TEST_BOT_ID = parseBotId('bot_initial_turn_test');
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { CliId } from '../src/adapters/cli/types.js';
@@ -266,7 +269,7 @@ describe('empty-started session — first real business turn must use the new-to
       cliId: 'codex',
       allowedUsers: [OWNER],
       oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
-    });
+    }, TEST_BOT_ID);
     bot.resolvedAllowedUsers = [OWNER];
     bot.botName = 'TestBot';
     bot.botOpenId = 'ou_selfbot';
@@ -376,7 +379,7 @@ describe('empty-started session — first real business turn must use the new-to
       codexAppCleanInput: true,
       allowedUsers: [OWNER],
       oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
-    }).resolvedAllowedUsers = [OWNER];
+    }, TEST_BOT_ID).resolvedAllowedUsers = [OWNER];
     seedEmptyStarted(anchor, { cliId: 'codex-app' });
 
     const data = makeEventData('om_codex_app_msg', '接着上一条改', anchor, { parentId: 'om_codex_quote_target' });
@@ -400,7 +403,7 @@ describe('empty-started session — first real business turn must use the new-to
       cliId: 'codex-app',
       allowedUsers: [OWNER],
       oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
-    }).resolvedAllowedUsers = [OWNER];
+    }, TEST_BOT_ID).resolvedAllowedUsers = [OWNER];
     seedEmptyStarted(anchor, { cliId: 'codex-app' });
 
     await handleThreadReply(
@@ -423,7 +426,7 @@ describe('empty-started session — first real business turn must use the new-to
       cliId: 'codex-app',
       allowedUsers: [OWNER],
       oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
-    }).resolvedAllowedUsers = [OWNER];
+    }, TEST_BOT_ID).resolvedAllowedUsers = [OWNER];
     seedEmptyStarted(anchor, { live: false, hasHistory: true, cliId: 'codex-app' });
 
     await handleThreadReply(

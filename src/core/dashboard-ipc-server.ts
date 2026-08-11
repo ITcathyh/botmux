@@ -2686,7 +2686,11 @@ ipcRoute('POST', '/api/trigger', async (req, res) => {
         error: 'active session registry unavailable',
       });
     }
-    const result = await triggerSessionTurn(valid.request, { larkAppId: cachedLarkAppId, activeSessions });
+    const result = await triggerSessionTurn(valid.request, {
+      ownerBotId: getBot(cachedLarkAppId).botId!,
+      larkAppId: cachedLarkAppId,
+      activeSessions,
+    });
     const status = result.ok
       ? 200
       // An idempotent retry that resolves to a durable `failed` async state is a
@@ -3229,7 +3233,11 @@ ipcRoute('POST', '/api/message-listeners/:chatId/run-preview', async (req, res, 
           },
           instruction: renderMessageListenerInstruction(match),
           presentation: { topicMessage: null },
-        }, { larkAppId: cachedLarkAppId, activeSessions }, { stableTurnId: triggerId });
+        }, {
+          ownerBotId: getBot(cachedLarkAppId).botId!,
+          larkAppId: cachedLarkAppId,
+          activeSessions,
+        }, { stableTurnId: triggerId });
         const tracked = result.ok
           ? markMessageListenerRunPreviewTriggered(run.runId, match.messageId, {
               action: result.action,

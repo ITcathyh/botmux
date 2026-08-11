@@ -40,8 +40,11 @@ import type {
   KeyedTriggerCommandOutcome,
   SessionRuntime,
 } from './session-runtime.js';
+import type { BotId } from './bot-identity.js';
 
 export interface TriggerSessionDeps {
+  /** Production callers receive this binding from the daemon's startup gate. */
+  ownerBotId: BotId;
   larkAppId: string;
   activeSessions: Map<string, DaemonSession>;
 }
@@ -928,6 +931,7 @@ async function triggerSessionTurnAdmitted(
     }
 
     const sessionRuntime: SessionRuntime = currentSessionRuntimeHost({
+      ownerBotId: deps.ownerBotId,
       ownerLarkAppId: larkAppId,
       activeSessions: deps.activeSessions,
       ownerBootId: getDaemonBootId(),

@@ -10,8 +10,11 @@ import type {
 } from './session-runtime.js';
 import { activeSessionKey, type DaemonSession } from './types.js';
 import { getDaemonBootId } from './worker-pool.js';
+import type { BotId } from './bot-identity.js';
 
 export interface CurrentPendingRepoCompletionSubmitInput {
+  /** Production callers receive this binding from the daemon's startup gate. */
+  readonly ownerBotId: BotId;
   readonly ownerLarkAppId: string;
   readonly activeSessions: Map<string, DaemonSession>;
   readonly sessionId: string;
@@ -109,6 +112,7 @@ export async function submitCurrentPendingRepoCompletion(
   let host: ReturnType<typeof currentSessionRuntimeHost>;
   try {
     host = currentSessionRuntimeHost({
+      ownerBotId: input.ownerBotId,
       ownerLarkAppId: input.ownerLarkAppId,
       activeSessions: input.activeSessions,
       ownerBootId,

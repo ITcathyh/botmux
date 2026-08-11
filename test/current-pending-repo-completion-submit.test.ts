@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { registerBot } from '../src/bot-registry.js';
+import { parseBotId } from '../src/core/bot-identity.js';
 import {
   createCurrentOrdinaryIngressProductionPort,
   type CurrentOrdinaryIngressProductionExternalEffect,
@@ -134,7 +135,7 @@ beforeEach(() => {
     apiOnly: true,
     cliId: 'codex-app',
     codexAppCleanInput: true,
-  });
+  }, parseBotId('bot_pending_repo_submit'));
 });
 
 afterEach(() => {

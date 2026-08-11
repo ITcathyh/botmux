@@ -1,7 +1,10 @@
+import { randomUUID } from 'node:crypto';
+
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import * as idempotencyStore from '../services/idempotency-store.js';
 import * as sessionStore from '../services/session-store.js';
 import type { Session } from '../types.js';
+import { parseBotId, type BotId } from './bot-identity.js';
 import {
   currentDashboardProjectionProtocol,
   type CurrentDashboardProjectionProtocol,
@@ -514,6 +517,29 @@ const hostsByRegistry = new WeakMap<
   Map<string, DaemonSession>,
   Map<string, CachedCurrentSessionRuntimeHost>
 >();
+const adapterBotIdsByRegistry = new WeakMap<
+  Map<string, DaemonSession>,
+  Map<string, BotId>
+>();
+
+function ownerBotIdForCurrentAdapter(options: {
+  ownerBotId: BotId | undefined;
+  ownerLarkAppId: string;
+  activeSessions: Map<string, DaemonSession>;
+}): BotId {
+  if (options.ownerBotId) return options.ownerBotId;
+  let byOwner = adapterBotIdsByRegistry.get(options.activeSessions);
+  if (!byOwner) {
+    byOwner = new Map();
+    adapterBotIdsByRegistry.set(options.activeSessions, byOwner);
+  }
+  let botId = byOwner.get(options.ownerLarkAppId);
+  if (!botId) {
+    botId = parseBotId(`bot_${randomUUID().replaceAll('-', '')}`);
+    byOwner.set(options.ownerLarkAppId, botId);
+  }
+  return botId;
+}
 
 function leaseCurrentSessionRuntimeHost(
   host: CurrentSessionRuntimeHost,
@@ -581,6 +607,8 @@ function leaseCurrentSessionRuntimeHost(
 
 /** One owner-bound runtime instance per immutable registry/daemon epoch. */
 export function currentSessionRuntimeHost(options: {
+  /** Canonical owner; all production callers must supply the I1 binding. */
+  ownerBotId: BotId;
   ownerLarkAppId: string;
   activeSessions: Map<string, DaemonSession>;
   ownerBootId: string;
@@ -598,6 +626,9 @@ export function currentSessionRuntimeHost(options: {
   dashboardProjectionProtocol?: CurrentDashboardProjectionProtocol;
 }): CurrentSessionRuntimeHost {
   const runtimeEpoch = options.runtimeEpoch ?? options.ownerBootId;
+  // Pre-I1 JavaScript tests can omit the compile-time-required binding. Their
+  // adapter identity remains opaque and process-local; production is gated.
+  const stableOwnerKey = ownerBotIdForCurrentAdapter(options);
   const cacheable = options.keyedTriggerTurns === undefined
     && options.dashboardProjectionProtocol === undefined;
   const createInnerHost = (input: {
@@ -606,6 +637,7 @@ export function currentSessionRuntimeHost(options: {
       pendingRepoCompletion?: PendingRepoCompletionPort;
     };
   } = {}): CurrentSessionRuntimeHost => createSessionRuntimeHost({
+    ownerBotId: stableOwnerKey,
     directory: new CurrentSessionDirectory(
       options.ownerLarkAppId,
       options.activeSessions,
@@ -634,7 +666,7 @@ export function currentSessionRuntimeHost(options: {
     commandLane: currentSessionCommandLane,
     sessionLaneAddress: sessionId => currentSessionLaneAddress(
       runtimeEpoch,
-      options.ownerLarkAppId,
+      stableOwnerKey,
       sessionId,
     ),
   });
@@ -670,7 +702,7 @@ export function currentSessionRuntimeHost(options: {
     byOwner = new Map();
     hostsByRegistry.set(options.activeSessions, byOwner);
   }
-  const cached = byOwner.get(options.ownerLarkAppId);
+  const cached = byOwner.get(stableOwnerKey);
   if (cached?.runtimeEpoch === runtimeEpoch) {
     const ordinaryCompatible = options.ordinaryIngress === undefined
       || cached.ordinaryIngress === options.ordinaryIngress;
@@ -706,7 +738,7 @@ export function currentSessionRuntimeHost(options: {
     const lease = { active: true };
     const host = leaseCurrentSessionRuntimeHost(composedHost, lease);
     cached.lease.active = false;
-    byOwner.set(options.ownerLarkAppId, {
+    byOwner.set(stableOwnerKey, {
       runtimeEpoch,
       ordinaryIngress,
       ordinaryRouteOpeningCreator,
@@ -733,7 +765,7 @@ export function currentSessionRuntimeHost(options: {
   const lease = { active: true };
   const host = leaseCurrentSessionRuntimeHost(routeHost ?? innerHost, lease);
   if (cached) cached.lease.active = false;
-  byOwner.set(options.ownerLarkAppId, {
+  byOwner.set(stableOwnerKey, {
     runtimeEpoch,
     ordinaryIngress: options.ordinaryIngress,
     ordinaryRouteOpeningCreator: options.ordinaryRouteOpeningCreator,
