@@ -18434,7 +18434,7 @@ async function observeOrdinaryIngressOutcome(
   // 必须给用户一条可行动的提示。同一 anchor 只提示一次：粘滞的 route 隔离会让
   // 后续每条消息都走到这里，共享群里逐条回 ⚠️ 是纯噪音。
   if (outcome.kind === 'rejected' || !context.replyAnchor) return;
-  const noticeKey = `${context.ownerLarkAppId} ${context.replyAnchor}`;
+  const noticeKey = `${context.ownerLarkAppId}\0${context.replyAnchor}`;
   if (ordinaryIngressFailureNoticed.has(noticeKey)) return;
   ordinaryIngressFailureNoticed.add(noticeKey);
   if (ordinaryIngressFailureNoticed.size > 256) {
