@@ -24420,12 +24420,6 @@ dialog.onboarding-dialog .onboarding-technical > code {
   color: var(--text-muted, #888);
 }
 
-.create-session-modal .cs-bot-list {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--cs-inner-gap);
-}
 .create-session-modal .cs-mode,
 .create-session-modal .cs-column {
   display: flex;
@@ -24437,7 +24431,6 @@ dialog.onboarding-dialog .onboarding-technical > code {
 .create-session-modal .cs-column legend {
   flex: 0 0 100%;
 }
-.create-session-modal .cs-bot,
 .create-session-modal .cs-mode label,
 .create-session-modal .cs-column label {
   position: relative;
@@ -24461,7 +24454,7 @@ dialog.onboarding-dialog .onboarding-technical > code {
     background-color 150ms ease,
     color 150ms ease;
 }
-.create-session-modal :where(.cs-bot, .cs-mode label, .cs-column label)::before {
+.create-session-modal :where(.cs-mode label, .cs-column label)::before {
   content: "";
   width: 8px;
   height: 8px;
@@ -24470,37 +24463,30 @@ dialog.onboarding-dialog .onboarding-technical > code {
   background: var(--border-soft);
   box-shadow: inset 0 0 0 1px var(--border);
 }
-.create-session-modal .cs-bot {
-  width: auto;
-  min-width: 120px;
-  max-width: min(220px, 100%);
-  margin: 0;
-}
-.create-session-modal :where(.cs-bot, .cs-mode label, .cs-column label) span {
+.create-session-modal :where(.cs-mode label, .cs-column label) span {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.create-session-modal .cs-bot:hover,
 .create-session-modal .cs-mode label:hover,
 .create-session-modal .cs-column label:hover {
   border-color: color-mix(in srgb, var(--accent) 42%, var(--border-soft));
   background: color-mix(in srgb, var(--accent) 6%, var(--surface));
 }
-.create-session-modal :where(.cs-bot, .cs-mode label, .cs-column label):has(input:checked) {
+.create-session-modal :where(.cs-mode label, .cs-column label):has(input:checked) {
   border-color: color-mix(in srgb, var(--accent) 52%, var(--border-soft));
   background: color-mix(in srgb, var(--accent) 9%, var(--surface));
   color: var(--accent-strong);
 }
-.create-session-modal :where(.cs-bot, .cs-mode label, .cs-column label):has(input:checked)::before {
+.create-session-modal :where(.cs-mode label, .cs-column label):has(input:checked)::before {
   background: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
-.create-session-modal :where(.cs-bot, .cs-mode label, .cs-column label):has(input:focus-visible) {
+.create-session-modal :where(.cs-mode label, .cs-column label):has(input:focus-visible) {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
-.create-session-modal :where(.cs-bot, .cs-mode label, .cs-column label) input {
+.create-session-modal :where(.cs-mode label, .cs-column label) input {
   position: absolute;
   width: 1px;
   height: 1px;
@@ -24668,43 +24654,7 @@ dialog.create-session-modal .cs-advanced input.cs-pill-input[type="text"]:focus 
   background: color-mix(in srgb, var(--accent) 8%, transparent);
   color: var(--accent-strong);
 }
-.create-session-modal .cs-empty {
-  margin: 0;
-  padding: var(--cs-gap);
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-lg);
-  background: var(--surface);
-  color: var(--muted);
-}
 .create-session-modal .cs-warn { color: var(--warning); }
-dialog.create-session-modal input.cs-bot-search[type="search"] {
-  box-sizing: border-box;
-  display: block;
-  width: 100%;
-  height: var(--button-height) !important;
-  min-height: var(--button-height) !important;
-  max-height: var(--button-height) !important;
-  padding: 0 var(--button-padding-x) !important;
-  border: 1px solid var(--border-soft) !important;
-  /* Mirrors .cs-pill-input: the legacy global input reset uses high-specificity chained :not() selectors. */
-  border-radius: var(--radius-full) !important;
-  background: var(--surface) !important;
-  background-clip: padding-box;
-  color: var(--fg);
-  font: inherit;
-  font-size: 13px;
-  line-height: normal;
-  outline: none;
-  appearance: none;
-  -webkit-appearance: none;
-}
-dialog.create-session-modal input.cs-bot-search[type="search"]:hover {
-  border-color: color-mix(in srgb, var(--accent) 42%, var(--border-soft)) !important;
-}
-dialog.create-session-modal input.cs-bot-search[type="search"]:focus {
-  border-color: var(--accent) !important;
-  box-shadow: 0 0 0 3px var(--accent-soft);
-}
 .create-session-modal .cs-keep-open {
   display: inline-flex;
   align-items: center;

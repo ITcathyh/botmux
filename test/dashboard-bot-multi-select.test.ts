@@ -1,23 +1,31 @@
 /**
  * dashboard-bot-multi-select.test.ts
  *
- * Render tests for the shared searchable bot multi-select (used by the
- * new-group modal, add-bots dialog, and create-session composer). Verifies:
- *  - every row emits a real `<input type="checkbox" name="bot">` so callers
- *    submitting through a <form> can still read ids via FormData.getAll('bot');
- *  - `checked` reflects the controlled `selected` Set;
- *  - the empty roster renders the empty label, not the list;
- *  - the selected-count label appears only when something is selected.
+ * Covers the shared searchable bot multi-select (used by the new-group modal,
+ * add-bots dialog, and create-session composer) at two levels:
  *
- * The search box filters client-side via component-local state, which
- * renderToStaticMarkup cannot drive (no events); the filtering predicate is
- * exercised indirectly — full-roster render shows all rows, matching the
- * create-session behavior the shared component replaced.
+ *  1. Component (renderToStaticMarkup): the picker is fully controlled — `checked`
+ *     reflects the `selected` Set, the empty roster renders the empty label, the
+ *     count label appears only when something is selected, and no `name`
+ *     attribute is emitted (selection is NOT submitted through the DOM).
+ *
+ *  2. Consumer regression (react-test-renderer, interactive): the add-bots
+ *     dialog must submit EVERY selected bot even when the search box has since
+ *     filtered some of them out of view. This is the regression the shared
+ *     component introduced: the list renders only search-matching rows, so a
+ *     consumer that harvested ids from the DOM (`FormData.getAll('bot')`) would
+ *     silently drop a bot that was selected while a different search was active.
+ *     The dialog now reads selection from controlled state, so it survives.
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi, afterEach } from 'vitest';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
+import TestRenderer, { act } from 'react-test-renderer';
 import { BotMultiSelect } from '../src/dashboard/web/bot-multi-select.js';
+import { AddBotsDialog } from '../src/dashboard/web/groups-page.js';
+import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
+
+(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
 const BOTS = [
   { larkAppId: 'cli_a', botName: 'Alpha(Claude)' },
@@ -38,27 +46,24 @@ function render(props: Partial<Parameters<typeof BotMultiSelect>[0]> = {}): stri
   }));
 }
 
-describe('BotMultiSelect', () => {
-  it('renders one name="bot" checkbox per bot (FormData contract)', () => {
+describe('BotMultiSelect (component)', () => {
+  it('renders one checkbox per bot with its larkAppId as value', () => {
     const html = render();
-    const checkboxes = html.match(/type="checkbox"[^>]*name="bot"/g) ?? [];
+    const checkboxes = html.match(/type="checkbox"/g) ?? [];
     expect(checkboxes.length).toBe(BOTS.length);
-    // each bot's larkAppId appears as an input value
     for (const bot of BOTS) expect(html).toContain(`value="${bot.larkAppId}"`);
   });
 
-  it('honors a custom inputName for FormData', () => {
-    const html = render({ inputName: 'targetBot' });
-    expect(html).toContain('name="targetBot"');
-    expect(html).not.toContain('name="bot"');
+  it('does NOT emit a form name — selection is controlled state, never harvested from the DOM', () => {
+    // Guards the regression: a `name="bot"` here invites callers to read the
+    // selection via FormData.getAll, which drops search-filtered-out rows.
+    expect(render()).not.toContain('name=');
   });
 
   it('reflects the controlled selected Set in checked state', () => {
     const html = render({ selected: new Set(['cli_b']) });
-    // exactly one checkbox is checked, and it is Beta's
     const checkedCount = (html.match(/checked=""|checked="checked"/g) ?? []).length;
     expect(checkedCount).toBe(1);
-    // the checked input carries cli_b's value
     expect(/value="cli_b"[^>]*checked|checked[^>]*value="cli_b"/.test(html)).toBe(true);
   });
 
@@ -78,5 +83,58 @@ describe('BotMultiSelect', () => {
     const html = render();
     expect(html).toContain('type="search"');
     for (const bot of BOTS) expect(html).toContain(bot.botName);
+  });
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+// Drive the real add-bots dialog: select a bot, search for a *different* one so
+// the first is filtered out of the DOM, select the second, then submit. The
+// POST body must carry BOTH ids — proving submission reads controlled state,
+// not the (now-partial) rendered checkbox set.
+describe('AddBotsDialog (consumer) — submits selections filtered out by search', () => {
+  function findSearch(root: TestRenderer.ReactTestInstance): TestRenderer.ReactTestInstance {
+    return root.findByProps({ className: 'bot-multi-select-search' });
+  }
+  function checkboxFor(root: TestRenderer.ReactTestInstance, id: string): TestRenderer.ReactTestInstance | undefined {
+    return root.findAllByType('input').find(node => node.props.type === 'checkbox' && node.props.value === id);
+  }
+
+  it('keeps a selection made under an earlier search query', async () => {
+    const fetchMock = vi.fn(async () => ({
+      json: async () => ({ result: [{ larkAppId: 'cli_a', ok: true }, { larkAppId: 'cli_c', ok: true }] }),
+    }));
+    vi.stubGlobal('fetch', fetchMock as any);
+
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(createElement(AddBotsDialog, {
+        chat: { chatId: 'oc_x', name: 'Room', memberBots: [] } as any,
+        bots: BOTS as any,
+        tr: createDashboardTranslator('zh'),
+        onClose: () => {},
+        onReloadGroups: async () => ({}) as any,
+      }));
+    });
+    const root = renderer.root;
+
+    // 1) select Alpha while the list is unfiltered
+    act(() => checkboxFor(root, 'cli_a')!.props.onChange({ currentTarget: { checked: true } }));
+    // 2) search "Gamma" → Alpha's row is unmounted (no longer in the DOM)
+    act(() => findSearch(root).props.onChange({ currentTarget: { value: 'Gamma' } }));
+    expect(checkboxFor(root, 'cli_a')).toBeUndefined();       // Alpha really is gone from the DOM
+    expect(checkboxFor(root, 'cli_c')).toBeDefined();          // Gamma is visible
+    // 3) select Gamma, then submit
+    act(() => checkboxFor(root, 'cli_c')!.props.onChange({ currentTarget: { checked: true } }));
+    await act(async () => {
+      root.findByType('form').props.onSubmit({ preventDefault() {}, currentTarget: {} });
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const body = JSON.parse((fetchMock.mock.calls[0] as any)[1].body);
+    // BOTH the search-hidden Alpha and the visible Gamma must be submitted.
+    expect(new Set(body.larkAppIds)).toEqual(new Set(['cli_a', 'cli_c']));
   });
 });
