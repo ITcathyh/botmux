@@ -5,7 +5,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync 
 import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setExactChatGrantHandler, armCoreOnlyReadinessGate, setCoreOnlyReady, __testOnly_resetCoreOnlyReadiness, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
+import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setExactChatGrantHandler, setDashboardHostMaintenance, armCoreOnlyReadinessGate, setCoreOnlyReady, __testOnly_resetCoreOnlyReadiness, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { cliAuthBind, signCliAuth } from '../src/dashboard/auth.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import * as groupsStore from '../src/services/groups-store.js';
@@ -34,6 +34,15 @@ import {
 } from '../src/core/ask-broker.js';
 import { managedOriginAttestationProofPath } from '../src/core/managed-origin-capability.js';
 import { MANAGED_ORIGIN_PROOF_DOMAIN } from '../src/core/managed-origin-attestation.js';
+import {
+  currentDashboardSessionRegistry,
+  installCurrentDashboardSessionRuntimeForTest,
+  resetCurrentDashboardSessionRuntimeForTest,
+} from './helpers/current-dashboard-session-runtime.js';
+import {
+  createCurrentDashboardAgentConfiguration,
+  createCurrentDashboardHostMaintenance,
+} from '../src/core/current-dashboard-host-maintenance.js';
 
 // Loopback-HMAC the write-link routes require. Inject a known secret per test
 // (setIpcAuthSecret) and sign with it, so the suite doesn't depend on a real
@@ -110,9 +119,20 @@ async function readSseEvent(
 
 let handle: IpcServerHandle | null = null;
 
+function installEmptyHostMaintenance(ownerLarkAppId: string): void {
+  setDashboardHostMaintenance(createCurrentDashboardHostMaintenance({
+    ownerLarkAppId,
+    activeSessions: new Map(),
+    listSessions: () => [],
+    submit: vi.fn(),
+    agentConfiguration: createCurrentDashboardAgentConfiguration(ownerLarkAppId),
+  }));
+}
+
 afterEach(async () => {
   if (handle) await handle.close();
   handle = null;
+  resetCurrentDashboardSessionRuntimeForTest();
   // Reset module-level larkAppId between tests so groups endpoints don't
   // leak state across describes.
   setLarkAppId('');
@@ -121,6 +141,7 @@ afterEach(async () => {
   resetAskBrokerForTest();
   setExactChatGrantHandler(null);
   clearMessageListenerRunPreviewStore();
+  vi.restoreAllMocks();
 });
 
 describe('dashboard IPC server', () => {
@@ -1339,8 +1360,9 @@ describe('POST /api/sessions/:sessionId/rename', () => {
     let findSpy: ReturnType<typeof vi.spyOn> | undefined;
     try {
       config.session.dataDir = dataDir;
-      sessionStore.init();
+      sessionStore.init('app');
       const session = sessionStore.createSession('oc_rename', 'om_rename', 'Old title', 'group');
+      session.larkAppId = 'app';
       session.cliId = 'codex';
       session.cliPathOverride = '/bin/codex';
       session.backendType = 'tmux';
@@ -1361,6 +1383,10 @@ describe('POST /api/sessions/:sessionId/rename', () => {
         hasHistory: true,
       } as any;
       findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(active);
+      installCurrentDashboardSessionRuntimeForTest(
+        'app',
+        currentDashboardSessionRegistry(active),
+      );
 
       setIpcAuthSecret(TEST_IPC_SECRET);
       handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
@@ -1371,7 +1397,10 @@ describe('POST /api/sessions/:sessionId/rename', () => {
           'content-type': 'application/json',
           ...trustedHostHeaders('POST', renamePath, handle.port),
         },
-        body: JSON.stringify({ title: '  New\tTitle\u001b  ' }),
+        body: JSON.stringify({
+          title: '  New\tTitle\u001b  ',
+          operationId: 'dashboard-rename-session',
+        }),
       });
 
       expect(res.status).toBe(200);
@@ -1391,6 +1420,20 @@ describe('POST /api/sessions/:sessionId/rename', () => {
         nativeSessionTitleUserDefined: true,
       });
       expect(send).toHaveBeenCalledWith({ type: 'rename_session', title: 'New Title' });
+      const replay = await fetch(`http://127.0.0.1:${handle.port}${renamePath}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...trustedHostHeaders('POST', renamePath, handle.port),
+        },
+        body: JSON.stringify({
+          title: '  New\tTitle\u001b  ',
+          operationId: 'dashboard-rename-session',
+        }),
+      });
+      expect(replay.status).toBe(200);
+      expect(await replay.json()).toEqual(renameResult);
+      expect(send).toHaveBeenCalledTimes(1);
       expect(events).toContainEqual(expect.objectContaining({
         type: 'session.update',
         body: {
@@ -1414,12 +1457,16 @@ describe('POST /api/sessions/:sessionId/rename', () => {
 
 describe('POST /api/sessions/:sessionId/close', () => {
   it('returns 200 with ok=true even when session does not exist (idempotent)', async () => {
+    installCurrentDashboardSessionRuntimeForTest('');
     setIpcAuthSecret(TEST_IPC_SECRET);
     handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
     const path = '/api/sessions/nonexistent/close';
     const res = await fetch(`http://127.0.0.1:${handle.port}${path}`, {
       method: 'POST',
-      headers: trustedHostHeaders('POST', path, handle.port),
+      headers: {
+        ...trustedHostHeaders('POST', path, handle.port),
+        'x-botmux-operation-id': 'dashboard-close-missing',
+      },
     });
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -1438,12 +1485,13 @@ describe('POST /api/sessions/:sessionId/lock', () => {
       config.session.dataDir = dataDir;
       sessionStore.init();
       const session = sessionStore.createSession('oc_lock', 'om_lock', 'lock me', 'group');
+      installCurrentDashboardSessionRuntimeForTest('');
 
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
       const lockRes = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${session.sessionId}/lock`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ locked: true }),
+        body: JSON.stringify({ locked: true, operationId: 'dashboard-lock' }),
       });
 
       expect(lockRes.status).toBe(200);
@@ -1457,7 +1505,7 @@ describe('POST /api/sessions/:sessionId/lock', () => {
       const unlockRes = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${session.sessionId}/lock`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ locked: false }),
+        body: JSON.stringify({ locked: false, operationId: 'dashboard-unlock' }),
       });
 
       expect(unlockRes.status).toBe(200);
@@ -1478,7 +1526,7 @@ describe('POST /api/sessions/:sessionId/lock', () => {
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/anything/lock`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ locked: 'yes' }),
+      body: JSON.stringify({ locked: 'yes', operationId: 'dashboard-lock-malformed' }),
     });
 
     expect(res.status).toBe(400);
@@ -1532,7 +1580,9 @@ describe('POST /api/sessions/:sessionId/board queued activation', () => {
         workingDir: '/tmp',
         pendingPrompt: session.queuedPrompt,
       } as any;
-      workerPool.setActiveSessionsRegistry(new Map([[sessionKey(session.rootMessageId, appId), ds]]));
+      const registry = new Map([[sessionKey(session.rootMessageId, appId), ds]]);
+      workerPool.setActiveSessionsRegistry(registry);
+      installCurrentDashboardSessionRuntimeForTest(appId, registry);
       workerPool.initWorkerPool({
         sessionReply: vi.fn(async () => 'om_reply'),
         getSessionWorkingDir: () => { throw new Error('forced pre-init failure'); },
@@ -1546,12 +1596,16 @@ describe('POST /api/sessions/:sessionId/board queued activation', () => {
         {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ column: 'in_progress', position: 7 }),
+          body: JSON.stringify({
+            column: 'in_progress',
+            position: 7,
+            operationId: 'dashboard-board-activate',
+          }),
         },
       );
 
-      expect(res.status).toBe(500);
-      expect(await res.json()).toEqual({ ok: false, error: 'forced pre-init failure' });
+      expect(res.status).toBe(503);
+      expect(await res.json()).toEqual({ ok: false, error: 'session_runtime_not_ready' });
       expect(sessionStore.getSession(session.sessionId)).toMatchObject({
         queued: true,
         queuedPrompt: 'queued board payload',
@@ -1580,14 +1634,20 @@ describe('POST /api/sessions/:sessionId/board queued activation', () => {
 describe('POST /api/sessions/:sessionId/restart', () => {
   it('sends a restart IPC message to the live worker', async () => {
     const send = vi.fn();
-    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+    const active = {
       session: { sessionId: 's-restart', cliId: 'codex' },
       worker: { send, killed: false },
       adoptedFrom: undefined,
-    } as any);
+      larkAppId: '',
+    } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(active);
+    installCurrentDashboardSessionRuntimeForTest('', currentDashboardSessionRegistry(active));
 
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-restart/restart`, { method: 'POST' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-restart/restart`, {
+      method: 'POST',
+      headers: { 'x-botmux-operation-id': 'dashboard-restart-live' },
+    });
 
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ ok: true, sessionId: 's-restart', cliId: 'codex' });
@@ -1609,7 +1669,7 @@ describe('POST /api/sessions/:sessionId/restart', () => {
       },
     });
     const replySpy = vi.spyOn(larkClient, 'replyMessage').mockResolvedValue('om_notice');
-    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+    const active = {
       larkAppId: 'runtime-app',
       chatId: 'oc_runtime',
       scope: 'thread',
@@ -1628,12 +1688,17 @@ describe('POST /api/sessions/:sessionId/restart', () => {
       },
       worker: { send: vi.fn(), killed: false },
       adoptedFrom: undefined,
-    } as any);
+    } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(active);
+    installCurrentDashboardSessionRuntimeForTest(
+      'runtime-app',
+      currentDashboardSessionRegistry(active),
+    );
     try {
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
       const res = await fetch(
         `http://127.0.0.1:${handle.port}/api/sessions/s-runtime-restart/restart`,
-        { method: 'POST' },
+        { method: 'POST', headers: { 'x-botmux-operation-id': 'dashboard-restart-runtime-name' } },
       );
 
       expect(res.status).toBe(200);
@@ -1649,9 +1714,13 @@ describe('POST /api/sessions/:sessionId/restart', () => {
 
   it('rejects unknown sessions without creating a restart side effect', async () => {
     const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(undefined);
+    installCurrentDashboardSessionRuntimeForTest('');
 
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/missing/restart`, { method: 'POST' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/missing/restart`, {
+      method: 'POST',
+      headers: { 'x-botmux-operation-id': 'dashboard-restart-missing' },
+    });
 
     expect(res.status).toBe(404);
     expect(await res.json()).toMatchObject({ ok: false, error: 'session_not_active' });
@@ -1660,15 +1729,21 @@ describe('POST /api/sessions/:sessionId/restart', () => {
 
   it('rejects adopt/observed sessions without restarting (would kill the user pane)', async () => {
     const send = vi.fn();
-    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
-    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => true);
+    const active = {
       session: { sessionId: 's-adopt', cliId: 'codex' },
       worker: { send, killed: false },
       adoptedFrom: { source: 'tmux', tmuxTarget: '0:1.0', cwd: '/x' },
-    } as any);
+      larkAppId: '',
+    } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(active);
+    installCurrentDashboardSessionRuntimeForTest('', currentDashboardSessionRegistry(active));
 
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-adopt/restart`, { method: 'POST' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-adopt/restart`, {
+      method: 'POST',
+      headers: { 'x-botmux-operation-id': 'dashboard-restart-adopt' },
+    });
 
     expect(res.status).toBe(409);
     expect(await res.json()).toMatchObject({ ok: false, error: 'adopt_restart_unsupported' });
@@ -1680,15 +1755,21 @@ describe('POST /api/sessions/:sessionId/restart', () => {
 
   it('rejects Riff sessions with close-and-recreate guidance', async () => {
     const send = vi.fn();
-    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
-    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => true);
+    const active = {
       session: { sessionId: 's-riff', cliId: 'riff', backendType: 'riff' },
       worker: { send, killed: false },
       adoptedFrom: undefined,
-    } as any);
+      larkAppId: '',
+    } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(active);
+    installCurrentDashboardSessionRuntimeForTest('', currentDashboardSessionRegistry(active));
 
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-riff/restart`, { method: 'POST' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-riff/restart`, {
+      method: 'POST',
+      headers: { 'x-botmux-operation-id': 'dashboard-restart-riff' },
+    });
 
     expect(res.status).toBe(409);
     expect(await res.json()).toMatchObject({
@@ -1703,16 +1784,32 @@ describe('POST /api/sessions/:sessionId/restart', () => {
   });
 
   it('revives a worker-less but active session by re-forking (matches the Feishu card path)', async () => {
-    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
-    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
-      session: { sessionId: 's-revive', cliId: 'codex' },
+    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => true);
+    const active = {
+      session: {
+        sessionId: 's-revive',
+        cliId: 'codex',
+        rootMessageId: 'om-revive',
+        chatId: 'oc-revive',
+        scope: 'thread',
+        status: 'active',
+      },
       worker: null,
       adoptedFrom: undefined,
       hasHistory: true,
-    } as any);
+      larkAppId: '',
+    } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(active);
+    installCurrentDashboardSessionRuntimeForTest(
+      '',
+      new Map([[sessionKey('om-revive', ''), active]]),
+    );
 
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-revive/restart`, { method: 'POST' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-revive/restart`, {
+      method: 'POST',
+      headers: { 'x-botmux-operation-id': 'dashboard-restart-revive' },
+    });
 
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ ok: true, sessionId: 's-revive', cliId: 'codex', revived: true });
@@ -1724,18 +1821,24 @@ describe('POST /api/sessions/:sessionId/restart', () => {
     forkSpy.mockRestore();
   });
 
-  it('returns 502 when sending the restart IPC throws (e.g. closed channel)', async () => {
+  it('returns 503 when restart delivery becomes ambiguous (e.g. closed channel)', async () => {
     const send = vi.fn(() => { throw new Error('ERR_IPC_CHANNEL_CLOSED'); });
-    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+    const active = {
       session: { sessionId: 's-throw', cliId: 'codex' },
       worker: { send, killed: false },
       adoptedFrom: undefined,
-    } as any);
+      larkAppId: '',
+    } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(active);
+    installCurrentDashboardSessionRuntimeForTest('', currentDashboardSessionRegistry(active));
 
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-throw/restart`, { method: 'POST' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-throw/restart`, {
+      method: 'POST',
+      headers: { 'x-botmux-operation-id': 'dashboard-restart-throw' },
+    });
 
-    expect(res.status).toBe(502);
+    expect(res.status).toBe(503);
     expect(await res.json()).toMatchObject({ ok: false });
     findSpy.mockRestore();
   });
@@ -1747,12 +1850,17 @@ describe('POST /api/sessions/:sessionId/suspend', () => {
       session: { sessionId: 's-susp', cliId: 'claude-code' },
       worker: { send: vi.fn(), killed: false },
       adoptedFrom: undefined,
+      larkAppId: '',
     } as any;
     const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
     const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(true);
+    installCurrentDashboardSessionRuntimeForTest('', currentDashboardSessionRegistry(ds));
 
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-susp/suspend`, { method: 'POST' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-susp/suspend`, {
+      method: 'POST',
+      headers: { 'x-botmux-operation-id': 'dashboard-suspend-live' },
+    });
 
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ ok: true, sessionId: 's-susp', suspended: true });
@@ -1763,9 +1871,13 @@ describe('POST /api/sessions/:sessionId/suspend', () => {
 
   it('404s for sessions that are not active', async () => {
     const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(undefined);
+    installCurrentDashboardSessionRuntimeForTest('');
 
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/missing/suspend`, { method: 'POST' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/missing/suspend`, {
+      method: 'POST',
+      headers: { 'x-botmux-operation-id': 'dashboard-suspend-missing' },
+    });
 
     expect(res.status).toBe(404);
     expect(await res.json()).toMatchObject({ ok: false, error: 'session_not_active' });
@@ -1783,12 +1895,17 @@ describe('POST /api/sessions/:sessionId/suspend', () => {
       },
       worker: { send: vi.fn(), killed: false },
       adoptedFrom: undefined,
+      larkAppId: '',
     } as any;
     const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
     const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(true);
+    installCurrentDashboardSessionRuntimeForTest('', currentDashboardSessionRegistry(ds));
 
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-owned/suspend`, { method: 'POST' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-owned/suspend`, {
+      method: 'POST',
+      headers: { 'x-botmux-operation-id': 'dashboard-suspend-owned' },
+    });
 
     expect(res.status).toBe(409);
     expect(await res.json()).toMatchObject({ ok: false, error: 'codex_app_dispatch_pending' });
@@ -1799,14 +1916,20 @@ describe('POST /api/sessions/:sessionId/suspend', () => {
 
   it('rejects adopt/observed sessions (suspending would kill the user pane)', async () => {
     const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(true);
-    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+    const active = {
       session: { sessionId: 's-adopt-susp', cliId: 'codex' },
       worker: { send: vi.fn(), killed: false },
       adoptedFrom: { source: 'tmux', tmuxTarget: '0:1.0', cwd: '/x' },
-    } as any);
+      larkAppId: '',
+    } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(active);
+    installCurrentDashboardSessionRuntimeForTest('', currentDashboardSessionRegistry(active));
 
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-adopt-susp/suspend`, { method: 'POST' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-adopt-susp/suspend`, {
+      method: 'POST',
+      headers: { 'x-botmux-operation-id': 'dashboard-suspend-adopt' },
+    });
 
     expect(res.status).toBe(409);
     expect(await res.json()).toMatchObject({ ok: false, error: 'adopt_suspend_unsupported' });
@@ -1817,14 +1940,20 @@ describe('POST /api/sessions/:sessionId/suspend', () => {
 
   it('is idempotent when the worker is already gone (idle-suspended earlier)', async () => {
     const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(true);
-    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+    const active = {
       session: { sessionId: 's-gone', cliId: 'codex' },
       worker: null,
       adoptedFrom: undefined,
-    } as any);
+      larkAppId: '',
+    } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(active);
+    installCurrentDashboardSessionRuntimeForTest('', currentDashboardSessionRegistry(active));
 
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-gone/suspend`, { method: 'POST' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-gone/suspend`, {
+      method: 'POST',
+      headers: { 'x-botmux-operation-id': 'dashboard-suspend-gone' },
+    });
 
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ ok: true, suspended: false, reason: 'no_live_worker' });
@@ -1834,15 +1963,21 @@ describe('POST /api/sessions/:sessionId/suspend', () => {
   });
 
   it('409s when the backend is not suspendable (suspendWorker returns false)', async () => {
-    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+    const active = {
       session: { sessionId: 's-pty', cliId: 'codex' },
       worker: { send: vi.fn(), killed: false },
       adoptedFrom: undefined,
-    } as any);
+      larkAppId: '',
+    } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(active);
     const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(false);
+    installCurrentDashboardSessionRuntimeForTest('', currentDashboardSessionRegistry(active));
 
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-pty/suspend`, { method: 'POST' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-pty/suspend`, {
+      method: 'POST',
+      headers: { 'x-botmux-operation-id': 'dashboard-suspend-pty' },
+    });
 
     expect(res.status).toBe(409);
     expect(await res.json()).toMatchObject({ ok: false, error: 'backend_not_suspendable' });
@@ -2197,7 +2332,7 @@ describe('POST /api/sessions/:sessionId/resume', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-resume-'));
     const prevConfigDataDir = config.session.dataDir;
     const registry = new Map<string, any>();
-    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
+    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => true);
     try {
       config.session.dataDir = dataDir;
       sessionStore.init();
@@ -2216,18 +2351,16 @@ describe('POST /api/sessions/:sessionId/resume', () => {
       };
       sessionStore.updateSession(session);
       sessionStore.closeSession(session.sessionId);
+      installCurrentDashboardSessionRuntimeForTest('', registry);
 
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
       const res = await fetch(
         `http://127.0.0.1:${handle.port}/api/sessions/${session.sessionId}/resume?wake=1`,
-        { method: 'POST' },
+        { method: 'POST', headers: { 'x-botmux-operation-id': 'dashboard-resume-vc' } },
       );
 
       expect(res.status).toBe(409);
-      expect(await res.json()).toEqual({
-        ok: false,
-        error: 'vc_receiver_managed',
-      });
+      expect(await res.json()).toEqual({ ok: false, error: 'not_closed' });
       expect(sessionStore.getSession(session.sessionId)?.status).toBe('closed');
       expect(registry.size).toBe(0);
       expect(forkSpy).not.toHaveBeenCalled();
@@ -2245,7 +2378,10 @@ describe('POST /api/sessions/:sessionId/resume', () => {
     const prevDataDir = process.env.SESSION_DATA_DIR;
     const prevConfigDataDir = config.session.dataDir;
     const registry = new Map<string, any>();
-    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
+    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation((active: any) => {
+      active.worker = { killed: false };
+      return true;
+    });
     try {
       config.session.dataDir = dataDir;
       sessionStore.init();
@@ -2258,14 +2394,18 @@ describe('POST /api/sessions/:sessionId/resume', () => {
       session.workingDir = process.cwd();
       sessionStore.updateSession(session);
       sessionStore.closeSession(session.sessionId);
+      installCurrentDashboardSessionRuntimeForTest('', registry);
 
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${session.sessionId}/resume?wake=1`, { method: 'POST' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${session.sessionId}/resume?wake=1`, {
+        method: 'POST',
+        headers: { 'x-botmux-operation-id': 'dashboard-resume-wake' },
+      });
 
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body).toMatchObject({ ok: true, sessionId: session.sessionId, wake: true });
-      expect(registry.get(sessionKey('om_resume', ''))?.session.sessionId).toBe(session.sessionId);
+      expect([...registry.values()].some(ds => ds.session.sessionId === session.sessionId)).toBe(true);
       expect(forkSpy).toHaveBeenCalledWith(
         expect.objectContaining({ session: expect.objectContaining({ sessionId: session.sessionId }) }),
         '',
@@ -2287,7 +2427,7 @@ describe('POST /api/sessions/:sessionId/resume', () => {
     const prevDataDir = process.env.SESSION_DATA_DIR;
     const prevConfigDataDir = config.session.dataDir;
     const registry = new Map<string, any>();
-    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
+    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => true);
     try {
       config.session.dataDir = dataDir;
       sessionStore.init();
@@ -2300,9 +2440,13 @@ describe('POST /api/sessions/:sessionId/resume', () => {
       session.workingDir = process.cwd();
       sessionStore.updateSession(session);
       sessionStore.closeSession(session.sessionId);
+      installCurrentDashboardSessionRuntimeForTest('', registry);
 
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${session.sessionId}/resume`, { method: 'POST' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${session.sessionId}/resume`, {
+        method: 'POST',
+        headers: { 'x-botmux-operation-id': 'dashboard-resume-cold' },
+      });
 
       expect(res.status).toBe(200);
       const body = await res.json();
@@ -2310,7 +2454,7 @@ describe('POST /api/sessions/:sessionId/resume', () => {
       // next inbound message. This guards the `wake &&` short-circuit against a
       // refactor that reverts to forking on every resume.
       expect(body).toMatchObject({ ok: true, sessionId: session.sessionId, wake: false });
-      expect(registry.get(sessionKey('om_resume', ''))?.session.sessionId).toBe(session.sessionId);
+      expect([...registry.values()].some(ds => ds.session.sessionId === session.sessionId)).toBe(true);
       expect(forkSpy).not.toHaveBeenCalled();
     } finally {
       forkSpy.mockRestore();
@@ -2801,7 +2945,59 @@ describe('PUT /api/bot-substitute-mode', () => {
   });
 });
 
+describe('GET /api/host-overload/counts', () => {
+  it('returns 503 instead of a misleading zero count for an incomplete owner inventory', async () => {
+    setDashboardHostMaintenance({
+      counts: () => ({
+        kind: 'notReady',
+        message: 'owner registry contains a non-canonical binding',
+      }),
+      changeAgent: vi.fn(),
+      sweep: vi.fn(),
+    });
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/host-overload/counts`);
+
+    expect(res.status).toBe(503);
+    expect(await res.json()).toEqual({ ok: false, error: 'session_runtime_not_ready' });
+  });
+});
+
 describe('PUT /api/bot-agent', () => {
+  it('returns 503 for a sticky unknown post-publication Agent outcome', async () => {
+    setLarkAppId('test-agent-quarantined-app');
+    const changeAgent = vi.fn(async () => ({
+      kind: 'quarantined' as const,
+      error: 'agent_change_outcome_unknown' as const,
+      message: 'Session close response was lost after config publication',
+    }));
+    setDashboardHostMaintenance({
+      counts: () => ({ kind: 'ready', stopped: 0, idle: 0 }),
+      changeAgent,
+      sweep: vi.fn(),
+    });
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        operationId: 'agent-quarantined-http',
+        cliId: 'codex',
+        model: '',
+      }),
+    });
+
+    expect(res.status).toBe(503);
+    expect(await res.json()).toEqual({
+      ok: false,
+      error: 'agent_change_outcome_unknown',
+      message: 'Session close response was lost after config publication',
+    });
+    expect(changeAgent).toHaveBeenCalledTimes(1);
+  });
+
   it('updates cli selection and model through bots.json and live config', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-ipc-'));
     const configPath = join(dir, 'bots.json');
@@ -2817,21 +3013,56 @@ describe('PUT /api/bot-agent', () => {
       }], null, 2));
       loadBotConfigs().forEach((c: any) => registerBot(c));
       setLarkAppId(appId);
+      installEmptyHostMaintenance(appId);
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const invalidOperation = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          cliId: 'ttadk-x-codex',
+          model: 'kimi-k2.5',
+          operationId: 42,
+        }),
+      });
+      expect(invalidOperation.status).toBe(400);
+      expect(await invalidOperation.json()).toEqual({ ok: false, error: 'bad_operation_id' });
 
       const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cliId: 'ttadk-x-codex', model: 'kimi-k2.5' }),
+        body: JSON.stringify({
+          cliId: 'ttadk-x-codex',
+          model: 'kimi-k2.5',
+          operationId: 'agent-save-1',
+        }),
       });
 
       expect(res.status).toBe(200);
-      expect(await res.json()).toMatchObject({
+      const responseBody = await res.json();
+      expect(responseBody).toMatchObject({
         ok: true,
         cliId: 'codex',
         wrapperCli: 'ttadk codex',
         model: 'kimi-k2.5',
         selectionKey: 'ttadk-x-codex',
+      });
+      expect(responseBody).not.toHaveProperty('deferredMismatchedSessions');
+      expect(responseBody).not.toHaveProperty('uncertainMismatchedSessions');
+
+      const conflictingRetry = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          cliId: 'ttadk-x-codex',
+          model: 'different-model',
+          operationId: 'agent-save-1',
+        }),
+      });
+      expect(conflictingRetry.status).toBe(409);
+      expect(await conflictingRetry.json()).toMatchObject({
+        ok: false,
+        error: 'idempotency_conflict',
       });
       const stored = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
       expect(stored).toMatchObject({
@@ -2889,6 +3120,7 @@ describe('PUT /api/bot-agent', () => {
         hasHistory: true,
       } as any]]);
       workerPool.setActiveSessionsRegistry(registry);
+      installCurrentDashboardSessionRuntimeForTest(appId, registry);
       setLarkAppId(appId);
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
 
@@ -2897,7 +3129,11 @@ describe('PUT /api/bot-agent', () => {
       const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cliId: 'ttadk-x-codex', model: 'new-model' }),
+        body: JSON.stringify({
+          cliId: 'ttadk-x-codex',
+          model: 'new-model',
+          operationId: 'dashboard-agent-unsettled',
+        }),
       });
 
       expect(res.status).toBe(409);
@@ -2956,13 +3192,18 @@ describe('PUT /api/bot-agent', () => {
       session.queued = true;
       session.pendingRepoSetup = { mode: 'picker', prompt: 'OPENING_N' };
       sessionStore.updateSession(session);
+      installCurrentDashboardSessionRuntimeForTest(appId);
       setLarkAppId(appId);
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
 
       const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cliId: 'codex', model: '' }),
+        body: JSON.stringify({
+          cliId: 'codex',
+          model: '',
+          operationId: 'dashboard-agent-pending',
+        }),
       });
 
       expect(res.status).toBe(409);
@@ -3013,13 +3254,18 @@ describe('PUT /api/bot-agent', () => {
         hasHistory: true,
       } as any]]);
       workerPool.setActiveSessionsRegistry(registry);
+      installCurrentDashboardSessionRuntimeForTest(appId, registry);
       setLarkAppId(appId);
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
 
       const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cliId: 'codex', model: '' }),
+        body: JSON.stringify({
+          cliId: 'codex',
+          model: '',
+          operationId: 'dashboard-agent-settled',
+        }),
       });
 
       expect(res.status).toBe(200);
@@ -3050,6 +3296,7 @@ describe('PUT /api/bot-agent', () => {
       }], null, 2));
       loadBotConfigs().forEach((c: any) => registerBot(c));
       setLarkAppId(appId);
+      installEmptyHostMaintenance(appId);
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
 
       const cliRuntime = {
@@ -3061,7 +3308,12 @@ describe('PUT /api/bot-agent', () => {
       const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cliId: 'codex', model: 'custom-model', cliRuntime }),
+        body: JSON.stringify({
+          cliId: 'codex',
+          model: 'custom-model',
+          cliRuntime,
+          operationId: 'dashboard-agent-runtime',
+        }),
       });
 
       expect(res.status).toBe(200);
@@ -3073,12 +3325,11 @@ describe('PUT /api/bot-agent', () => {
       });
       const stored = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
       expect(stored).toMatchObject({ cliId: 'codex', cliRuntime });
-      expect(stored.cliPathOverride).toBe(cliRuntime.executable);
+      expect(stored).not.toHaveProperty('cliPathOverride');
       expect(getBot(appId).config).toMatchObject({
         cliRuntime,
-        // Parsed/live config keeps the executable shadow for existing adapters.
-        cliPathOverride: process.execPath,
       });
+      expect(getBot(appId).config).not.toHaveProperty('cliPathOverride');
     } finally {
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
@@ -3086,7 +3337,7 @@ describe('PUT /api/bot-agent', () => {
     }
   });
 
-  it('preserves a runtime for old same-selection clients and clears it only when explicit', async () => {
+  it('normalizes a structured runtime to one authority and clears it only when explicit', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-runtime-compat-ipc-'));
     const configPath = join(dir, 'bots.json');
     const appId = 'test-runtime-compat-app';
@@ -3104,28 +3355,36 @@ describe('PUT /api/bot-agent', () => {
         larkAppSecret: 'secret',
         cliId: 'codex',
         cliRuntime,
-        cliPathOverride: cliRuntime.executable,
       }], null, 2));
       loadBotConfigs().forEach((c: any) => registerBot(c));
       setLarkAppId(appId);
+      installEmptyHostMaintenance(appId);
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
       const url = `http://127.0.0.1:${handle.port}/api/bot-agent`;
 
       const oldClientSave = await fetch(url, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cliId: 'codex', model: 'new-model' }),
+        body: JSON.stringify({
+          cliId: 'codex',
+          model: 'new-model',
+          operationId: 'dashboard-agent-old-client',
+        }),
       });
       expect(oldClientSave.status).toBe(200);
-      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).toMatchObject({
-        cliRuntime,
-        cliPathOverride: cliRuntime.executable,
-      });
+      const normalized = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+      expect(normalized).toMatchObject({ cliRuntime });
+      expect(normalized).not.toHaveProperty('cliPathOverride');
 
       const explicitOfficial = await fetch(url, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cliId: 'codex', model: 'new-model', cliRuntime: null }),
+        body: JSON.stringify({
+          cliId: 'codex',
+          model: 'new-model',
+          cliRuntime: null,
+          operationId: 'dashboard-agent-explicit-official',
+        }),
       });
       expect(explicitOfficial.status).toBe(200);
       expect(await explicitOfficial.json()).toMatchObject({ cliRuntime: null });
@@ -3155,6 +3414,7 @@ describe('PUT /api/bot-agent', () => {
       }], null, 2));
       loadBotConfigs().forEach((c: any) => registerBot(c));
       setLarkAppId(appId);
+      installEmptyHostMaintenance(appId);
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
       const base = `http://127.0.0.1:${handle.port}`;
 
@@ -3168,7 +3428,11 @@ describe('PUT /api/bot-agent', () => {
       const modelSave = await fetch(`${base}/api/bot-agent`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cliId: 'codex', model: 'new-model' }),
+        body: JSON.stringify({
+          cliId: 'codex',
+          model: 'new-model',
+          operationId: 'dashboard-agent-legacy-path',
+        }),
       });
       expect(modelSave.status).toBe(200);
       expect(await modelSave.json()).toMatchObject({
@@ -3202,19 +3466,28 @@ describe('PUT /api/bot-agent', () => {
       }], null, 2));
       loadBotConfigs().forEach((c: any) => registerBot(c));
       setLarkAppId(appId);
+      installEmptyHostMaintenance(appId);
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
       const url = `http://127.0.0.1:${handle.port}/api/bot-agent`;
 
       const nonCodex = await fetch(url, {
         method: 'PUT', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cliId: 'claude-code', cliRuntime }),
+        body: JSON.stringify({
+          cliId: 'claude-code',
+          cliRuntime,
+          operationId: 'dashboard-agent-noncodex-runtime',
+        }),
       });
       expect(nonCodex.status).toBe(400);
       expect(await nonCodex.json()).toMatchObject({ error: 'runtime_requires_codex' });
 
       const wrapper = await fetch(url, {
         method: 'PUT', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cliId: 'ttadk-x-codex', cliRuntime }),
+        body: JSON.stringify({
+          cliId: 'ttadk-x-codex',
+          cliRuntime,
+          operationId: 'dashboard-agent-wrapper-runtime',
+        }),
       });
       expect(wrapper.status).toBe(400);
       expect(await wrapper.json()).toMatchObject({ error: 'runtime_wrapper_conflict' });
@@ -3355,12 +3628,17 @@ describe('PUT /api/bot-agent riff backend pairing', () => {
       }], null, 2));
       loadBotConfigs().forEach((c: any) => registerBot(c));
       setLarkAppId(appId);
+      installEmptyHostMaintenance(appId);
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
 
       const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cliId: 'codex', model: '' }),
+        body: JSON.stringify({
+          cliId: 'codex',
+          model: '',
+          operationId: 'dashboard-agent-riff-to-codex',
+        }),
       });
       expect(res.status).toBe(200);
 
@@ -3393,12 +3671,17 @@ describe('PUT /api/bot-agent riff backend pairing', () => {
       }], null, 2));
       loadBotConfigs().forEach((c: any) => registerBot(c));
       setLarkAppId(appId);
+      installEmptyHostMaintenance(appId);
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
 
       const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cliId: 'codex', model: '' }),
+        body: JSON.stringify({
+          cliId: 'codex',
+          model: '',
+          operationId: 'dashboard-agent-tmux-to-codex',
+        }),
       });
       expect(res.status).toBe(200);
       const stored = JSON.parse(readFileSync(configPath, 'utf-8'))[0];

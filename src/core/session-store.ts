@@ -33,16 +33,40 @@ export interface StoredSessionState {
   titleUpdatedAt?: string;
   titleSource?: StoredSessionTitleSource;
   executorGeneration: number;
+  kanbanColumn?: 'backlog' | 'todo' | 'in_progress' | 'in_review' | 'done';
+  kanbanPosition?: number;
+  queued: boolean;
+  locked: boolean;
+  whiteboardId?: string;
+  chatDisplayName?: string;
+  ownerUnionId?: string;
+  workingDir?: string;
+  riffRepoDirs?: readonly string[];
 }
 
 /** Semantic state changes; arbitrary JSON patches are intentionally absent. */
-export type SessionStoreTransition = {
-  kind: 'rename';
-  /** Must already be normalized by the shared Session title policy. */
-  title: string;
-  updatedAt: string;
-  source: StoredSessionTitleSource;
-};
+export type SessionStoreTransition =
+  | {
+      kind: 'rename';
+      /** Must already be normalized by the shared Session title policy. */
+      title: string;
+      updatedAt: string;
+      source: StoredSessionTitleSource;
+    }
+  | {
+      kind: 'setBoardPlacement';
+      column?: 'backlog' | 'todo' | 'in_progress' | 'in_review' | 'done';
+      position?: number;
+    }
+  | { kind: 'setLocked'; locked: boolean }
+  | { kind: 'bindWhiteboard'; whiteboardId: string }
+  | { kind: 'setChatDisplayName'; chatDisplayName: string }
+  | { kind: 'bindOwnerUnionId'; ownerUnionId: string }
+  | {
+      /** Canonical absolute path; changing it invalidates any prior Riff repo stamp. */
+      kind: 'changeWorkingDirectory';
+      workingDir: string;
+    };
 
 export type SessionStoreLoadResult =
   | {

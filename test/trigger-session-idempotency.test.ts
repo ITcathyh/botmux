@@ -17,7 +17,7 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
-import type { DaemonSession } from '../src/core/types.js';
+import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 
 let tempDir: string;
 
@@ -40,12 +40,13 @@ vi.mock('../src/core/worker-pool.js', () => ({
   getDaemonBootId: () => 'boot-CURRENT',
 }));
 
-// session-store: getSession + getOwnedSession are consulted by the decision/
-// reconcile paths (getOwnedSession is the owner-scoped read finding #3 requires).
+// session-store: the decision uses an explicit owner-bound lookup; reconcile's
+// injected lookup remains independent.
 const sessionRows = new Map<string, any>();
 vi.mock('../src/services/session-store.js', () => ({
   getSession: (id: string) => sessionRows.get(id),
   getOwnedSession: (id: string) => sessionRows.get(id),
+  getSessionForOwnerStrict: (_owner: string, id: string) => sessionRows.get(id),
   createSession: vi.fn(),
   updateSession: vi.fn(),
   registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
@@ -84,12 +85,55 @@ describe('resolveIdempotencyHit (at-most-once decisions)', () => {
   // A genuinely in-flight session: registered AND holding a non-killed worker.
   // Registry presence alone is NOT liveness (codex #776 round-6 finding #1) —
   // resolveIdempotencyHit requires a live worker to treat a turn as in-flight.
-  const liveFor = (sessionId: string, chatId = 'http_async_x') =>
-    new Map<string, DaemonSession>([['k', { session: { sessionId }, chatId, worker: { killed: false } } as any]]);
+  const liveFor = (sessionId: string, chatId = 'http_async_x') => {
+    const live = {
+      session: {
+        sessionId,
+        larkAppId: OWNER,
+        chatId,
+        rootMessageId: `${chatId}-root`,
+        status: 'active',
+        scope: 'thread',
+        chatType: 'group',
+        createdAt: new Date(0).toISOString(),
+      },
+      larkAppId: OWNER,
+      chatId,
+      chatType: 'group',
+      scope: 'thread',
+      worker: { killed: false },
+    } as DaemonSession;
+    return new Map<string, DaemonSession>([[activeSessionKey(live), live]]);
+  };
   // Registry-present but worker DEAD (worker exited, ds not yet removed) — the
   // orphan case that must NOT be treated as in-flight.
   const deadWorkerFor = (sessionId: string, chatId = 'http_async_x') =>
     new Map<string, DaemonSession>([['k', { session: { sessionId }, chatId, worker: null } as any]]);
+
+  const exactLiveBinding = (
+    sessionId: string,
+    ownerLarkAppId: string,
+    chatId: string,
+  ): [string, DaemonSession] => {
+    const live = {
+      session: {
+        sessionId,
+        larkAppId: ownerLarkAppId,
+        chatId,
+        rootMessageId: `${chatId}-root`,
+        status: 'active',
+        scope: 'thread',
+        chatType: 'group',
+        createdAt: new Date(0).toISOString(),
+      },
+      larkAppId: ownerLarkAppId,
+      chatId,
+      chatType: 'group',
+      scope: 'thread',
+      worker: { killed: false },
+    } as DaemonSession;
+    return [activeSessionKey(live), live];
+  };
 
   it('completed async result (SAME owner) → reuse (poll it), regardless of lease state', () => {
     asyncTriggerStore.recordCompleted('sess-1', 'trg_1', 'done', 100, OWNER);
@@ -117,6 +161,60 @@ describe('resolveIdempotencyHit (at-most-once decisions)', () => {
     // Own turn is live in flight → foreign failed ignored → reuse (poll it).
     const d = resolveIdempotencyHit(lease({ state: 'attempting', ownerBootId: 'boot-CURRENT' }), 'boot-CURRENT', liveFor('sess-1'));
     expect(d.kind).toBe('reuse');
+  });
+
+  it('does not borrow in-flight liveness or chat identity from a foreign live binding with the same Session id', () => {
+    const foreignChatId = 'oc_foreign_same_session';
+    const active = new Map<string, DaemonSession>([
+      exactLiveBinding('sess-1', 'cli_FOREIGN', foreignChatId),
+    ]);
+
+    const d = resolveIdempotencyHit(
+      lease({ state: 'attempting', ownerBootId: 'boot-OLD' }),
+      'boot-CURRENT',
+      active,
+    );
+
+    expect(d.kind).toBe('terminal');
+    if (d.kind !== 'terminal') throw new Error('expected an interrupted own lease to be terminal');
+    expect(d.chatId).not.toBe(foreignChatId);
+  });
+
+  it.each([
+    ['owner binding under an alias key', () => {
+      const [, live] = exactLiveBinding('sess-1', OWNER, 'oc_owner_alias');
+      return new Map<string, DaemonSession>([['noncanonical-alias', live]]);
+    }],
+    ['foreign runtime binding carrying this owner in the nested Session', () => {
+      const [key, live] = exactLiveBinding('sess-1', 'cli_FOREIGN', 'oc_foreign_alias');
+      live.session.larkAppId = OWNER;
+      return new Map<string, DaemonSession>([[key, live]]);
+    }],
+    ['runtime owner conflicting with the nested Session owner', () => {
+      const [key, live] = exactLiveBinding('sess-1', OWNER, 'oc_nested_mismatch');
+      live.session.larkAppId = 'cli_FOREIGN';
+      return new Map<string, DaemonSession>([[key, live]]);
+    }],
+    ['inactive owner binding', () => {
+      const [key, live] = exactLiveBinding('sess-1', OWNER, 'oc_inactive');
+      live.session.status = 'closed';
+      return new Map<string, DaemonSession>([[key, live]]);
+    }],
+    ['duplicate owner bindings for one Session id', () => new Map<string, DaemonSession>([
+      exactLiveBinding('sess-1', OWNER, 'oc_duplicate_a'),
+      exactLiveBinding('sess-1', OWNER, 'oc_duplicate_b'),
+    ])],
+  ] as const)('fails closed instead of reusing an old attempting lease for %s', (_label, registry) => {
+    const d = resolveIdempotencyHit(
+      lease({ state: 'attempting', ownerBootId: 'boot-OLD' }),
+      'boot-CURRENT',
+      registry(),
+    );
+
+    expect(d).toMatchObject({
+      kind: 'unreadable',
+      message: expect.stringMatching(/live owner binding/),
+    });
   });
 
   it('attempting + LIVE worker → reuse (turn genuinely in flight), any boot', () => {

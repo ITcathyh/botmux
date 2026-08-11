@@ -137,6 +137,91 @@ describe('Codex-compatible runtime editor', () => {
     return { renderer, root: renderer.root, patchBot };
   }
 
+  it('sends one stable Agent operation identity in both the request body and header', async () => {
+    const previousFetch = globalThis.fetch;
+    let request: { body: any; headers: Headers } | undefined;
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      request = {
+        body: JSON.parse(init?.body ?? '{}'),
+        headers: new Headers(init?.headers),
+      };
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ok: true,
+          cliId: 'codex',
+          cliRuntime: null,
+          cliPathOverride: null,
+          wrapperCli: null,
+          model: '',
+          selectionKey: 'codex',
+          closedMismatchedSessions: 0,
+        }),
+      } as any;
+    });
+
+    try {
+      const { root } = renderAgent({ cliId: 'codex' });
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(request?.body.operationId).toMatch(/^bot-agent:cli_runtime:/);
+      expect(request?.headers.get('x-botmux-operation-id')).toBe(request?.body.operationId);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('reuses retryable Agent identity and blocks a new key after an unknown outcome', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    let error = 'session_runtime_not_ready';
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      requests.push(JSON.parse(init?.body ?? '{}'));
+      return {
+        ok: false,
+        status: 503,
+        json: async () => ({ ok: false, error }),
+      } as any;
+    });
+
+    try {
+      const { root } = renderAgent({ cliId: 'codex' });
+      const save = async () => {
+        await act(async () => {
+          root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+          await Promise.resolve();
+          await Promise.resolve();
+        });
+      };
+
+      await save();
+      await save();
+      expect(requests).toHaveLength(2);
+      expect(requests[1].operationId).toBe(requests[0].operationId);
+
+      error = 'agent_change_outcome_unknown';
+      await save();
+      expect(requests).toHaveLength(3);
+      expect(requests[2].operationId).toBe(requests[0].operationId);
+      await save();
+      expect(requests).toHaveLength(3);
+
+      act(() => root.findByProps({ 'data-input': 'agentModel' }).props.onChange({
+        currentTarget: { value: 'changed-model' },
+      }));
+      await save();
+      expect(requests).toHaveLength(4);
+      expect(requests[3].operationId).not.toBe(requests[0].operationId);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
   it('defaults old payloads to Official Codex and keeps wrapper or non-Codex selections unchanged', () => {
     const official = renderAgent({ cliId: 'codex' });
     expect(official.root.findByProps({ 'data-input': 'agentRuntimeMode' }).props.value).toBe('official');
@@ -198,7 +283,11 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
       });
 
-      expect(requests).toEqual([{ cliId: 'codex', model: 'new-model' }]);
+      expect(requests).toEqual([{
+        operationId: expect.stringMatching(/^bot-agent:cli_runtime:/),
+        cliId: 'codex',
+        model: 'new-model',
+      }]);
       expect(patchBot).toHaveBeenCalledWith('cli_runtime', expect.objectContaining({
         cliRuntime: null,
         cliPathOverride: legacyPath,
@@ -241,7 +330,12 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
       });
 
-      expect(requests).toEqual([{ cliId: 'codex', model: '', cliRuntime: null }]);
+      expect(requests).toEqual([{
+        operationId: expect.stringMatching(/^bot-agent:cli_runtime:/),
+        cliId: 'codex',
+        model: '',
+        cliRuntime: null,
+      }]);
       expect(root.findByProps({ 'data-agent-status': '' }).children.join('')).toContain('2');
     } finally {
       (globalThis as any).fetch = previousFetch;
@@ -288,7 +382,12 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
       });
 
-      expect(requests).toEqual([{ cliId: 'codex', model: '', cliRuntime: savedRuntime }]);
+      expect(requests).toEqual([{
+        operationId: expect.stringMatching(/^bot-agent:cli_runtime:/),
+        cliId: 'codex',
+        model: '',
+        cliRuntime: savedRuntime,
+      }]);
     } finally {
       (globalThis as any).fetch = previousFetch;
     }
@@ -343,7 +442,11 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
         await Promise.resolve();
       });
-      expect(requests).toEqual([{ cliId: 'codex', model: 'gpt-next' }]);
+      expect(requests).toEqual([{
+        operationId: expect.stringMatching(/^bot-agent:cli_runtime:/),
+        cliId: 'codex',
+        model: 'gpt-next',
+      }]);
     } finally {
       (globalThis as any).fetch = previousFetch;
     }
@@ -392,7 +495,12 @@ describe('Codex-compatible runtime editor', () => {
 
       expect(requests).toEqual([{
         url: '/api/bots/cli_runtime/agent',
-        body: { cliId: 'codex', model: '', cliRuntime: savedRuntime },
+        body: {
+          operationId: expect.stringMatching(/^bot-agent:cli_runtime:/),
+          cliId: 'codex',
+          model: '',
+          cliRuntime: savedRuntime,
+        },
       }]);
       expect(patchBot).toHaveBeenCalledWith('cli_runtime', expect.objectContaining({ cliRuntime: savedRuntime }));
       const probeText = root.findByProps({ 'data-runtime-status': '' }).children.join('');
@@ -431,7 +539,12 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
         await Promise.resolve();
       });
-      expect(requests[requests.length - 1]).toEqual({ cliId: 'codex', model: '', cliRuntime: null });
+      expect(requests[requests.length - 1]).toEqual({
+        operationId: expect.stringMatching(/^bot-agent:cli_runtime:/),
+        cliId: 'codex',
+        model: '',
+        cliRuntime: null,
+      });
     } finally {
       (globalThis as any).fetch = previousFetch;
     }
@@ -521,7 +634,11 @@ describe('riff CLI switch persistence (PR #467 P1)', () => {
     await act(async () => { await root.findByProps({ 'data-action': 'save-riff' }).props.onClick(); });
     const puts = requests.filter(r => r.method === 'PUT');
     expect(puts.map(r => r.url.split('/').pop())).toEqual(['riff', 'agent']);
-    expect(puts[1]!.body).toEqual({ cliId: 'riff', model: '' });
+    expect(puts[1]!.body).toEqual({
+      operationId: expect.stringMatching(/^bot-agent:cli_x:/),
+      cliId: 'riff',
+      model: '',
+    });
     expect(JSON.parse(puts[0]!.body.riff)).toMatchObject({ sandboxCluster: 'cn', reasoningEffort: 'xhigh' });
   });
 });

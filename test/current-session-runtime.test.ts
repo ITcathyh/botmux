@@ -6,6 +6,7 @@ import { currentSessionRuntimeHost } from '../src/core/current-session-runtime.j
 import { DashboardEventBus } from '../src/core/dashboard-events.js';
 import { CurrentDashboardProjectionProtocol } from '../src/core/dashboard-projection.js';
 import { parseBotId } from '../src/core/bot-identity.js';
+import { createCurrentDashboardSessionCommandClient } from '../src/core/current-dashboard-session-command-client.js';
 import { createCurrentOrdinaryImTurnPreparationPort } from '../src/core/current-ordinary-im-turn.js';
 import { createCurrentOrdinaryIngressPort } from '../src/core/current-ordinary-ingress.js';
 import type { CurrentOrdinaryRouteOpeningRollbackToken } from '../src/core/current-ordinary-route-registry.js';
@@ -19,6 +20,7 @@ import type {
   OrdinaryImTransportEnvelope,
 } from '../src/core/ordinary-im-turn.js';
 import type {
+  ControlMutationPort,
   KeyedTriggerStartInput,
   KeyedTriggerTurnPort,
   OrdinaryIngressPort,
@@ -73,6 +75,20 @@ function startInput(key: string): KeyedTriggerStartInput {
 function requestHash(key: string): string {
   const input = startInput(key);
   return computeInputHash({ business: input.business, persistInputHistory: true });
+}
+
+function seedAttemptingTrigger(key: string, sessionId: string): void {
+  const claimed = idempotencyStore.claim({
+    ownerLarkAppId: APP,
+    key,
+    sessionId,
+    triggerId: `old-trigger-${key}`,
+    requestHash: requestHash(key),
+    ownerBootId: 'boot-old',
+    now: 1,
+  });
+  if (claimed.kind !== 'won') throw new Error('expected keyed-trigger claim');
+  idempotencyStore.transition(APP, key, claimed.record, { state: 'attempting', now: 2 });
 }
 
 function startCommand(key: string) {
@@ -136,6 +152,24 @@ function committedOrdinaryIngress(): OrdinaryIngressPort {
   };
 }
 
+function currentDaemonSession(session: Session): DaemonSession {
+  const createdAt = Date.parse(session.createdAt);
+  return {
+    session,
+    worker: null,
+    workerPort: null,
+    workerToken: null,
+    larkAppId: APP,
+    chatId: session.chatId,
+    chatType: session.chatType ?? 'group',
+    scope: session.scope ?? 'thread',
+    spawnedAt: createdAt,
+    cliVersion: 'test',
+    lastMessageAt: createdAt,
+    hasHistory: false,
+  };
+}
+
 beforeEach(() => {
   dataDir = mkdtempSync(join(tmpdir(), 'session-runtime-current-'));
   previousDataDir = process.env.SESSION_DATA_DIR;
@@ -151,6 +185,186 @@ afterEach(() => {
 });
 
 describe('Current SessionRuntime projection adapter', () => {
+  it('does not mint an address from a live owner Session registered under a non-canonical key', async () => {
+    const session = sessionStore.createSession(
+      'oc_non_canonical_live',
+      'om_non_canonical_live',
+      'non-canonical live',
+      'group',
+    );
+    session.larkAppId = APP;
+    session.scope = 'thread';
+    sessionStore.updateSession(session);
+    const live = currentDaemonSession(session);
+    const host = currentSessionRuntimeHost({
+      ownerLarkAppId: APP,
+      activeSessions: new Map([['stale-registry-key', live]]),
+      ownerBootId: 'boot-non-canonical-live',
+      keyedTriggerAdmissionBlocked: () => false,
+    });
+
+    await expect(host.projection.read({
+      kind: 'byExternalSession',
+      sessionId: session.sessionId,
+    })).resolves.toMatchObject({ kind: 'notReady' });
+    await expect(host.projection.read({
+      kind: 'byRoute',
+      route: { kind: 'thread', anchorId: session.rootMessageId },
+    })).resolves.toMatchObject({ kind: 'notReady' });
+    await expect(host.projection.read({ kind: 'list' }))
+      .resolves.toMatchObject({ kind: 'notReady' });
+  });
+
+  it('treats nested-owner evidence under a foreign runtime binding as notReady before external close', async () => {
+    const session = {
+      sessionId: 'nested-owner-foreign-runtime',
+      larkAppId: APP,
+      chatId: 'oc_nested_owner_foreign_runtime',
+      rootMessageId: 'om_nested_owner_foreign_runtime',
+      title: 'nested owner mismatch',
+      status: 'active',
+      scope: 'thread',
+      chatType: 'group',
+      createdAt: new Date(0).toISOString(),
+    } as Session;
+    const live = currentDaemonSession(session);
+    live.larkAppId = 'cli_foreign_runtime_owner';
+    const activeSessions = new Map([[activeSessionKey(live), live]]);
+    const host = currentSessionRuntimeHost({
+      ownerLarkAppId: APP,
+      activeSessions,
+      ownerBootId: 'boot-nested-owner-foreign-runtime',
+      keyedTriggerAdmissionBlocked: () => false,
+    });
+    const submit = createCurrentDashboardSessionCommandClient({
+      ownerLarkAppId: () => APP,
+      host: () => host,
+    });
+
+    await expect(host.projection.read({
+      kind: 'byExternalSession',
+      sessionId: session.sessionId,
+    })).resolves.toMatchObject({ kind: 'notReady' });
+    await expect(submit({
+      target: { kind: 'externalSession', sessionId: session.sessionId },
+      idempotencyKey: 'nested-owner-close',
+      command: {
+        kind: 'control.mutate',
+        input: { kind: 'close', reason: 'dashboard' },
+      },
+    })).resolves.toMatchObject({ kind: 'retryable' });
+  });
+
+  it('does not mint an address when one owner has duplicate live bindings for a Session id', async () => {
+    const session = sessionStore.createSession(
+      'oc_duplicate_live',
+      'om_duplicate_live_a',
+      'duplicate live',
+      'group',
+    );
+    session.larkAppId = APP;
+    session.scope = 'thread';
+    sessionStore.updateSession(session);
+    const first = currentDaemonSession(structuredClone(session));
+    const secondSession = structuredClone(session);
+    secondSession.rootMessageId = 'om_duplicate_live_b';
+    const second = currentDaemonSession(secondSession);
+    const host = currentSessionRuntimeHost({
+      ownerLarkAppId: APP,
+      activeSessions: new Map([
+        [activeSessionKey(first), first],
+        [activeSessionKey(second), second],
+      ]),
+      ownerBootId: 'boot-duplicate-live',
+      keyedTriggerAdmissionBlocked: () => false,
+    });
+
+    for (const query of [
+      { kind: 'byExternalSession' as const, sessionId: session.sessionId },
+      { kind: 'byRoute' as const, route: { kind: 'thread' as const, anchorId: session.rootMessageId } },
+      { kind: 'byRoute' as const, route: { kind: 'thread' as const, anchorId: secondSession.rootMessageId } },
+      { kind: 'list' as const },
+    ]) {
+      await expect(host.projection.read(query)).resolves.toMatchObject({
+        kind: 'notReady',
+        message: expect.stringMatching(/multiple live owner bindings/),
+      });
+    }
+  });
+
+  it('does not mint an address when a live Session drifts from its owner-strict durable row', async () => {
+    const session = sessionStore.createSession(
+      'oc_live_drift',
+      'om_live_drift_durable',
+      'durable route',
+      'group',
+    );
+    session.larkAppId = APP;
+    session.scope = 'thread';
+    sessionStore.updateSession(session);
+    const liveSession = structuredClone(session);
+    liveSession.rootMessageId = 'om_live_drift_memory';
+    liveSession.title = 'in-memory drift';
+    const live = currentDaemonSession(liveSession);
+    const host = currentSessionRuntimeHost({
+      ownerLarkAppId: APP,
+      activeSessions: new Map([[activeSessionKey(live), live]]),
+      ownerBootId: 'boot-live-drift',
+      keyedTriggerAdmissionBlocked: () => false,
+    });
+
+    for (const query of [
+      { kind: 'byExternalSession' as const, sessionId: session.sessionId },
+      { kind: 'byRoute' as const, route: { kind: 'thread' as const, anchorId: session.rootMessageId } },
+      { kind: 'byRoute' as const, route: { kind: 'thread' as const, anchorId: liveSession.rootMessageId } },
+      { kind: 'list' as const },
+    ]) {
+      await expect(host.projection.read(query)).resolves.toMatchObject({
+        kind: 'notReady',
+        message: expect.stringMatching(/differs from its owner-strict durable row/),
+      });
+    }
+  });
+
+  it('treats an own undefined live property as equal to its JSON-persisted absence', async () => {
+    const session = sessionStore.createSession(
+      'oc_live_json_equal',
+      'om_live_json_equal',
+      'JSON-equivalent live',
+      'group',
+    );
+    session.larkAppId = APP;
+    session.scope = 'thread';
+    sessionStore.updateSession(session);
+    const liveSession = structuredClone(session);
+    liveSession.titleUpdatedAt = undefined;
+    expect(Object.hasOwn(liveSession, 'titleUpdatedAt')).toBe(true);
+    const live = currentDaemonSession(liveSession);
+    const host = currentSessionRuntimeHost({
+      ownerLarkAppId: APP,
+      activeSessions: new Map([[activeSessionKey(live), live]]),
+      ownerBootId: 'boot-live-json-equal',
+      keyedTriggerAdmissionBlocked: () => false,
+    });
+
+    const byExternal = await host.projection.read({
+      kind: 'byExternalSession',
+      sessionId: session.sessionId,
+    });
+    const byRoute = await host.projection.read({
+      kind: 'byRoute',
+      route: { kind: 'thread', anchorId: session.rootMessageId },
+    });
+    const listed = await host.projection.read({ kind: 'list' });
+
+    expect(byExternal).toMatchObject({ kind: 'one', session: { sessionId: session.sessionId } });
+    expect(byRoute).toMatchObject({ kind: 'one', session: { sessionId: session.sessionId } });
+    expect(listed).toMatchObject({
+      kind: 'list',
+      sessions: [{ sessionId: session.sessionId }],
+    });
+  });
+
   it('rebuilds detached dormant/idle/working views from current lifecycle authority', async () => {
     const session = sessionStore.createSession('oc_chat', 'om_root', 'runtime', 'group');
     session.larkAppId = APP;
@@ -183,12 +397,8 @@ describe('Current SessionRuntime projection adapter', () => {
     expect('larkAppId' in dormant.session).toBe(false);
     expect('worker' in dormant.session).toBe(false);
 
-    activeSessions.set('live', {
-      session,
-      worker: null,
-      larkAppId: APP,
-      chatId: session.chatId,
-    } as DaemonSession);
+    const live = currentDaemonSession(session);
+    activeSessions.set(activeSessionKey(live), live);
     const workerless = await host.projection.read({
       kind: 'byExternalSession',
       sessionId: session.sessionId,
@@ -198,7 +408,7 @@ describe('Current SessionRuntime projection adapter', () => {
     expect(workerless.session.executorStatus).toBe('dormant');
     expect(workerless.session.address).toBe(dormant.session.address);
 
-    const ds = activeSessions.get('live')!;
+    const ds = live;
     ds.worker = { killed: false } as DaemonSession['worker'];
     ds.lastScreenStatus = 'idle';
     const idle = await host.projection.read({ kind: 'byExternalSession', sessionId: session.sessionId });
@@ -218,13 +428,7 @@ describe('Current SessionRuntime projection adapter', () => {
     session.larkAppId = APP;
     session.scope = 'thread';
     sessionStore.updateSession(session);
-    const ds = {
-      session,
-      worker: null,
-      larkAppId: APP,
-      chatId: session.chatId,
-      chatType: 'group',
-    } as DaemonSession;
+    const ds = currentDaemonSession(session);
     const protocol = new CurrentDashboardProjectionProtocol();
     const bus = new DashboardEventBus(protocol);
     bus.publish({
@@ -255,6 +459,100 @@ describe('Current SessionRuntime projection adapter', () => {
       cursor: 1,
       readiness: { contract: 'Current/v1', state: 'ready', online: true },
     });
+  });
+
+  it('does not mint a control/ordinary/executor address during Dashboard initial-effect publication', async () => {
+    const session = sessionStore.createSession(
+      'oc_dashboard_opening_barrier',
+      'oc_dashboard_opening_barrier',
+      'Dashboard opening',
+      'group',
+      'chat',
+    );
+    session.larkAppId = APP;
+    session.scope = 'chat';
+    sessionStore.updateSession(session);
+    const opening = {
+      session,
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId: APP,
+      chatId: session.chatId,
+      chatType: 'group',
+      scope: 'chat',
+      spawnedAt: Date.parse(session.createdAt),
+      cliVersion: 'test',
+      lastMessageAt: Date.parse(session.createdAt),
+      hasHistory: false,
+      dashboardSpawnOpeningPending: true,
+    } as DaemonSession;
+    const activeSessions = new Map([[activeSessionKey(opening), opening]]);
+    const closeBegins = vi.fn<ControlMutationPort['begin']>((input) => {
+      if (input.command.kind !== 'close') {
+        return { kind: 'rejected', reason: 'invalidCommand', message: 'close only' };
+      }
+      opening.session.status = 'closed';
+      sessionStore.updateSession(opening.session);
+      return {
+        kind: 'committed',
+        result: { kind: 'closed', alreadyClosed: false, known: true },
+      };
+    });
+    const controlMutation: ControlMutationPort = {
+      begin: closeBegins,
+      async execute() { throw new Error('close has no external effect'); },
+      resume() { throw new Error('close has no external effect'); },
+    };
+    const host = currentSessionRuntimeHost({
+      ownerLarkAppId: APP,
+      activeSessions,
+      ownerBootId: 'boot-dashboard-opening-barrier',
+      runtimeEpoch: 'epoch-dashboard-opening-barrier',
+      keyedTriggerAdmissionBlocked: () => false,
+      controlMutation,
+    });
+
+    await expect(host.projection.read({
+      kind: 'byExternalSession',
+      sessionId: session.sessionId,
+    })).resolves.toMatchObject({ kind: 'notReady' });
+    await expect(host.projection.read({
+      kind: 'byRoute',
+      route: { kind: 'chat', chatId: session.chatId },
+    })).resolves.toMatchObject({ kind: 'notReady' });
+    await expect(host.projection.read({ kind: 'list' }))
+      .resolves.toEqual({ kind: 'list', sessions: [] });
+    await expect(host.projection.read({ kind: 'dashboardSnapshot' }))
+      .resolves.toMatchObject({ kind: 'dashboardSnapshot', snapshot: { rows: [] } });
+
+    const operationId = 'dashboard-close:opening-race';
+    const submitClose = async () => {
+      const projected = await host.projection.read({
+        kind: 'byExternalSession',
+        sessionId: session.sessionId,
+      });
+      if (projected.kind === 'notReady') {
+        return { kind: 'retryable' as const, message: projected.message };
+      }
+      if (projected.kind !== 'one') throw new Error('close target disappeared');
+      return host.runtime.submit({
+        target: { kind: 'session', address: projected.session.address },
+        idempotencyKey: operationId,
+        command: { kind: 'control.mutate', input: { kind: 'close', reason: 'dashboard' } },
+      });
+    };
+    await expect(submitClose()).resolves.toMatchObject({ kind: 'retryable' });
+    expect(closeBegins).not.toHaveBeenCalled();
+
+    opening.dashboardSpawnOpeningPending = false;
+    await expect(submitClose()).resolves.toMatchObject({
+      kind: 'applied',
+      sessionId: session.sessionId,
+      result: { kind: 'closed', alreadyClosed: false },
+    });
+    expect(closeBegins).toHaveBeenCalledTimes(1);
+    expect(opening.session.status).toBe('closed');
   });
 
   it('reports a corrupt owner projection as notReady rather than notFound', async () => {
@@ -928,6 +1226,170 @@ describe('Current SessionRuntime projection adapter', () => {
     expect(result).toMatchObject({ kind: 'ambiguous', sessionId: sharedSessionId });
     if (result.kind !== 'ambiguous') throw new Error('expected ambiguous');
     expect(result.chatId).not.toBe('foreign-chat');
+    expect(turns.accepts).not.toHaveBeenCalled();
+  });
+
+  it('quarantines keyed-trigger observation when an owner Session is registered under a non-canonical key', async () => {
+    const key = 'keyed-non-canonical-owner-binding';
+    const sessionId = 'keyed-non-canonical-session';
+    seedAttemptingTrigger(key, sessionId);
+    const targetSession = {
+      sessionId,
+      larkAppId: APP,
+      chatId: 'oc_keyed_non_canonical',
+      rootMessageId: 'om_keyed_non_canonical',
+      title: 'valid keyed owner target',
+      status: 'active',
+      scope: 'thread',
+      chatType: 'group',
+      createdAt: new Date(0).toISOString(),
+    } as Session;
+    const targetLive = currentDaemonSession(targetSession);
+    targetLive.worker = { killed: false } as DaemonSession['worker'];
+    const malformedSession = {
+      ...structuredClone(targetSession),
+      sessionId: 'unrelated-non-canonical-session',
+      chatId: 'oc_unrelated_non_canonical',
+      rootMessageId: 'om_unrelated_non_canonical',
+    };
+    const malformedLive = currentDaemonSession(malformedSession);
+    const turns = new TestTurns();
+    const host = currentSessionRuntimeHost({
+      ownerLarkAppId: APP,
+      activeSessions: new Map([
+        [activeSessionKey(targetLive), targetLive],
+        ['stale-owner-key', malformedLive],
+      ]),
+      ownerBootId: 'boot-current',
+      keyedTriggerAdmissionBlocked: () => false,
+      keyedTriggerTurns: turns,
+    });
+
+    await expect(host.runtime.submit({
+      target: target(key),
+      idempotencyKey: key,
+      command: startCommand(key),
+    })).resolves.toMatchObject({
+      kind: 'quarantined',
+      message: expect.stringMatching(/malformed live owner binding/),
+    });
+    expect(turns.accepts).not.toHaveBeenCalled();
+  });
+
+  it('quarantines keyed-trigger observation when the runtime owner conflicts with the nested Session owner', async () => {
+    const key = 'keyed-nested-owner-conflict';
+    const sessionId = 'keyed-nested-owner-conflict-session';
+    seedAttemptingTrigger(key, sessionId);
+    const session = {
+      sessionId,
+      larkAppId: 'cli_foreign_nested_owner',
+      chatId: 'oc_keyed_nested_owner_conflict',
+      rootMessageId: 'om_keyed_nested_owner_conflict',
+      title: 'nested owner conflict',
+      status: 'active',
+      scope: 'thread',
+      chatType: 'group',
+      createdAt: new Date(0).toISOString(),
+    } as Session;
+    const live = currentDaemonSession(session);
+    live.worker = { killed: false } as DaemonSession['worker'];
+    const turns = new TestTurns();
+    const host = currentSessionRuntimeHost({
+      ownerLarkAppId: APP,
+      activeSessions: new Map([[activeSessionKey(live), live]]),
+      ownerBootId: 'boot-current',
+      keyedTriggerAdmissionBlocked: () => false,
+      keyedTriggerTurns: turns,
+    });
+
+    await expect(host.runtime.submit({
+      target: target(key),
+      idempotencyKey: key,
+      command: startCommand(key),
+    })).resolves.toMatchObject({
+      kind: 'quarantined',
+      message: expect.stringMatching(/malformed live owner binding/),
+    });
+    expect(turns.accepts).not.toHaveBeenCalled();
+  });
+
+  it('quarantines keyed-trigger observation when an owner registry binding is not active', async () => {
+    const key = 'keyed-inactive-owner-binding';
+    const sessionId = 'keyed-inactive-owner-session';
+    seedAttemptingTrigger(key, sessionId);
+    const session = {
+      sessionId,
+      larkAppId: APP,
+      chatId: 'oc_keyed_inactive_owner',
+      rootMessageId: 'om_keyed_inactive_owner',
+      title: 'inactive keyed owner',
+      status: 'closed',
+      scope: 'thread',
+      chatType: 'group',
+      createdAt: new Date(0).toISOString(),
+    } as Session;
+    const live = currentDaemonSession(session);
+    live.worker = { killed: false } as DaemonSession['worker'];
+    const turns = new TestTurns();
+    const host = currentSessionRuntimeHost({
+      ownerLarkAppId: APP,
+      activeSessions: new Map([[activeSessionKey(live), live]]),
+      ownerBootId: 'boot-current',
+      keyedTriggerAdmissionBlocked: () => false,
+      keyedTriggerTurns: turns,
+    });
+
+    await expect(host.runtime.submit({
+      target: target(key),
+      idempotencyKey: key,
+      command: startCommand(key),
+    })).resolves.toMatchObject({
+      kind: 'quarantined',
+      message: expect.stringMatching(/malformed live owner binding/),
+    });
+    expect(turns.accepts).not.toHaveBeenCalled();
+  });
+
+  it('quarantines keyed-trigger observation when one owner has duplicate live bindings for a Session id', async () => {
+    const key = 'keyed-duplicate-owner-bindings';
+    const sessionId = 'keyed-duplicate-owner-session';
+    seedAttemptingTrigger(key, sessionId);
+    const base = {
+      sessionId,
+      larkAppId: APP,
+      chatId: 'oc_keyed_duplicate_owner',
+      rootMessageId: 'om_keyed_duplicate_owner_a',
+      title: 'duplicate keyed owner',
+      status: 'active',
+      scope: 'thread',
+      chatType: 'group',
+      createdAt: new Date(0).toISOString(),
+    } as Session;
+    const first = currentDaemonSession(structuredClone(base));
+    first.worker = { killed: false } as DaemonSession['worker'];
+    const secondSession = structuredClone(base);
+    secondSession.rootMessageId = 'om_keyed_duplicate_owner_b';
+    const second = currentDaemonSession(secondSession);
+    const turns = new TestTurns();
+    const host = currentSessionRuntimeHost({
+      ownerLarkAppId: APP,
+      activeSessions: new Map([
+        [activeSessionKey(first), first],
+        [activeSessionKey(second), second],
+      ]),
+      ownerBootId: 'boot-current',
+      keyedTriggerAdmissionBlocked: () => false,
+      keyedTriggerTurns: turns,
+    });
+
+    await expect(host.runtime.submit({
+      target: target(key),
+      idempotencyKey: key,
+      command: startCommand(key),
+    })).resolves.toMatchObject({
+      kind: 'quarantined',
+      message: expect.stringMatching(/multiple live owner bindings/),
+    });
     expect(turns.accepts).not.toHaveBeenCalled();
   });
 

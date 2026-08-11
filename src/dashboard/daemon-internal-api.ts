@@ -356,9 +356,8 @@ const ROUTES: RouteDef[] = [
       // Three-state routing mirrors schedules:
       //  - owner !== undefined + caller mismatch → 403 session_owner_mismatch
       //  - owner !== undefined + caller match (or test seam) → proxy owner
-      //  - owner === undefined + sessionExists + callerAppId set → legacy,
-      //    proxy to caller's bot (same bot that fetched the row via the
-      //    scoped read endpoint).
+      //  - owner === undefined + sessionExists → fail closed: caller identity
+      //    is not evidence of which daemon owns the Session.
       //  - row genuinely missing → 404 unknown_session
       // Route B fails closed too, not only the IM card layer.
       const owner = deps.ownerOf(sessionId);
@@ -366,21 +365,7 @@ const ROUTES: RouteDef[] = [
         if (!deps.sessionExists(sessionId)) {
           return { status: 404, body: { ok: false, error: 'unknown_session' } };
         }
-        if (ctx.callerAppId === undefined) {
-          // test seam preserves the historical 404 — production callers
-          // always have an HMAC-resolved appId.
-          return { status: 404, body: { ok: false, error: 'unknown_session' } };
-        }
-        const upstream = await deps.proxyToDaemon(
-          ctx.callerAppId,
-          `/api/sessions/${encodeURIComponent(sessionId)}/${action}`,
-          {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: ctx.bodyRaw.length > 0 ? ctx.bodyRaw : '{}',
-          },
-        );
-        return { status: upstream.status, body: await readUpstream(upstream) };
+        return { status: 409, body: { ok: false, error: 'owner_unresolved' } };
       }
       const isGlobal = ctx.url.searchParams.get('scope') === 'global';
       if (!isGlobal && ctx.callerAppId !== undefined && owner !== ctx.callerAppId) {

@@ -876,24 +876,21 @@ describe('dispatch: schedules write — cross-bot owner gate', () => {
         );
       });
 
-      it(`legacy row + callerAppId=cli_caller → proxy caller (${action})`, async () => {
+      it(`owner-unresolved row + callerAppId=cli_caller → 409 without guessing caller ownership (${action})`, async () => {
         const deps = ownerMismatchDeps();
         const api = createDaemonInternalApi(deps);
         const r = await api.dispatchForTest('POST', url(`/__daemon/sessions/sess-legacy/${action}`), '', 'cli_caller');
-        expect(r.status).toBe(200);
-        expect(deps.proxyToDaemon).toHaveBeenCalledWith(
-          'cli_caller',
-          `/api/sessions/sess-legacy/${action}`,
-          expect.objectContaining({ method: 'POST' }),
-        );
+        expect(r.status).toBe(409);
+        expect((r.body as any).error).toBe('owner_unresolved');
+        expect(deps.proxyToDaemon).not.toHaveBeenCalled();
       });
 
-      it(`legacy row + test seam → 404 unknown_session (back-compat) (${action})`, async () => {
+      it(`owner-unresolved row + test seam → 409 owner_unresolved (${action})`, async () => {
         const deps = ownerMismatchDeps();
         const api = createDaemonInternalApi(deps);
         const r = await api.dispatchForTest('POST', url(`/__daemon/sessions/sess-legacy/${action}`));
-        expect(r.status).toBe(404);
-        expect((r.body as any).error).toBe('unknown_session');
+        expect(r.status).toBe(409);
+        expect((r.body as any).error).toBe('owner_unresolved');
         expect(deps.proxyToDaemon).not.toHaveBeenCalled();
       });
 

@@ -3,13 +3,10 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
 
 import type { SessionRow } from '../src/core/dashboard-rows.js';
 import { composeDetail } from '../src/dashboard/session-card-model.js';
-import { globalConfigPath } from '../src/global-config.js';
+import { setTerminalMultiUrlPreferenceProviderForTests } from '../src/im/lark/card-builder.js';
 import type { CardActionData } from '../src/im/lark/card-handler.js';
 import {
   buildSessionsCard,
@@ -27,22 +24,14 @@ import {
 const INVOKER = 'ou_owner';
 const LARK_APP_ID = 'cli_test';
 
-// The terminal button's URL wrapping depends on the global dashboard setting
-// `openTerminalInFeishu` (read via readGlobalConfig at card-build time): default
-// → direct URL, opt-in → Feishu sidebar applink wrapper. Isolate HOME to an
-// empty temp dir so these tests deterministically see the DEFAULT (no
-// config.json → direct URL), independent of whatever the test runner's real
-// ~/.botmux/config.json holds. readGlobalConfig's read cache is keyed on the
-// resolved config path, so stubbing HOME forces a fresh read of the empty dir.
-let sessionsCardTestHome: string;
+// Card rendering reads a machine-global terminal-link preference. Pin that
+// narrow lookup to the production default without changing the process HOME or
+// consulting the workstation's real config.json.
 beforeEach(() => {
-  sessionsCardTestHome = mkdtempSync(join(tmpdir(), 'botmux-sessions-card-'));
-  vi.stubEnv('HOME', sessionsCardTestHome);
-  mkdirSync(dirname(globalConfigPath()), { recursive: true });
+  setTerminalMultiUrlPreferenceProviderForTests(() => false);
 });
 afterEach(() => {
-  vi.unstubAllEnvs();
-  rmSync(sessionsCardTestHome, { recursive: true, force: true });
+  setTerminalMultiUrlPreferenceProviderForTests(undefined);
 });
 
 function row(over: Partial<SessionRow> = {}): SessionRow {
@@ -421,6 +410,7 @@ describe('buildSessionsDetailCard (slice 2a)', () => {
     );
     expect(closeBtn).toBeDefined();
     expect(closeBtn.value.session_id).toBe('sess_close_me');
+    expect(closeBtn.value.operation_id).toMatch(/^dashboard-card:/);
     expect(closeBtn.value.invoker_open_id).toBe(INVOKER);
   });
 
@@ -467,6 +457,7 @@ describe('buildSessionsDetailCard (slice 2a)', () => {
     // resume button present with confirm dialog.
     const resumeBtn = actions.find((a: any) => a.value?.action === 'dash_sessions_resume');
     expect(resumeBtn).toBeDefined();
+    expect(resumeBtn.value.operation_id).toMatch(/^dashboard-card:/);
     expect(resumeBtn.disabled).not.toBe(true);
     expect(resumeBtn.confirm).toBeDefined();
   });
@@ -722,9 +713,16 @@ describe('handleSessionsCardAction', () => {
   }
 
   function makeAction(value: Record<string, string>, operator = INVOKER): CardActionData {
+    const withOperationIdentity = (
+      (value.action === SESSIONS_ACTION_CLOSE || value.action === SESSIONS_ACTION_RESUME)
+      && value.operation_id === undefined
+    ) ? {
+        ...value,
+        operation_id: `test-card:${value.action}:${value.session_id ?? 'missing'}`,
+      } : value;
     return {
       operator: { open_id: operator },
-      action: { value },
+      action: { value: withOperationIdentity },
       context: { open_message_id: 'om_card' },
     } as any;
   }
@@ -1291,16 +1289,17 @@ describe('handleSessionsCardAction', () => {
       expect(postCalls.length).toBe(0);
     });
 
-    // codex 2026-06-10 SECURITY BLOCKER: client-side `disabled` on the close
-    // button is UX only. The callback handler MUST re-run composeDetail's
-    // action matrix against the fresh snapshot and fail-closed on
-    // `enabled === false`. These two tests cover the matrix's two
-    // closed-button reasonKeys (alreadyClosed + starting).
+    // A snapshot cannot reject a stable callback: it may already reflect the
+    // committed operation whose response was lost. Runtime owns transition
+    // validation and receipt replay.
     function makeCloseDepsWithStatus(sessionId: string, status: SessionRow['status']) {
       const sessions = [row({ sessionId, status, title: 'guard me' })];
       const requestSpy = vi.fn(async (req: any) => {
         if (req.method === 'GET' && req.path === '/__daemon/sessions-list') {
           return { status: 200, body: { sessions }, raw: '' };
+        }
+        if (req.method === 'POST') {
+          return { status: 409, body: { error: `runtime_rejected_${status}` }, raw: '' };
         }
         throw new Error('unexpected: ' + JSON.stringify(req));
       });
@@ -1313,33 +1312,30 @@ describe('handleSessionsCardAction', () => {
       };
     }
 
-    it('pre-POST snapshot status=starting → toast (close.disabled.starting), POST 0 times', async () => {
+    it('starting snapshot still delegates the stable close identity to Runtime', async () => {
       const deps = makeCloseDepsWithStatus('sess_a', 'starting');
       const r = await handleSessionsCardAction(
         makeAction({ action: SESSIONS_ACTION_CLOSE, invoker_open_id: INVOKER, session_id: 'sess_a' }),
         LARK_APP_ID,
         deps,
       );
-      // Toast surfaces the matrix's starting reason (matches the inline
-      // disabled-button note text).
-      expect(r.toast?.content).toContain('启动中');
+      expect(r.toast?.content).toContain('runtime_rejected_starting');
       expect(r.card).toBeUndefined();
-      // GET happened (snapshot); POST NEVER happened.
       const postCalls = deps.requestSpy.mock.calls.filter((c: any[]) => (c[0] as any).method === 'POST');
-      expect(postCalls.length).toBe(0);
+      expect(postCalls.length).toBe(1);
     });
 
-    it('pre-POST snapshot status=closed → toast (close.disabled.alreadyClosed), POST 0 times', async () => {
+    it('closed snapshot still delegates so a response-loss replay can resolve', async () => {
       const deps = makeCloseDepsWithStatus('sess_a', 'closed');
       const r = await handleSessionsCardAction(
         makeAction({ action: SESSIONS_ACTION_CLOSE, invoker_open_id: INVOKER, session_id: 'sess_a' }),
         LARK_APP_ID,
         deps,
       );
-      expect(r.toast?.content).toContain('已关闭');
+      expect(r.toast?.content).toContain('runtime_rejected_closed');
       expect(r.card).toBeUndefined();
       const postCalls = deps.requestSpy.mock.calls.filter((c: any[]) => (c[0] as any).method === 'POST');
-      expect(postCalls.length).toBe(0);
+      expect(postCalls.length).toBe(1);
     });
   });
 
@@ -1619,11 +1615,11 @@ describe('handleSessionsCardAction', () => {
       expect(cardJson).not.toContain('"action":"dash_sessions_resume"');
     });
 
-    it('active state replay (matrix says resume.enabled=false) → toast resume.disabled.onlyClosed, 0 POST', async () => {
+    it('active snapshot still delegates so a response-loss replay can resolve', async () => {
       const activeRow = row({ sessionId: 'sess_active', status: 'idle' });
       const requestSpy = vi.fn(async (req: any) => {
         if (req.method === 'GET') return { status: 200, body: { sessions: [activeRow] }, raw: '' };
-        throw new Error('POST should not be called');
+        return { status: 409, body: { error: 'not_closed' }, raw: '' };
       });
       const deps = {
         createClient: vi.fn(() => ({ request: requestSpy } as any)),
@@ -1637,10 +1633,9 @@ describe('handleSessionsCardAction', () => {
         deps as any,
       );
       expect(r.toast?.type).toBe('error');
-      expect(r.toast?.content).toContain('仅可恢复已关闭');
-      // No POST was issued — security matrix gate worked.
+      expect(r.toast?.content).toContain('not_closed');
       const postCalls = requestSpy.mock.calls.filter((c: any[]) => (c[0] as any).method === 'POST');
-      expect(postCalls).toHaveLength(0);
+      expect(postCalls).toHaveLength(1);
     });
 
     it('POST 500 → toast resume_failed, no card', async () => {

@@ -580,7 +580,7 @@ describe('daemon existing-owner ordinary ingress one-cut', () => {
     })));
   });
 
-  it('releases the delivery lock after enqueue while materialization is pending', async () => {
+  it('releases the delivery lock after enqueue while Session effects remain FIFO', async () => {
     const firstGate = deferred<void>();
     const firstMaterializeStarted = deferred<void>();
     const sessionA = daemonSession('session-current-one-cut-a', ANCHOR_A, CHAT_A);
@@ -617,6 +617,7 @@ describe('daemon existing-owner ordinary ingress one-cut', () => {
       event('om_pending_a_n', ANCHOR_A, CHAT_A, 'A/N'),
       context('om_pending_a_n', ANCHOR_A, CHAT_A),
     );
+    let control: ReturnType<typeof host.runtime.submit> | undefined;
     let follower: Promise<void> | undefined;
     let otherSession: Promise<void> | undefined;
     try {
@@ -628,7 +629,7 @@ describe('daemon existing-owner ordinary ingress one-cut', () => {
       }, { timeout: 1_000 });
       await firstMaterializeStarted.promise;
 
-      const control = await host.runtime.submit({
+      control = host.runtime.submit({
         target: { kind: 'session', address: projectedA.session.address },
         idempotencyKey: 'control-while-a-n-materializes',
         command: {
@@ -640,7 +641,6 @@ describe('daemon existing-owner ordinary ingress one-cut', () => {
           },
         },
       });
-      expect(control).toMatchObject({ kind: 'applied', action: 'control.renamed' });
 
       follower = handleThreadReply(
         event('om_pending_a_n_plus_1', ANCHOR_A, CHAT_A, 'A/N+1'),
@@ -662,6 +662,20 @@ describe('daemon existing-owner ordinary ingress one-cut', () => {
           'om_other_b_n',
         ]));
         expect(daemonSubmit).toHaveBeenCalledTimes(3);
+      }, { timeout: 1_000 });
+      expect(execute).not.toHaveBeenCalledWith({
+        sessionId: sessionA.session.sessionId,
+        messageKey: 'om_pending_a_n_plus_1',
+      });
+
+      firstGate.resolve();
+      await expect(control).resolves.toMatchObject({
+        kind: 'applied',
+        action: 'control.renamed',
+      });
+      await expect(follower).resolves.toBeUndefined();
+      await expect(first).resolves.toBeUndefined();
+      await vi.waitFor(() => {
         expect(execute).toHaveBeenCalledWith({
           sessionId: sessionA.session.sessionId,
           messageKey: 'om_pending_a_n_plus_1',
@@ -674,6 +688,7 @@ describe('daemon existing-owner ordinary ingress one-cut', () => {
       firstGate.resolve();
       await Promise.allSettled([
         first,
+        ...(control ? [control] : []),
         ...(follower ? [follower] : []),
         ...(otherSession ? [otherSession] : []),
       ]);

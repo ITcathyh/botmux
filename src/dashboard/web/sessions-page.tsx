@@ -50,6 +50,11 @@ import {
 } from './preferences.js';
 import { OPEN_CREATE_SESSION_EVENT, consumePendingCreateSession } from './create-session-entry.js';
 import {
+  SemanticOperationCoordinator,
+  semanticOperationDisposition,
+  type SemanticOperationLease,
+} from './operation-id.js';
+import {
   BOARD_COLUMNS,
   CLI_FILTER_OPTIONS,
   ICON,
@@ -2106,6 +2111,7 @@ function CreateSessionDialog(props: {
   const [submitting, setSubmitting] = useState(false);
   const [keepOpen, setKeepOpen] = useState(() => readStoredCreateKeepOpen(windowStorage()));
   const [keptSuccess, setKeptSuccess] = useState<any>(null);
+  const createOperations = useRef(new SemanticOperationCoordinator());
   const [feedGroups, setFeedGroups] = useState<Array<{ groupId: string; name: string }>>([]);
   const [feedGroupAppId, setFeedGroupAppId] = useState('');
   const [feedGroupId, setFeedGroupId] = useState('');
@@ -2357,31 +2363,47 @@ function CreateSessionDialog(props: {
     if (checkedIds.length === 0) { alert(t('sessions.create.errNoBot')); return; }
     const leadLarkAppId = lead || checkedIds[0] || '';
     if (mode === 'lead' && (!leadLarkAppId || !checkedIds.includes(leadLarkAppId))) { alert(t('sessions.create.errLead')); return; }
+    const request = {
+      content: text,
+      larkAppIds: checkedIds,
+      mode,
+      column,
+      leadLarkAppId: mode === 'lead' ? leadLarkAppId : undefined,
+      name: name.trim() || undefined,
+      bindWorkingDir: bindWorkingDir.trim() || undefined,
+      feedGroupId: feedGroupId || undefined,
+      newFeedGroupName: newFeedGroupName.trim() || undefined,
+      feedGroupAppId: (feedGroupId || newFeedGroupName.trim()) ? feedGroupAppId : undefined,
+      images: images.map(image => ({
+        name: image.name,
+        mimeType: image.mimeType,
+        dataBase64: image.dataBase64,
+      })),
+    };
+    const operation = createOperations.current.begin('create', 'dashboard', request);
+    if (operation.kind === 'blocked') {
+      alert('Operation outcome is unknown. Refresh or change the request before retrying.');
+      return;
+    }
     setSubmitting(true);
     setKeptSuccess(null);
     try {
       const r = await fetch('/api/sessions/create', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: {
+          'content-type': 'application/json',
+          'x-botmux-operation-id': operation.operationId,
+        },
         body: JSON.stringify({
-          content: text,
-          larkAppIds: checkedIds,
-          mode,
-          column,
-          leadLarkAppId: mode === 'lead' ? leadLarkAppId : undefined,
-          name: name.trim() || undefined,
-          bindWorkingDir: bindWorkingDir.trim() || undefined,
-          feedGroupId: feedGroupId || undefined,
-          newFeedGroupName: newFeedGroupName.trim() || undefined,
-          feedGroupAppId: (feedGroupId || newFeedGroupName.trim()) ? feedGroupAppId : undefined,
-          images: images.map(image => ({
-            name: image.name,
-            mimeType: image.mimeType,
-            dataBase64: image.dataBase64,
-          })),
+          ...request,
+          operationId: operation.operationId,
         }),
       });
       const body = await r.json().catch(() => null);
+      createOperations.current.finish(operation, semanticOperationDisposition({
+        status: r.status,
+        body,
+      }));
       if (r.ok && body?.ok) {
         if (keepOpen) {
           // 连续创建：不切成功页、不关弹窗，保留机器人勾选等配置，清空内容/群名继续下一条
@@ -2395,6 +2417,10 @@ function CreateSessionDialog(props: {
         }
       } else if (r.status !== 401) alert(`${t('sessions.create.failed')}: ${body?.error ?? r.status}`);
     } catch (e) {
+      createOperations.current.finish(
+        operation,
+        semanticOperationDisposition({ transportError: true }),
+      );
       alert(`${t('sessions.create.failed')}: ${e}`);
     } finally {
       setSubmitting(false);
@@ -2670,6 +2696,7 @@ function SessionsPage(): React.JSX.Element {
   const [teamBoard, setTeamBoard] = useState<TeamBoardState>({ data: null, key: '', fetchedAt: 0 });
   const teamBoardLoadingRef = useRef(false);
   const restartCooldownIds = useRef(new Set<string>());
+  const semanticOperations = useRef(new SemanticOperationCoordinator());
   const [teamScopeText, setTeamScopeText] = useState('');
   const [bulkCloseProgress, setBulkCloseProgress] = useState<{ done: number; total: number } | null>(null);
   const [bulkLockProgress, setBulkLockProgress] = useState<{ locked: boolean; done: number; total: number } | null>(null);
@@ -2685,6 +2712,34 @@ function SessionsPage(): React.JSX.Element {
   const [createState, setCreateState] = useState<CreateSessionState | null>(null);
   const [createLoading, setCreateLoading] = useState(false);
   const createRequestRef = useRef(0);
+
+  const beginSemanticOperation = useCallback((
+    kind: string,
+    sessionId: string,
+    semantic: unknown,
+  ): SemanticOperationLease | null => {
+    const lease = semanticOperations.current.begin(kind, sessionId, semantic);
+    if (lease.kind === 'blocked') {
+      alert('Operation outcome is unknown. Refresh or reconcile the session before retrying.');
+      return null;
+    }
+    return lease;
+  }, []);
+
+  const finishSemanticResponse = useCallback((
+    lease: SemanticOperationLease,
+    response: Response,
+    body: any,
+  ): void => {
+    semanticOperations.current.finish(lease, semanticOperationDisposition({
+      status: response.status,
+      body,
+    }));
+  }, []);
+
+  const finishSemanticTransportError = useCallback((lease: SemanticOperationLease): void => {
+    semanticOperations.current.finish(lease, semanticOperationDisposition({ transportError: true }));
+  }, []);
 
   useLayoutEffect(() => {
     if (viewStageInitialRef.current) {
@@ -2953,13 +3008,25 @@ function SessionsPage(): React.JSX.Element {
     position: number,
     prev: { column: unknown; position: unknown },
   ): Promise<void> => {
+    const operation = beginSemanticOperation('board', row.sessionId, { column, position });
+    if (!operation) {
+      row.kanbanColumn = prev.column;
+      row.kanbanPosition = prev.position;
+      refresh();
+      return;
+    }
     try {
       const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/board`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ column, position }),
+        body: JSON.stringify({
+          column,
+          position,
+          operationId: operation.operationId,
+        }),
       });
       const body = await r.json().catch(() => ({}));
+      finishSemanticResponse(operation, r, body);
       if (!r.ok || body?.ok === false) {
         row.kanbanColumn = prev.column;
         row.kanbanPosition = prev.position;
@@ -2967,12 +3034,13 @@ function SessionsPage(): React.JSX.Element {
         if (r.status !== 401) alert(`${t('sessions.kanban.moveFail')}: ${body?.error ?? r.status}`);
       }
     } catch (e) {
+      finishSemanticTransportError(operation);
       row.kanbanColumn = prev.column;
       row.kanbanPosition = prev.position;
       refresh();
       alert(`${t('sessions.kanban.moveFail')}: ${e}`);
     }
-  }, [refresh]);
+  }, [beginSemanticOperation, finishSemanticResponse, finishSemanticTransportError, refresh]);
 
   const handleKanbanMoves = useCallback((moves: SessionsKanbanMove[]): void => {
     let changed = false;
@@ -3011,24 +3079,35 @@ function SessionsPage(): React.JSX.Element {
     const prevTitle = row.title;
     row.title = title;
     refresh();
+    const operation = beginSemanticOperation('rename', row.sessionId, { title });
+    if (!operation) {
+      row.title = prevTitle;
+      refresh();
+      return;
+    }
     try {
       const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/rename`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ title }),
+        body: JSON.stringify({
+          title,
+          operationId: operation.operationId,
+        }),
       });
       const body = await r.json().catch(() => ({}));
+      finishSemanticResponse(operation, r, body);
       if (!r.ok || body?.ok === false) {
         row.title = prevTitle;
         refresh();
         if (r.status !== 401) alert(`${t('sessions.kanban.renameFail')}: ${body?.error ?? r.status}`);
       }
     } catch (e) {
+      finishSemanticTransportError(operation);
       row.title = prevTitle;
       refresh();
       alert(`${t('sessions.kanban.renameFail')}: ${e}`);
     }
-  }, [refresh]);
+  }, [beginSemanticOperation, finishSemanticResponse, finishSemanticTransportError, refresh]);
 
   const locateSession = useCallback(async (row: any): Promise<boolean> => {
     // Busy/cooldown UI is owned by the React-state LocateButton / LocateIconButton;
@@ -3048,10 +3127,17 @@ function SessionsPage(): React.JSX.Element {
 
   const closeSession = useCallback(async (row: any, closeBtn?: HTMLButtonElement): Promise<boolean> => {
     if (!confirm(t('sessions.closeConfirm'))) return false;
+    const operation = beginSemanticOperation('close', row.sessionId, {});
+    if (!operation) return false;
     if (closeBtn) closeBtn.disabled = true;
     try {
-      const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/close`, { method: 'POST' });
+      const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/close`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ operationId: operation.operationId }),
+      });
       const body = await r.json().catch(() => ({}));
+      finishSemanticResponse(operation, r, body);
       if (!r.ok || body?.ok === false) {
         if (r.status !== 401) alert(`Close failed: ${body?.error ?? r.status}`);
         return false;
@@ -3064,26 +3150,37 @@ function SessionsPage(): React.JSX.Element {
       refresh();
       return true;
     } catch (e) {
+      finishSemanticTransportError(operation);
       alert(`Close error: ${e}`);
       return false;
     } finally {
       if (closeBtn) closeBtn.disabled = false;
     }
-  }, [refresh]);
+  }, [beginSemanticOperation, finishSemanticResponse, finishSemanticTransportError, refresh]);
 
   const setSessionLocked = useCallback(async (row: any, locked: boolean, btn?: HTMLButtonElement): Promise<boolean> => {
     const prev = !!row.locked;
     if (prev === locked) return true;
     row.locked = locked;
     refresh();
+    const operation = beginSemanticOperation('lock', row.sessionId, { locked });
+    if (!operation) {
+      row.locked = prev;
+      refresh();
+      return false;
+    }
     if (btn) btn.disabled = true;
     try {
       const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/lock`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ locked }),
+        body: JSON.stringify({
+          locked,
+          operationId: operation.operationId,
+        }),
       });
       const body = await r.json().catch(() => ({}));
+      finishSemanticResponse(operation, r, body);
       if (!r.ok || body?.ok === false) {
         row.locked = prev;
         refresh();
@@ -3094,6 +3191,7 @@ function SessionsPage(): React.JSX.Element {
       refresh();
       return true;
     } catch (e) {
+      finishSemanticTransportError(operation);
       row.locked = prev;
       refresh();
       alert(`${t('sessions.lockFailed')}: ${e}`);
@@ -3101,15 +3199,22 @@ function SessionsPage(): React.JSX.Element {
     } finally {
       if (btn) btn.disabled = false;
     }
-  }, [refresh]);
+  }, [beginSemanticOperation, finishSemanticResponse, finishSemanticTransportError, refresh]);
 
   const restartSession = useCallback(async (row: any, restartBtn?: HTMLButtonElement): Promise<boolean> => {
     if (restartCooldownIds.current.has(row.sessionId)) return false;
     if (!confirm(restartConfirmMessage(row))) return false;
+    const operation = beginSemanticOperation('restart', row.sessionId, {});
+    if (!operation) return false;
     if (restartBtn) restartBtn.disabled = true;
     try {
-      const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/restart`, { method: 'POST' });
+      const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/restart`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ operationId: operation.operationId }),
+      });
       const body = await r.json().catch(() => ({}));
+      finishSemanticResponse(operation, r, body);
       if (!r.ok || body?.ok === false) {
         if (r.status !== 401) alert(`${t('sessions.restartFailed')}: ${body?.message ?? body?.error ?? r.status}`);
         return false;
@@ -3118,48 +3223,65 @@ function SessionsPage(): React.JSX.Element {
       window.setTimeout(() => restartCooldownIds.current.delete(row.sessionId), 5000);
       return true;
     } catch (e) {
+      finishSemanticTransportError(operation);
       alert(`${t('sessions.restartFailed')}: ${e}`);
       return false;
     } finally {
       if (restartBtn) restartBtn.disabled = false;
     }
-  }, []);
+  }, [beginSemanticOperation, finishSemanticResponse, finishSemanticTransportError]);
 
   const resumeSession = useCallback(async (row: any, button?: HTMLButtonElement): Promise<boolean> => {
+    const operation = beginSemanticOperation('resume', row.sessionId, {});
+    if (!operation) return false;
     if (button) button.disabled = true;
     try {
-      const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/resume`, { method: 'POST' });
+      const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/resume`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ operationId: operation.operationId }),
+      });
       const body = await r.json().catch(() => ({}));
+      finishSemanticResponse(operation, r, body);
       if (!r.ok || body.ok === false) {
         alert(`${t('sessions.resumeFailed')}: ${body?.error ?? r.status}`);
         return false;
       }
       return true;
     } catch (e) {
+      finishSemanticTransportError(operation);
       alert(`${t('sessions.resumeFailed')}: ${e}`);
       return false;
     } finally {
       if (button) button.disabled = false;
     }
-  }, []);
+  }, [beginSemanticOperation, finishSemanticResponse, finishSemanticTransportError]);
 
   const startSession = useCallback(async (row: any, button?: HTMLButtonElement): Promise<boolean> => {
+    const operation = beginSemanticOperation('start', row.sessionId, {});
+    if (!operation) return false;
     if (button) button.disabled = true;
     try {
-      const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/start`, { method: 'POST' });
+      const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/start`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ operationId: operation.operationId }),
+      });
       const body = await r.json().catch(() => ({}));
+      finishSemanticResponse(operation, r, body);
       if (!r.ok || body.ok === false) {
         if (r.status !== 401) alert(`${t('sessions.create.startFailed')}: ${body?.error ?? r.status}`);
         return false;
       }
       return true;
     } catch (e) {
+      finishSemanticTransportError(operation);
       alert(`${t('sessions.create.startFailed')}: ${e}`);
       return false;
     } finally {
       if (button) button.disabled = false;
     }
-  }, []);
+  }, [beginSemanticOperation, finishSemanticResponse, finishSemanticTransportError]);
 
   const openHistoryModal = useCallback((row: any): void => {
     setHistoryState({ sessionId: row.sessionId, loading: true, messages: [] });
@@ -3202,16 +3324,31 @@ function SessionsPage(): React.JSX.Element {
     setBulkCloseProgress({ done: 0, total: ids.length });
     let done = 0;
     let failed = 0;
+    const closed = new Set<string>();
     const queue = [...ids];
     async function worker() {
       while (queue.length) {
         const sid = queue.shift()!;
+        const operation = beginSemanticOperation('bulk-close', sid, {});
+        if (!operation) {
+          failed += 1;
+          done += 1;
+          setBulkCloseProgress({ done, total: ids.length });
+          continue;
+        }
         try {
-          const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/close`, { method: 'POST' });
+          const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/close`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ operationId: operation.operationId }),
+          });
           const body = await r.json().catch(() => ({}));
+          finishSemanticResponse(operation, r, body);
           if (!r.ok || body?.ok === false) failed += 1;
+          else closed.add(sid);
         } catch {
           failed += 1;
+          finishSemanticTransportError(operation);
         } finally {
           done += 1;
           setBulkCloseProgress({ done, total: ids.length });
@@ -3220,10 +3357,14 @@ function SessionsPage(): React.JSX.Element {
     }
     await Promise.all(Array.from({ length: Math.min(6, ids.length) }, () => worker()));
     setBulkCloseProgress(null);
-    setSelected(new Set());
+    setSelected(prev => {
+      const next = new Set(prev);
+      for (const sessionId of closed) next.delete(sessionId);
+      return next;
+    });
     refresh();
     if (failed > 0) alert(`Failed: ${failed}/${ids.length}`);
-  }, [refresh, selected]);
+  }, [beginSemanticOperation, finishSemanticResponse, finishSemanticTransportError, refresh, selected]);
 
   const runBulkLock = useCallback(async (locked: boolean): Promise<void> => {
     const targetRows = [...selected]
@@ -3238,13 +3379,24 @@ function SessionsPage(): React.JSX.Element {
       while (queue.length) {
         const row = queue.shift()!;
         const prev = !!row.locked;
+        const operation = beginSemanticOperation('bulk-lock', row.sessionId, { locked });
+        if (!operation) {
+          failed += 1;
+          done += 1;
+          setBulkLockProgress({ locked, done, total: targetRows.length });
+          continue;
+        }
         try {
           const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/lock`, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ locked }),
+            body: JSON.stringify({
+              locked,
+              operationId: operation.operationId,
+            }),
           });
           const body = await r.json().catch(() => ({}));
+          finishSemanticResponse(operation, r, body);
           if (!r.ok || body?.ok === false) {
             failed += 1;
             row.locked = prev;
@@ -3254,6 +3406,7 @@ function SessionsPage(): React.JSX.Element {
         } catch {
           failed += 1;
           row.locked = prev;
+          finishSemanticTransportError(operation);
         } finally {
           done += 1;
           setBulkLockProgress({ locked, done, total: targetRows.length });
@@ -3264,7 +3417,7 @@ function SessionsPage(): React.JSX.Element {
     setBulkLockProgress(null);
     refresh();
     if (failed > 0) alert(`${t('sessions.lockFailed')}: ${failed}/${targetRows.length}`);
-  }, [refresh, rowsById, selected]);
+  }, [beginSemanticOperation, finishSemanticResponse, finishSemanticTransportError, refresh, rowsById, selected]);
 
   const addSelectedToMonitorRoom = useCallback((): void => {
     const ids = [...selected].filter(id => !!rowsById.get(id));
@@ -3279,16 +3432,30 @@ function SessionsPage(): React.JSX.Element {
     if (!nextHours) return;
     const candidates = idleCleanupCandidatesFor(nextHours);
     if (candidates.length === 0) return;
+    const sessionIds = candidates.map(candidate => candidate.sessionId);
+    const operation = beginSemanticOperation('cleanup-idle', 'selection', {
+      olderThanHours: nextHours,
+      sessionIds,
+    });
+    if (!operation) return;
     setIdleCleanupHours(nextHours);
     setIdleCleanupBusy(true);
     setIdleCleanupStatus(t('sessions.idleCleanupRunning'));
     try {
       const r = await fetch('/api/sessions/cleanup-idle', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ olderThanHours: nextHours, sessionIds: candidates.map(c => c.sessionId) }),
+        headers: {
+          'content-type': 'application/json',
+          'x-botmux-operation-id': operation.operationId,
+        },
+        body: JSON.stringify({
+          olderThanHours: nextHours,
+          sessionIds,
+          operationId: operation.operationId,
+        }),
       });
       const body = await r.json().catch(() => ({}));
+      finishSemanticResponse(operation, r, body);
       if (!r.ok) {
         if (r.status !== 401) alert(`${t('sessions.idleCleanupFailed')}: ${body?.error ?? r.status}`);
         setIdleCleanupStatus('');
@@ -3307,12 +3474,13 @@ function SessionsPage(): React.JSX.Element {
       }));
       refresh();
     } catch (e) {
+      finishSemanticTransportError(operation);
       alert(`${t('sessions.idleCleanupFailed')}: ${e}`);
       setIdleCleanupStatus('');
     } finally {
       setIdleCleanupBusy(false);
     }
-  }, [idleCleanupCandidatesFor, refresh]);
+  }, [beginSemanticOperation, finishSemanticResponse, finishSemanticTransportError, idleCleanupCandidatesFor, refresh]);
 
   const setView = (nextRaw: string | undefined): void => {
     const next = normalizeSessionsViewMode(nextRaw) ?? 'board';

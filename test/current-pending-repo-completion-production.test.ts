@@ -50,8 +50,20 @@ const exactOpening: CliTurnPayload = {
   codexAppSteerable: true,
 };
 
-function pendingSession(): DaemonSession {
-  const session = sessionStore.createSession(CHAT, ROOT, 'pending production completion', 'group', 'thread');
+function pendingSession(input: {
+  readonly chatId?: string;
+  readonly rootMessageId?: string;
+  readonly title?: string;
+} = {}): DaemonSession {
+  const chatId = input.chatId ?? CHAT;
+  const rootMessageId = input.rootMessageId ?? ROOT;
+  const session = sessionStore.createSession(
+    chatId,
+    rootMessageId,
+    input.title ?? 'pending production completion',
+    'group',
+    'thread',
+  );
   Object.assign(session, {
     larkAppId: APP,
     cliId: 'codex-app',
@@ -62,7 +74,7 @@ function pendingSession(): DaemonSession {
     workerPort: null,
     workerToken: null,
     larkAppId: APP,
-    chatId: CHAT,
+    chatId,
     chatType: 'group',
     scope: 'thread',
     spawnedAt: 1,
@@ -1060,6 +1072,8 @@ describe('Current pending-repo production composition', () => {
   it('cleans a created worktree when a scope change aliases the same active-Session key', async () => {
     const ds = pendingSession();
     ds.chatId = ROOT;
+    ds.session.chatId = ROOT;
+    sessionStore.updateSession(ds.session);
     const activeSessions = new Map([[activeSessionKey(ds), ds]]);
     const createGate = deferred<void>();
     vi.spyOn(worktreeSlugAI, 'worktreeSlugFromContextAI').mockResolvedValue('route-alias');
@@ -1098,6 +1112,8 @@ describe('Current pending-repo production composition', () => {
 
     expect(activeSessionKey(ds)).toBe(activeSessions.keys().next().value);
     ds.scope = 'chat';
+    ds.session.scope = 'chat';
+    sessionStore.updateSession(ds.session);
     expect(activeSessionKey(ds)).toBe(activeSessions.keys().next().value);
     createGate.resolve();
 
@@ -1222,6 +1238,7 @@ describe('Current pending-repo production composition', () => {
     });
     const ds = pendingSession();
     ds.session.cliId = 'riff';
+    sessionStore.updateSession(ds.session);
     const activeSessions = new Map([[activeSessionKey(ds), ds]]);
     vi.spyOn(worktreeSlugAI, 'worktreeSlugFromContextAI').mockResolvedValue('resume-gap');
     vi.spyOn(gitWorktree, 'createRepoWorktree').mockResolvedValue({
@@ -1281,6 +1298,7 @@ describe('Current pending-repo production composition', () => {
     });
     const ds = pendingSession();
     ds.session.cliId = 'riff';
+    sessionStore.updateSession(ds.session);
     const activeSessions = new Map([[activeSessionKey(ds), ds]]);
     vi.spyOn(worktreeSlugAI, 'worktreeSlugFromContextAI').mockResolvedValue('resume-loss');
     vi.spyOn(gitWorktree, 'createRepoWorktree').mockResolvedValue({
@@ -1516,6 +1534,7 @@ describe('Current pending-repo production composition', () => {
     });
     const ds = pendingSession();
     ds.session.cliId = 'riff';
+    sessionStore.updateSession(ds.session);
     const activeSessions = new Map([[activeSessionKey(ds), ds]]);
     const pushGate = deferred<void>();
     vi.spyOn(gitWorktree, 'createRepoWorktree').mockResolvedValue({
@@ -1562,11 +1581,19 @@ describe('Current pending-repo production composition', () => {
     expect(publish).not.toHaveBeenCalled();
   });
 
-  it('releases the Session lane across worktree and roster awaits, then fences a late replacement', async () => {
+  it('keeps another Session lane available across worktree and roster awaits, then fences a late replacement', async () => {
     const ds = pendingSession();
     delete ds.session.pendingRepoSetup?.cliInput;
     sessionStore.updateSession(ds.session);
-    const activeSessions = new Map([[activeSessionKey(ds), ds]]);
+    const unrelated = pendingSession({
+      chatId: 'oc_pending_repo_unrelated',
+      rootMessageId: 'om_pending_repo_unrelated',
+      title: 'unrelated Session',
+    });
+    const activeSessions = new Map([
+      [activeSessionKey(ds), ds],
+      [activeSessionKey(unrelated), unrelated],
+    ]);
     const worktreeGate = deferred<void>();
     const rosterGate = deferred<void>();
     const createWorktree = vi.fn(async (_repoPath: string, options: PendingWorktreeCreateOptions) => {
@@ -1601,6 +1628,7 @@ describe('Current pending-repo production composition', () => {
       pendingRepoCompletion,
     });
     const address = await addressFor(host, ds.session.sessionId);
+    const unrelatedAddress = await addressFor(host, unrelated.session.sessionId);
     const completion = complete(host.runtime, address, 'pending-repo/late-replacement', {
       kind: 'worktree',
       repositories: [
@@ -1613,7 +1641,7 @@ describe('Current pending-repo production composition', () => {
     await vi.waitFor(() => expect(createWorktree).toHaveBeenCalledTimes(1));
 
     await expect(host.runtime.submit({
-      target: { kind: 'session', address },
+      target: { kind: 'session', address: unrelatedAddress },
       idempotencyKey: 'pending-repo/rename-during-worktree',
       command: {
         kind: 'control.rename',
@@ -1628,7 +1656,7 @@ describe('Current pending-repo production composition', () => {
     worktreeGate.resolve();
     await vi.waitFor(() => expect(availableBots).toHaveBeenCalledTimes(1));
     await expect(host.runtime.submit({
-      target: { kind: 'session', address },
+      target: { kind: 'session', address: unrelatedAddress },
       idempotencyKey: 'pending-repo/rename-during-roster',
       command: {
         kind: 'control.rename',
@@ -1658,6 +1686,7 @@ describe('Current pending-repo production composition', () => {
       ['/repos/beta', '/repos/feat-roster-owner-loss/beta'],
     ]);
     expect(forkWorker).not.toHaveBeenCalled();
+    expect(unrelated.session.title).toBe('lane stayed available through roster');
     expect(replacement).toMatchObject({
       pendingRepo: false,
       pendingRepoCommitInFlight: true,

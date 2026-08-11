@@ -50,6 +50,7 @@ vi.mock('../src/services/session-store.js', () => ({
   updateSession: vi.fn(),
   getSession: vi.fn((id: string) => existingRows.find(s => s.sessionId === id)),
   getOwnedSession: vi.fn((id: string) => existingRows.find(s => s.sessionId === id)),
+  getSessionForOwnerStrict: vi.fn((_owner: string, id: string) => existingRows.find(s => s.sessionId === id)),
   registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
   cleanupSessionBridgeSendMarkers: vi.fn(),
   cleanupSessionBridgeSendMarkersNow: vi.fn(),
@@ -71,9 +72,13 @@ vi.mock('../src/im/lark/card-handler.js', () => ({ runAutoWorktreeCommit: vi.fn(
 // worker-pool: sendWorkerInput (worker-live) + forkWorker (dormant) are the two
 // dispatch side effects. Either can be made to throw/refuse on demand.
 let forkShouldThrow = false;
+let forkShouldRefuse = false;
 let sendShouldRefuse = false;
 let queuedActivationGateActive = false;
-const mockForkWorker = vi.fn(() => { if (forkShouldThrow) throw new Error('injected fork failure'); });
+const mockForkWorker = vi.fn(() => {
+  if (forkShouldThrow) throw new Error('injected fork failure');
+  return !forkShouldRefuse;
+});
 const mockSendWorkerInput = vi.fn(() => !sendShouldRefuse);
 const mockCloseSession = vi.fn(async () => ({ ok: true, alreadyClosed: false, known: true }));
 vi.mock('../src/core/worker-pool.js', () => ({
@@ -107,7 +112,7 @@ function followUpReq(turnIdempotencyKey: string | undefined, instruction = 'foll
 }
 
 function existingDs(overrides: Partial<DaemonSession> = {}): DaemonSession {
-  const s = { sessionId: SID, chatId: CHAT, rootMessageId: '', scope: 'chat', status: 'active', createdAt: '2026-06-01T00:00:00.000Z' };
+  const s = { sessionId: SID, larkAppId: APP, chatId: CHAT, rootMessageId: '', scope: 'chat', status: 'active', createdAt: '2026-06-01T00:00:00.000Z' };
   return {
     session: s,
     worker: null,
@@ -136,7 +141,7 @@ beforeEach(() => {
   process.env.SESSION_DATA_DIR = tempDir;
   existingRows.length = 0;
   existingRows.push({ sessionId: SID, chatId: CHAT, scope: 'chat', status: 'active' });
-  forkShouldThrow = false; sendShouldRefuse = false; queuedActivationGateActive = false;
+  forkShouldThrow = false; forkShouldRefuse = false; sendShouldRefuse = false; queuedActivationGateActive = false;
   mockForkWorker.mockClear(); mockSendWorkerInput.mockClear(); mockCloseSession.mockClear();
 });
 afterEach(() => {
@@ -179,6 +184,72 @@ describe('turn-level idempotency — worker LIVE (sendWorkerInput) branch', () =
     expect(second.idempotent).toBe(true);
     expect(second.triggerId).toBe(first.triggerId);
     expect(mockSendWorkerInput).toHaveBeenCalledTimes(1); // still ONE send
+  });
+
+  it('old attempting retry does not borrow a foreign same-id worker or its chat before route admission', async () => {
+    const own = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    const first = await triggerSessionTurn(
+      followUpReq('tk-foreign-live'),
+      { larkAppId: APP, activeSessions: activeWith(own) },
+    );
+    expect(first.ok).toBe(true);
+    expect(mockSendWorkerInput).toHaveBeenCalledTimes(1);
+
+    const foreignChat = `http_async_${'f'.repeat(8)}-0000-0000-0000-000000000000`;
+    const foreign = existingDs({
+      session: {
+        ...own.session,
+        larkAppId: 'cli_FOREIGN',
+        chatId: foreignChat,
+        rootMessageId: '',
+      },
+      larkAppId: 'cli_FOREIGN',
+      chatId: foreignChat,
+      worker: { killed: false, send: vi.fn() } as any,
+    });
+    const foreignRegistry = new Map<string, DaemonSession>([
+      [sessionKey(foreignChat, 'cli_FOREIGN'), foreign],
+    ]);
+
+    const retry = await triggerSessionTurn(
+      followUpReq('tk-foreign-live'),
+      { larkAppId: APP, activeSessions: foreignRegistry },
+    );
+
+    expect(retry).toMatchObject({
+      ok: false,
+      state: 'failed',
+      idempotent: true,
+      target: { sessionId: SID },
+    });
+    expect(retry.target?.chatId).not.toBe(foreignChat);
+    expect(mockSendWorkerInput).toHaveBeenCalledTimes(1);
+  });
+
+  it('old attempting retry fails closed when the apparent own live worker is registered under an alias key', async () => {
+    const own = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    const first = await triggerSessionTurn(
+      followUpReq('tk-owner-alias'),
+      { larkAppId: APP, activeSessions: activeWith(own) },
+    );
+    expect(first.ok).toBe(true);
+    expect(mockSendWorkerInput).toHaveBeenCalledTimes(1);
+
+    const retry = await triggerSessionTurn(
+      followUpReq('tk-owner-alias'),
+      {
+        larkAppId: APP,
+        activeSessions: new Map<string, DaemonSession>([['noncanonical-alias', own]]),
+      },
+    );
+
+    expect(retry).toMatchObject({
+      ok: false,
+      errorCode: 'trigger_failed',
+      error: expect.stringMatching(/malformed live owner binding/),
+    });
+    expect(retry.idempotent).not.toBe(true);
+    expect(mockSendWorkerInput).toHaveBeenCalledTimes(1);
   });
 
   it('same key + DIFFERENT payload → 409 idempotency_conflict, no second send', async () => {
@@ -251,6 +322,40 @@ describe('turn-level idempotency — worker DORMANT (forkWorker) branch', () => 
     const retry = await triggerSessionTurn(followUpReq('tk-fthrow'), { larkAppId: APP, activeSessions: active });
     expect(retry.state).toBe('failed');
     expect(mockForkWorker.mock.calls.length).toBe(forksBefore); // no new fork
+  });
+
+  it('fork refusal after the barrier terminalizes keyed async at-most-once and never reports queued', async () => {
+    const ds = existingDs({ worker: null, hasHistory: true });
+    const active = activeWith(ds);
+    forkShouldRefuse = true;
+
+    const first = await triggerSessionTurn(
+      followUpReq('tk-frefuse'),
+      { larkAppId: APP, activeSessions: active },
+    );
+    expect(first).toMatchObject({
+      ok: false,
+      state: 'failed',
+      errorCode: 'no_output',
+      turnIdempotencyKey: 'tk-frefuse',
+    });
+    expect(asyncTriggerStore.lookup(SID, first.triggerId!)?.result).toMatchObject({
+      status: 'failed',
+      reason: 'dispatch_unknown',
+    });
+
+    forkShouldRefuse = false;
+    const retry = await triggerSessionTurn(
+      followUpReq('tk-frefuse'),
+      { larkAppId: APP, activeSessions: active },
+    );
+    expect(retry).toMatchObject({
+      ok: false,
+      state: 'failed',
+      errorCode: 'no_output',
+      idempotent: true,
+    });
+    expect(mockForkWorker).toHaveBeenCalledTimes(1);
   });
 });
 

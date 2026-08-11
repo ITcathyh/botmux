@@ -2,9 +2,16 @@ import { lstatSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 
+let roleLibraryRootForTests: string | undefined;
+
+/** Narrow filesystem seam for tests that must exercise the real realpath/dev+ino checks. */
+export function setRoleLibraryRootForTests(root: string | undefined): void {
+  roleLibraryRootForTests = root;
+}
+
 /** 角色库根：v0 固定约定，不做配置。 */
 export function roleLibraryRoot(): string {
-  return join(homedir(), 'botmux-roles');
+  return roleLibraryRootForTests ?? join(homedir(), 'botmux-roles');
 }
 
 /** appId 必须是「单段目录名」：它要被拼进沙盒 readWrite 白名单路径，含 `/` 或

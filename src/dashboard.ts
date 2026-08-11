@@ -9,7 +9,7 @@ import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, extname, resolve, relative, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { logger } from './utils/logger.js';
 import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { config, isWildcardBindHost } from './config.js';
@@ -36,7 +36,11 @@ import {
 import { createDebugTerminalManager } from './dashboard/debug-terminal.js';
 import { pickCreatorForGroup } from './dashboard/operator-selector.js';
 import { buildTeamGroupCreatePayload, planGroupCreator } from './dashboard/team-group.js';
-import { jsonRes } from './dashboard/http.js';
+import {
+  jsonRes,
+  sessionOperationProxyInit,
+  SessionOperationProxyBodyTooLargeError,
+} from './dashboard/http.js';
 import { handleV3RunsApi } from './dashboard/v3-runs-api.js';
 import { defaultRunsDir as v3RunsDir } from './workflows/v3/ops-projection.js';
 import {
@@ -209,7 +213,14 @@ import { readPlatformBinding } from './platform/binding.js';
 import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncMessage } from './platform/tunnel-client.js';
 import { applyPlatformTeamSync, getPlatformTeamSyncRev, listPlatformTeams } from './services/platform-team-store.js';
 import { getBotUnionId } from './services/bot-union-ids-store.js';
-import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
+import {
+  idleCleanupCutoffMs,
+  parseIdleCleanupHours,
+  selectIdleCleanupCandidates,
+  type IdleCleanupCloseResult,
+  type IdleCleanupHours,
+  type IdleCleanupResult,
+} from './dashboard/session-cleanup.js';
 import {
   compatMachineIdForAuthenticatedRequest,
   handleDesktopCompat,
@@ -220,7 +231,8 @@ import { automateOpenPlatformSetup, vcListenerEventGateError } from './setup/ope
 import { VC_MEETING_FEATURE_SCOPES, VC_MEETING_REALTIME_VOICE_SCOPES } from './setup/verify-permissions.js';
 import { maybeInstallTraexPluginOnSettingsChange, TRAEX_RECOMMENDED_SOURCE, TRAEX_RECOMMENDED_REF } from './setup/ensure-herdr-integrations.js';
 import { deriveCreateGroupName, selectCreateSessionTargets } from './core/session-create.js';
-import { parseDashboardImageUploads } from './core/dashboard-images.js';
+import { parseDashboardImageUploads, type DashboardImageUpload } from './core/dashboard-images.js';
+import { computeInputHash } from './utils/canonical-input-hash.js';
 import { checkLarkCliVersion, MIN_LARK_CLI_VERSION_FOR_VC_BOT } from './vc-agent/polling-source.js';
 import { larkHosts, normalizeBrand } from './im/lark/lark-hosts.js';
 import { buildResourceMonitorDaemonSeeds, createResourceMonitorService, handleResourceMonitorApi, toResourceMonitorSessionSeed } from './dashboard/resource-monitor-service.js';
@@ -260,6 +272,766 @@ const REGISTRY_DIR = join(resolveBotmuxDataDir(), 'dashboard-daemons');
 // the `botmux dashboard` CLI can reach /__cli/current, /__cli/ensure, and
 // /__cli/rotate without guessing.
 const PORT_PATH = join(homedir(), '.botmux', '.dashboard-port');
+
+export interface DashboardSessionCreateHttpResponse {
+  readonly status: number;
+  /** Frozen serialized response body; terminal replay is byte-for-byte exact. */
+  readonly body: string;
+}
+
+export type DashboardSessionCreateAttemptResult =
+  | { readonly kind: 'retryable'; readonly response: DashboardSessionCreateHttpResponse }
+  | { readonly kind: 'terminal'; readonly response: DashboardSessionCreateHttpResponse };
+
+export type DashboardSessionCreateOperationResult =
+  | { readonly kind: 'response'; readonly response: DashboardSessionCreateHttpResponse }
+  | { readonly kind: 'conflict' };
+
+type DashboardSessionCreateOperationReceipt =
+  | { readonly requestHash: string; readonly state: 'reserved' }
+  | {
+      readonly requestHash: string;
+      readonly state: 'running';
+      readonly promise: Promise<DashboardSessionCreateOperationResult>;
+    }
+  | {
+      readonly requestHash: string;
+      readonly state: 'terminal';
+      readonly response: DashboardSessionCreateHttpResponse;
+    };
+
+export interface DashboardSessionCreateOperationHost {
+  /** Target-A: receipts deliberately live only for this Dashboard process epoch. */
+  readonly receiptDurability: 'processLocal';
+  run(
+    input: { readonly operationId: string; readonly requestHash: string },
+    execute: () => Promise<DashboardSessionCreateAttemptResult>,
+  ): Promise<DashboardSessionCreateOperationResult>;
+}
+
+function dashboardSessionCreateDispatchUnknown(): DashboardSessionCreateHttpResponse {
+  return Object.freeze({
+    status: 503,
+    body: JSON.stringify({ ok: false, error: 'dispatch_unknown' }),
+  });
+}
+
+/**
+ * Process-epoch parent receipt for the Dashboard create-session composite
+ * operation. Publication happens synchronously before `execute` is scheduled,
+ * so synchronous re-entry and concurrent retries join the exact same attempt.
+ */
+export function createDashboardSessionCreateOperationHost(): DashboardSessionCreateOperationHost {
+  const receipts = new Map<string, DashboardSessionCreateOperationReceipt>();
+  return {
+    receiptDurability: 'processLocal',
+    run(input, execute) {
+      const existing = receipts.get(input.operationId);
+      if (existing) {
+        if (existing.requestHash !== input.requestHash) {
+          return Promise.resolve({ kind: 'conflict' });
+        }
+        if (existing.state === 'running') return existing.promise;
+        if (existing.state === 'terminal') {
+          return Promise.resolve({ kind: 'response', response: existing.response });
+        }
+      }
+
+      const promise = Promise.resolve()
+        .then(execute)
+        .then((attempt): DashboardSessionCreateOperationResult => {
+          if (!attempt
+            || (attempt.kind !== 'retryable' && attempt.kind !== 'terminal')
+            || !attempt.response
+            || !Number.isInteger(attempt.response.status)
+            || typeof attempt.response.body !== 'string') {
+            throw new Error('Dashboard create-session operation returned an invalid attempt result');
+          }
+          const response = Object.freeze({
+            status: attempt.response.status,
+            body: attempt.response.body,
+          });
+          if (attempt.kind === 'retryable') {
+            receipts.set(input.operationId, {
+              requestHash: input.requestHash,
+              state: 'reserved',
+            });
+          } else {
+            receipts.set(input.operationId, {
+              requestHash: input.requestHash,
+              state: 'terminal',
+              response,
+            });
+          }
+          return { kind: 'response', response };
+        })
+        .catch(() => {
+          const response = dashboardSessionCreateDispatchUnknown();
+          receipts.set(input.operationId, {
+            requestHash: input.requestHash,
+            state: 'terminal',
+            response,
+          });
+          return { kind: 'response', response } as const;
+        });
+      receipts.set(input.operationId, {
+        requestHash: input.requestHash,
+        state: 'running',
+        promise,
+      });
+      return promise;
+    },
+  };
+}
+
+const dashboardSessionCreateOperations = createDashboardSessionCreateOperationHost();
+
+export interface DashboardIdleCleanupChildPlan {
+  readonly sessionId: string;
+  readonly larkAppId: string;
+  readonly ipcPort: number;
+  readonly bootInstanceId: string;
+  readonly operationId: string;
+}
+
+export type DashboardIdleCleanupDiscovery =
+  | { readonly kind: 'retryable' }
+  | {
+      readonly kind: 'plan';
+      readonly olderThanHours: IdleCleanupHours;
+      readonly cutoffMs: number;
+      readonly children: readonly DashboardIdleCleanupChildPlan[];
+    };
+
+export type DashboardIdleCleanupChildOutcome =
+  | { readonly kind: 'closed'; readonly result: IdleCleanupCloseResult }
+  | { readonly kind: 'terminal'; readonly result: IdleCleanupCloseResult }
+  | { readonly kind: 'retryable'; readonly result: IdleCleanupCloseResult }
+  | { readonly kind: 'unknown' };
+
+export interface DashboardIdleCleanupOperationExecution {
+  discover(): Promise<DashboardIdleCleanupDiscovery> | DashboardIdleCleanupDiscovery;
+  executeChild(child: DashboardIdleCleanupChildPlan): Promise<DashboardIdleCleanupChildOutcome>;
+}
+
+export type DashboardIdleCleanupOperationResult =
+  | { readonly kind: 'response'; readonly response: DashboardSessionCreateHttpResponse }
+  | { readonly kind: 'conflict' };
+
+interface DashboardIdleCleanupBatch {
+  readonly olderThanHours: IdleCleanupHours;
+  readonly cutoffMs: number;
+  readonly children: readonly DashboardIdleCleanupChildPlan[];
+  readonly unresolved: Map<string, DashboardIdleCleanupChildPlan>;
+  readonly settled: Map<string, IdleCleanupCloseResult>;
+  readonly retryable: Map<string, IdleCleanupCloseResult>;
+}
+
+type DashboardIdleCleanupReceipt =
+  | { readonly requestHash: string; readonly state: 'reserved' }
+  | {
+      readonly requestHash: string;
+      readonly state: 'running';
+      readonly promise: Promise<DashboardIdleCleanupOperationResult>;
+    }
+  | {
+      readonly requestHash: string;
+      readonly state: 'planned';
+      readonly batch: DashboardIdleCleanupBatch;
+    }
+  | {
+      readonly requestHash: string;
+      readonly state: 'terminal';
+      readonly response: DashboardSessionCreateHttpResponse;
+    };
+
+export interface DashboardIdleCleanupOperationHost {
+  /** Target-A: receipts deliberately live only for this Dashboard process epoch. */
+  readonly receiptDurability: 'processLocal';
+  run(
+    input: { readonly operationId: string; readonly requestHash: string },
+    execution: DashboardIdleCleanupOperationExecution,
+  ): Promise<DashboardIdleCleanupOperationResult>;
+}
+
+type DashboardIdleCleanupAttempt =
+  | { readonly kind: 'reserved'; readonly response: DashboardSessionCreateHttpResponse }
+  | {
+      readonly kind: 'planned';
+      readonly batch: DashboardIdleCleanupBatch;
+      readonly response: DashboardSessionCreateHttpResponse;
+    }
+  | { readonly kind: 'terminal'; readonly response: DashboardSessionCreateHttpResponse };
+
+function dashboardIdleCleanupResponse(
+  status: number,
+  body: Record<string, unknown> | IdleCleanupResult,
+): DashboardSessionCreateHttpResponse {
+  return Object.freeze({ status, body: JSON.stringify(body) });
+}
+
+function dashboardIdleCleanupUnknownResponse(): DashboardSessionCreateHttpResponse {
+  return dashboardIdleCleanupResponse(503, { ok: false, error: 'dispatch_unknown' });
+}
+
+function dashboardIdleCleanupRetryableResponse(): DashboardSessionCreateHttpResponse {
+  return dashboardIdleCleanupResponse(503, { ok: false, error: 'dispatch_retryable' });
+}
+
+function dashboardIdleCleanupBatchResponse(
+  batch: DashboardIdleCleanupBatch,
+): DashboardSessionCreateHttpResponse {
+  const results = batch.children.map(child => (
+    batch.settled.get(child.sessionId)
+    ?? batch.retryable.get(child.sessionId)
+    ?? { sessionId: child.sessionId, ok: false, error: 'dispatch_retryable' }
+  ));
+  const closed = results.filter(result => result.ok).length;
+  const failed = results.length - closed;
+  return dashboardIdleCleanupResponse(200, {
+    ok: failed === 0,
+    olderThanHours: batch.olderThanHours,
+    cutoffMs: batch.cutoffMs,
+    matched: batch.children.length,
+    closed,
+    failed,
+    results,
+  });
+}
+
+function validIdleCleanupPlan(
+  discovery: DashboardIdleCleanupDiscovery,
+): discovery is Extract<DashboardIdleCleanupDiscovery, { kind: 'plan' }> {
+  if (discovery.kind !== 'plan'
+    || !Number.isFinite(discovery.cutoffMs)
+    || !Array.isArray(discovery.children)) return false;
+  const seen = new Set<string>();
+  for (const child of discovery.children) {
+    if (!child
+      || typeof child.sessionId !== 'string'
+      || child.sessionId.length === 0
+      || seen.has(child.sessionId)
+      || typeof child.larkAppId !== 'string'
+      || child.larkAppId.length === 0
+      || !Number.isInteger(child.ipcPort)
+      || child.ipcPort <= 0
+      || typeof child.bootInstanceId !== 'string'
+      || child.bootInstanceId.length === 0
+      || typeof child.operationId !== 'string'
+      || child.operationId.length === 0) return false;
+    seen.add(child.sessionId);
+  }
+  return true;
+}
+
+async function driveDashboardIdleCleanupAttempt(
+  priorBatch: DashboardIdleCleanupBatch | undefined,
+  execution: DashboardIdleCleanupOperationExecution,
+): Promise<DashboardIdleCleanupAttempt> {
+  let batch = priorBatch;
+  if (!batch) {
+    let discovery: DashboardIdleCleanupDiscovery;
+    try {
+      discovery = await execution.discover();
+    } catch {
+      return { kind: 'reserved', response: dashboardIdleCleanupRetryableResponse() };
+    }
+    if (!discovery || discovery.kind === 'retryable') {
+      return { kind: 'reserved', response: dashboardIdleCleanupRetryableResponse() };
+    }
+    if (!validIdleCleanupPlan(discovery)) {
+      return { kind: 'reserved', response: dashboardIdleCleanupRetryableResponse() };
+    }
+    const children = Object.freeze(discovery.children.map(child => Object.freeze({ ...child })));
+    batch = {
+      olderThanHours: discovery.olderThanHours,
+      cutoffMs: discovery.cutoffMs,
+      children,
+      unresolved: new Map(children.map(child => [child.sessionId, child] as const)),
+      settled: new Map(),
+      retryable: new Map(),
+    };
+  }
+
+  for (const child of batch.children) {
+    if (!batch.unresolved.has(child.sessionId)) continue;
+    let outcome: DashboardIdleCleanupChildOutcome;
+    try {
+      outcome = await execution.executeChild(child);
+    } catch {
+      return { kind: 'terminal', response: dashboardIdleCleanupUnknownResponse() };
+    }
+    if (!outcome || outcome.kind === 'unknown') {
+      return { kind: 'terminal', response: dashboardIdleCleanupUnknownResponse() };
+    }
+    if (outcome.result.sessionId !== child.sessionId || outcome.result.ok !== (outcome.kind === 'closed')) {
+      return { kind: 'terminal', response: dashboardIdleCleanupUnknownResponse() };
+    }
+    if (outcome.kind === 'retryable') {
+      batch.retryable.set(child.sessionId, Object.freeze({ ...outcome.result }));
+      continue;
+    }
+    batch.unresolved.delete(child.sessionId);
+    batch.retryable.delete(child.sessionId);
+    batch.settled.set(child.sessionId, Object.freeze({ ...outcome.result }));
+  }
+
+  const response = dashboardIdleCleanupBatchResponse(batch);
+  return batch.unresolved.size > 0
+    ? { kind: 'planned', batch, response }
+    : { kind: 'terminal', response };
+}
+
+/**
+ * Process-epoch fixed-batch receipt for idle cleanup. The running receipt is
+ * installed synchronously, before candidate or daemon discovery. A frozen
+ * plan survives retryable child outcomes; only its unresolved children may be
+ * driven by later same-key requests.
+ */
+export function createDashboardIdleCleanupOperationHost(): DashboardIdleCleanupOperationHost {
+  const receipts = new Map<string, DashboardIdleCleanupReceipt>();
+  return {
+    receiptDurability: 'processLocal',
+    run(input, execution) {
+      const existing = receipts.get(input.operationId);
+      if (existing) {
+        if (existing.requestHash !== input.requestHash) {
+          return Promise.resolve({ kind: 'conflict' });
+        }
+        if (existing.state === 'running') return existing.promise;
+        if (existing.state === 'terminal') {
+          return Promise.resolve({ kind: 'response', response: existing.response });
+        }
+      }
+      const priorBatch = existing?.state === 'planned' ? existing.batch : undefined;
+      const promise = Promise.resolve()
+        .then(() => driveDashboardIdleCleanupAttempt(priorBatch, execution))
+        .then((attempt): DashboardIdleCleanupOperationResult => {
+          if (attempt.kind === 'reserved') {
+            receipts.set(input.operationId, {
+              requestHash: input.requestHash,
+              state: 'reserved',
+            });
+          } else if (attempt.kind === 'planned') {
+            receipts.set(input.operationId, {
+              requestHash: input.requestHash,
+              state: 'planned',
+              batch: attempt.batch,
+            });
+          } else {
+            receipts.set(input.operationId, {
+              requestHash: input.requestHash,
+              state: 'terminal',
+              response: attempt.response,
+            });
+          }
+          return { kind: 'response', response: attempt.response };
+        })
+        .catch(() => {
+          const response = dashboardIdleCleanupUnknownResponse();
+          receipts.set(input.operationId, {
+            requestHash: input.requestHash,
+            state: 'terminal',
+            response,
+          });
+          return { kind: 'response', response } as const;
+        });
+      receipts.set(input.operationId, {
+        requestHash: input.requestHash,
+        state: 'running',
+        promise,
+      });
+      return promise;
+    },
+  };
+}
+
+const dashboardIdleCleanupOperations = createDashboardIdleCleanupOperationHost();
+
+interface DashboardSessionCreateSemanticInput {
+  readonly content: string;
+  readonly selectedIds: readonly string[];
+  readonly mode: 'lead' | 'all';
+  readonly column: 'backlog' | 'in_progress';
+  readonly leadLarkAppId?: string;
+  readonly name: string;
+  readonly bindWorkingDir?: string;
+  readonly images: readonly DashboardImageUpload[];
+  readonly existingFeedGroupId: string;
+  readonly newFeedGroupName: string;
+  readonly feedGroupAppId: string;
+}
+
+function dashboardSessionCreateResponse(
+  status: number,
+  body: Record<string, unknown>,
+): DashboardSessionCreateHttpResponse {
+  return Object.freeze({ status, body: JSON.stringify(body) });
+}
+
+function dashboardSessionCreateAttempt(
+  kind: DashboardSessionCreateAttemptResult['kind'],
+  status: number,
+  body: Record<string, unknown>,
+): DashboardSessionCreateAttemptResult {
+  return { kind, response: dashboardSessionCreateResponse(status, body) };
+}
+
+function sendDashboardSessionCreateResponse(
+  res: ServerResponse,
+  response: DashboardSessionCreateHttpResponse,
+): void {
+  res.writeHead(response.status, { 'content-type': 'application/json' });
+  res.end(response.body);
+}
+
+function requiredDashboardSessionCreateOperationId(
+  req: IncomingMessage,
+  bodyValue: unknown,
+): string | undefined {
+  const headerValue = req.headers['x-botmux-operation-id'];
+  if (typeof bodyValue !== 'string'
+    || typeof headerValue !== 'string'
+    || bodyValue !== headerValue
+    || bodyValue.length === 0
+    || bodyValue.length > 256
+    || bodyValue.trim() !== bodyValue
+    || bodyValue.includes('\0')) {
+    return undefined;
+  }
+  return bodyValue;
+}
+
+function normalizedIdleCleanupSessionIds(value: unknown): readonly string[] | null {
+  if (!Array.isArray(value)) return null;
+  return Object.freeze(Array.from(new Set(
+    value.slice(0, 10_000).map(String),
+  )).sort());
+}
+
+function idleCleanupChildOperationId(parentOperationId: string, sessionId: string): string {
+  return `dashboard-cleanup:${computeInputHash({ parentOperationId, sessionId })}`;
+}
+
+function discoverDashboardIdleCleanup(
+  parentOperationId: string,
+  olderThanHours: IdleCleanupHours,
+  sessionIds: readonly string[] | null,
+): DashboardIdleCleanupDiscovery {
+  const now = Date.now();
+  const rows = aggregator.getSessions();
+  const idScope = sessionIds ? new Set(sessionIds) : null;
+  const scoped = idScope ? rows.filter(row => idScope.has(row.sessionId)) : rows;
+  const candidates = selectIdleCleanupCandidates(scoped, olderThanHours, now)
+    .slice()
+    .sort((left, right) => left.sessionId.localeCompare(right.sessionId));
+  const seen = new Set<string>();
+  const daemonInventory = registry.list();
+  const children: DashboardIdleCleanupChildPlan[] = [];
+  for (const candidate of candidates) {
+    const sessionId = candidate.sessionId;
+    const larkAppId = candidate.larkAppId;
+    if (typeof sessionId !== 'string'
+      || sessionId.length === 0
+      || seen.has(sessionId)
+      || typeof larkAppId !== 'string'
+      || larkAppId.length === 0) {
+      return { kind: 'retryable' };
+    }
+    seen.add(sessionId);
+    const owners = daemonInventory.filter(daemon => daemon.larkAppId === larkAppId);
+    const owner = owners.length === 1 ? owners[0] : undefined;
+    if (!owner
+      || typeof owner.bootInstanceId !== 'string'
+      || owner.bootInstanceId.length === 0
+      || !Number.isInteger(owner.ipcPort)
+      || owner.ipcPort <= 0) {
+      return { kind: 'retryable' };
+    }
+    children.push({
+      sessionId,
+      larkAppId,
+      ipcPort: owner.ipcPort,
+      bootInstanceId: owner.bootInstanceId,
+      operationId: idleCleanupChildOperationId(parentOperationId, sessionId),
+    });
+  }
+  return {
+    kind: 'plan',
+    olderThanHours,
+    cutoffMs: idleCleanupCutoffMs(olderThanHours, now),
+    children,
+  };
+}
+
+const IDLE_CLEANUP_RETRYABLE_ERRORS = new Set([
+  'dispatch_retryable',
+  'session_runtime_not_ready',
+  'session_runtime_unavailable',
+  'session_transferring',
+]);
+
+async function executeDashboardIdleCleanupChild(
+  child: DashboardIdleCleanupChildPlan,
+): Promise<DashboardIdleCleanupChildOutcome> {
+  let owners: ReturnType<typeof registry.list>;
+  try {
+    owners = registry.list().filter(daemon => daemon.larkAppId === child.larkAppId);
+  } catch {
+    return {
+      kind: 'retryable',
+      result: { sessionId: child.sessionId, ok: false, error: 'dispatch_retryable' },
+    };
+  }
+  if (owners.length === 0) {
+    return {
+      kind: 'retryable',
+      result: { sessionId: child.sessionId, ok: false, error: 'dispatch_retryable' },
+    };
+  }
+  const owner = owners.length === 1 ? owners[0] : undefined;
+  if (!owner
+    || owner.bootInstanceId !== child.bootInstanceId
+    || owner.ipcPort !== child.ipcPort) {
+    return { kind: 'unknown' };
+  }
+
+  const operationId = child.operationId;
+  let upstream: Response;
+  try {
+    upstream = await fetchDaemonIpc(
+      child.ipcPort,
+      `/api/sessions/${encodeURIComponent(child.sessionId)}/close`,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-botmux-operation-id': operationId,
+        },
+        body: JSON.stringify({ operationId }),
+      },
+    );
+  } catch {
+    return { kind: 'unknown' };
+  }
+
+  let parsed: Record<string, unknown>;
+  try {
+    const value = JSON.parse(await upstream.text()) as unknown;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return { kind: 'unknown' };
+    }
+    parsed = value as Record<string, unknown>;
+  } catch {
+    return { kind: 'unknown' };
+  }
+
+  if (upstream.ok && parsed.ok === true) {
+    return {
+      kind: 'closed',
+      result: { sessionId: child.sessionId, ok: true },
+    };
+  }
+  const error = typeof parsed.error === 'string' && parsed.error.length > 0
+    ? parsed.error
+    : undefined;
+  if (!error || parsed.ok !== false) return { kind: 'unknown' };
+  if (error.includes('unknown') || error.includes('quarantin') || error.includes('ambiguous')) {
+    return { kind: 'unknown' };
+  }
+  const result = { sessionId: child.sessionId, ok: false, error } as const;
+  if (parsed.retryable === true || IDLE_CLEANUP_RETRYABLE_ERRORS.has(error)) {
+    return { kind: 'retryable', result };
+  }
+  return { kind: 'terminal', result };
+}
+
+async function executeDashboardSessionCreate(
+  input: DashboardSessionCreateSemanticInput,
+): Promise<DashboardSessionCreateAttemptResult> {
+  let creatorLarkAppId: string;
+  if (input.mode === 'lead') {
+    const leadLarkAppId = input.leadLarkAppId!;
+    if (!registry.getByAppId(leadLarkAppId)) {
+      return dashboardSessionCreateAttempt(
+        'retryable',
+        503,
+        { ok: false, error: 'lead_offline' },
+      );
+    }
+    creatorLarkAppId = leadLarkAppId;
+  } else {
+    const pick = pickCreatorForGroup([...input.selectedIds], (id) => {
+      const daemon = registry.getByAppId(id);
+      return daemon
+        ? { larkAppId: daemon.larkAppId, resolvedAllowedUsers: daemon.resolvedAllowedUsers ?? [] }
+        : undefined;
+    });
+    if (!pick) {
+      return dashboardSessionCreateAttempt(
+        'retryable',
+        503,
+        { ok: false, error: 'no_online_daemon' },
+      );
+    }
+    creatorLarkAppId = pick.creatorLarkAppId;
+  }
+
+  const creator = registry.getByAppId(creatorLarkAppId);
+  if (!creator) {
+    return dashboardSessionCreateAttempt(
+      'retryable',
+      503,
+      { ok: false, error: input.mode === 'lead' ? 'lead_offline' : 'no_online_daemon' },
+    );
+  }
+  const allowed = [...(creator.resolvedAllowedUsers ?? [])];
+  const userOpenId = allowed.find(value => value.startsWith('ou_'));
+  const ownerUnionIds = allowed.filter(value => value.startsWith('on_'));
+
+  let groupUpstream: Response;
+  try {
+    groupUpstream = await proxyToDaemon(creatorLarkAppId, '/api/groups/create', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: input.name,
+        larkAppIds: input.selectedIds,
+        userOpenIds: userOpenId ? [userOpenId] : [],
+        ownerUnionIds,
+        transferOwnerTo: userOpenId,
+        notifyOwnerOpenId: userOpenId,
+        bindWorkingDir: input.bindWorkingDir,
+      }),
+    });
+  } catch {
+    return { kind: 'terminal', response: dashboardSessionCreateDispatchUnknown() };
+  }
+
+  let groupResp: any;
+  try {
+    groupResp = await groupUpstream.json();
+  } catch {
+    return { kind: 'terminal', response: dashboardSessionCreateDispatchUnknown() };
+  }
+  if (!groupResp || typeof groupResp !== 'object') {
+    return { kind: 'terminal', response: dashboardSessionCreateDispatchUnknown() };
+  }
+  if (!groupUpstream.ok || groupResp.ok !== true) {
+    if (groupResp.ok === false) {
+      return dashboardSessionCreateAttempt(
+        'terminal',
+        502,
+        { ok: false, error: groupResp.error ?? `group_create_http_${groupUpstream.status}` },
+      );
+    }
+    return { kind: 'terminal', response: dashboardSessionCreateDispatchUnknown() };
+  }
+  if (typeof groupResp.chatId !== 'string' || groupResp.chatId.length === 0) {
+    return { kind: 'terminal', response: dashboardSessionCreateDispatchUnknown() };
+  }
+  groupsMatrixSnapshot.invalidate();
+
+  const chatId: string = groupResp.chatId;
+  const invalidBotIds = new Set<string>(
+    Array.isArray(groupResp.invalidBotIds)
+      ? groupResp.invalidBotIds.filter((value: unknown): value is string => typeof value === 'string')
+      : [],
+  );
+  let feedGroupId = '';
+  let feedGroupError = '';
+  if (input.existingFeedGroupId || input.newFeedGroupName) {
+    try {
+      const feedBot = loadBotConfigs().find(
+        bot => bot.larkAppId === input.feedGroupAppId && !bot.apiOnly,
+      );
+      if (!feedBot) {
+        feedGroupError = '读取标签所用的机器人当前不可用。';
+      } else {
+        feedGroupId = input.existingFeedGroupId
+          || await createFeedGroup(feedBot, input.newFeedGroupName);
+        await addChatToFeedGroup(feedBot, feedGroupId, chatId);
+      }
+    } catch (error) {
+      feedGroupError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  // This is the immutable child plan for this parent receipt. Later retries
+  // replay the terminal parent response and never enumerate the fleet again.
+  const joinedIds = input.selectedIds.filter(
+    id => !invalidBotIds.has(id) && !!registry.getByAppId(id),
+  );
+  const targets = selectCreateSessionTargets(input.mode, joinedIds, creatorLarkAppId);
+  if (targets.length === 0) {
+    return dashboardSessionCreateAttempt('terminal', 200, {
+      ok: true,
+      chatId,
+      shareLink: groupResp.shareLink,
+      spawned: [],
+      failed: [],
+      warning: 'no_spawn_target',
+      feedGroupId,
+      feedGroupError,
+    });
+  }
+
+  const botNames = new Map(liveBots().map(bot => [bot.larkAppId, bot.botName] as const));
+  const childResults = await Promise.all(targets.map(async (appId) => {
+    const role = input.mode === 'lead' ? 'lead' : (targets.length > 1 ? 'collab' : 'solo');
+    const coworkerIds = (input.mode === 'lead' ? joinedIds : targets).filter(id => id !== appId);
+    const coworkers = coworkerIds.map(id => ({ name: botNames.get(id) ?? id }));
+    try {
+      const upstream = await proxyToDaemon(appId, '/api/sessions/spawn', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          operationId: `dashboard-spawn:${chatId}`,
+          chatId,
+          content: input.content,
+          column: input.column,
+          role,
+          coworkers,
+          images: input.images,
+          postBanner: appId === creatorLarkAppId,
+        }),
+      });
+      const body = await upstream.json().catch(() => null);
+      return upstream.ok && body?.ok
+        ? { kind: 'spawned' as const, larkAppId: appId }
+        : {
+            kind: 'failed' as const,
+            larkAppId: appId,
+            error: body?.error ?? `http_${upstream.status}`,
+          };
+    } catch (error) {
+      return {
+        kind: 'failed' as const,
+        larkAppId: appId,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }));
+  const spawned = childResults
+    .filter((result): result is Extract<typeof childResults[number], { kind: 'spawned' }> => result.kind === 'spawned')
+    .map(result => result.larkAppId);
+  const failed = childResults
+    .filter((result): result is Extract<typeof childResults[number], { kind: 'failed' }> => result.kind === 'failed')
+    .map(result => ({ larkAppId: result.larkAppId, error: result.error }));
+
+  return dashboardSessionCreateAttempt('terminal', 200, {
+    ok: true,
+    chatId,
+    shareLink: groupResp.shareLink,
+    mode: input.mode,
+    column: input.column,
+    spawned,
+    failed,
+    feedGroupId,
+    feedGroupError,
+  });
+}
+
 
 function loadOrCreateSecret(): string {
   let existing: string | null;
@@ -2448,7 +3220,13 @@ async function closeSessionsMatching(
       const upstream = await proxyToDaemon(
         s.larkAppId as string,
         `/api/sessions/${encodeURIComponent(s.sessionId)}/close`,
-        { method: 'POST' },
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            operationId: `dashboard-close:${s.sessionId}:${randomUUID()}`,
+          }),
+        },
       );
       const text = await upstream.text();
       let body: any = null;
@@ -3175,52 +3953,39 @@ const server = createServer(async (req, res) => {
       return;
     }
     if (req.method === 'POST' && url.pathname === '/api/sessions/cleanup-idle') {
-      let body: { olderThanHours?: unknown; sessionIds?: unknown };
+      let body: { operationId?: unknown; olderThanHours?: unknown; sessionIds?: unknown };
       try {
-        body = await readJsonBody(req) as { olderThanHours?: unknown; sessionIds?: unknown };
+        body = await readJsonBody(req) as {
+          operationId?: unknown;
+          olderThanHours?: unknown;
+          sessionIds?: unknown;
+        };
       } catch {
         return jsonRes(res, 400, { ok: false, error: 'bad_json' });
       }
+      const operationId = requiredDashboardSessionCreateOperationId(req, body.operationId);
+      if (!operationId) return jsonRes(res, 400, { ok: false, error: 'bad_operation_id' });
       const olderThanHours = parseIdleCleanupHours(body?.olderThanHours);
       if (!olderThanHours) return jsonRes(res, 400, { ok: false, error: 'invalid_threshold' });
-
-      // WYSIWYG: the UI scopes cleanup to the rows currently visible under the
-      // page filters and sends their sessionIds, so the closed set matches the
-      // confirmed count. We still hand the scoped rows to cleanupIdleSessions,
-      // which re-validates each is a genuine idle candidate — a stale/forged id
-      // can never close a non-idle session. Omitting sessionIds (e.g. an older
-      // client) falls back to a deployment-wide sweep. Cap the id set so a giant
-      // body can't blow up the Set build.
-      const idScope = Array.isArray(body?.sessionIds)
-        ? new Set((body.sessionIds as unknown[]).slice(0, 10000).map(String))
-        : null;
-      const rows = aggregator.getSessions();
-      const scoped = idScope ? rows.filter(s => idScope.has(s.sessionId)) : rows;
-
-      const result = await cleanupIdleSessions(scoped, olderThanHours, async s => {
-        try {
-          const upstream = await proxyToDaemon(
-            s.larkAppId as string,
-            `/api/sessions/${encodeURIComponent(s.sessionId)}/close`,
-            { method: 'POST' },
-          );
-          const text = await upstream.text();
-          let parsed: any = null;
-          try { parsed = JSON.parse(text); } catch { /* tolerate */ }
-          // The daemon close route always replies 200 {ok:true}; treat anything
-          // else (incl. an unparseable/missing body) as a failure rather than a
-          // silent success.
-          const ok = upstream.ok && parsed?.ok === true;
-          return {
-            sessionId: s.sessionId,
-            ok,
-            error: ok ? undefined : (parsed?.error ?? `http_${upstream.status}`),
-          };
-        } catch (e: any) {
-          return { sessionId: s.sessionId, ok: false, error: e?.message ?? String(e) };
-        }
-      });
-      return jsonRes(res, 200, result);
+      const sessionIds = normalizedIdleCleanupSessionIds(body.sessionIds);
+      let requestHash: string;
+      try {
+        requestHash = computeInputHash({ olderThanHours, sessionIds });
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+      }
+      const operation = await dashboardIdleCleanupOperations.run(
+        { operationId, requestHash },
+        {
+          discover: () => discoverDashboardIdleCleanup(operationId, olderThanHours, sessionIds),
+          executeChild: child => executeDashboardIdleCleanupChild(child),
+        },
+      );
+      if (operation.kind === 'conflict') {
+        return jsonRes(res, 409, { ok: false, error: 'idempotency_conflict' });
+      }
+      sendDashboardSessionCreateResponse(res, operation.response);
+      return;
     }
     if (req.method === 'GET' && url.pathname === '/api/insights/summary') {
       const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') ?? '200', 10) || 200, 1), 500);
@@ -4235,7 +5000,20 @@ const server = createServer(async (req, res) => {
       const sid = decodeURIComponent(m[1]); const op = m[2];
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
-      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/${op}`, { method: 'POST' });
+      let proxyInit: RequestInit;
+      try {
+        proxyInit = await sessionOperationProxyInit(req, op !== 'locate');
+      } catch (error) {
+        if (error instanceof SessionOperationProxyBodyTooLargeError) {
+          return jsonRes(res, 413, { ok: false, error: 'body_too_large' });
+        }
+        throw error;
+      }
+      const upstream = await proxyToDaemon(
+        owner,
+        `/api/sessions/${sid}/${op}`,
+        proxyInit,
+      );
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
       return;
@@ -4276,13 +5054,20 @@ const server = createServer(async (req, res) => {
       const sid = decodeURIComponent(m[1]); const op = m[2];
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/${op}`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: Buffer.concat(chunks).toString('utf8'),
-      });
+      let proxyInit: RequestInit;
+      try {
+        proxyInit = await sessionOperationProxyInit(req, true);
+      } catch (error) {
+        if (error instanceof SessionOperationProxyBodyTooLargeError) {
+          return jsonRes(res, 413, { ok: false, error: 'body_too_large' });
+        }
+        throw error;
+      }
+      const upstream = await proxyToDaemon(
+        owner,
+        `/api/sessions/${sid}/${op}`,
+        proxyInit,
+      );
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
       return;
@@ -4939,14 +5724,16 @@ const server = createServer(async (req, res) => {
     let mBotAgent: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mBotAgent = url.pathname.match(/^\/api\/bots\/([^/]+)\/agent$/))) {
       const appId = decodeURIComponent(mBotAgent[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-agent`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
+      let proxyInit: RequestInit;
+      try {
+        proxyInit = await sessionOperationProxyInit(req, true, 'PUT');
+      } catch (error) {
+        if (error instanceof SessionOperationProxyBodyTooLargeError) {
+          return jsonRes(res, 413, { ok: false, error: 'body_too_large' });
+        }
+        throw error;
+      }
+      const upstream = await proxyToDaemon(appId, `/api/bot-agent`, proxyInit);
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
       return;
@@ -5573,6 +6360,7 @@ const server = createServer(async (req, res) => {
     // 在群里 @ 拉起 sub bot。in_progress=立即开跑；backlog=入待办池（parked，等激活）。
     if (req.method === 'POST' && url.pathname === '/api/sessions/create') {
       let parsed: {
+        operationId?: unknown;
         content?: unknown; larkAppIds?: unknown; mode?: unknown; column?: unknown;
         leadLarkAppId?: unknown; name?: unknown; bindWorkingDir?: unknown; images?: unknown;
         feedGroupId?: unknown; newFeedGroupName?: unknown; feedGroupAppId?: unknown;
@@ -5584,6 +6372,8 @@ const server = createServer(async (req, res) => {
       } catch {
         return jsonRes(res, 400, { ok: false, error: 'bad_json' });
       }
+      const operationId = requiredDashboardSessionCreateOperationId(req, parsed.operationId);
+      if (!operationId) return jsonRes(res, 400, { ok: false, error: 'bad_operation_id' });
       const content = typeof parsed.content === 'string' ? parsed.content.replace(/\s+$/u, '') : '';
       if (!content.trim()) return jsonRes(res, 400, { ok: false, error: 'empty_content' });
       const selectedIds = Array.isArray(parsed.larkAppIds)
@@ -5599,116 +6389,46 @@ const server = createServer(async (req, res) => {
       const name = deriveCreateGroupName(parsed.name, content);
       const parsedImages = parseDashboardImageUploads(parsed.images);
       if (!parsedImages.ok) return jsonRes(res, 400, { ok: false, error: parsedImages.error });
-
-      // 解析 creator：lead 模式 = lead bot；一起开工 = pickCreatorForGroup 在选中里挑一个在线的。
-      let creatorLarkAppId: string;
+      let leadLarkAppId: string | undefined;
       if (mode === 'lead') {
-        const leadLarkAppId = typeof parsed.leadLarkAppId === 'string' ? parsed.leadLarkAppId : '';
+        leadLarkAppId = typeof parsed.leadLarkAppId === 'string' ? parsed.leadLarkAppId : '';
         if (!leadLarkAppId || !selectedIds.includes(leadLarkAppId)) {
           return jsonRes(res, 400, { ok: false, error: 'bad_lead' });
         }
-        if (!registry.getByAppId(leadLarkAppId)) return jsonRes(res, 503, { ok: false, error: 'lead_offline' });
-        creatorLarkAppId = leadLarkAppId;
-      } else {
-        const pick = pickCreatorForGroup(selectedIds, (id) => {
-          const d = registry.getByAppId(id);
-          return d ? { larkAppId: d.larkAppId, resolvedAllowedUsers: d.resolvedAllowedUsers ?? [] } : undefined;
-        });
-        if (!pick) return jsonRes(res, 503, { ok: false, error: 'no_online_daemon' });
-        creatorLarkAppId = pick.creatorLarkAppId;
       }
-
-      // creator 作用域里的操作者 open_id（首个 ou_ allowedUser）——用于邀请进群 + 转群主 + @通知。
-      // 同时取 on_（union_id，租户内跨 app 稳定）做兜底邀请：lead 模式强制 creator=lead，
-      // 万一 lead 的 allowlist 没有 ou_ 条目，open_id 解析不到、操作者就进不了群——union_id
-      // 不受 app 作用域影响，仍能把人拉进来（createGroupWithBots 走 ownerUnionIds 通道）。
-      const creatorDesc = registry.getByAppId(creatorLarkAppId)!;
-      const allowed = creatorDesc.resolvedAllowedUsers ?? [];
-      const userOpenId = allowed.find(u => u.startsWith('ou_'));
-      const ownerUnionIds = allowed.filter(u => u.startsWith('on_'));
-
-      // 建群（拉所有选中 bot + 邀请操作者 + 转群主 + @通知 + 可选绑 oncall 工作目录）。
-      let groupResp: any = null;
-      try {
-        const groupUpstream = await proxyToDaemon(creatorLarkAppId, '/api/groups/create', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            name,
-            larkAppIds: selectedIds,
-            userOpenIds: userOpenId ? [userOpenId] : [],
-            ownerUnionIds,
-            transferOwnerTo: userOpenId,
-            notifyOwnerOpenId: userOpenId,
-            bindWorkingDir,
-          }),
-        });
-        groupResp = await groupUpstream.json().catch(() => null);
-        if (!groupUpstream.ok || !groupResp?.ok || typeof groupResp.chatId !== 'string') {
-          return jsonRes(res, 502, { ok: false, error: groupResp?.error ?? `group_create_http_${groupUpstream.status}` });
-        }
-        groupsMatrixSnapshot.invalidate();
-      } catch {
-        return jsonRes(res, 502, { ok: false, error: 'group_create_proxy_failed' });
-      }
-      const chatId: string = groupResp.chatId;
-      const invalidBotIds: string[] = Array.isArray(groupResp.invalidBotIds) ? groupResp.invalidBotIds : [];
       const existingFeedGroupId = typeof parsed.feedGroupId === 'string' ? parsed.feedGroupId.trim() : '';
       const newFeedGroupName = typeof parsed.newFeedGroupName === 'string' ? parsed.newFeedGroupName.trim() : '';
-      let feedGroupId = '';
-      let feedGroupError = '';
-      if (existingFeedGroupId || newFeedGroupName) {
-        const feedGroupAppId = typeof parsed.feedGroupAppId === 'string' ? parsed.feedGroupAppId.trim() : '';
-        try {
-          const feedBot = loadBotConfigs().find(bot => bot.larkAppId === feedGroupAppId && !bot.apiOnly);
-          if (!feedBot) {
-            feedGroupError = '读取标签所用的机器人当前不可用。';
-          } else {
-            feedGroupId = existingFeedGroupId || await createFeedGroup(feedBot, newFeedGroupName);
-            await addChatToFeedGroup(feedBot, feedGroupId, chatId);
-          }
-        } catch (error) {
-          feedGroupError = error instanceof Error ? error.message : String(error);
-        }
+      const feedGroupAppId = existingFeedGroupId || newFeedGroupName
+        ? (typeof parsed.feedGroupAppId === 'string' ? parsed.feedGroupAppId.trim() : '')
+        : '';
+      const semanticInput: DashboardSessionCreateSemanticInput = {
+        content,
+        selectedIds,
+        mode,
+        column,
+        leadLarkAppId,
+        name,
+        bindWorkingDir,
+        images: parsedImages.images,
+        existingFeedGroupId,
+        newFeedGroupName,
+        feedGroupAppId,
+      };
+      let requestHash: string;
+      try {
+        requestHash = computeInputHash(semanticInput);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_request' });
       }
-
-      // spawn 目标：lead 模式只有 lead；一起开工是所有成功入群的选中 bot。
-      const joinedIds = selectedIds.filter(id => !invalidBotIds.includes(id) && !!registry.getByAppId(id));
-      const targets = selectCreateSessionTargets(mode, joinedIds, creatorLarkAppId);
-      if (targets.length === 0) {
-        return jsonRes(res, 200, { ok: true, chatId, shareLink: groupResp.shareLink, spawned: [], failed: [], warning: 'no_spawn_target', feedGroupId, feedGroupError });
+      const operation = await dashboardSessionCreateOperations.run(
+        { operationId, requestHash },
+        () => executeDashboardSessionCreate(semanticInput),
+      );
+      if (operation.kind === 'conflict') {
+        return jsonRes(res, 409, { ok: false, error: 'idempotency_conflict' });
       }
-
-      const bots = liveBots();
-      const nameOf = (id: string) => bots.find(b => b.larkAppId === id)?.botName ?? id;
-      const spawned: string[] = [];
-      const failed: Array<{ larkAppId: string; error: string }> = [];
-      await Promise.all(targets.map(async (appId) => {
-        const role = mode === 'lead' ? 'lead' : (targets.length > 1 ? 'collab' : 'solo');
-        // lead 的 coworker = 所有 sub（除自己）；collab 的 coworker = 其它并列 bot（除自己）。
-        const coworkerIds = (mode === 'lead' ? joinedIds : targets).filter(id => id !== appId);
-        const coworkers = coworkerIds.map(id => ({ name: nameOf(id) }));
-        try {
-          const up = await proxyToDaemon(appId, '/api/sessions/spawn', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({
-              chatId, content, column, role, coworkers,
-              images: parsedImages.images,
-              postBanner: appId === creatorLarkAppId,
-            }),
-          });
-          const b = await up.json().catch(() => null);
-          if (up.ok && b?.ok) spawned.push(appId);
-          else failed.push({ larkAppId: appId, error: b?.error ?? `http_${up.status}` });
-        } catch (e: any) {
-          failed.push({ larkAppId: appId, error: e?.message ?? String(e) });
-        }
-      }));
-
-      return jsonRes(res, 200, {
-        ok: true, chatId, shareLink: groupResp.shareLink, mode, column, spawned, failed, feedGroupId, feedGroupError,
-      });
+      sendDashboardSessionCreateResponse(res, operation.response);
+      return;
     }
 
     // Public SSE — relays aggregator's listener events

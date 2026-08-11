@@ -7,6 +7,10 @@ const dashboardSource = readFileSync(
   new URL('../src/core/dashboard-ipc-server.ts', import.meta.url),
   'utf8',
 );
+const currentControlSource = readFileSync(
+  new URL('../src/core/current-session-control.ts', import.meta.url),
+  'utf8',
+);
 const cardHandlerSource = readFileSync(
   new URL('../src/im/lark/card-handler.ts', import.meta.url),
   'utf8',
@@ -29,9 +33,9 @@ describe('transfer input gate wiring', () => {
   });
 
   it('routes dashboard and card input controls through the same gate', () => {
-    expect(dashboardSource).toContain(
-      "sendWorkerSessionInput(ds, { type: 'inject_command', command: v.command })",
-    );
+    expect(dashboardSource).toContain("input: { kind: 'injectCommand', command: v.command }");
+    expect(currentControlSource).toContain('sendWorkerSessionInput(plan.active!, {');
+    expect(currentControlSource).toContain("type: 'inject_command'");
     expect(daemonSource).toContain('sendWorkerSessionInput(cocoDs, {');
     expect(cardHandlerSource).toContain(
       "sendWorkerSessionInput(ds, { type: 'term_action', key })",

@@ -339,7 +339,7 @@ describe('SessionRuntime staged ordinary ingress protocol', () => {
     expect(begin).not.toHaveBeenCalled();
   });
 
-  it('runs only begin/resume in the Session lane while one async effect is pending', async () => {
+  it('runs the async effect outside the lane without letting a later control pass it', async () => {
     const registry = new Map<string, DaemonSession>();
     const ds = makeDaemonSession();
     register(registry, ds);
@@ -405,7 +405,8 @@ describe('SessionRuntime staged ordinary ingress protocol', () => {
       command: { kind: 'ordinary.ingress', input: { turn } },
     });
     duplicate.then(() => { duplicateSettled = true; });
-    const control = await host.runtime.submit({
+    let controlSettled = false;
+    const control = host.runtime.submit({
       target: { kind: 'session', address },
       idempotencyKey: 'rename-during-effect',
       command: {
@@ -416,12 +417,15 @@ describe('SessionRuntime staged ordinary ingress protocol', () => {
           source: 'user',
         },
       },
+    }).then((result) => {
+      controlSettled = true;
+      return result;
     });
 
     await Promise.resolve();
     expect(duplicateSettled).toBe(false);
-    expect(control).toMatchObject({ kind: 'applied', action: 'control.renamed' });
-    expect(order).toEqual(['ordinary:begin', 'effect:start', 'control:rename']);
+    expect(controlSettled).toBe(false);
+    expect(order).toEqual(['ordinary:begin', 'effect:start']);
 
     gate.resolve({ kind: 'accepted' });
     await expect(first).resolves.toMatchObject({
@@ -434,11 +438,12 @@ describe('SessionRuntime staged ordinary ingress protocol', () => {
       state: 'inputCommitted',
       policy: 'ordinary-replayable',
     });
+    await expect(control).resolves.toMatchObject({ kind: 'applied', action: 'control.renamed' });
     expect(order).toEqual([
       'ordinary:begin',
       'effect:start',
-      'control:rename',
       'ordinary:resume',
+      'control:rename',
     ]);
     expect(begin).toHaveBeenCalledTimes(1);
     expect(execute).toHaveBeenCalledTimes(1);

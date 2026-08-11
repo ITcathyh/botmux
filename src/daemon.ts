@@ -133,11 +133,20 @@ import {
   createCurrentScheduledFireAdapter,
   toSchedulerSubmitOutcome,
 } from './core/current-scheduled-fire.js';
+import { currentSessionControlPort } from './core/current-session-control.js';
 import {
   createCurrentOrdinaryRouteOpeningProduction,
   type CurrentOrdinaryRouteOpeningPolicyFacts,
   type CurrentOrdinaryRouteOpeningPostCommitEffect,
 } from './core/current-ordinary-route-opening-production.js';
+import { createCurrentDashboardRouteOpeningPort } from './core/current-dashboard-route-opening.js';
+import { createCurrentDashboardSessionCommandClient } from './core/current-dashboard-session-command-client.js';
+import { createCurrentDashboardControlEffects } from './core/current-dashboard-control-effects.js';
+import {
+  createCurrentDashboardAgentConfiguration,
+  createCurrentDashboardHostMaintenance,
+} from './core/current-dashboard-host-maintenance.js';
+import { createCurrentDashboardChatRename } from './core/current-dashboard-chat-rename.js';
 import {
   currentPendingRepoCompletionPort,
   submitCurrentPendingRepoCompletion,
@@ -198,9 +207,10 @@ import {
   getDaemonStreamingCardUsageSnapshot,
   postTurnStartingCard,
   isSessionTransferring,
+  deferUntilSessionTransferSettled,
   type WorkerSessionReplyOptions,
 } from './core/worker-pool.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, readCurrentDashboardSessionSnapshot } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, readCurrentDashboardSessionSnapshot, setDashboardSessionRuntimeSubmitter, setDashboardControlEffects, setDashboardHostMaintenance, setDashboardChatRename } from './core/dashboard-ipc-server.js';
 import { currentDashboardProjectionProtocol } from './core/dashboard-projection.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import {
@@ -636,6 +646,10 @@ const currentScheduledFireAdapters = new Map<
     wrapped?: ReturnType<typeof currentSessionRuntimeHost>;
   }
 >();
+const currentDashboardOpeningPorts = new Map<
+  string,
+  ReturnType<typeof createCurrentDashboardRouteOpeningPort>
+>();
 
 // #796: a bare `/t` whose setup falls through to the repo-picker opening still
 // runs the talk-permission recheck in materialization, but topic setup must
@@ -1059,6 +1073,19 @@ function currentDaemonSessionActivation(ownerLarkAppId: string) {
   });
 }
 
+function currentDashboardOpeningPort(
+  ownerLarkAppId: string,
+): ReturnType<typeof createCurrentDashboardRouteOpeningPort> {
+  const cached = currentDashboardOpeningPorts.get(ownerLarkAppId);
+  if (cached) return cached;
+  const port = createCurrentDashboardRouteOpeningPort({
+    ownerLarkAppId,
+    activeSessions,
+  });
+  currentDashboardOpeningPorts.set(ownerLarkAppId, port);
+  return port;
+}
+
 function currentDaemonSessionRuntimeHost(ownerLarkAppId: string) {
   const ownerBootId = getDaemonBootId();
   const ownerBotId = requireBotId(ownerLarkAppId);
@@ -1081,18 +1108,19 @@ function currentDaemonSessionRuntimeHost(ownerLarkAppId: string) {
   }
   return currentSessionRuntimeHost({
     // startDaemon binds the durable identity before any route can reach this
-    // composition. Pre-start unit adapters may carry no BotState identity;
-    // Current then allocates an opaque process-local adapter ID.
+    // composition. Every port below therefore shares one BotId + boot epoch.
     ownerBotId,
     ownerLarkAppId,
     activeSessions,
     ownerBootId,
+    runtimeEpoch: ownerBootId,
     keyedTriggerAdmissionBlocked: () => currentDeviceIsolationFreezeLease() !== null,
     ordinaryIngress: currentOrdinaryIngressPort(ownerLarkAppId, ownerBootId, activation),
     ordinaryRouteOpeningCreator: currentOrdinaryOpeningCreator(
       ownerLarkAppId,
       ownerBootId,
     ),
+    dashboardRouteOpening: currentDashboardOpeningPort(ownerLarkAppId),
     pendingRepoCompletion: currentPendingRepoCompletionPort({
       ownerLarkAppId,
       activeSessions,
@@ -1100,6 +1128,10 @@ function currentDaemonSessionRuntimeHost(ownerLarkAppId: string) {
       activation,
     }),
     scheduledFire: scheduled.adapter.port,
+    controlMutation: currentSessionControlPort({
+      ownerLarkAppId,
+      activeSessions,
+    }),
   });
 }
 
@@ -1115,6 +1147,22 @@ function currentDaemonScheduledFireRuntimeHost(ownerLarkAppId: string) {
   scheduled.wrapped = wrapped;
   return wrapped;
 }
+
+// One client for this daemon epoch. Its external-Session receipts deliberately
+// outlive individual Host leases so response-loss retries are recognized
+// before projection, including after a successful close removes the row.
+const dashboardSessionCommandClient = createCurrentDashboardSessionCommandClient({
+  ownerLarkAppId: () => {
+    if (!selfDaemonLarkAppId) throw new Error('daemon SessionRuntime owner is not ready');
+    return selfDaemonLarkAppId;
+  },
+  host: () => {
+    const ownerLarkAppId = selfDaemonLarkAppId;
+    if (!ownerLarkAppId) throw new Error('daemon SessionRuntime owner is not ready');
+    return currentDaemonSessionRuntimeHost(ownerLarkAppId);
+  },
+});
+setDashboardSessionRuntimeSubmitter(dashboardSessionCommandClient);
 /** False until restoreActiveSessions() finishes. During the startup window the
  *  IPC server is already listening but activeSessions is empty, so a reconnecting
  *  ask hook would fail session lookup and get a 403 origin_unproven — which the
@@ -19870,6 +19918,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }
   registerBot(cfg, botIdentity.botId);
   selfDaemonLarkAppId = cfg.larkAppId;
+  setDashboardControlEffects(createCurrentDashboardControlEffects({
+    ownerLarkAppId: cfg.larkAppId,
+    activeSessions,
+  }));
   // Establish the target-scoped daemon control credential before publishing
   // the daemon descriptor or accepting IPC traffic. Corruption fails startup
   // closed; silently rotating here could strand peers on mismatched tokens.
@@ -19926,6 +19978,19 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   try { ensureCliEnv(cfg.cliId, cfg.cliPathOverride); }
   catch (err) { logger.warn(`[hook] startup ensureCliEnv failed for ${cfg.cliId}: ${err instanceof Error ? err.message : String(err)}`); }
   sessionStore.init(cfg.larkAppId);
+  setDashboardHostMaintenance(createCurrentDashboardHostMaintenance({
+    ownerLarkAppId: cfg.larkAppId,
+    activeSessions,
+    listSessions: () => sessionStore.listSessionsForOwnerStrict(cfg.larkAppId),
+    submit: dashboardSessionCommandClient,
+    deferTransfer: deferUntilSessionTransferSettled,
+    agentConfiguration: createCurrentDashboardAgentConfiguration(cfg.larkAppId),
+  }));
+  setDashboardChatRename(createCurrentDashboardChatRename({
+    ownerLarkAppId: cfg.larkAppId,
+    activeSessions,
+    submit: dashboardSessionCommandClient,
+  }));
   chatFirstSeenStore.init(cfg.larkAppId);
   const ambiguousOnBoot = reconcileVcMeetingDeliveriesOnBoot(
     config.session.dataDir,

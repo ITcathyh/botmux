@@ -2643,7 +2643,9 @@ type RiffClosePreparation =
         | 'riff_durable_close_failed'
         | 'riff_close_reconciliation_required'
         | 'riff_shutdown_fence_in_progress';
-      retryable: true;
+      /** Evidence about the semantic close, independent of which provider or
+       * durable sub-effect was attempted. Only notApplied may be re-driven. */
+      closeDisposition: 'notApplied' | 'unknown';
       taskId?: string;
     };
 
@@ -2723,13 +2725,13 @@ async function abortLiveRiffWorkerClose(
 async function prepareLiveRiffWorkerClose(ds: DaemonSession): Promise<RiffClosePreparation> {
   const worker = ds.worker;
   if (!worker || worker.killed) {
-    return { ok: false, error: 'riff_worker_close_failed', retryable: true };
+    return { ok: false, error: 'riff_worker_close_failed', closeDisposition: 'notApplied' };
   }
   if (ds.riffCloseState || ds.riffShutdownState) {
     return {
       ok: false,
       error: 'riff_worker_close_failed',
-      retryable: true,
+      closeDisposition: 'unknown',
       ...((ds.riffCloseState?.taskId ?? ds.riffShutdownState?.taskId)
         ? { taskId: (ds.riffCloseState?.taskId ?? ds.riffShutdownState?.taskId)! }
         : {}),
@@ -2792,14 +2794,14 @@ async function prepareLiveRiffWorkerClose(ds: DaemonSession): Promise<RiffCloseP
       return {
         ok: false,
         error: 'riff_durable_close_failed',
-        retryable: true,
+        closeDisposition: 'unknown',
         taskId: result.taskId,
       };
     }
   }
 
   if (!result.ok) {
-    await abortLiveRiffWorkerClose(ds, requestId, {
+    const restored = await abortLiveRiffWorkerClose(ds, requestId, {
       allowAbsentAfterProvenRestore: matchedCloseResult,
     });
     logger.warn(
@@ -2809,7 +2811,7 @@ async function prepareLiveRiffWorkerClose(ds: DaemonSession): Promise<RiffCloseP
     return {
       ok: false,
       error: 'riff_worker_close_failed',
-      retryable: true,
+      closeDisposition: restored ? 'notApplied' : 'unknown',
       ...(taskId ? { taskId } : {}),
     };
   }
@@ -2842,7 +2844,7 @@ async function prepareRiffExplicitClose(
     return {
       ok: false,
       error: 'riff_shutdown_fence_in_progress',
-      retryable: true,
+      closeDisposition: 'notApplied',
       ...(typeof fencedTaskId === 'string' && fencedTaskId ? { taskId: fencedTaskId } : {}),
     };
   }
@@ -2850,7 +2852,7 @@ async function prepareRiffExplicitClose(
     return {
       ok: false,
       error: 'riff_close_reconciliation_required',
-      retryable: true,
+      closeDisposition: 'unknown',
       ...(ds.riffCloseState.taskId ? { taskId: ds.riffCloseState.taskId } : {}),
     };
   }
@@ -2862,7 +2864,7 @@ async function prepareRiffExplicitClose(
       return {
         ok: false,
         error: 'riff_row_inconsistent',
-        retryable: true,
+        closeDisposition: 'notApplied',
         ...(taskId ? { taskId } : {}),
       };
     }
@@ -2880,7 +2882,7 @@ async function prepareRiffExplicitClose(
     return {
       ok: false,
       error: 'riff_task_changed',
-      retryable: true,
+      closeDisposition: 'notApplied',
       ...(authoritativeTaskId ? { taskId: authoritativeTaskId } : {}),
     };
   }
@@ -2904,7 +2906,7 @@ async function prepareRiffExplicitClose(
     return {
       ok: false,
       error: cleanup.kind === 'riff_config_missing' ? 'riff_config_missing' : 'riff_cancel_failed',
-      retryable: true,
+      closeDisposition: cleanup.kind === 'riff_config_missing' ? 'notApplied' : 'unknown',
       taskId,
     };
   }
@@ -2923,7 +2925,7 @@ async function prepareRiffExplicitClose(
     return {
       ok: false,
       error: 'riff_task_changed',
-      retryable: true,
+      closeDisposition: 'unknown',
       taskId: latestTaskId ?? runtimeTaskId ?? cleanup.taskId,
     };
   }
@@ -3263,27 +3265,66 @@ export type CloseSessionResult =
       ok: false;
       alreadyClosed: false;
       error: 'executor_generation_stale';
-      retryable: false;
+      closeDisposition: 'notApplied' | 'unknown';
     }
   | ({
       ok: false;
       alreadyClosed: false;
     } & Exclude<RiffClosePreparation, { ok: true }>);
 
+export interface CloseSessionOptions {
+  isCurrent?: () => boolean;
+  /** Exact daemon partition that owns both the active registry and JSON cache. */
+  owner?: {
+    larkAppId: string;
+    activeSessions: Map<string, DaemonSession>;
+  };
+}
+
 export async function closeSession(
   sessionId: string,
-  options: { isCurrent?: () => boolean } = {},
+  options: CloseSessionOptions = {},
 ): Promise<CloseSessionResult> {
-  if (options.isCurrent && !options.isCurrent()) {
+  const ownerScopeCurrent = (): boolean => (
+    !options.owner
+    || sessionStore.currentSessionStoreOwner() === options.owner.larkAppId
+  );
+  if (!ownerScopeCurrent() || (options.isCurrent && !options.isCurrent())) {
     return {
       ok: false,
       alreadyClosed: false,
       error: 'executor_generation_stale',
-      retryable: false,
+      closeDisposition: 'notApplied',
     };
   }
-  const ds = findActiveBySessionId(sessionId);
+  const registry = options.owner?.activeSessions ?? activeSessionsRegistry;
+  const ownerCandidates = options.owner
+    ? [...options.owner.activeSessions.entries()]
+      .filter(([key, candidate]) => (
+        key === activeSessionKey(candidate)
+        && candidate.larkAppId === options.owner!.larkAppId
+        && candidate.session.sessionId === sessionId
+      ))
+      .map(([, candidate]) => candidate)
+    : [];
+  if (ownerCandidates.length > 1) {
+    return {
+      ok: false,
+      alreadyClosed: false,
+      error: 'executor_generation_stale',
+      closeDisposition: 'notApplied',
+    };
+  }
+  const ds = options.owner ? ownerCandidates[0] : findActiveBySessionId(sessionId);
   const stored = sessionStore.getOwnedSession(sessionId);
+  if (options.owner && stored?.larkAppId && stored.larkAppId !== options.owner.larkAppId) {
+    return {
+      ok: false,
+      alreadyClosed: false,
+      error: 'executor_generation_stale',
+      closeDisposition: 'notApplied',
+    };
+  }
   // Prove fail-closed ZMX teardown before any registry/store mutation. Repo
   // replacement paths reuse the same helper before their own state transition.
   const teardownTarget = ds ?? stored;
@@ -3322,15 +3363,22 @@ export async function closeSession(
   const preparedRiffRequestId = ds?.riffCloseState?.phase === 'prepared'
     ? ds.riffCloseState.requestId
     : undefined;
-  if (options.isCurrent && !options.isCurrent()) {
+  if (!ownerScopeCurrent() || (options.isCurrent && !options.isCurrent())) {
+    let closeDisposition: 'notApplied' | 'unknown' = 'notApplied';
     if (ds && preparedRiffRequestId) {
-      await abortLiveRiffWorkerClose(ds, preparedRiffRequestId);
+      closeDisposition = await abortLiveRiffWorkerClose(ds, preparedRiffRequestId)
+        ? 'notApplied'
+        : 'unknown';
+    } else if (isOwnedRiffClose && prepared.taskId) {
+      // A worker-less cancel has no abort protocol. The remote effect is known,
+      // but the semantic close did not reach its durable publication.
+      closeDisposition = 'unknown';
     }
     return {
       ok: false,
       alreadyClosed: false,
       error: 'executor_generation_stale',
-      retryable: false,
+      closeDisposition,
     };
   }
 
@@ -3350,15 +3398,20 @@ export async function closeSession(
   // Mutations are bot-owner scoped. getSession() has a read-only cross-file
   // fallback for agent CLI discovery, so it must not authorize close.
   if (wasOpen) {
-    if (options.isCurrent && !options.isCurrent()) {
+    if (!ownerScopeCurrent() || (options.isCurrent && !options.isCurrent())) {
+      let closeDisposition: 'notApplied' | 'unknown' = 'notApplied';
       if (ds && preparedRiffRequestId) {
-        await abortLiveRiffWorkerClose(ds, preparedRiffRequestId);
+        closeDisposition = await abortLiveRiffWorkerClose(ds, preparedRiffRequestId)
+          ? 'notApplied'
+          : 'unknown';
+      } else if (isOwnedRiffClose && prepared.taskId) {
+        closeDisposition = 'unknown';
       }
       return {
         ok: false,
         alreadyClosed: false,
         error: 'executor_generation_stale',
-        retryable: false,
+        closeDisposition,
       };
     }
     if (!ds && stored && !isOwnedRiffClose) destroyUnregisteredPersistentBacking(stored);
@@ -3380,7 +3433,7 @@ export async function closeSession(
         ok: false,
         alreadyClosed: false,
         error: 'riff_durable_close_failed',
-        retryable: true,
+        closeDisposition: 'unknown',
         ...(prepared.taskId ? { taskId: prepared.taskId } : {}),
       };
     }
@@ -3397,9 +3450,9 @@ export async function closeSession(
     });
     // A transferred/restored exact object may remain under more than one alias.
     // Remove only identity matches, never a same-key successor.
-    if (activeSessionsRegistry) {
-      for (const [registeredKey, candidate] of activeSessionsRegistry) {
-        if (candidate === ds) activeSessionsRegistry.delete(registeredKey);
+    if (registry) {
+      for (const [registeredKey, candidate] of registry) {
+        if (candidate === ds) registry.delete(registeredKey);
       }
     }
     // Mark the captured object too. Async message/card paths may already hold a
@@ -4420,9 +4473,10 @@ function releaseTransferInputGate(
  *   - Source worker must be in idle/limited (or already dead) — otherwise
  *     refuse with `worker_busy`
  *   - Target chat must not already host a real chat-scope session for the
- *     same bot (`target_chat_has_session`). Scratch (worker:null) occupants
- *     are NOT a conflict — they're command-time placeholders and we close
- *     them in-line to free the slot before continuing.
+ *     same bot (`target_chat_has_session`). Legacy callers close disposable
+ *     command scratches in-line. Owner-bound Current callers require the
+ *     route registry to retire each scratch through its own Session lane
+ *     before entering this transfer effect.
  *
  * Idempotent for `same_chat`: returns error without side effects when the
  * source chat equals the target chat.
@@ -4457,6 +4511,17 @@ export async function transferSession(
    */
   targetScope: 'thread' | 'chat',
   opts?: {
+    /** Exact daemon-owned registry. Current adapters pass this fixed host
+     * binding; transport callers cannot choose an owner. */
+    owner?: {
+      larkAppId: string;
+      activeSessions: Map<string, DaemonSession>;
+    };
+    /** Revalidate the opaque Runtime binding before every irreversible step. */
+    isCurrent?: () => boolean;
+    /** Revalidate the Current ordinary-route reservation held by the Runtime
+     * route wrapper. Required for owner-bound transfers. */
+    isTargetRouteReservationCurrent?: () => boolean;
     /** @internal Override for tests — the real implementation forks a child
      *  process and tries to attach to tmux, neither of which is appropriate
      *  in a unit test environment. Defaults to module-level forkWorker. */
@@ -4485,9 +4550,27 @@ export async function transferSession(
   if ((targetChatType as string) !== 'group' && (targetChatType as string) !== 'p2p') {
     return { ok: false, error: 'target_chat_type_unsupported' };
   }
-  const initial = findActiveBySessionId(sessionId);
+  const targetAnchor = targetScope === 'chat' ? targetChatId : targetRootMessageId;
+  const transferRegistry = opts?.owner?.activeSessions ?? activeSessionsRegistry;
+  const resolveExactSource = (): DaemonSession | undefined => {
+    if (!opts?.owner) return findActiveBySessionId(sessionId);
+    const matches = [...opts.owner.activeSessions.entries()]
+      .filter(([key, candidate]) => (
+        key === activeSessionKey(candidate)
+        && candidate.larkAppId === opts.owner!.larkAppId
+        && candidate.session.larkAppId === opts.owner!.larkAppId
+        && candidate.session.sessionId === sessionId
+      ))
+      .map(([, candidate]) => candidate);
+    return matches.length === 1 ? matches[0] : undefined;
+  };
+  const initial = resolveExactSource();
   if (!initial) return { ok: false, error: 'session_not_active' };
-  if (!opts?.mutationHeld) {
+  if (opts?.isCurrent?.() === false) return { ok: false, error: 'session_not_active' };
+  if (opts?.owner && opts.isTargetRouteReservationCurrent?.() !== true) {
+    return { ok: false, error: 'target_route_not_reserved' };
+  }
+  if (!opts?.owner && !opts?.mutationHeld) {
     // Transfer rewrites both the source and target routing identities and may
     // await scratch cleanup.  Drain every admitted turn for this bot first so
     // no source prompt can become durable mid-transfer and no target creator
@@ -4501,7 +4584,7 @@ export async function transferSession(
       { ...opts, mutationHeld: true },
     ));
   }
-  const ds = findActiveBySessionId(sessionId);
+  const ds = resolveExactSource();
   if (!ds || ds.session.status !== 'active') return { ok: false, error: 'session_not_active' };
   const sourceSession = ds.session;
   const sourceLifecycleIdentity = JSON.stringify({
@@ -4526,11 +4609,13 @@ export async function transferSession(
   // the old `targetChatId === ds.chatId → same_chat` check, which would have
   // blocked同群话题间搬运.
   const sourceAnchor = sessionAnchorId(ds);
-  const targetAnchor = targetScope === 'chat' ? targetChatId : targetRootMessageId;
   if (targetAnchor === sourceAnchor) return { ok: false, error: 'same_anchor' };
   const sourceKey = sessionKey(sourceAnchor, ds.larkAppId);
   const targetKey = sessionKey(targetAnchor, ds.larkAppId);
   const validateSourceIdentity = (): { ok: false; error: string } | undefined => {
+    if (opts?.owner && opts.isTargetRouteReservationCurrent?.() !== true) {
+      return { ok: false, error: 'target_route_not_reserved' };
+    }
     if (
       ds.session.status !== 'active'
       || ds.session !== sourceSession
@@ -4547,7 +4632,8 @@ export async function transferSession(
         runtimeWorkingDir: ds.workingDir,
         runtimeAdoptedFrom: ds.adoptedFrom,
       }) !== sourceLifecycleIdentity
-      || activeSessionsRegistry?.get(sourceKey) !== ds
+      || transferRegistry?.get(sourceKey) !== ds
+      || opts?.isCurrent?.() === false
     ) {
       return { ok: false, error: 'session_not_active' };
     }
@@ -4559,7 +4645,7 @@ export async function transferSession(
     if (currentDeviceIsolationFreezeLease()) {
       return { ok: false, error: 'worker_busy' };
     }
-    const targetOccupant = activeSessionsRegistry?.get(targetKey);
+    const targetOccupant = transferRegistry?.get(targetKey);
     if (targetOccupant && targetOccupant !== ds) {
       return { ok: false, error: 'target_chat_has_session' };
     }
@@ -4640,8 +4726,8 @@ export async function transferSession(
   // Only a session at the target anchor collides — same-chat other-topic
   // sessions have a different anchor and are fine (enables同群话题间搬运).
   const scratchesToClose: string[] = [];
-  if (activeSessionsRegistry) {
-    for (const existing of activeSessionsRegistry.values()) {
+  if (transferRegistry) {
+    for (const existing of transferRegistry.values()) {
       if (existing === ds) continue;
       if (existing.larkAppId !== ds.larkAppId) continue;
       if (sessionAnchorId(existing) !== targetAnchor) continue;
@@ -4650,6 +4736,7 @@ export async function transferSession(
       // ledger-empty command scratch may be retired.
       if (isDisposableCommandScratch(existing)
         && !hasProtectedSessionMutationOwnership(existing)) {
+        if (opts?.owner) return { ok: false, error: 'target_chat_has_session' };
         scratchesToClose.push(existing.session.sessionId);
         continue;
       }
@@ -4657,19 +4744,29 @@ export async function transferSession(
     }
   }
   for (const sid of scratchesToClose) {
-    await closeSession(sid);
+    await closeSession(sid, opts?.owner ? { owner: opts.owner } : undefined);
   }
   // A partially hydrated daemon can have an active target row absent from the
   // runtime map. Durable ownership makes that row a real conflict even when it
   // has worker:null and no legacy CLI markers; only proven ledger-empty
   // scratch rows may be retired.
-  const runtimeIds = new Set(activeSessionsRegistry
-    ? [...activeSessionsRegistry.values()].map(item => item.session.sessionId)
+  const runtimeIds = new Set(transferRegistry
+    ? [...transferRegistry.values()].map(item => item.session.sessionId)
     : []);
-  const persistedTargetConflicts = sessionStore.listSessions().filter(item =>
+  let persistedSessions: Session[];
+  try {
+    persistedSessions = opts?.owner
+      ? sessionStore.listSessionsForOwnerStrict(opts.owner.larkAppId)
+      : sessionStore.listSessions();
+  } catch {
+    return { ok: false, error: 'target_chat_has_session' };
+  }
+  const persistedTargetConflicts = persistedSessions.filter(item =>
     item.sessionId !== ds.session.sessionId
     && item.status === 'active'
-    && (!item.larkAppId || item.larkAppId === ds.larkAppId)
+    && (opts?.owner
+      ? item.larkAppId === opts.owner.larkAppId
+      : (!item.larkAppId || item.larkAppId === ds.larkAppId))
     && !item.vcMeetingReceiver
     && (item.scope === 'chat' ? item.chatId : item.rootMessageId) === targetAnchor
     && !runtimeIds.has(item.sessionId),
@@ -4679,6 +4776,11 @@ export async function transferSession(
     || !!item.cliId
     || !!item.lastCliInput
     || item.queued === true)) {
+    return { ok: false, error: 'target_chat_has_session' };
+  }
+  if (opts?.owner && persistedTargetConflicts.length > 0) {
+    // Current cleanup must have crossed every scratch's own SessionRuntime
+    // close barrier. Never fall back to a bare-id lifecycle call here.
     return { ok: false, error: 'target_chat_has_session' };
   }
   for (const scratch of persistedTargetConflicts) {
@@ -4754,7 +4856,7 @@ export async function transferSession(
       logger.warn(`[${tagPrefix}] build source-chat frozen card failed: ${err instanceof Error ? err.message : err}`);
     }
   }
-  activeSessionsRegistry?.delete(sessionKey(oldAnchor, ds.larkAppId));
+  transferRegistry?.delete(sessionKey(oldAnchor, ds.larkAppId));
 
   // Rewrite routing fields per the requested target scope.
   //   chat-scope:   routes by chatId; `targetRootMessageId` (e.g. an M1 id) is
@@ -4786,8 +4888,8 @@ export async function transferSession(
   sessionStore.updateSession(ds.session);
 
   const newAnchor = sessionAnchorId(ds);
-  if (activeSessionsRegistry) {
-    if (!setActiveSessionIfActive(activeSessionsRegistry, sessionKey(newAnchor, ds.larkAppId), ds)) {
+  if (transferRegistry) {
+    if (!setActiveSessionIfActive(transferRegistry, sessionKey(newAnchor, ds.larkAppId), ds)) {
       return { ok: false, error: 'session_not_active' };
     }
   }
@@ -4821,8 +4923,8 @@ export async function transferSession(
   // `bmx-<sessionId>` session and re-attaches instead of creating a new one.
   if (
     ds.session.status === 'active'
-    && (!activeSessionsRegistry
-      || activeSessionsRegistry.get(sessionKey(newAnchor, ds.larkAppId)) === ds)
+    && (!transferRegistry
+      || transferRegistry.get(sessionKey(newAnchor, ds.larkAppId)) === ds)
   ) {
     try {
       forkTransferReplacement(ds, fkw);
@@ -4848,8 +4950,8 @@ export async function transferSession(
       sourceDetached
       && !routingCommitted
       && ds.session.status === 'active'
-      && (!activeSessionsRegistry
-        || activeSessionsRegistry.get(sourceKey) === ds)
+      && (!transferRegistry
+        || transferRegistry.get(sourceKey) === ds)
     ) {
       // A target/device/lifecycle race after a successful detach leaves the
       // routing on the source. Reattach even when no user input happened

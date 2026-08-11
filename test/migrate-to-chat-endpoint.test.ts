@@ -80,7 +80,11 @@ vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
   };
 });
 
-import { startIpcServer, setLarkAppId } from '../src/core/dashboard-ipc-server.js';
+import {
+  setDashboardSessionRuntimeSubmitter,
+  startIpcServer,
+  setLarkAppId,
+} from '../src/core/dashboard-ipc-server.js';
 import { setActiveSessionsRegistry } from '../src/core/worker-pool.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -89,6 +93,7 @@ import type { Session } from '../src/types.js';
 let server: { port: number; close: () => Promise<void> };
 let baseUrl: string;
 let registry: Map<string, DaemonSession>;
+const submitRuntime = vi.fn();
 
 function makeDs(): DaemonSession {
   const session: Session = {
@@ -125,10 +130,12 @@ function makeDs(): DaemonSession {
 
 const validBody = () => ({
   sourceAnchor: 'om_thread_root',
+  sourceScope: 'thread',
   targetChatId: 'oc_target',
   targetRootMessageId: 'om_M1',
   requesterLarkAppId: 'cli_leader',
   requestingUserOpenId: 'ou_owner',
+  operationId: 'relay-migrate:test-op-1',
 });
 
 async function postMigrate(body: unknown): Promise<{ status: number; body: any }> {
@@ -148,6 +155,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  setDashboardSessionRuntimeSubmitter(null);
   await server.close();
 });
 
@@ -155,11 +163,20 @@ beforeEach(() => {
   vi.clearAllMocks();
   registry = new Map();
   setActiveSessionsRegistry(registry);
+  submitRuntime.mockResolvedValue({
+    kind: 'rejected',
+    reason: 'sessionNotFound',
+    message: 'no_session_at_anchor',
+  });
+  setDashboardSessionRuntimeSubmitter(submitRuntime as never);
 });
 
 describe('POST /api/sessions/migrate-to-chat', () => {
   it('400 when a required field is missing', async () => {
-    const r = await postMigrate({ sourceAnchor: 'om_thread_root' });
+    const r = await postMigrate({
+      sourceAnchor: 'om_thread_root',
+      operationId: 'migrate-missing-field',
+    });
     expect(r.status).toBe(400);
     expect(r.body.error).toBe('missing_field');
   });
@@ -184,20 +201,55 @@ describe('POST /api/sessions/migrate-to-chat', () => {
     const ds = makeDs();
     registry.set(sessionKey('om_thread_root', 'cli_peer'), ds);
 
+    submitRuntime.mockResolvedValueOnce({
+      kind: 'rejected',
+      reason: 'transitionRejected',
+      code: 'not_session_owner',
+      message: 'not_session_owner',
+    });
     const r = await postMigrate({ ...validBody(), requestingUserOpenId: 'ou_other' });
     expect(r.status).toBe(403);
     expect(r.body.error).toBe('not_session_owner');
   });
 
-  // Note: the happy-path "200 + delegates to transferSession" assertion
-  // is intentionally NOT tested here. The endpoint hands a vetted call into
-  // `transferSession()`, which internally invokes the real `forkWorker`
-  // (binding resolved at module-declaration time, so vi.mock of the export
-  // doesn't intercept the internal closure). Exercising forkWorker means
-  // actually spawning a child process and attaching tmux — explicitly out
-  // of scope for unit tests. transferSession's behaviour is covered in
-  // `transfer-session.test.ts` (via its forkWorkerImpl / detachWorkerImpl DI
-  // overrides), and the integration of the two layers is covered at E2E.
+  it('submits one route-targeted owner-bound relocate command', async () => {
+    submitRuntime.mockResolvedValueOnce({
+      kind: 'applied',
+      action: 'control.mutated',
+      policy: 'control-staged-transition',
+      sessionId: 'sess-peer-1',
+      result: {
+        kind: 'relocated',
+        targetChatId: 'oc_target',
+        targetRootMessageId: 'om_M1',
+      },
+    });
+
+    const r = await postMigrate(validBody());
+
+    expect(r).toEqual({
+      status: 200,
+      body: { ok: true, sessionId: 'sess-peer-1' },
+    });
+    expect(submitRuntime).toHaveBeenCalledOnce();
+    expect(submitRuntime).toHaveBeenCalledWith({
+      target: {
+        kind: 'route',
+        route: { kind: 'thread', anchorId: 'om_thread_root' },
+      },
+      idempotencyKey: 'relay-migrate:test-op-1',
+      command: {
+        kind: 'control.mutate',
+        input: {
+          kind: 'relocate',
+          sourceAnchor: 'om_thread_root',
+          targetChatId: 'oc_target',
+          targetRootMessageId: 'om_M1',
+          requester: { larkAppId: 'cli_leader', openId: 'ou_owner' },
+        },
+      },
+    });
+  });
 
   it('404 when sourceAnchor matches a session owned by a different daemon', async () => {
     // This daemon presents itself as cli_peer (set in beforeAll). A session

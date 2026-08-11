@@ -35,7 +35,22 @@ function dryRunReq(): TriggerRequest {
 }
 
 function liveChatScopeSession(): DaemonSession {
-  return { session: { sessionId: 'sess_existing' }, worker: { killed: false } } as unknown as DaemonSession;
+  return {
+    session: {
+      sessionId: 'sess_existing',
+      larkAppId: APP,
+      chatId: CHAT,
+      rootMessageId: CHAT,
+      scope: 'chat',
+      chatType: 'group',
+      status: 'active',
+    },
+    worker: { killed: false },
+    larkAppId: APP,
+    chatId: CHAT,
+    chatType: 'group',
+    scope: 'chat',
+  } as unknown as DaemonSession;
 }
 
 function setMode(mode: ChatReplyMode | undefined, perChat?: ChatReplyMode) {

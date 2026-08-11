@@ -19,6 +19,7 @@
  */
 
 import { isDashboardAdmin } from '../../dashboard/dashboard-admins.js';
+import { randomUUID } from 'node:crypto';
 import type { SessionRowDto, SessionDetailDto } from '../../dashboard/session-card-model.js';
 import { composeEntries, sortByStatus, paginate, composeDetail } from '../../dashboard/session-card-model.js';
 import type { DaemonClient } from '../../dashboard/daemon-internal-client.js';
@@ -460,6 +461,10 @@ export function buildSessionsDetailCard(
 
   // 3) close OR resume — mutually exclusive based on row status.
   //    closed → resume button replaces close; otherwise → close stays.
+  // Each rebuilt detail card owns a fresh write identity. Lark retries of the
+  // same callback retain this value, while close → resume → close rebuilds do
+  // not accidentally reuse an earlier lifecycle receipt.
+  const writeOperationId = `dashboard-card:${randomUUID()}`;
   const isClosed = detail.actions.resume.enabled === true;
   let writeButton: Record<string, unknown>;
   if (isClosed) {
@@ -470,6 +475,7 @@ export function buildSessionsDetailCard(
       type: 'primary',
       value: {
         action: SESSIONS_ACTION_RESUME,
+        operation_id: writeOperationId,
         invoker_open_id: opts.invokerOpenId,
         session_id: detail.sessionId,
         ...backNav,
@@ -490,6 +496,7 @@ export function buildSessionsDetailCard(
       type: 'danger',
       value: {
         action: SESSIONS_ACTION_CLOSE,
+        operation_id: writeOperationId,
         invoker_open_id: opts.invokerOpenId,
         session_id: detail.sessionId,
         ...backNav,
@@ -576,16 +583,6 @@ function mapTerminalDisabledReason(reasonKey: string | undefined): string | unde
   }
 }
 
-/** Map resume reason keys to card i18n keys. */
-function mapResumeDisabledReason(reasonKey: string | undefined): string | undefined {
-  switch (reasonKey) {
-    case 'sessions.action.resume.onlyClosed':
-      return 'card.dashboard.sessions.resume.disabled.onlyClosed';
-    default:
-      return undefined;
-  }
-}
-
 /** Compute the Web Terminal URL for a SessionRow. Mirrors
  *  `src/dashboard/web/sessions.ts:terminalHref`: proxy port wins (with the
  *  `/s/{sessionId}` suffix); otherwise direct worker port. Returns null when
@@ -666,6 +663,14 @@ function ackToast(textKey: string, locale: Locale): SessionsCardHandlerResult {
 
 function errorToast(textKey: string, params: Record<string, string> | undefined, locale: Locale): SessionsCardHandlerResult {
   return { toast: { type: 'error', content: t(textKey, params, locale) } };
+}
+
+function validCardOperationId(value: unknown): value is string {
+  return typeof value === 'string'
+    && value.length > 0
+    && value.length <= 256
+    && value.trim() === value
+    && !value.includes('\0');
 }
 
 /**
@@ -763,6 +768,14 @@ export async function handleSessionsCardAction(
     if (typeof sessionId !== 'string' || !sessionId) {
       return errorToast('card.dashboard.sessions.session_not_found', undefined, locale);
     }
+    const operationId = value.operation_id;
+    if (!validCardOperationId(operationId)) {
+      return errorToast(
+        'card.dashboard.sessions.close_failed',
+        { reason: 'bad_operation_id' },
+        locale,
+      );
+    }
     // Pre-POST snapshot confirms the row still exists and lets us synthesize
     // the closed-state card without racing list propagation.
     const pre = await safeGetSessionsList(client, locale, pathSuffix);
@@ -772,19 +785,9 @@ export async function handleSessionsCardAction(
       return errorToast('card.dashboard.sessions.session_not_found', undefined, locale);
     }
 
-    // Client-side `disabled` is UX only; replayed or crafted callbacks can
-    // still arrive. Re-run the same availability matrix server-side and
-    // fail closed before POSTing.
-    const beforeDetail = composeDetail(before, now());
-    if (beforeDetail.actions.close.enabled !== true) {
-      // Reuse the same reasonKey → i18n mapping the builder uses
-      // for the inline disabled-button note (`mapCloseDisabledReason`) so
-      // toast text matches what the user already sees on the card. NEVER
-      // POST; NEVER redraw the card.
-      const mappedKey = mapCloseDisabledReason(beforeDetail.actions.close.reasonKey)
-        ?? 'card.dashboard.sessions.close_failed';
-      return errorToast(mappedKey, undefined, locale);
-    }
+    // The fresh snapshot is rendering input, not mutation authority. A prior
+    // close may already have committed while its response was lost; the same
+    // card callback must still reach the owner Runtime and replay its receipt.
 
     // Route B owner routing is the authority on whether this session can be
     // closed; we only sanitize the routing key above.
@@ -793,6 +796,7 @@ export async function handleSessionsCardAction(
       resp = await client.request({
         method: 'POST',
         path: `/__daemon/sessions/${encodeURIComponent(sessionId)}/close${pathSuffix}`,
+        body: { operationId },
       });
     } catch (e) {
       return errorToast('card.dashboard.sessions.close_failed', { reason: (e as Error).message }, locale);
@@ -895,26 +899,30 @@ export async function handleSessionsCardAction(
     if (typeof sessionId !== 'string' || !sessionId) {
       return errorToast('card.dashboard.sessions.session_not_found', undefined, locale);
     }
+    const operationId = value.operation_id;
+    if (!validCardOperationId(operationId)) {
+      return errorToast(
+        'card.dashboard.sessions.resume_failed',
+        { reason: 'bad_operation_id' },
+        locale,
+      );
+    }
     const pre = await safeGetSessionsList(client, locale, pathSuffix);
     if ('errorResult' in pre) return pre.errorResult;
     const before = pre.rows.find(s => s.sessionId === sessionId);
     if (!before) {
       return errorToast('card.dashboard.sessions.session_not_found', undefined, locale);
     }
-    // Re-run the availability matrix against the fresh snapshot. A replayed
-    // event on an active session must not POST resume.
-    const beforeDetail = composeDetail(before, now());
-    if (beforeDetail.actions.resume.enabled !== true) {
-      const mappedKey = mapResumeDisabledReason(beforeDetail.actions.resume.reasonKey)
-        ?? 'card.dashboard.sessions.resume_failed';
-      return errorToast(mappedKey, undefined, locale);
-    }
+    // Do not reject an active snapshot here: it may be the committed result
+    // of this exact resume operation whose response was lost. Runtime owns the
+    // stable operation receipt and transition validation.
 
     let resp: Awaited<ReturnType<DaemonClient['request']>>;
     try {
       resp = await client.request({
         method: 'POST',
         path: `/__daemon/sessions/${encodeURIComponent(sessionId)}/resume${pathSuffix}`,
+        body: { operationId },
       });
     } catch (e) {
       return errorToast('card.dashboard.sessions.resume_failed', { reason: (e as Error).message }, locale);

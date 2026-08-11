@@ -7,6 +7,7 @@
  * wrapped queuedPrompt, clears queued). The CLI process is external — forkWorker
  * is stubbed so we exercise the routing/parking logic in isolation.
  */
+import { EventEmitter } from 'node:events';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import type { Session } from '../src/types.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -61,31 +62,37 @@ const sendWorkerInputMock = vi.fn();
 const closeWorkerSessionMock = vi.fn(async () => ({ ok: true, alreadyClosed: false }));
 const runAutoWorktreeCommitMock = vi.fn(async () => {});
 let activeRegistryMock: Map<string, DaemonSession> | null = null;
-vi.mock('../src/core/worker-pool.js', () => ({
-  forkWorker: (...a: any[]) => forkWorkerMock(...a),
-  sendWorkerInput: (...a: any[]) => sendWorkerInputMock(...a),
-  forkAdoptWorker: vi.fn(),
-  adoptSandboxBlocked: vi.fn((botCfg, session) => botCfg?.sandbox === true || botCfg?.readIsolation === true || session?.sandbox === true || process.env.BOTMUX_SANDBOX === '1'),
-  killStalePids: vi.fn(),
-  sweepDeadPidMarkers: vi.fn(),
-  getCurrentCliVersion: vi.fn(() => 'test-cli-v1'),
-  restoreUsageLimitRuntimeState: vi.fn(),
-  setActiveSessionIfActive: vi.fn((map: Map<string, any>, k: string, ds: any) => {
-    if (map.has(k) && map.get(k) !== ds) return false;
-    map.set(k, ds);
-    return true;
-  }),
-  setActiveSessionSafe: vi.fn(async (map: Map<string, any>, k: string, ds: any) => {
-    map.set(k, ds);
-    return { accepted: true };
-  }),
-  getActiveSessionsRegistry: vi.fn(() => activeRegistryMock),
-  isRelayableRealSession: vi.fn((ds: any) => !!ds?.worker || !!ds?.session?.cliId || !!ds?.session?.lastCliInput),
-  isDisposableCommandScratch: vi.fn(() => true),
-  closeSession: (...a: any[]) => closeWorkerSessionMock(...a),
-  promoteQueuedActivationTail: vi.fn(() => false),
-  withActiveSessionKeyLock: vi.fn(async (_map: Map<string, any>, _key: string, action: () => any) => action()),
-}));
+vi.mock('../src/core/worker-pool.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('../src/core/worker-pool.js')>();
+  return {
+    forkWorker: (...a: any[]) => forkWorkerMock(...a),
+    sendWorkerInput: (...a: any[]) => sendWorkerInputMock(...a),
+    forkAdoptWorker: vi.fn(),
+    adoptSandboxBlocked: vi.fn((botCfg, session) => botCfg?.sandbox === true || botCfg?.readIsolation === true || session?.sandbox === true || process.env.BOTMUX_SANDBOX === '1'),
+    killStalePids: vi.fn(),
+    sweepDeadPidMarkers: vi.fn(),
+    getCurrentCliVersion: vi.fn(() => 'test-cli-v1'),
+    restoreUsageLimitRuntimeState: vi.fn(),
+    setActiveSessionIfActive: vi.fn((map: Map<string, any>, k: string, ds: any) => {
+      if (map.has(k) && map.get(k) !== ds) return false;
+      map.set(k, ds);
+      return true;
+    }),
+    setActiveSessionSafe: vi.fn(async (map: Map<string, any>, k: string, ds: any) => {
+      map.set(k, ds);
+      return { accepted: true };
+    }),
+    getActiveSessionsRegistry: vi.fn(() => activeRegistryMock),
+    isRelayableRealSession: vi.fn((ds: any) => !!ds?.worker || !!ds?.session?.cliId || !!ds?.session?.lastCliInput),
+    isDisposableCommandScratch: vi.fn(() => true),
+    closeSession: (...a: any[]) => closeWorkerSessionMock(...a),
+    promoteQueuedActivationTail: vi.fn(() => false),
+    withActiveSessionKeyLock: vi.fn(async (_map: Map<string, any>, _key: string, action: () => any) => action()),
+    initWorkerPool: actual.initWorkerPool,
+    __testOnly_resetSessionExecutorRuntime: actual.__testOnly_resetSessionExecutorRuntime,
+    __testOnly_setupWorkerHandlers: actual.__testOnly_setupWorkerHandlers,
+  };
+});
 
 vi.mock('../src/im/lark/card-handler.js', () => ({
   runAutoWorktreeCommit: (...args: any[]) => runAutoWorktreeCommitMock(...args),
@@ -137,6 +144,11 @@ import { getBot } from '../src/bot-registry.js';
 import { getAllBots } from '../src/bot-registry.js';
 import type { ScheduledTask } from '../src/types.js';
 import { setActiveSessionSafe } from '../src/core/worker-pool.js';
+import {
+  __testOnly_resetSessionExecutorRuntime,
+  __testOnly_setupWorkerHandlers,
+  initWorkerPool,
+} from '../src/core/worker-pool.js';
 import {
   applyQueuedCodexAppLegacyFallback,
   mergeQueuedCodexAppTurn,
@@ -746,6 +758,119 @@ describe('spawnDashboardSession — backlog (待办池) parks without starting t
 });
 
 describe('spawnDashboardSession — in_progress starts immediately', () => {
+  it('publishes an address barrier before awaiting the initial effect and clears it on settlement', async () => {
+    const active = new Map<string, DaemonSession>();
+    let releasePicker!: () => void;
+    let pickerStarted!: () => void;
+    const pickerGate = new Promise<void>(resolve => { releasePicker = resolve; });
+    const pickerStart = new Promise<void>(resolve => { pickerStarted = resolve; });
+    vi.mocked(getBot).mockReturnValue({
+      config: { cliId: 'claude-code', workingDir: '/tmp', defaultWorkingDir: undefined },
+      botName: 'TestBot',
+      botOpenId: 'ou_bot',
+    } as any);
+    scanMultipleProjectsMock.mockReturnValue([
+      { name: 'repo', path: '/tmp', type: 'repo', branch: 'main' },
+    ]);
+    sendMessageMock.mockImplementationOnce(async () => {
+      pickerStarted();
+      await pickerGate;
+      return 'om_opening_barrier_picker';
+    });
+
+    const spawning = spawnDashboardSession(active, undefined, {
+      larkAppId: APP,
+      chatId: CHAT,
+      content: 'hold the initial effect',
+      column: 'in_progress',
+      role: 'solo',
+    });
+
+    await pickerStart;
+    const published = active.get(sessionKey(CHAT, APP))!;
+    expect(published.dashboardSpawnOpeningPending).toBe(true);
+    releasePicker();
+    await expect(spawning).resolves.toMatchObject({ ok: true });
+    expect(published.dashboardSpawnOpeningPending).toBe(false);
+  });
+
+  it('clears the opening barrier before a forked worker executor observation mutates the Session actor', async () => {
+    const active = new Map<string, DaemonSession>();
+    const terminalObserved = new Promise<void>(resolve => {
+      __testOnly_resetSessionExecutorRuntime();
+      initWorkerPool({
+        sessionReply: vi.fn(async () => 'om_reply'),
+        getSessionWorkingDir: () => '/tmp',
+        getActiveCount: () => 1,
+        closeSession: vi.fn(),
+        onTurnTerminal: vi.fn(async () => resolve()),
+      } as any);
+    });
+    let openingPendingAtWorkerEvent: boolean | undefined;
+    let openingPendingAtActorMutation: boolean | undefined;
+    let published: DaemonSession | undefined;
+
+    forkWorkerMock.mockImplementationOnce((ds: DaemonSession) => {
+      published = ds;
+      const worker = new EventEmitter() as DaemonSession['worker'];
+      Object.assign(worker as object, {
+        killed: false,
+        pid: 91234,
+        send: vi.fn(),
+        kill: vi.fn(),
+        stdout: new EventEmitter(),
+        stderr: new EventEmitter(),
+      });
+      ds.worker = worker;
+      __testOnly_setupWorkerHandlers(ds, worker as never);
+
+      let managedTurnOrigin: DaemonSession['managedTurnOrigin'] = {
+        turnId: 'turn-dashboard-opening-race',
+        dispatchAttempt: 1,
+      } as DaemonSession['managedTurnOrigin'];
+      Object.defineProperty(ds, 'managedTurnOrigin', {
+        configurable: true,
+        get: () => managedTurnOrigin,
+        set: value => {
+          if (managedTurnOrigin !== undefined && value === undefined) {
+            openingPendingAtActorMutation = ds.dashboardSpawnOpeningPending;
+          }
+          managedTurnOrigin = value;
+        },
+      });
+
+      // ChildProcess IPC is delivered from an event-loop task. The fulfilled
+      // forkOrShowRepoCard Promise must resume spawnDashboardSession's finally
+      // microtask and clear the publication barrier before this observation
+      // can enter the real Executor Runtime transition.
+      setImmediate(() => {
+        openingPendingAtWorkerEvent = ds.dashboardSpawnOpeningPending;
+        (worker as unknown as EventEmitter).emit('message', {
+          type: 'turn_terminal',
+          sessionId: ds.session.sessionId,
+          turnId: 'turn-dashboard-opening-race',
+          dispatchAttempt: 1,
+          status: 'completed',
+        });
+      });
+      return true;
+    });
+
+    await expect(spawnDashboardSession(active, undefined, {
+      larkAppId: APP,
+      chatId: CHAT,
+      content: 'prove executor ordering',
+      column: 'in_progress',
+      role: 'solo',
+    })).resolves.toMatchObject({ ok: true });
+
+    expect(published?.dashboardSpawnOpeningPending).toBe(false);
+    await terminalObserved;
+    expect(openingPendingAtWorkerEvent).toBe(false);
+    expect(openingPendingAtActorMutation).toBe(false);
+    expect(published?.managedTurnOrigin).toBeUndefined();
+  });
+
   it('forks the worker with a botmux-wrapped prompt carrying the content; not queued', async () => {
     const active = new Map<string, DaemonSession>();
     const r = await spawnDashboardSession(active, undefined, {

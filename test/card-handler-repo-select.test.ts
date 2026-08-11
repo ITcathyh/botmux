@@ -167,7 +167,13 @@ import { submitCurrentPendingRepoCompletion } from '../src/core/current-pending-
 import { forkWorker, killWorker, teardownAuthoritativePersistentBackingBeforeClose, deliverEphemeralOrReply, deliverWriteLinkCard, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock } from '../src/core/worker-pool.js';
 import { buildNewTopicCliInput, getAvailableBots, getSessionWorkingDir } from '../src/core/session-manager.js';
 import { getBot } from '../src/bot-registry.js';
-import { createSession, closeSession, updateSession } from '../src/services/session-store.js';
+import {
+  createSession,
+  closeSession,
+  getSessionForOwnerStrict,
+  listSessionsForOwnerStrict,
+  updateSession,
+} from '../src/services/session-store.js';
 import { createRepoWorktree, pushWorktreeBranch, removeRepoWorktree } from '../src/services/git-worktree.js';
 import { applyConfigField } from '../src/services/bot-config-store.js';
 import { deleteMessage, replyMessage } from '../src/im/lark/client.js';
@@ -230,6 +236,23 @@ function makeDs(overrides?: Partial<DaemonSession>): DaemonSession {
 
 function makeDeps(ds: DaemonSession, projects = PROJECTS) {
   const activeSessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
+  vi.mocked(listSessionsForOwnerStrict).mockImplementation((ownerLarkAppId: string) => (
+    [...activeSessions.values()]
+      .filter(candidate => candidate.larkAppId === ownerLarkAppId)
+      .map(candidate => JSON.parse(JSON.stringify(candidate.session)) as DaemonSession['session'])
+  ));
+  vi.mocked(getSessionForOwnerStrict).mockImplementation((
+    ownerLarkAppId: string,
+    sessionId: string,
+  ) => {
+    const candidate = [...activeSessions.values()].find(current => (
+      current.larkAppId === ownerLarkAppId
+      && current.session.sessionId === sessionId
+    ));
+    return candidate
+      ? JSON.parse(JSON.stringify(candidate.session)) as DaemonSession['session']
+      : undefined;
+  });
   const sessionReply = vi.fn(async () => 'om_reply');
   const pendingRepoCompletions: Array<ReturnType<typeof submitCurrentPendingRepoCompletion>> = [];
   const submitPendingRepoCompletion: typeof submitCurrentPendingRepoCompletion = input => {

@@ -134,6 +134,10 @@ import { buildExternalEventTopicMessage, triggerSessionTurn } from '../src/core/
 import { sessionKey } from '../src/core/types.js';
 import { withActiveSessionKeyLock } from '../src/core/worker-pool.js';
 import { resolveSessionReplyTarget } from '../src/core/reply-target.js';
+import {
+  currentRouteAdmissionKey,
+  reserveCurrentRouteAdmission,
+} from '../src/core/current-route-admission.js';
 
 const APP = 'app1';
 const CHAT = 'oc_root_chat';
@@ -148,7 +152,7 @@ function request(overrides: Partial<TriggerRequest['target']> = {}): TriggerRequ
 }
 
 function session(id: string): any {
-  return { sessionId: id, chatId: CHAT, rootMessageId: ROOT, scope: 'thread', status: 'active', createdAt: '2026-06-01T00:00:00.000Z' };
+  return { sessionId: id, larkAppId: APP, chatId: CHAT, rootMessageId: ROOT, scope: 'thread', status: 'active', createdAt: '2026-06-01T00:00:00.000Z' };
 }
 
 function existingDs(overrides: Partial<DaemonSession> = {}): DaemonSession {
@@ -640,6 +644,7 @@ describe('triggerSessionTurn rootMessageId target', () => {
 
   it('reforks an explicitly targeted dormant chat-scope session with the stable turn id', async () => {
     const ds = existingDs({ scope: 'chat', workerGeneration: 3 });
+    ds.session.scope = 'chat';
     ds.session.rootMessageId = CHAT;
     const activeSessions = new Map<string, DaemonSession>([[sessionKey(CHAT, APP), ds]]);
     const req = request({ sessionId: ds.session.sessionId, rootMessageId: undefined });
@@ -661,8 +666,164 @@ describe('triggerSessionTurn rootMessageId target', () => {
     );
   });
 
+  it('does not accept an existing-session turn after relocation owns and retires that route', async () => {
+    const ds = existingDs({ scope: 'chat' });
+    ds.session.scope = 'chat';
+    ds.session.rootMessageId = CHAT;
+    const activeSessions = new Map<string, DaemonSession>([[sessionKey(CHAT, APP), ds]]);
+    const routeKey = currentRouteAdmissionKey({
+      ownerLarkAppId: APP,
+      scope: 'chat',
+      canonicalAnchor: CHAT,
+      chatId: CHAT,
+      chatType: 'group',
+    });
+    const relocation = reserveCurrentRouteAdmission(routeKey);
+    await relocation.ready;
+
+    const triggering = triggerSessionTurn(
+      request({ sessionId: ds.session.sessionId, rootMessageId: undefined }),
+      { larkAppId: APP, activeSessions },
+    );
+    await vi.waitFor(() => expect(mockIsInChat).toHaveBeenCalledWith(APP, CHAT));
+    await Promise.resolve();
+
+    expect(mockForkWorker).not.toHaveBeenCalled();
+    expect(mockRememberLastCliInput).not.toHaveBeenCalled();
+
+    const unrelated = reserveCurrentRouteAdmission(currentRouteAdmissionKey({
+      ownerLarkAppId: APP,
+      scope: 'chat',
+      canonicalAnchor: 'oc_unrelated',
+      chatId: 'oc_unrelated',
+      chatType: 'group',
+    }));
+    await unrelated.ready;
+    unrelated.release();
+
+    activeSessions.delete(sessionKey(CHAT, APP));
+    relocation.release();
+
+    await expect(triggering).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'session_not_found',
+    });
+    expect(mockForkWorker).not.toHaveBeenCalled();
+    expect(mockRememberLastCliInput).not.toHaveBeenCalled();
+  });
+
+  it('waits through an empty relocation window and joins the relocated route winner', async () => {
+    const routeKey = currentRouteAdmissionKey({
+      ownerLarkAppId: APP,
+      scope: 'chat',
+      canonicalAnchor: CHAT,
+      chatId: CHAT,
+      chatType: 'group',
+    });
+    const relocation = reserveCurrentRouteAdmission(routeKey);
+    await relocation.ready;
+    const activeSessions = new Map<string, DaemonSession>();
+    const req = request({ rootMessageId: undefined });
+    req.presentation = { topicMessage: null };
+
+    const triggering = triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+    await vi.waitFor(() => expect(mockIsInChat).toHaveBeenCalledWith(APP, CHAT));
+    await Promise.resolve();
+    expect(mockCreateSession).not.toHaveBeenCalled();
+
+    const send = vi.fn();
+    const relocated = existingDs({
+      scope: 'chat',
+      worker: { killed: false, send } as any,
+    });
+    relocated.session.scope = 'chat';
+    relocated.session.rootMessageId = CHAT;
+    activeSessions.set(sessionKey(CHAT, APP), relocated);
+    relocation.release();
+
+    await expect(triggering).resolves.toMatchObject({
+      ok: true,
+      action: 'delivered',
+      target: { sessionId: relocated.session.sessionId },
+    });
+    expect(mockCreateSession).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses the resolved p2p chat type for an empty fresh-route admission', async () => {
+    mockGetChatMode.mockResolvedValueOnce('p2p');
+    const route = reserveCurrentRouteAdmission(currentRouteAdmissionKey({
+      ownerLarkAppId: APP,
+      scope: 'chat',
+      canonicalAnchor: CHAT,
+      chatId: CHAT,
+      chatType: 'p2p',
+    }));
+    await route.ready;
+    const req = request({ rootMessageId: undefined });
+    req.presentation = { topicMessage: null };
+
+    const triggering = triggerSessionTurn(req, {
+      larkAppId: APP,
+      activeSessions: new Map(),
+    });
+    await vi.waitFor(() => expect(mockGetChatMode).toHaveBeenCalled());
+    await Promise.resolve();
+    expect(mockCreateSession).not.toHaveBeenCalled();
+
+    route.release();
+    await expect(triggering).resolves.toMatchObject({ ok: true, action: 'queued' });
+    expect(mockCreateSession).toHaveBeenCalledWith(
+      CHAT,
+      CHAT,
+      '[External] alerts',
+      'p2p',
+    );
+  });
+
+  it('fails closed for noncanonical or cross-owner duplicate existing bindings', async () => {
+    const noncanonical = existingDs({ scope: 'chat' });
+    noncanonical.session.scope = 'chat';
+    noncanonical.session.rootMessageId = CHAT;
+    const explicit = request({
+      sessionId: noncanonical.session.sessionId,
+      rootMessageId: undefined,
+    });
+    await expect(triggerSessionTurn(explicit, {
+      larkAppId: APP,
+      activeSessions: new Map([['noncanonical-alias', noncanonical]]),
+    })).resolves.toMatchObject({ ok: false, errorCode: 'session_not_found' });
+
+    const owner = existingDs({ scope: 'chat' });
+    owner.session.scope = 'chat';
+    owner.session.rootMessageId = CHAT;
+    const foreign = existingDs({
+      scope: 'chat',
+      larkAppId: 'foreign-app',
+      chatId: 'oc_foreign',
+    });
+    foreign.session = {
+      ...foreign.session,
+      sessionId: owner.session.sessionId,
+      larkAppId: 'foreign-app',
+      chatId: 'oc_foreign',
+      rootMessageId: 'oc_foreign',
+      scope: 'chat',
+    };
+    await expect(triggerSessionTurn(explicit, {
+      larkAppId: APP,
+      activeSessions: new Map([
+        [sessionKey(CHAT, APP), owner],
+        [sessionKey('oc_foreign', 'foreign-app'), foreign],
+      ]),
+    })).resolves.toMatchObject({ ok: false, errorCode: 'session_not_found' });
+    expect(mockForkWorker).not.toHaveBeenCalled();
+    expect(mockRememberLastCliInput).not.toHaveBeenCalled();
+  });
+
   it('uses the persisted generation when a daemon-restored dormant session reforks', async () => {
     const ds = existingDs({ scope: 'chat', workerGeneration: undefined });
+    ds.session.scope = 'chat';
     ds.session.rootMessageId = CHAT;
     ds.session.workerGeneration = 8;
     const activeSessions = new Map<string, DaemonSession>([[sessionKey(CHAT, APP), ds]]);
@@ -697,6 +858,7 @@ describe('triggerSessionTurn rootMessageId target', () => {
       botOpenId: 'ou_bot',
     });
     const ds = existingDs({ scope: 'chat', workerGeneration: 4 });
+    ds.session.scope = 'chat';
     ds.session.rootMessageId = CHAT;
     const req = request({ sessionId: ds.session.sessionId, rootMessageId: undefined });
     const beforeDispatch = vi.fn(() => ({ dispatchAttempt: 6 }));
@@ -746,6 +908,53 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(mockCreateSession).not.toHaveBeenCalled();
   });
 
+  it('reports a dormant wait dispatch refusal without accepting or persisting the turn', async () => {
+    mockForkWorker.mockReturnValueOnce(false);
+    const ds = existingDs();
+    const activeSessions = new Map<string, DaemonSession>([[sessionKey(ROOT, APP), ds]]);
+    const req = request();
+    req.options = { waitForFinalOutput: true, timeoutMs: 1000 };
+
+    await expect(triggerSessionTurn(req, { larkAppId: APP, activeSessions }))
+      .resolves.toMatchObject({
+        ok: false,
+        errorCode: 'trigger_failed',
+        error: expect.stringContaining('refused'),
+      });
+    expect(ds.pendingWaitPromises?.size ?? 0).toBe(0);
+    expect(mockRememberLastCliInput).not.toHaveBeenCalled();
+  });
+
+  it('releases existing route admission after synchronous dispatch instead of model terminal', async () => {
+    const ds = existingDs({ scope: 'chat' });
+    ds.session.scope = 'chat';
+    ds.session.rootMessageId = CHAT;
+    const activeSessions = new Map<string, DaemonSession>([[sessionKey(CHAT, APP), ds]]);
+    const req = request({ sessionId: ds.session.sessionId, rootMessageId: undefined });
+    req.options = { waitForFinalOutput: true, timeoutMs: 1000 };
+
+    const waitingForModel = triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+    await vi.waitFor(() => expect(ds.pendingWaitPromises?.size).toBe(1));
+
+    const successor = reserveCurrentRouteAdmission(currentRouteAdmissionKey({
+      ownerLarkAppId: APP,
+      scope: 'chat',
+      canonicalAnchor: CHAT,
+      chatId: CHAT,
+      chatType: 'group',
+    }));
+    await successor.ready;
+    successor.release();
+
+    const waiter = [...ds.pendingWaitPromises!.values()][0]!;
+    waiter.resolve('done');
+    await expect(waitingForModel).resolves.toMatchObject({
+      ok: true,
+      action: 'completed',
+      output: { content: 'done' },
+    });
+  });
+
   it('shares first-owner locking with a paused resume claim and reuses the resume winner', async () => {
     const activeSessions = new Map<string, DaemonSession>();
     const key = sessionKey(ROOT, APP);
@@ -789,6 +998,23 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(ds?.initialStartPending).toBe(true);
     expect(ds?.pendingPrompt).toContain('<botmux_external_event trusted="false">');
     expect(ds?.pendingCodexAppText).toBe('外部事件触发');
+  });
+
+  it('keeps a fresh opening reservation when ordinary dormant fork refuses acceptance', async () => {
+    mockForkWorker.mockReturnValueOnce(false);
+    const activeSessions = new Map<string, DaemonSession>();
+
+    await expect(triggerSessionTurn(request(), { larkAppId: APP, activeSessions }))
+      .resolves.toMatchObject({
+        ok: false,
+        errorCode: 'trigger_failed',
+        error: expect.stringContaining('refused'),
+      });
+
+    const ds = activeSessions.get(sessionKey(ROOT, APP));
+    expect(ds?.initialStartPending).toBe(true);
+    expect(ds?.pendingPrompt).toContain('<botmux_external_event trusted="false">');
+    expect(mockRememberLastCliInput).not.toHaveBeenCalled();
   });
 
   it('cleans the wait registry but retains the opening reservation when write-ahead throws', async () => {
@@ -959,9 +1185,12 @@ describe('triggerSessionTurn suppressFinalOutput (loud connector opt-in)', () =>
     ds.session.scope = 'chat';
     ds.session.currentReplyTarget = anchor as any;
     ds.session.replyTargets = { om_human: { rootMessageId: 'om_shared_topic', updatedAt: 'x' } };
-    const activeSessions = new Map<string, DaemonSession>([[sessionKey(ROOT, APP), ds]]);
+    const activeSessions = new Map<string, DaemonSession>([[sessionKey(CHAT, APP), ds]]);
+    const req = loudReq();
+    req.target.sessionId = ds.session.sessionId;
+    req.target.rootMessageId = undefined;
 
-    await triggerSessionTurn(loudReq(), { larkAppId: APP, activeSessions });
+    await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
 
     const turnId = armedTurnId(ds);
     // The synthetic trigger turn inherited the shared-topic anchor, so its

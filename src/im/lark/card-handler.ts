@@ -39,7 +39,7 @@ import {
   OVERLOAD_ACTION_NOOP,
   type OverloadCardState,
 } from '../../core/host-overload-alert.js';
-import { listOnlineDaemons } from '../../utils/daemon-discovery.js';
+import { listOnlineDaemons, type OnlineDaemonInfo } from '../../utils/daemon-discovery.js';
 import { fetchDaemonIpc } from '../../core/daemon-ipc-auth.js';
 import { recordObservedBots } from '../../services/observed-bots-store.js';
 import {
@@ -717,53 +717,197 @@ export async function runAutoWorktreeCommit(deps: {
 
 // ─── Main handler ─────────────────────────────────────────────────────────
 
-/**
- * Drive a host-overload降压 sweep across daemons.
- *
- * Both modes fan out to EVERY online daemon and sum the affected counts. Each
- * daemon owns one bot-scoped session store and its own live workers, so neither
- * stopped sessions nor idle workers can be swept through a sibling daemon.
- *
- * Fail-closed on partial failure: if ANY discovered daemon doesn't ACK, throw —
- * the caller then rolls back the nonce (releaseOverloadNonce) so the owner can
- * retry, instead of burning the button on a card that reports「已清理 0」while
- * the daemon that actually held the zombies never ran. Both sweeps are
- * idempotent (an already-closed session leaves the stopped set; an already-
- * suspended worker leaves the idle set), so a retry only re-hits whatever
- * failed. Reporting a partial count as a completed action would resurrect the
- * exact "显示 0、实际没清" symptom this fix exists to kill — just triggered by
- * "the daemon holding the zombies failed" instead of "the first daemon had none".
- */
-async function sweepHostOverload(mode: 'clean_stopped' | 'suspend_idle'): Promise<number> {
-  const daemons = listOnlineDaemons();
-  if (daemons.length === 0) throw new Error(`sweep ${mode}: no online daemon`);
+type HostOverloadSweepMode = 'clean_stopped' | 'suspend_idle';
 
-  const postSweep = async (d: { ipcPort: number; larkAppId: string }): Promise<number | null> => {
+interface HostOverloadSweepTarget {
+  readonly larkAppId: string;
+  readonly bootInstanceId: string;
+}
+
+interface HostOverloadSweepReceipt {
+  readonly mode: HostOverloadSweepMode;
+  plan?: readonly HostOverloadSweepTarget[];
+  readonly unresolved: Map<string, HostOverloadSweepTarget>;
+  affected: number;
+  state: 'retryable' | 'running' | 'completed' | 'quarantined';
+  terminal?: Promise<number>;
+  error?: Error;
+}
+
+// Process-epoch receipts are deliberately never evicted. Without durable
+// evidence, forgetting one could fan the same operation out to a later daemon
+// population or reuse an operation identity for another mode.
+const hostOverloadSweepReceipts = new Map<string, HostOverloadSweepReceipt>();
+
+function quarantineHostOverloadSweep(
+  receipt: HostOverloadSweepReceipt,
+  message: string,
+): never {
+  const error = new Error(message);
+  receipt.state = 'quarantined';
+  receipt.error = error;
+  throw error;
+}
+
+function freezeHostOverloadSweepPlan(
+  receipt: HostOverloadSweepReceipt,
+  daemons: readonly OnlineDaemonInfo[],
+): readonly HostOverloadSweepTarget[] {
+  if (daemons.length === 0) {
+    throw new Error(`sweep ${receipt.mode}: no online daemon available to freeze the operation batch`);
+  }
+  const seenApps = new Set<string>();
+  const plan: HostOverloadSweepTarget[] = [];
+  for (const daemon of daemons) {
+    if (!daemon.larkAppId
+        || !daemon.bootInstanceId
+        || seenApps.has(daemon.larkAppId)) {
+      return quarantineHostOverloadSweep(
+        receipt,
+        `sweep ${receipt.mode}: daemon inventory has no unique process identity`,
+      );
+    }
+    seenApps.add(daemon.larkAppId);
+    plan.push(Object.freeze({
+      larkAppId: daemon.larkAppId,
+      bootInstanceId: daemon.bootInstanceId,
+    }));
+  }
+  plan.sort((left, right) => left.larkAppId.localeCompare(right.larkAppId));
+  const frozen = Object.freeze(plan);
+  receipt.plan = frozen;
+  for (const target of frozen) receipt.unresolved.set(target.larkAppId, target);
+  return frozen;
+}
+
+function exactUnresolvedHostOverloadDaemons(
+  receipt: HostOverloadSweepReceipt,
+  daemons: readonly OnlineDaemonInfo[],
+): { readonly exact: readonly OnlineDaemonInfo[]; readonly missing: number } {
+  const candidates = new Map<string, OnlineDaemonInfo[]>();
+  for (const daemon of daemons) {
+    if (!receipt.unresolved.has(daemon.larkAppId)) continue;
+    const appCandidates = candidates.get(daemon.larkAppId) ?? [];
+    appCandidates.push(daemon);
+    candidates.set(daemon.larkAppId, appCandidates);
+  }
+
+  const exact: OnlineDaemonInfo[] = [];
+  let missing = 0;
+  for (const target of receipt.unresolved.values()) {
+    const appCandidates = candidates.get(target.larkAppId) ?? [];
+    if (appCandidates.length === 0) {
+      missing += 1;
+      continue;
+    }
+    if (appCandidates.length !== 1
+        || appCandidates[0]!.bootInstanceId !== target.bootInstanceId) {
+      return quarantineHostOverloadSweep(
+        receipt,
+        `sweep ${receipt.mode}: daemon ${target.larkAppId} changed process identity; reconciliation required`,
+      );
+    }
+    exact.push(appCandidates[0]!);
+  }
+  return { exact, missing };
+}
+
+async function driveHostOverloadSweep(
+  receipt: HostOverloadSweepReceipt,
+  operationId: string,
+): Promise<number> {
+  let daemons: readonly OnlineDaemonInfo[];
+  try {
+    daemons = listOnlineDaemons();
+  } catch (error) {
+    if (!receipt.plan) {
+      throw new Error(
+        `sweep ${receipt.mode}: initial daemon inventory is unreadable: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    throw error;
+  }
+  if (!receipt.plan) freezeHostOverloadSweepPlan(receipt, daemons);
+  const { exact, missing } = exactUnresolvedHostOverloadDaemons(receipt, daemons);
+
+  const results = await Promise.all(exact.map(async (daemon) => {
     try {
-      const res = await fetchDaemonIpc(d.ipcPort, '/api/host-overload/sweep', {
+      const res = await fetchDaemonIpc(daemon.ipcPort, '/api/host-overload/sweep', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ mode }),
+        body: JSON.stringify({ mode: receipt.mode, operationId }),
       });
       const body: any = await res.json().catch(() => ({}));
-      if (res.ok && body?.ok && typeof body.affected === 'number') return body.affected;
-      logger.warn(`[overload-sweep] daemon ${d.larkAppId} returned ${res.status} ${JSON.stringify(body)}`);
-      return null;
-    } catch (err) {
-      logger.warn(`[overload-sweep] daemon ${d.larkAppId} unreachable: ${err instanceof Error ? err.message : String(err)}`);
-      return null;
+      if (res.ok && body?.ok && typeof body.affected === 'number') {
+        return { daemon, affected: body.affected } as const;
+      }
+      logger.warn(
+        `[overload-sweep] daemon ${daemon.larkAppId}@${daemon.bootInstanceId} `
+        + `returned ${res.status} ${JSON.stringify(body)}`,
+      );
+    } catch (error) {
+      logger.warn(
+        `[overload-sweep] daemon ${daemon.larkAppId}@${daemon.bootInstanceId} unreachable: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
     }
-  };
+    return { daemon, affected: null } as const;
+  }));
 
-  // Fan out to all daemons and sum. Fail the whole action if ANY didn't ACK, so
-  // the caller keeps the button retriable rather than reporting a partial sweep
-  // as complete.
-  const results = await Promise.all(daemons.map(postSweep));
-  const failed = results.filter(n => n === null).length;
-  if (failed > 0) {
-    throw new Error(`sweep ${mode}: ${failed}/${daemons.length} daemon(s) did not ack — retriable`);
+  let failed = missing;
+  for (const result of results) {
+    if (result.affected === null) {
+      failed += 1;
+      continue;
+    }
+    receipt.affected += result.affected;
+    receipt.unresolved.delete(result.daemon.larkAppId);
   }
-  return results.reduce((sum: number, n) => sum + (n ?? 0), 0);
+  if (failed > 0) {
+    throw new Error(
+      `sweep ${receipt.mode}: ${failed}/${receipt.unresolved.size} unresolved daemon(s) did not ack — retriable`,
+    );
+  }
+  receipt.state = 'completed';
+  return receipt.affected;
+}
+
+/** Drive one stable, fixed-daemon host-overload sweep. */
+export async function sweepHostOverload(
+  mode: HostOverloadSweepMode,
+  operationId: string,
+): Promise<number> {
+  const prior = hostOverloadSweepReceipts.get(operationId);
+  if (prior) {
+    if (prior.mode !== mode) {
+      throw new Error(`sweep operation ${operationId} already belongs to mode ${prior.mode}`);
+    }
+    if (prior.state === 'completed') return prior.affected;
+    if (prior.state === 'quarantined') throw prior.error;
+    if (prior.state === 'running') return prior.terminal!;
+  }
+
+  const receipt = prior ?? {
+    mode,
+    unresolved: new Map<string, HostOverloadSweepTarget>(),
+    affected: 0,
+    state: 'retryable' as const,
+  };
+  if (!prior) hostOverloadSweepReceipts.set(operationId, receipt);
+
+  // Defer inventory discovery so the process-epoch receipt is visible even to
+  // synchronous instrumentation that re-enters from listOnlineDaemons().
+  const terminal = Promise.resolve().then(
+    () => driveHostOverloadSweep(receipt, operationId),
+  );
+  receipt.state = 'running';
+  receipt.terminal = terminal;
+  try {
+    return await terminal;
+  } catch (error) {
+    if (receipt.state === 'running') receipt.state = 'retryable';
+    throw error;
+  }
 }
 
 /**
@@ -837,7 +981,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const mode = value.action === OVERLOAD_ACTION_CLEAN_STOPPED ? 'clean_stopped' : 'suspend_idle';
     let affected: number;
     try {
-      affected = await sweepHostOverload(mode);
+      affected = await sweepHostOverload(mode, `${st.nonce}:${value.action}`);
     } catch (err) {
       logger.warn(`[overload] ${value.action} failed: ${err instanceof Error ? err.message : String(err)}`);
       // Only the destructive sweep is guarded here: roll back the claim so a

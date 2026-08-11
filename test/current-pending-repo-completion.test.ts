@@ -735,7 +735,7 @@ describe('Current pending-repo first-start completion', () => {
     expect(dispatchWorker).not.toHaveBeenCalled();
   });
 
-  it('does not hold the Session lane while worktree and available-Bot materialization awaits', async () => {
+  it('runs repository materialization outside the lane without letting a later control pass it', async () => {
     const effect = deferred<CurrentPendingRepoCompletionMaterializeResult>();
     const seenMaterial = deferred<CurrentPendingRepoCompletionMaterializeInput>();
     const { host } = createFixture(async input => {
@@ -770,9 +770,8 @@ describe('Current pending-repo first-start completion', () => {
     expect(Object.isFrozen(externalInput.opening)).toBe(true);
     expect(Object.isFrozen(externalInput.opening.followUps)).toBe(true);
 
-    // A same-Session semantic command must finish while the external effect is
-    // unresolved. If completion held the lane, this await would deadlock.
-    await expect(host.runtime.submit({
+    let renameSettled = false;
+    const rename = host.runtime.submit({
       target: { kind: 'session', address },
       idempotencyKey: 'rename-while-worktree-awaits',
       command: {
@@ -783,13 +782,19 @@ describe('Current pending-repo first-start completion', () => {
           source: 'user',
         },
       },
-    })).resolves.toMatchObject({ kind: 'applied', action: 'control.renamed' });
+    }).then((result) => {
+      renameSettled = true;
+      return result;
+    });
+    await Promise.resolve();
+    expect(renameSettled).toBe(false);
 
     effect.resolve(materialized(materialFor(externalInput)));
     await completion;
+    await expect(rename).resolves.toMatchObject({ kind: 'applied', action: 'control.renamed' });
   });
 
-  it('preserves a public control rename committed while refused-worktree cleanup awaits', async () => {
+  it('preserves a public control rename ordered after refused-worktree cleanup', async () => {
     const cleanupStarted = deferred<void>();
     const cleanupResult = deferred<{ kind: 'cleaned' }>();
     const materialize = vi.fn(async (input: CurrentPendingRepoCompletionMaterializeInput) => (
@@ -817,7 +822,8 @@ describe('Current pending-repo first-start completion', () => {
     );
     await cleanupStarted.promise;
 
-    await expect(host.runtime.submit({
+    let renameSettled = false;
+    const rename = host.runtime.submit({
       target: { kind: 'session', address },
       idempotencyKey: 'rename-during-refused-worktree-cleanup',
       command: {
@@ -828,14 +834,20 @@ describe('Current pending-repo first-start completion', () => {
           source: 'user',
         },
       },
-    })).resolves.toMatchObject({ kind: 'applied', action: 'control.renamed' });
-    expect(ds.session.title).toBe('rename committed during cleanup');
+    }).then((result) => {
+      renameSettled = true;
+      return result;
+    });
+    await Promise.resolve();
+    expect(renameSettled).toBe(false);
+    expect(ds.session.title).not.toBe('rename committed during cleanup');
 
     cleanupResult.resolve({ kind: 'cleaned' });
     await expect(completion).resolves.toMatchObject({
       kind: 'retryable',
       message: 'worker synchronously refused the prepared worktree',
     });
+    await expect(rename).resolves.toMatchObject({ kind: 'applied', action: 'control.renamed' });
     expect(ds.session.title).toBe('rename committed during cleanup');
     expect(ds.pendingRepo).toBe(true);
     expect(ds.pendingRepoCommitInFlight).toBe(false);

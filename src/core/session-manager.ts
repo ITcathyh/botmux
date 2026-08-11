@@ -4,7 +4,7 @@
  * session restoration, and scheduled task execution.
  */
 import { existsSync, statSync } from 'node:fs';
-import { basename, join, resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { expandHome } from './working-dir.js';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
@@ -36,7 +36,6 @@ import { adoptTargetLabel, validateAdoptTargetState } from './session-discovery.
 import { getBot, getAllBots, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
 import type { BotConfig } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
-import { sameRuntimeIdentity, type CliRuntimeConfig, type CliRuntimeSnapshot } from '../adapters/cli/runtime.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { composeRowFromActive, composeRowFromPersistedActive } from './dashboard-rows.js';
 import {
@@ -54,6 +53,7 @@ import type { ChatContext, CliTurnPayload, CodexAppAdditionalContextEntry, Codex
 import { addCodexAppContext } from '../utils/codex-app-context.js';
 import { hasUnsettledCodexAppDispatch } from '../utils/codex-app-dispatch-ledger.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
+import { sessionCliSelectionMismatch } from './session-cli-selection.js';
 import type { MessageResource } from '../im/lark/message-parser.js';
 import type { ResolvedSender } from '../im/lark/identity-cache.js';
 import {
@@ -258,52 +258,16 @@ function sameUsageLimit(a: DaemonSession['usageLimit'], b: DaemonSession['usageL
 }
 
 function sessionBotCliMismatch(ds: DaemonSession): { sessionCli: string; botCli: string } | null {
-  const sessionCliId = ds.session.cliId;
-  if (!sessionCliId) return null;
-  let botCfg: { cliId?: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string };
+  let botCfg: ReturnType<typeof getBot>['config'];
   try { botCfg = getBot(ds.larkAppId).config; } catch { return null; }
   if (!botCfg.cliId) return null;
-  const sessionWrapper = ds.session.wrapperCli?.trim() || undefined;
-  const botWrapper = botCfg.wrapperCli?.trim() || undefined;
-  const describe = (
-    cliId: CliId,
-    runtime: CliRuntimeConfig | CliRuntimeSnapshot | undefined,
-    legacyPath: string | undefined,
-    wrapper: string | undefined,
-  ) => {
-    const runtimeName = runtime?.displayName ?? runtime?.id ?? (legacyPath ? basename(legacyPath) : cliId);
-    return wrapper ? `${wrapper} (${runtimeName})` : runtimeName;
-  };
-  if (sessionCliId !== botCfg.cliId) {
-    return {
-      sessionCli: describe(sessionCliId, ds.session.cliRuntime, ds.session.cliPathOverride, sessionWrapper),
-      botCli: describe(botCfg.cliId, botCfg.cliRuntime, botCfg.cliPathOverride, botWrapper),
-    };
-  }
-  // wrapper 轴：'aiden x claude' 与裸 claude-code 共享同一个 cliId，但是两种不同的
-  // 启动选择（selectionKeyForBot 以 cliId+wrapperCli 为键），wrapper 间切换同样不能
-  // 复活旧会话。仅 agentFrozen 的会话有可靠的 wrapper 快照——legacy 未冻结会话下次
-  // fork 会从 live bot 配置回填 wrapper，天然不会在这条轴上失配。
-  if (ds.session.agentFrozen && !sameRuntimeIdentity(
-    {
-      cliId: sessionCliId,
-      cliRuntime: ds.session.cliRuntime,
-      cliPathOverride: ds.session.cliPathOverride,
-      wrapperCli: sessionWrapper,
-    },
-    {
-      cliId: botCfg.cliId,
-      cliRuntime: botCfg.cliRuntime,
-      cliPathOverride: botCfg.cliPathOverride,
-      wrapperCli: botWrapper,
-    },
-  )) {
-    return {
-      sessionCli: describe(sessionCliId, ds.session.cliRuntime, ds.session.cliPathOverride, sessionWrapper),
-      botCli: describe(botCfg.cliId, botCfg.cliRuntime, botCfg.cliPathOverride, botWrapper),
-    };
-  }
-  return null;
+  const mismatch = sessionCliSelectionMismatch(ds.session, {
+    cliId: botCfg.cliId,
+    ...(botCfg.cliRuntime ? { cliRuntime: botCfg.cliRuntime } : {}),
+    ...(botCfg.cliPathOverride ? { cliPathOverride: botCfg.cliPathOverride } : {}),
+    ...(botCfg.wrapperCli ? { wrapperCli: botCfg.wrapperCli } : {}),
+  });
+  return mismatch ? { sessionCli: mismatch.sessionCli, botCli: mismatch.targetCli } : null;
 }
 
 type CliMismatchCloseResult =
@@ -2451,14 +2415,33 @@ export async function ensureTerminalWorkerPort(ds: DaemonSession): Promise<numbe
  *   - 'deferred_unmaterialized' — a silent fresh-topic run finished without
  *                          publishing, so it has no conversation to resume
  *   - 'resume_cancelled' — a concurrent close won while resume was committing
+ *   - 'owner_mismatch'    — the caller's owner/store binding is not current
  */
 export async function resumeSession(
   sessionId: string,
   activeSessions: Map<string, DaemonSession>,
+  options: {
+    owner?: { larkAppId: string; activeSessions: Map<string, DaemonSession> };
+  } = {},
 ): Promise<{ ok: true; ds: DaemonSession }
-| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'vc_receiver_managed' | 'deferred_unmaterialized' | 'resume_cancelled'; activeSessionId?: string }> {
-  let session = sessionStore.getSession(sessionId);
+| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'vc_receiver_managed' | 'deferred_unmaterialized' | 'resume_cancelled' | 'owner_mismatch'; activeSessionId?: string }> {
+  const ownerCurrent = (): boolean => (
+    !options.owner
+    || (options.owner.activeSessions === activeSessions
+      && sessionStore.currentSessionStoreOwner() === options.owner.larkAppId)
+  );
+  const readSession = (): Session | undefined => (
+    options.owner ? sessionStore.getOwnedSession(sessionId) : sessionStore.getSession(sessionId)
+  );
+  const closeWithinOwner = (targetSessionId: string) => options.owner
+    ? closeSession(targetSessionId, { owner: options.owner })
+    : closeSession(targetSessionId);
+  if (!ownerCurrent()) return { ok: false, error: 'owner_mismatch' };
+  let session = readSession();
   if (!session) return { ok: false, error: 'not_found' };
+  if (options.owner && session.larkAppId && session.larkAppId !== options.owner.larkAppId) {
+    return { ok: false, error: 'owner_mismatch' };
+  }
   if (session.status !== 'closed') return { ok: false, error: 'not_closed' };
 
   // A dedicated VC receiver is not an ordinary chat conversation. Its
@@ -2490,15 +2473,22 @@ export async function resumeSession(
   }
 
   const scope: 'thread' | 'chat' = session.scope === 'chat' ? 'chat' : 'thread';
-  const larkAppId = session.larkAppId ?? getAllBots()[0]?.config.larkAppId ?? '';
+  const larkAppId = options.owner?.larkAppId
+    ?? session.larkAppId
+    ?? getAllBots()[0]?.config.larkAppId
+    ?? '';
   const anchor = storedSessionAnchorId(session);
   const key = sessionKey(anchor, larkAppId);
 
   return withActiveSessionKeyLock(activeSessions, key, async () => {
+  if (!ownerCurrent()) return { ok: false as const, error: 'owner_mismatch' as const };
   // The resume request may have waited behind a fresh creator. Re-read the
   // durable row and keep the already-active creator as first owner.
-  const latest = sessionStore.getSession(sessionId);
+  const latest = readSession();
   if (!latest) return { ok: false as const, error: 'not_found' as const };
+  if (options.owner && latest.larkAppId && latest.larkAppId !== options.owner.larkAppId) {
+    return { ok: false as const, error: 'owner_mismatch' as const };
+  }
   if (latest.status !== 'closed') return { ok: false as const, error: 'not_closed' as const };
   if (latest.vcMeetingReceiver) return { ok: false as const, error: 'vc_receiver_managed' as const };
   if (latest.deferredScheduleRun
@@ -2535,7 +2525,7 @@ export async function resumeSession(
       || !isDisposableCommandScratch(existing)) {
       return { ok: false, error: 'anchor_occupied', activeSessionId: existing.session.sessionId };
     }
-    await closeSession(existing.session.sessionId);
+    await closeWithinOwner(existing.session.sessionId);
     const replacement = activeSessions.get(key);
     if (replacement) {
       return { ok: false, error: 'anchor_occupied', activeSessionId: replacement.session.sessionId };
@@ -2589,7 +2579,7 @@ export async function resumeSession(
     return { ok: false, error: 'anchor_occupied', activeSessionId: realConflict.sessionId };
   }
   for (const scratch of conflicts) {
-    await closeSession(scratch.sessionId);
+    await closeWithinOwner(scratch.sessionId);
   }
   const replacementAfterDiskCleanup = activeSessions.get(key);
   if (replacementAfterDiskCleanup) {
@@ -2616,6 +2606,7 @@ export async function resumeSession(
   // Closed rows created by older releases may still contain a prepared head,
   // tail, or repo picker; generic resume starts a new lifecycle and must never
   // replay those abandoned inputs.
+  if (!ownerCurrent()) return { ok: false as const, error: 'owner_mismatch' as const };
   const reactivated = sessionStore.reactivateClosedSession(sessionId);
   if (!reactivated.ok) return reactivated;
   session = reactivated.session;
@@ -2661,7 +2652,7 @@ export async function resumeSession(
   const registered = setActiveSessionIfActive(activeSessions, key, ds);
   if (!registered || session.status !== 'active' || activeSessions.get(key) !== ds) {
     const occupant = activeSessions.get(key);
-    if (session.status === 'active') await closeSession(sessionId);
+    if (session.status === 'active') await closeWithinOwner(sessionId);
     if (occupant && occupant !== ds) {
       return { ok: false, error: 'anchor_occupied', activeSessionId: occupant.session.sessionId };
     }
@@ -3065,63 +3056,68 @@ export async function spawnDashboardSession(
       pendingCodexAppText: content,
       pendingCodexAppMessageContext: codexAppMessageContext,
       pendingAttachments: args.attachments,
+      dashboardSpawnOpeningPending: true,
     };
     if (column !== 'backlog') {
       ds.initialStartPending = true;
       ds.pendingPrompt = userContent;
     }
     activeSessions.set(key, ds);
-    if (column === 'backlog') {
-      ds.pendingPrompt = userContent;
-      dashboardEventBus.publish({ type: 'session.spawned', body: { session: composeRowFromActive(ds) } });
-    } else {
-      // Keep the key reservation through initial worker/repo-picker
-      // installation. Otherwise a concurrent creator can classify this brief
-      // worker:null interval as disposable scratch, replace it, and let this
-      // caller resume by forking an orphan.
-      try {
-        await forkOrShowRepoCard(ds, userContent);
-      } catch (err) {
-        const durableOwner = hasProtectedSessionMutationOwnership(ds.session);
-        const liveWorkerOwner = !!ds.worker && !ds.worker.killed;
-        if (durableOwner || liveWorkerOwner) {
-          // `forkOrShowRepoCard` can fail after the repo/setup journal was
-          // durably staged (for example picker publish fallback followed by a
-          // fork rejection). That journal is now the exact opening owner; never
-          // erase it in the generic spawn rollback. Rebuild volatile picker
-          // buffers where possible and leave this exact map row active/retryable.
-          if (!ds.session.queuedActivationPending && ds.session.pendingRepoSetup) {
-            restorePendingRepoRuntime(ds);
+    try {
+      if (column === 'backlog') {
+        ds.pendingPrompt = userContent;
+        dashboardEventBus.publish({ type: 'session.spawned', body: { session: composeRowFromActive(ds) } });
+      } else {
+        // Keep the key reservation through initial worker/repo-picker
+        // installation. Otherwise a concurrent creator can classify this brief
+        // worker:null interval as disposable scratch, replace it, and let this
+        // caller resume by forking an orphan.
+        try {
+          await forkOrShowRepoCard(ds, userContent);
+        } catch (err) {
+          const durableOwner = hasProtectedSessionMutationOwnership(ds.session);
+          const liveWorkerOwner = !!ds.worker && !ds.worker.killed;
+          if (durableOwner || liveWorkerOwner) {
+            // `forkOrShowRepoCard` can fail after the repo/setup journal was
+            // durably staged (for example picker publish fallback followed by a
+            // fork rejection). That journal is now the exact opening owner; never
+            // erase it in the generic spawn rollback. Rebuild volatile picker
+            // buffers where possible and leave this exact map row active/retryable.
+            if (!ds.session.queuedActivationPending && ds.session.pendingRepoSetup) {
+              restorePendingRepoRuntime(ds);
+            }
+            ds.initialStartPending = ds.session.queuedActivationPending === true
+              || (ds.session.queuedActivationTail?.length ?? 0) > 0;
+            // The create IPC reports failure, but this durable row is still the
+            // authoritative retry owner. Upsert it so dashboard clients do not
+            // see an invisible occupied chat until the next full hydrate.
+            announceSessionRow(ds);
+            logger.error(
+              `[createSession] opening failed after durable ownership transfer for ${session.sessionId}; `
+              + `retaining exact active owner: ${err instanceof Error ? err.message : String(err)}`,
+            );
+            return { error: err instanceof Error ? err.message : String(err) };
           }
-          ds.initialStartPending = ds.session.queuedActivationPending === true
-            || (ds.session.queuedActivationTail?.length ?? 0) > 0;
-          // The create IPC reports failure, but this durable row is still the
-          // authoritative retry owner. Upsert it so dashboard clients do not
-          // see an invisible occupied chat until the next full hydrate.
-          announceSessionRow(ds);
-          logger.error(
-            `[createSession] opening failed after durable ownership transfer for ${session.sessionId}; `
-            + `retaining exact active owner: ${err instanceof Error ? err.message : String(err)}`,
-          );
-          return { error: err instanceof Error ? err.message : String(err) };
+          // No durable or live owner accepted the opening. Roll back only our
+          // exact runtime claim and close only our row; a concurrently published
+          // successor must survive.
+          if (activeSessions.get(key) === ds) activeSessions.delete(key);
+          try { sessionStore.closeSession(session.sessionId); }
+          catch (closeErr) {
+            logger.error(
+              `[createSession] failed to close unaccepted session ${session.sessionId}: `
+              + `${closeErr instanceof Error ? closeErr.message : String(closeErr)}`,
+            );
+          }
+          return {
+            error: err instanceof Error ? err.message : String(err),
+          };
         }
-        // No durable or live owner accepted the opening. Roll back only our
-        // exact runtime claim and close only our row; a concurrently published
-        // successor must survive.
-        if (activeSessions.get(key) === ds) activeSessions.delete(key);
-        try { sessionStore.closeSession(session.sessionId); }
-        catch (closeErr) {
-          logger.error(
-            `[createSession] failed to close unaccepted session ${session.sessionId}: `
-            + `${closeErr instanceof Error ? closeErr.message : String(closeErr)}`,
-          );
-        }
-        return {
-          error: err instanceof Error ? err.message : String(err),
-        };
       }
+      return { ds, session };
+    } finally {
+      ds.dashboardSpawnOpeningPending = false;
     }
-    return { ds, session };
   });
   if (!registered) return { ok: false, error: 'session_exists' };
   if ('error' in registered && typeof registered.error === 'string') {

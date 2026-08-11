@@ -11,14 +11,22 @@ import {
 import { currentSessionRuntimeHost } from '../src/core/current-session-runtime.js';
 import {
   createCurrentOrdinaryRouteRegistryRuntime,
+  isCurrentRelocationRouteReservation,
   type CurrentOrdinaryRouteOpeningRollbackToken,
 } from '../src/core/current-ordinary-route-registry.js';
+import {
+  createCurrentDashboardRouteOpeningPort,
+  type CurrentDashboardRouteInspection,
+  type CurrentDashboardRouteOpeningPort,
+} from '../src/core/current-dashboard-route-opening.js';
 import type {
   NormalizedOrdinaryImTurn,
   OrdinaryImTransportEnvelope,
 } from '../src/core/ordinary-im-turn.js';
 import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 import type {
+  CommandOutcomeFor,
+  DashboardSpawnCommand,
   SessionAddress,
   SessionProjection,
   SessionRuntime,
@@ -52,14 +60,17 @@ function turn(input: {
   anchor?: string;
   chatId?: string;
   content?: string;
+  scope?: 'thread' | 'chat';
 } = {}): OrdinaryImTransportEnvelope {
   const messageKey = input.messageKey ?? MESSAGE_KEY;
-  const anchor = input.anchor ?? ANCHOR;
+  const scope = input.scope ?? 'thread';
+  const chatId = input.chatId ?? CHAT_ID;
+  const anchor = scope === 'chat' ? chatId : (input.anchor ?? ANCHOR);
   return {
     route: {
-      scope: 'thread',
+      scope,
       canonicalAnchor: anchor,
-      chatId: input.chatId ?? CHAT_ID,
+      chatId,
       chatType: 'group',
     },
     source: 'lark.im',
@@ -131,6 +142,7 @@ function createHarness(input: {
   ownerLarkAppId?: string;
   activeSessions?: Map<string, DaemonSession>;
   materializationGate?: Promise<void>;
+  persistMetadata?: boolean;
 } = {}) {
   const ownerLarkAppId = input.ownerLarkAppId ?? OWNER;
   const activeSessions = input.activeSessions ?? new Map<string, DaemonSession>();
@@ -142,6 +154,7 @@ function createHarness(input: {
     activeSessions,
     metadata: {
       apply(_current, metadataInput) {
+        if (input.persistMetadata) sessionStore.updateSession(_current.session);
         return {
           kind: 'committed',
           sessionId: metadataInput.binding.sessionId,
@@ -254,6 +267,402 @@ afterEach(() => {
 });
 
 describe('Current ordinary route registry', () => {
+  it('quarantines a target scratch published under a noncanonical active key', async () => {
+    const sourceTurn = turn({
+      messageKey: 'om_relocate_alias_source',
+      anchor: 'om_relocate_alias_source_root',
+      chatId: 'oc_relocate_alias_source',
+    });
+    const targetTurn = turn({
+      messageKey: 'om_relocate_alias_target',
+      chatId: 'oc_relocate_alias_target',
+      scope: 'chat',
+    });
+    const source = liveDaemonSession(OWNER, 'session-relocate-alias-source', sourceTurn);
+    const scratch = liveDaemonSession(OWNER, 'session-relocate-alias-scratch', targetTurn);
+    scratch.worker = null;
+    scratch.workerGeneration = 0;
+    scratch.hasHistory = false;
+    const activeSessions = new Map<string, DaemonSession>([
+      [activeSessionKey(source), source],
+      ['noncanonical-target-alias', scratch],
+    ]);
+    sessionStore.updateSession(source.session);
+    sessionStore.updateSession(scratch.session);
+    const address = Object.freeze({}) as SessionAddress;
+    const runtimeSubmit = vi.fn<SessionRuntime['submit']>();
+    const routeRuntime = createCurrentOrdinaryRouteRegistryRuntime({
+      ownerLarkAppId: OWNER,
+      activeSessions,
+      openingCreator: {
+        begin: () => ({ kind: 'unknown', message: 'unused' }),
+        async execute() { throw new Error('unused'); },
+        resume: () => ({ kind: 'unknown', message: 'unused' }),
+        rollback: () => ({ kind: 'rolledBack' }),
+      },
+      downstream: {
+        projection: {
+          async read(query) {
+            if (query.kind !== 'byRoute') return { kind: 'notFound' };
+            return {
+              kind: 'one',
+              session: {
+                address,
+                sessionId: source.session.sessionId,
+                route: { kind: 'thread', anchorId: source.session.rootMessageId },
+                recordStatus: 'active',
+                executorStatus: 'idle',
+              },
+            };
+          },
+        },
+        runtime: { submit: runtimeSubmit },
+      },
+    });
+
+    await expect(routeRuntime.submit({
+      target: {
+        kind: 'route',
+        route: { kind: 'thread', anchorId: source.session.rootMessageId },
+      },
+      idempotencyKey: 'relocate-noncanonical-target-scratch',
+      command: {
+        kind: 'control.mutate',
+        input: {
+          kind: 'relocate',
+          sourceAnchor: source.session.rootMessageId,
+          targetChatId: targetTurn.route.chatId,
+          targetRootMessageId: 'om_relocate_alias_target_audit',
+          requester: { larkAppId: 'app-leader', openId: 'ou_route_sender' },
+        },
+      },
+    })).resolves.toMatchObject({
+      kind: 'quarantined',
+      message: expect.stringContaining('noncanonical registry key'),
+    });
+    expect(runtimeSubmit).not.toHaveBeenCalled();
+    expect(activeSessions.get('noncanonical-target-alias')).toBe(scratch);
+    expect(sessionStore.getSessionForOwnerStrict(OWNER, scratch.session.sessionId)?.status)
+      .toBe('active');
+  });
+
+  it('retires a persisted-only target scratch through its projected Session address', async () => {
+    const sourceTurn = turn({
+      messageKey: 'om_relocate_persisted_source',
+      anchor: 'om_relocate_persisted_source_root',
+      chatId: 'oc_relocate_persisted_source',
+    });
+    const targetTurn = turn({
+      messageKey: 'om_relocate_persisted_target',
+      chatId: 'oc_relocate_persisted_target',
+      scope: 'chat',
+    });
+    const source = liveDaemonSession(OWNER, 'session-relocate-persisted-source', sourceTurn);
+    const scratch = sessionFor(
+      OWNER,
+      'session-relocate-persisted-only-scratch',
+      targetTurn,
+    );
+    const activeSessions = new Map([[activeSessionKey(source), source]]);
+    sessionStore.updateSession(source.session);
+    sessionStore.updateSession(scratch);
+    const sourceAddress = Object.freeze({}) as SessionAddress;
+    const scratchAddress = Object.freeze({}) as SessionAddress;
+    const submissions: Array<{
+      readonly address: SessionAddress;
+      readonly operationIdentity: string;
+      readonly command: 'close' | 'relocate';
+    }> = [];
+    const runtime: SessionRuntime = {
+      async submit(request) {
+        if (request.command.kind !== 'control.mutate' || request.target.kind !== 'session') {
+          throw new Error('unexpected persisted scratch command');
+        }
+        const kind = request.command.input.kind;
+        if (kind !== 'close' && kind !== 'relocate') {
+          throw new Error('unexpected persisted scratch control');
+        }
+        submissions.push({
+          address: request.target.address,
+          operationIdentity: request.idempotencyKey,
+          command: kind,
+        });
+        if (kind === 'close') {
+          expect(request.command.input).toMatchObject({
+            reason: 'relocateScratch',
+            expectedRoute: {
+              scope: 'chat',
+              canonicalAnchor: targetTurn.route.chatId,
+              chatId: targetTurn.route.chatId,
+              chatType: 'group',
+            },
+          });
+          expect(request.target.controlRouteReservation).toBeDefined();
+          sessionStore.closeSession(scratch.sessionId);
+          return {
+            kind: 'applied',
+            action: 'control.mutated',
+            policy: 'control-staged-transition',
+            sessionId: scratch.sessionId,
+            result: { kind: 'closed', alreadyClosed: false, known: true },
+          } as CommandOutcomeFor<typeof request.command>;
+        }
+        return {
+          kind: 'applied',
+          action: 'control.mutated',
+          policy: 'control-staged-transition',
+          sessionId: source.session.sessionId,
+          result: {
+            kind: 'relocated',
+            targetChatId: request.command.input.targetChatId,
+            targetRootMessageId: request.command.input.targetRootMessageId,
+          },
+        } as CommandOutcomeFor<typeof request.command>;
+      },
+    };
+    const routeRuntime = createCurrentOrdinaryRouteRegistryRuntime({
+      ownerLarkAppId: OWNER,
+      activeSessions,
+      openingCreator: {
+        begin: () => ({ kind: 'unknown', message: 'unused' }),
+        async execute() { throw new Error('unused'); },
+        resume: () => ({ kind: 'unknown', message: 'unused' }),
+        rollback: () => ({ kind: 'rolledBack' }),
+      },
+      downstream: {
+        projection: {
+          async read(query) {
+            if (query.kind === 'byExternalSession'
+                && query.sessionId === scratch.sessionId) {
+              return {
+                kind: 'one',
+                session: {
+                  address: scratchAddress,
+                  sessionId: scratch.sessionId,
+                  route: { kind: 'chat', chatId: scratch.chatId },
+                  recordStatus: 'active',
+                  executorStatus: 'dormant',
+                },
+              };
+            }
+            if (query.kind === 'byRoute') {
+              return {
+                kind: 'one',
+                session: {
+                  address: sourceAddress,
+                  sessionId: source.session.sessionId,
+                  route: { kind: 'thread', anchorId: source.session.rootMessageId },
+                  recordStatus: 'active',
+                  executorStatus: 'idle',
+                },
+              };
+            }
+            return { kind: 'notFound' };
+          },
+        },
+        runtime,
+      },
+    });
+
+    await expect(routeRuntime.submit({
+      target: {
+        kind: 'route',
+        route: { kind: 'thread', anchorId: source.session.rootMessageId },
+      },
+      idempotencyKey: 'relocate-persisted-target-scratch',
+      command: {
+        kind: 'control.mutate',
+        input: {
+          kind: 'relocate',
+          sourceAnchor: source.session.rootMessageId,
+          targetChatId: targetTurn.route.chatId,
+          targetRootMessageId: 'om_relocate_persisted_target_audit',
+          requester: { larkAppId: 'app-leader', openId: 'ou_route_sender' },
+        },
+      },
+    })).resolves.toMatchObject({
+      kind: 'applied',
+      sessionId: source.session.sessionId,
+    });
+    expect(submissions).toEqual([
+      {
+        address: scratchAddress,
+        operationIdentity: expect.stringMatching(/^relocate-target-scratch:/),
+        command: 'close',
+      },
+      {
+        address: sourceAddress,
+        operationIdentity: 'relocate-persisted-target-scratch',
+        command: 'relocate',
+      },
+    ]);
+    expect(sessionStore.getSessionForOwnerStrict(OWNER, scratch.sessionId)?.status)
+      .toBe('closed');
+  });
+
+  it('holds the target route through relocate detach so an ordinary opener joins the moved Session', async () => {
+    const sourceTurn = turn({
+      messageKey: 'om_relocate_source',
+      anchor: 'om_relocate_source_root',
+      chatId: 'oc_relocate_source',
+    });
+    const targetTurn = turn({
+      messageKey: 'om_relocate_target_arrival',
+      chatId: 'oc_relocate_target',
+      scope: 'chat',
+    });
+    const source = liveDaemonSession(OWNER, 'session-relocate-route-race', sourceTurn);
+    const activeSessions = new Map([[activeSessionKey(source), source]]);
+    sessionStore.updateSession(source.session);
+
+    const address = Object.freeze({}) as SessionAddress;
+    const detachStarted = deferred<void>();
+    const releaseDetach = deferred<void>();
+    const openingBegin = vi.fn();
+    const controlEffects: string[] = [];
+    const ordinaryEffects: string[] = [];
+    const projection: SessionProjection = {
+      async read(query) {
+        const current = [...activeSessions.values()].find(candidate => (
+          query.kind === 'byExternalSession'
+            ? candidate.session.sessionId === query.sessionId
+            : query.kind === 'byRoute'
+              && (query.route.kind === 'thread'
+                ? candidate.scope === 'thread'
+                  && candidate.session.rootMessageId === query.route.anchorId
+                : candidate.scope === 'chat' && candidate.chatId === query.route.chatId)
+        ));
+        if (!current) return { kind: 'notFound' };
+        return {
+          kind: 'one',
+          session: {
+            address,
+            sessionId: current.session.sessionId,
+            route: current.scope === 'chat'
+              ? { kind: 'chat', chatId: current.chatId }
+              : { kind: 'thread', anchorId: current.session.rootMessageId },
+            recordStatus: 'active',
+            executorStatus: 'idle',
+          },
+        };
+      },
+    };
+    const runtime: SessionRuntime = {
+      async submit(request) {
+        if (request.command.kind === 'control.mutate') {
+          controlEffects.push(request.idempotencyKey);
+          expect(request.command.input.kind).toBe('relocate');
+          if (request.command.input.kind !== 'relocate'
+              || request.target.kind !== 'session') throw new Error('invalid relocate test request');
+          expect(isCurrentRelocationRouteReservation({
+            token: request.target.controlRouteReservation,
+            ownerLarkAppId: OWNER,
+            activeSessions,
+            route: { kind: 'chat', chatId: request.command.input.targetChatId },
+          })).toBe(true);
+          detachStarted.resolve();
+          await releaseDetach.promise;
+          activeSessions.delete(activeSessionKey(source));
+          source.session.chatId = request.command.input.targetChatId;
+          source.session.rootMessageId = request.command.input.targetRootMessageId;
+          source.session.scope = 'chat';
+          source.chatId = request.command.input.targetChatId;
+          source.scope = 'chat';
+          sessionStore.updateSession(source.session);
+          activeSessions.set(activeSessionKey(source), source);
+          return {
+            kind: 'applied',
+            action: 'control.mutated',
+            policy: 'control-staged-transition',
+            sessionId: source.session.sessionId,
+            result: {
+              kind: 'relocated',
+              targetChatId: request.command.input.targetChatId,
+              targetRootMessageId: request.command.input.targetRootMessageId,
+            },
+          } as CommandOutcomeFor<typeof request.command>;
+        }
+        if (request.command.kind !== 'ordinary.ingress') {
+          throw new Error('unexpected route-race command');
+        }
+        ordinaryEffects.push(request.idempotencyKey);
+        return {
+          kind: 'applied',
+          action: 'ordinary.inputCommitted',
+          policy: 'ordinary-replayable',
+          durability: 'processLocal',
+          sessionId: source.session.sessionId,
+        } as CommandOutcomeFor<typeof request.command>;
+      },
+    };
+    const routeRuntime = createCurrentOrdinaryRouteRegistryRuntime({
+      ownerLarkAppId: OWNER,
+      activeSessions,
+      openingCreator: {
+        begin: openingBegin.mockImplementation(() => {
+          throw new Error('target opener must join the relocated Session');
+        }),
+        async execute() {
+          throw new Error('target opener must not execute');
+        },
+        resume() {
+          throw new Error('target opener must not resume');
+        },
+        rollback() {
+          throw new Error('target opener must not roll back');
+        },
+      },
+      downstream: { projection, runtime },
+    });
+    const relocateRequest = {
+      target: {
+        kind: 'route' as const,
+        route: { kind: 'thread' as const, anchorId: sourceTurn.route.canonicalAnchor },
+      },
+      idempotencyKey: 'relay-route-race-op',
+      command: {
+        kind: 'control.mutate' as const,
+        input: {
+          kind: 'relocate' as const,
+          sourceAnchor: sourceTurn.route.canonicalAnchor,
+          targetChatId: targetTurn.route.chatId,
+          targetRootMessageId: 'om_relocate_target_audit',
+          requester: { larkAppId: 'app-leader', openId: 'ou_route_sender' },
+        },
+      },
+    };
+    const moving = routeRuntime.submit(relocateRequest);
+    await detachStarted.promise;
+    const arriving = routeRuntime.submit({
+      target: { kind: 'route', route: { kind: 'chat', chatId: targetTurn.route.chatId } },
+      idempotencyKey: targetTurn.messageKey,
+      command: { kind: 'ordinary.ingress', input: { turn: targetTurn } },
+    });
+
+    await Promise.resolve();
+    expect(openingBegin).not.toHaveBeenCalled();
+    expect(ordinaryEffects).toEqual([]);
+
+    releaseDetach.resolve();
+    await expect(moving).resolves.toMatchObject({ kind: 'applied' });
+    await expect(arriving).resolves.toMatchObject({
+      kind: 'applied',
+      sessionId: source.session.sessionId,
+    });
+    expect(openingBegin).not.toHaveBeenCalled();
+    expect(controlEffects).toEqual(['relay-route-race-op']);
+    expect(ordinaryEffects).toEqual([targetTurn.messageKey]);
+    expect([...activeSessions.values()]).toEqual([source]);
+
+    // The source route no longer exists, so duplicate protection must live
+    // above projection. Replaying the same operation cannot detach twice.
+    await expect(routeRuntime.submit(relocateRequest)).resolves.toMatchObject({
+      kind: 'duplicate',
+      sessionId: source.session.sessionId,
+    });
+    expect(controlEffects).toEqual(['relay-route-race-op']);
+  });
+
   it('deduplicates before Session identity resolution and gives concurrent creators one opening', async () => {
     const releaseMaterialization = deferred<void>();
     const harness = createHarness({ materializationGate: releaseMaterialization.promise });
@@ -741,5 +1150,475 @@ describe('Current ordinary route registry', () => {
     releaseFirstPolicy.resolve();
     await expect(first).resolves.toMatchObject({ kind: 'applied' });
     expect(publications).toEqual([secondTurn.messageKey, firstTurn.messageKey]);
+  });
+});
+
+function dashboardCommand(content = 'Dashboard route opening'): DashboardSpawnCommand {
+  return {
+    kind: 'dashboard.spawn',
+    input: {
+      content,
+      column: 'backlog',
+      role: 'solo',
+      coworkers: [],
+      images: [],
+      postBanner: true,
+    },
+  };
+}
+
+function dashboardOpeningHarness(input: {
+  gates?: ReadonlyMap<string, Promise<void>>;
+} = {}) {
+  const inspections = new Map<string, CurrentDashboardRouteInspection>();
+  const intents = new WeakMap<object, string>();
+  const continuations = new WeakMap<object, string>();
+  const effectResults = new WeakMap<object, string>();
+  const begins: string[] = [];
+  const executes: string[] = [];
+  const port: CurrentDashboardRouteOpeningPort = {
+    inspect(route) {
+      if (route.kind !== 'chat') return { kind: 'unknown', message: 'chat only' };
+      return inspections.get(route.chatId) ?? { kind: 'vacant' };
+    },
+    begin({ route }) {
+      if (route.kind !== 'chat') return { kind: 'refused', reason: 'invalidCommand', message: 'chat only' };
+      begins.push(route.chatId);
+      const intent = Object.freeze(Object.create(null)) as object;
+      const continuation = Object.freeze(Object.create(null)) as object;
+      intents.set(intent, route.chatId);
+      continuations.set(continuation, route.chatId);
+      return { kind: 'effect', intent, continuation };
+    },
+    async execute(intent) {
+      if (!intent || typeof intent !== 'object') throw new Error('invalid fake intent');
+      const chatId = intents.get(intent);
+      if (!chatId) throw new Error('foreign fake intent');
+      executes.push(chatId);
+      await input.gates?.get(chatId);
+      const result = Object.freeze(Object.create(null)) as object;
+      effectResults.set(result, chatId);
+      return result;
+    },
+    resume(continuation, settlement) {
+      if (!continuation || typeof continuation !== 'object') {
+        return { kind: 'unknown', message: 'invalid fake continuation' };
+      }
+      const chatId = continuations.get(continuation);
+      if (!chatId) return { kind: 'unknown', message: 'foreign fake continuation' };
+      if (settlement.kind === 'threw') {
+        return { kind: 'unknown', message: String(settlement.error) };
+      }
+      if (!settlement.value || typeof settlement.value !== 'object'
+          || effectResults.get(settlement.value) !== chatId) {
+        return { kind: 'unknown', message: 'foreign fake effect result' };
+      }
+      const sessionId = `session-${chatId}`;
+      inspections.set(chatId, { kind: 'occupied', sessionId });
+      return { kind: 'created', sessionId };
+    },
+  };
+  return { port, inspections, begins, executes };
+}
+
+function dashboardRouteRuntime(
+  port: CurrentDashboardRouteOpeningPort
+    | (() => CurrentDashboardRouteOpeningPort | undefined),
+  activeSessions: Map<string, DaemonSession> = new Map(),
+): SessionRuntime {
+  return createCurrentOrdinaryRouteRegistryRuntime({
+    ownerLarkAppId: OWNER,
+    activeSessions,
+    openingCreator: {
+      begin() { throw new Error('ordinary opening must not run'); },
+      async execute() { throw new Error('ordinary opening must not run'); },
+      resume() { throw new Error('ordinary opening must not run'); },
+      rollback() { throw new Error('ordinary opening must not run'); },
+    },
+    get dashboardRouteOpening() {
+      return typeof port === 'function' ? port() : port;
+    },
+    downstream: {
+      projection: { read: vi.fn(async () => ({ kind: 'notFound' as const })) },
+      runtime: {
+        submit: vi.fn(async () => ({ kind: 'quarantined', message: 'must not forward' })) as SessionRuntime['submit'],
+      },
+    },
+  });
+}
+
+function submitDashboardSpawn(
+  runtime: SessionRuntime,
+  chatId: string,
+  idempotencyKey: string,
+  content?: string,
+) {
+  return runtime.submit({
+    target: { kind: 'route', route: { kind: 'chat', chatId } },
+    idempotencyKey,
+    command: dashboardCommand(content),
+  });
+}
+
+describe('Current Dashboard route opening admission', () => {
+  it('joins a repeated stable operation before identity exists and executes its external effect once', async () => {
+    const release = deferred<void>();
+    const harness = dashboardOpeningHarness({ gates: new Map([[CHAT_ID, release.promise]]) });
+    const runtime = dashboardRouteRuntime(harness.port);
+
+    const first = submitDashboardSpawn(runtime, CHAT_ID, 'dashboard-spawn:same');
+    const repeated = submitDashboardSpawn(runtime, CHAT_ID, 'dashboard-spawn:same');
+    await vi.waitFor(() => expect(harness.executes).toEqual([CHAT_ID]));
+    release.resolve();
+
+    const outcomes = await Promise.all([first, repeated]);
+    expect(outcomes.map(outcome => outcome.kind).sort()).toEqual(['applied', 'duplicate']);
+    expect(outcomes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'applied', sessionId: `session-${CHAT_ID}` }),
+      expect.objectContaining({ kind: 'duplicate', sessionId: `session-${CHAT_ID}` }),
+    ]));
+    expect(harness.begins).toEqual([CHAT_ID]);
+    expect(harness.executes).toEqual([CHAT_ID]);
+  });
+
+  it('rejects a stable operation key reused for different spawn semantics without a second effect', async () => {
+    const harness = dashboardOpeningHarness();
+    const runtime = dashboardRouteRuntime(harness.port);
+    await expect(submitDashboardSpawn(runtime, CHAT_ID, 'dashboard-spawn:conflict', 'first'))
+      .resolves.toMatchObject({ kind: 'applied' });
+
+    await expect(submitDashboardSpawn(runtime, CHAT_ID, 'dashboard-spawn:conflict', 'different'))
+      .resolves.toMatchObject({ kind: 'rejected', reason: 'idempotencyConflict' });
+    expect(harness.executes).toEqual([CHAT_ID]);
+  });
+
+  it('reserves not-wired spawn semantics while allowing the same input to retry', async () => {
+    const harness = dashboardOpeningHarness();
+    let wired = false;
+    const runtime = dashboardRouteRuntime(() => wired ? harness.port : undefined);
+
+    await expect(submitDashboardSpawn(
+      runtime,
+      CHAT_ID,
+      'dashboard-spawn:not-wired-reservation',
+      'first',
+    )).resolves.toMatchObject({ kind: 'notWired' });
+    wired = true;
+
+    await expect(submitDashboardSpawn(
+      runtime,
+      CHAT_ID,
+      'dashboard-spawn:not-wired-reservation',
+      'different',
+    )).resolves.toMatchObject({
+      kind: 'rejected',
+      reason: 'idempotencyConflict',
+    });
+    expect(harness.begins).toEqual([]);
+    expect(harness.executes).toEqual([]);
+
+    await expect(submitDashboardSpawn(
+      runtime,
+      CHAT_ID,
+      'dashboard-spawn:not-wired-reservation',
+      'first',
+    )).resolves.toMatchObject({
+      kind: 'applied',
+      sessionId: `session-${CHAT_ID}`,
+    });
+    expect(harness.begins).toEqual([CHAT_ID]);
+    expect(harness.executes).toEqual([CHAT_ID]);
+  });
+
+  it('retries strict Store inspection failure under the same spawn hash without duplicating the effect', async () => {
+    const activeSessions = new Map<string, DaemonSession>();
+    const materializeImages = vi.fn(() => []);
+    const spawn = vi.fn(async () => {
+      const current = liveDaemonSession(
+        OWNER,
+        'session-dashboard-store-recovered',
+        turn({
+          messageKey: 'om_dashboard_store_recovered',
+          scope: 'chat',
+          chatId: CHAT_ID,
+        }),
+      );
+      sessionStore.updateSession(current.session);
+      activeSessions.set(activeSessionKey(current), current);
+      return { ok: true as const, sessionId: current.session.sessionId };
+    });
+    const port = createCurrentDashboardRouteOpeningPort({
+      ownerLarkAppId: OWNER,
+      activeSessions,
+      materializeImages,
+      cleanupImages: vi.fn(),
+      spawn,
+    });
+    const runtime = dashboardRouteRuntime(port, activeSessions);
+    vi.spyOn(sessionStore, 'listSessionsForOwnerStrict')
+      .mockImplementationOnce(() => { throw new Error('EIO: strict Store unavailable'); });
+    const operationId = 'dashboard-spawn:strict-store-retry';
+
+    await expect(submitDashboardSpawn(runtime, CHAT_ID, operationId, 'first'))
+      .resolves.toMatchObject({
+        kind: 'retryable',
+        message: expect.stringContaining('EIO'),
+      });
+    await expect(submitDashboardSpawn(runtime, CHAT_ID, operationId, 'different'))
+      .resolves.toMatchObject({
+        kind: 'rejected',
+        reason: 'idempotencyConflict',
+      });
+    expect(materializeImages).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+
+    await expect(submitDashboardSpawn(runtime, CHAT_ID, operationId, 'first'))
+      .resolves.toMatchObject({
+        kind: 'applied',
+        sessionId: 'session-dashboard-store-recovered',
+      });
+    expect(materializeImages).toHaveBeenCalledTimes(1);
+    expect(spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries a thrown route inspection without poisoning the route or operation hash', async () => {
+    const harness = dashboardOpeningHarness();
+    let inspectionReady = false;
+    const inspect = vi.fn((route: Parameters<CurrentDashboardRouteOpeningPort['inspect']>[0]) => {
+      if (!inspectionReady) throw new Error('route census temporarily unavailable');
+      return harness.port.inspect(route);
+    });
+    const runtime = dashboardRouteRuntime({ ...harness.port, inspect });
+    const operationId = 'dashboard-spawn:inspection-throw-retry';
+
+    await expect(submitDashboardSpawn(runtime, CHAT_ID, operationId, 'first'))
+      .resolves.toMatchObject({
+        kind: 'retryable',
+        message: expect.stringContaining('temporarily unavailable'),
+      });
+    inspectionReady = true;
+    await expect(submitDashboardSpawn(runtime, CHAT_ID, operationId, 'different'))
+      .resolves.toMatchObject({
+        kind: 'rejected',
+        reason: 'idempotencyConflict',
+      });
+    expect(harness.executes).toEqual([]);
+
+    await expect(submitDashboardSpawn(runtime, CHAT_ID, operationId, 'first'))
+      .resolves.toMatchObject({ kind: 'applied' });
+    expect(inspect).toHaveBeenCalledTimes(2);
+    expect(harness.executes).toEqual([CHAT_ID]);
+  });
+
+  it('retries a pure opening-begin throw under the same hash without duplicating the effect', async () => {
+    const harness = dashboardOpeningHarness();
+    let beginReady = false;
+    const begin = vi.fn((input: Parameters<CurrentDashboardRouteOpeningPort['begin']>[0]) => {
+      if (!beginReady) throw new Error('opening policy temporarily unavailable');
+      return harness.port.begin(input);
+    });
+    const runtime = dashboardRouteRuntime({ ...harness.port, begin });
+    const operationId = 'dashboard-spawn:begin-retry';
+
+    await expect(submitDashboardSpawn(runtime, CHAT_ID, operationId, 'first'))
+      .resolves.toMatchObject({
+        kind: 'retryable',
+        message: expect.stringContaining('temporarily unavailable'),
+      });
+    beginReady = true;
+    await expect(submitDashboardSpawn(runtime, CHAT_ID, operationId, 'different'))
+      .resolves.toMatchObject({
+        kind: 'rejected',
+        reason: 'idempotencyConflict',
+      });
+    expect(harness.executes).toEqual([]);
+
+    await expect(submitDashboardSpawn(runtime, CHAT_ID, operationId, 'first'))
+      .resolves.toMatchObject({ kind: 'applied' });
+    expect(begin).toHaveBeenCalledTimes(2);
+    expect(harness.executes).toEqual([CHAT_ID]);
+  });
+
+  it('replays a terminal spawn rejection and permanently rejects different semantics', async () => {
+    const harness = dashboardOpeningHarness();
+    harness.inspections.set(CHAT_ID, {
+      kind: 'occupied',
+      sessionId: 'session-existing-dashboard-route',
+    });
+    const runtime = dashboardRouteRuntime(harness.port);
+
+    await expect(submitDashboardSpawn(
+      runtime,
+      CHAT_ID,
+      'dashboard-spawn:terminal-rejected',
+      'first',
+    )).resolves.toMatchObject({
+      kind: 'rejected',
+      reason: 'sessionExists',
+    });
+    harness.inspections.set(CHAT_ID, { kind: 'vacant' });
+
+    await expect(submitDashboardSpawn(
+      runtime,
+      CHAT_ID,
+      'dashboard-spawn:terminal-rejected',
+      'different',
+    )).resolves.toMatchObject({
+      kind: 'rejected',
+      reason: 'idempotencyConflict',
+    });
+    await expect(submitDashboardSpawn(
+      runtime,
+      CHAT_ID,
+      'dashboard-spawn:terminal-rejected',
+      'first',
+    )).resolves.toMatchObject({
+      kind: 'rejected',
+      reason: 'sessionExists',
+    });
+    expect(harness.begins).toEqual([]);
+    expect(harness.executes).toEqual([]);
+  });
+
+  it('gives distinct concurrent operations on one route one creator and one occupied-route refusal', async () => {
+    const release = deferred<void>();
+    const harness = dashboardOpeningHarness({ gates: new Map([[CHAT_ID, release.promise]]) });
+    const runtime = dashboardRouteRuntime(harness.port);
+
+    const first = submitDashboardSpawn(runtime, CHAT_ID, 'dashboard-spawn:winner');
+    await vi.waitFor(() => expect(harness.executes).toEqual([CHAT_ID]));
+    const loser = submitDashboardSpawn(runtime, CHAT_ID, 'dashboard-spawn:loser');
+    await Promise.resolve();
+    expect(harness.begins).toEqual([CHAT_ID]);
+    release.resolve();
+
+    await expect(first).resolves.toMatchObject({ kind: 'applied' });
+    await expect(loser).resolves.toMatchObject({
+      kind: 'rejected',
+      reason: 'sessionExists',
+    });
+    expect(harness.executes).toEqual([CHAT_ID]);
+  });
+
+  it('does not serialize a slow Dashboard opening on route A with route B', async () => {
+    const chatA = 'oc_dashboard_route_a';
+    const chatB = 'oc_dashboard_route_b';
+    const releaseA = deferred<void>();
+    const harness = dashboardOpeningHarness({ gates: new Map([[chatA, releaseA.promise]]) });
+    const runtime = dashboardRouteRuntime(harness.port);
+
+    const first = submitDashboardSpawn(runtime, chatA, 'dashboard-spawn:route-a');
+    await vi.waitFor(() => expect(harness.executes).toEqual([chatA]));
+    const second = submitDashboardSpawn(runtime, chatB, 'dashboard-spawn:route-b');
+
+    await expect(second).resolves.toMatchObject({ kind: 'applied', sessionId: `session-${chatB}` });
+    expect(harness.executes).toEqual([chatA, chatB]);
+    releaseA.resolve();
+    await expect(first).resolves.toMatchObject({ kind: 'applied', sessionId: `session-${chatA}` });
+  });
+
+  it('lets an earlier ordinary opening win the shared chat route before Dashboard materializes', async () => {
+    const routeTurn = turn({
+      messageKey: 'om_ordinary_wins_dashboard_race',
+      scope: 'chat',
+      chatId: 'oc_ordinary_wins_dashboard_race',
+    });
+    const releaseOrdinary = deferred<void>();
+    const ordinary = createHarness({
+      materializationGate: releaseOrdinary.promise,
+      persistMetadata: true,
+    });
+    const dashboardSpawn = vi.fn();
+    const dashboardImages = vi.fn(() => []);
+    const dashboardPort = createCurrentDashboardRouteOpeningPort({
+      ownerLarkAppId: OWNER,
+      activeSessions: ordinary.activeSessions,
+      materializeImages: dashboardImages,
+      cleanupImages: vi.fn(),
+      spawn: dashboardSpawn,
+    });
+    const dashboard = dashboardRouteRuntime(dashboardPort, ordinary.activeSessions);
+
+    const opening = ordinary.submit(routeTurn);
+    await vi.waitFor(() => expect(ordinary.effects).toHaveLength(1));
+    const competing = submitDashboardSpawn(
+      dashboard,
+      routeTurn.route.chatId,
+      'dashboard-spawn:ordinary-winner',
+    );
+    await Promise.resolve();
+    expect(dashboardImages).not.toHaveBeenCalled();
+    expect(dashboardSpawn).not.toHaveBeenCalled();
+    releaseOrdinary.resolve();
+
+    await expect(opening).resolves.toMatchObject({ kind: 'applied' });
+    const competingOutcome = await competing;
+    expect(competingOutcome).toMatchObject({
+      kind: 'rejected',
+      reason: 'sessionExists',
+    });
+    expect(ordinary.openingSessions).toHaveLength(1);
+    expect(ordinary.activeSessions.size).toBe(1);
+    expect(dashboardImages).not.toHaveBeenCalled();
+    expect(dashboardSpawn).not.toHaveBeenCalled();
+  });
+
+  it('lets an earlier Dashboard opening publish one route before ordinary ingress resolves it', async () => {
+    const routeTurn = turn({
+      messageKey: 'om_dashboard_wins_ordinary_race',
+      scope: 'chat',
+      chatId: 'oc_dashboard_wins_ordinary_race',
+    });
+    const activeSessions = new Map<string, DaemonSession>();
+    const releaseDashboard = deferred<void>();
+    const dashboardStarted = deferred<void>();
+    const materializeImages = vi.fn(() => []);
+    const spawn = vi.fn(async () => {
+      dashboardStarted.resolve();
+      await releaseDashboard.promise;
+      const current = liveDaemonSession(
+        OWNER,
+        'session-dashboard-wins-route',
+        routeTurn,
+      );
+      sessionStore.updateSession(current.session);
+      activeSessions.set(activeSessionKey(current), current);
+      return { ok: true as const, sessionId: current.session.sessionId };
+    });
+    const dashboardPort = createCurrentDashboardRouteOpeningPort({
+      ownerLarkAppId: OWNER,
+      activeSessions,
+      materializeImages,
+      cleanupImages: vi.fn(),
+      spawn,
+    });
+    const dashboard = dashboardRouteRuntime(dashboardPort, activeSessions);
+    const ordinary = createHarness({ activeSessions, persistMetadata: true });
+
+    const opening = submitDashboardSpawn(
+      dashboard,
+      routeTurn.route.chatId,
+      'dashboard-spawn:dashboard-winner',
+    );
+    await dashboardStarted.promise;
+    const competing = ordinary.submit(routeTurn);
+    await Promise.resolve();
+    expect(ordinary.openingSessions).toHaveLength(0);
+    expect(ordinary.effects).toHaveLength(0);
+    releaseDashboard.resolve();
+
+    await expect(opening).resolves.toMatchObject({
+      kind: 'applied',
+      sessionId: 'session-dashboard-wins-route',
+    });
+    await expect(competing).resolves.toMatchObject({
+      kind: 'applied',
+      sessionId: 'session-dashboard-wins-route',
+    });
+    expect(activeSessions.size).toBe(1);
+    expect(ordinary.openingSessions).toHaveLength(0);
+    expect(ordinary.effects).toHaveLength(1);
+    expect(materializeImages).toHaveBeenCalledTimes(1);
+    expect(spawn).toHaveBeenCalledTimes(1);
   });
 });

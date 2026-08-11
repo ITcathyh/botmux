@@ -1,6 +1,5 @@
 // src/core/dashboard-ipc-server.ts
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
-import { execFileSync } from 'node:child_process';
 import { readFileSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -35,30 +34,17 @@ import type { BackendType } from '../adapters/backend/types.js';
 import * as persistentBackend from './persistent-backend.js';
 import * as cardPrefsStore from '../services/card-prefs-store.js';
 import * as substituteModeStore from '../services/substitute-mode-store.js';
-import { createCliAdapterSync } from '../adapters/cli/registry.js';
-import { normalizeCliRuntimeConfig, type CliRuntimeConfig } from '../adapters/cli/runtime.js';
-import { evaluateReadIsolationGate } from '../adapters/cli/read-isolation.js';
+import type { CliRuntimeConfig } from '../adapters/cli/runtime.js';
+import { dashboardAgentReadIsolationEnforceableFor } from './current-dashboard-host-maintenance.js';
 
 /** Whether read isolation can actually be ENFORCED for this bot right now — the
  *  SAME gate the worker fail-closes on (adapter support + no wrapperCli + macOS).
  *  The dashboard uses it to disable the toggle and to reject persisting an
  *  unenforceable flag, so flipping it on can never brick the bot's next session
  *  (the worker would otherwise refuse to start). Turning it OFF is always allowed. */
-function readIsolationEnforceableFor(cfg: { cliId?: string; cliPathOverride?: string; wrapperCli?: string }): boolean {
-  let adapterSupports = false;
-  try {
-    adapterSupports = createCliAdapterSync(cfg.cliId as never, cfg.cliPathOverride).supportsReadIsolation === true;
-  } catch { /* CLI missing / unknown adapter → treat as unenforceable */ }
-  return evaluateReadIsolationGate({
-    configured: true,
-    adapterSupports,
-    wrapperCliSet: !!cfg.wrapperCli,
-    platform: process.platform,
-    sessionDataDirSet: true,
-  }).enabled;
-}
 function readIsolationEnforceable(larkAppId: string): boolean {
-  try { return readIsolationEnforceableFor(getBot(larkAppId).config); } catch { return false; }
+  try { return dashboardAgentReadIsolationEnforceableFor(getBot(larkAppId).config); }
+  catch { return false; }
 }
 import * as observedBotsStore from '../services/observed-bots-store.js';
 import { getDeploymentIdentity } from '../services/deployment-identity.js';
@@ -78,17 +64,11 @@ import { readGlobalConfig } from '../global-config.js';
 import { normalizeChatReplyMode, setChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, getDaemonBootId, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, getActiveSessionsRegistry, getDaemonBootId, deliverWriteLinkCardToOwners, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
-import { isSessionStopped } from './session-liveness.js';
-import { isSuspendableBackendType } from './persistent-backend.js';
-import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
+import { replyMessage, sendMessage, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent, messageMentionsBot } from '../im/lark/message-parser.js';
-import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot } from './session-manager.js';
 import { parseSpawnRequest } from './session-create.js';
-import { cleanupMaterializedDashboardImages, materializeDashboardImages } from './dashboard-images.js';
-import { getCliDisplayName } from '../im/lark/card-builder.js';
-import { sessionConfiguredRuntimeDisplayName } from './cli-runtime-display.js';
 import { locateLimiter } from './dashboard-locate.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { dashboardEventBus } from './dashboard-events.js';
@@ -108,13 +88,12 @@ import {
 } from '../services/role-profile-store.js';
 import { triggerSessionTurn } from './trigger-session.js';
 import { validateTriggerRequest, type TriggerResponse } from '../services/trigger-types.js';
-import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
-import { checkCliAvailability } from '../setup/cli-availability.js';
+import { selectionKeyForBot } from '../setup/cli-selection.js';
 import { enrichHistorySenders, type HistoryBotInfo } from '../dashboard/history-senders.js';
 import {
   validateCodexAppManagedSendOrigin,
 } from '../utils/codex-app-dispatch-ledger.js';
-import { withBotTurnAdmission, withBotTurnMutation } from './bot-turn-mutation-gate.js';
+import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import {
   protectedSessionMutationReasons,
 } from './session-mutation-guard.js';
@@ -144,6 +123,94 @@ import {
   isExactSupervisorShutdownRequest,
   type SupervisorShutdownIdentity,
 } from './supervisor-shutdown-ipc.js';
+import type {
+  CurrentDashboardSessionCommandSubmitter,
+  CurrentDashboardSessionRuntimeCommand,
+  CurrentDashboardSessionRuntimeTarget,
+} from './current-dashboard-session-command-client.js';
+import type { CurrentDashboardControlEffects } from './current-dashboard-control-effects.js';
+import type {
+  DashboardHostMaintenance,
+  DashboardHostMaintenanceMode,
+} from './current-dashboard-host-maintenance.js';
+import type { DashboardChatRename } from './current-dashboard-chat-rename.js';
+
+export type DashboardSessionRuntimeCommand = CurrentDashboardSessionRuntimeCommand;
+export type DashboardSessionRuntimeTarget = CurrentDashboardSessionRuntimeTarget;
+export type DashboardSessionRuntimeSubmitter = CurrentDashboardSessionCommandSubmitter;
+
+let dashboardSessionRuntimeSubmitter: DashboardSessionRuntimeSubmitter | undefined;
+let dashboardControlEffects: CurrentDashboardControlEffects | undefined;
+let dashboardHostMaintenance: DashboardHostMaintenance | undefined;
+let dashboardChatRename: DashboardChatRename | undefined;
+
+export function setDashboardSessionRuntimeSubmitter(
+  submitter: DashboardSessionRuntimeSubmitter | null,
+): void {
+  dashboardSessionRuntimeSubmitter = submitter ?? undefined;
+}
+
+export function setDashboardControlEffects(
+  effects: CurrentDashboardControlEffects | null,
+): void {
+  dashboardControlEffects = effects ?? undefined;
+}
+
+export function setDashboardHostMaintenance(
+  maintenance: DashboardHostMaintenance | null,
+): void {
+  dashboardHostMaintenance = maintenance ?? undefined;
+}
+
+export function setDashboardChatRename(rename: DashboardChatRename | null): void {
+  dashboardChatRename = rename ?? undefined;
+}
+
+
+type SessionOperationIdResult =
+  | { readonly ok: true; readonly value: string }
+  | { readonly ok: false; readonly error: 'bad_operation_id' };
+
+function isValidSessionOperationId(value: unknown): value is string {
+  return typeof value === 'string'
+    && value.length > 0
+    && value.length <= 256
+    && value.trim() === value
+    && !value.includes('\0');
+}
+
+function sessionOperationId(
+  req: IncomingMessage,
+  body: unknown,
+): SessionOperationIdResult {
+  const record = body && typeof body === 'object' && !Array.isArray(body)
+    ? body as Record<string, unknown>
+    : undefined;
+  const hasBodyId = !!record && Object.prototype.hasOwnProperty.call(record, 'operationId');
+  const bodyId = record?.operationId;
+  const headerId = req.headers['x-botmux-operation-id'];
+  const hasHeaderId = headerId !== undefined;
+
+  // An explicitly supplied malformed value is a client error. Silently
+  // replacing it with a fresh UUID defeats retry identity: the caller believes
+  // it retried one operation while the Runtime sees a different command.
+  if ((hasBodyId && !isValidSessionOperationId(bodyId))
+    || (hasHeaderId && !isValidSessionOperationId(headerId))) {
+    return { ok: false, error: 'bad_operation_id' };
+  }
+  if (hasBodyId && hasHeaderId && bodyId !== headerId) {
+    return { ok: false, error: 'bad_operation_id' };
+  }
+  if (!hasBodyId && !hasHeaderId) {
+    return { ok: false, error: 'bad_operation_id' };
+  }
+  return {
+    ok: true,
+    value: hasBodyId
+      ? bodyId as string
+      : headerId as string,
+  };
+}
 
 let exactChatGrantHandler: typeof applyExactChatGrantRequest = applyExactChatGrantRequest;
 /** Test seam: replace the exact-grant service without touching live Feishu/config state. */
@@ -189,18 +256,14 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, getBotOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, requireBotId, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
+import { getBotBrand, getBot, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, requireBotId, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { normalizeKanbanColumn, normalizeKanbanPosition, normalizeSessionTitle } from './session-board.js';
 import { validateSlashInjection } from './slash-inject.js';
 import { validateRoleLibraryPath } from './role-library.js';
-import { repinSessionWorkingDir } from './session-cwd.js';
 import { authorizeSessionScopedIpc } from './daemon-ipc-session-auth.js';
-import { normalizeSessionTitleSource, updateSessionTitle } from './session-title.js';
-import { requestAgentSessionRename } from './session-rename.js';
-import { ChatRenameCooldown, ChatRenameSerialQueue, normalizeLarkChatName } from './chat-rename.js';
-import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
+import { normalizeSessionTitleSource } from './session-title.js';
+import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
 import { sessionAnchorId, larkTransportEnabled, type DaemonSession } from './types.js';
-import { isRiffBackendSession } from './persistent-backend.js';
 import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
 import { readSkillRegistry } from '../services/skill-registry-store.js';
 import {
@@ -1032,130 +1095,124 @@ ipcRoute('GET', '/api/sessions/:sessionId/usage', (_req, res, params) => {
  *  Host callers authenticate with HMAC; a read-isolated CLI may close only its
  *  exact live session with the rotating per-turn capability. */
 ipcRoute('POST', '/api/sessions/:sessionId/close', async (req, res, params) => {
-  const body = await readJsonBody<Record<string, unknown>>(req)
-    .catch(() => ({} as Record<string, unknown>));
-  const ds = findActiveBySessionId(params.sessionId);
-  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  let body: Record<string, unknown>;
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const operationId = sessionOperationId(req, body);
+  if (!operationId.ok) return jsonRes(res, 400, { ok: false, error: operationId.error });
+  const auth = sessionCliIpcAuth(req, params.sessionId, body);
   if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
-  const initial = findSessionRecord(params.sessionId);
-  // Resolve the owning bot for the FIFO-drain gate from the live DaemonSession
-  // first (it carries larkAppId even before a persisted record exists), then the
-  // stored row, then this daemon's own identity. A trusted-host close of an
-  // already-missing session has no owner to key the gate on, so close directly:
-  // closeSession is idempotent and reports alreadyClosed.
-  const larkAppId = ds?.larkAppId || initial?.larkAppId || cachedLarkAppId;
-  if (!larkAppId) {
-    const r = await closeSession(params.sessionId);
-    return jsonRes(res, r.ok ? 200 : 502, r);
+  if (!dashboardSessionRuntimeSubmitter) {
+    return jsonRes(res, 503, { ok: false, error: 'session_runtime_not_ready' });
   }
-  return withBotTurnMutation(larkAppId, async () => {
-    // Re-resolve only after every earlier admitted turn has drained. Explicit
-    // close is the abandon boundary and may clear accepted FIFO, but it must
-    // never clear a stale pre-drain snapshot while a turn is still preparing.
-    const current = findSessionRecord(params.sessionId);
-    if (current && current.status === 'closed') {
-      return jsonRes(res, 200, { ok: true, alreadyClosed: true });
-    }
-    const r = await closeSession(params.sessionId);
-    jsonRes(res, r.ok ? 200 : 502, r);
+  const outcome = await dashboardSessionRuntimeSubmitter({
+      target: { kind: 'externalSession', sessionId: params.sessionId },
+      idempotencyKey: operationId.value,
+      command: {
+        kind: 'control.mutate',
+        input: {
+          kind: 'close',
+          reason: isTrustedHostIpcRequest(req) ? 'dashboard' : 'cli',
+        },
+      },
+  });
+  if (outcome.kind !== 'applied' && outcome.kind !== 'duplicate') {
+    const failure = runtimeMutationWireFailure(outcome, {
+      notFound: 'session_not_found',
+      retryable: { status: 503, error: 'dispatch_retryable' },
+    });
+    return jsonRes(res, failure.status, failure.body);
+  }
+  const result = outcome.result;
+  jsonRes(res, 200, {
+    ok: true,
+    alreadyClosed: result?.kind === 'closed' ? result.alreadyClosed : true,
+    known: result?.kind === 'closed' ? result.known : true,
   });
 });
 
-// `botmux list` zombie pruning is maintenance, not explicit abandon. Serialize
-// against inbound admission and refuse if any backend-neutral durable owner
-// became unsettled after the CLI took its liveness snapshot.
-ipcRoute('POST', '/api/sessions/:sessionId/prune', async (_req, res, params) => {
-  const initial = findSessionRecord(params.sessionId);
-  if (!initial) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
-  const larkAppId = initial.larkAppId || cachedLarkAppId;
-  if (!larkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
-  return withBotTurnMutation(larkAppId, async () => {
-    const current = findSessionRecord(params.sessionId);
-    if (!current) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
-    if (rejectProtectedSessionMutation(res, [current])) return;
-    const r = await closeSession(params.sessionId);
-    jsonRes(res, r.ok ? 200 : 502, r);
+// `botmux list` zombie pruning is maintenance, not explicit abandon. The
+// Current control Adapter revalidates protected ownership inside the Session
+// lane before running the close effect.
+ipcRoute('POST', '/api/sessions/:sessionId/prune', async (req, res, params) => {
+  let body: Record<string, unknown>;
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const operationId = sessionOperationId(req, body);
+  if (!operationId.ok) return jsonRes(res, 400, { ok: false, error: operationId.error });
+  if (!dashboardSessionRuntimeSubmitter) {
+    return jsonRes(res, 503, { ok: false, error: 'session_runtime_not_ready' });
+  }
+  const outcome = await dashboardSessionRuntimeSubmitter({
+    target: { kind: 'externalSession', sessionId: params.sessionId },
+    idempotencyKey: operationId.value,
+    command: {
+      kind: 'control.mutate',
+      input: { kind: 'close', reason: 'prune' },
+    },
+  });
+  if (outcome.kind !== 'applied' && outcome.kind !== 'duplicate') {
+    const failure = runtimeMutationWireFailure(outcome, {
+      notFound: 'session_not_found',
+      retryable: { status: 503, error: 'dispatch_retryable' },
+    });
+    return jsonRes(res, failure.status, failure.body);
+  }
+  const result = outcome.result;
+  if (result?.kind === 'closed' && !result.known) {
+    return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  }
+  return jsonRes(res, 200, {
+    ok: true,
+    alreadyClosed: result?.kind === 'closed' ? result.alreadyClosed : true,
+    known: result?.kind === 'closed' ? result.known : true,
   });
 });
 
-/** Post a scope-aware "restarting" notice into the session's Lark thread/chat,
- *  mirroring the /resume route — so a Feishu-side observer sees why the CLI just
- *  restarted under them (the IM `/restart` command and the card button notify
- *  too; the dashboard was the lone silent path). `fresh` = the worker was gone
- *  and we re-forked it (revive) rather than doing an in-place CLI restart.
- *  Best-effort and fire-and-forget; never blocks the HTTP response. */
-function postRestartNotice(ds: DaemonSession, fresh: boolean): void {
-  if (!ds.larkAppId) return;
-  // No-transport session (apiOnly bot or HTTP virtual chat) has no Feishu chat
-  // to post a restart notice into — skip (the raw sendMessage/replyMessage below
-  // bypass sessionReply's gate). Best-effort path; a silent skip is correct.
-  if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return;
-  const loc = localeForBot(ds.larkAppId);
-  const botCfg = getBot(ds.larkAppId).config;
-  const cliName = sessionConfiguredRuntimeDisplayName(ds.session, botCfg.cliRuntime)
-    ?? getCliDisplayName(ds.session.cliId ?? botCfg.cliId ?? 'claude-code');
-  const text = fresh
-    ? t('card.action.restarted_fresh', { cliName }, loc)
-    : t('cmd.restart.in_progress', { cliName }, loc);
-  const notice = JSON.stringify({ text });
-  if (ds.scope === 'chat' && ds.chatId) {
-    getChatMode(ds.larkAppId, ds.chatId, { forceRefresh: true })
-      .then((mode) => mode === 'topic' && ds.session.rootMessageId
-        ? replyMessage(ds.larkAppId, ds.session.rootMessageId, notice, 'text', true)
-        : sendMessage(ds.larkAppId, ds.chatId, notice, 'text'))
-      .catch(err => logger.debug(`[restart] failed to post chat-scope restart notice: ${err}`));
-  } else if (ds.session.rootMessageId) {
-    replyMessage(ds.larkAppId, ds.session.rootMessageId, notice, 'text', true)
-      .catch(err => logger.debug(`[restart] failed to post thread-scope restart notice: ${err}`));
-  }
-}
-
-ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) => {
-  const initial = findActiveBySessionId(params.sessionId);
-  if (!initial) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
-  return withBotTurnMutation(initial.larkAppId, () => {
-  const ds = findActiveBySessionId(params.sessionId);
-  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
-  if (isSessionTransferring(ds)) {
-    return jsonRes(res, 409, { ok: false, error: 'session_transferring' });
-  }
-  // Adopt/observed sessions: botmux never owned the CLI — restarting would kill
-  // the user's real tmux/zellij pane. Hard-reject (the worker self-guards too).
-  if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
-    return jsonRes(res, 409, { ok: false, error: 'adopt_restart_unsupported' });
-  }
-  // Riff owns a remote task lineage. Its worker deliberately refuses restart
-  // because destroy + respawn would sever or replace that lineage. Reject at
-  // the daemon boundary so the dashboard never reports HTTP 200 for a no-op.
-  if (isRiffBackendSession(ds)) {
-    return jsonRes(res, 409, {
-      ok: false,
-      error: 'riff_restart_unsupported',
-      message: t('cmd.restart.riff_unsupported', undefined, localeForBot(ds.larkAppId)),
+ipcRoute('POST', '/api/sessions/:sessionId/restart', async (req, res, params) => {
+  let body: Record<string, unknown>;
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const operationId = sessionOperationId(req, body);
+  if (!operationId.ok) return jsonRes(res, 400, { ok: false, error: operationId.error });
+  const submitControl = dashboardSessionRuntimeSubmitter;
+  if (!submitControl) return jsonRes(res, 503, { ok: false, error: 'session_runtime_not_ready' });
+  const outcome = await submitControl({
+    target: { kind: 'externalSession', sessionId: params.sessionId },
+    idempotencyKey: operationId.value,
+    command: {
+      kind: 'control.mutate',
+      input: { kind: 'restart', source: 'dashboard' },
+    },
+  });
+  if (outcome.kind !== 'applied' && outcome.kind !== 'duplicate') {
+    const failure = runtimeMutationWireFailure(outcome, {
+      notFound: 'session_not_active',
+      transitionRejected: { status: 404, error: 'session_not_active' },
+      transitionCodeStatus: code => code === 'session_not_active' ? 404 : 409,
+    });
+    return jsonRes(res, failure.status, {
+      ...failure.body,
+      ...(failure.body.error === 'riff_restart_unsupported'
+        ? { message: t('cmd.restart.riff_unsupported', undefined, localeForBot(cachedLarkAppId)) }
+        : {}),
     });
   }
-  if (rejectProtectedSessionMutation(res, [ds])) return;
-  const cliId = ds.session.cliId ?? 'unknown';
-  if (ds.worker && !ds.worker.killed) {
-    // Live worker → in-place CLI restart (kills the CLI, respawns with --resume).
-    // 捎带最新 per-bot env：dashboard 改完 env 后重启才真正生效（与 /restart 同逻辑）。
-    try {
-      ds.workerReady = false;
-      ds.worker.send({ type: 'restart', reason: 'operator', env: latestPerBotEnvForRestart(ds) } as DaemonToWorker);
-    } catch (err) {
-      return jsonRes(res, 502, { ok: false, error: String(err) });
-    }
-    postRestartNotice(ds, false);
-    return jsonRes(res, 200, { ok: true, sessionId: params.sessionId, cliId, revived: false });
+  const result = outcome.result;
+  if (result?.kind !== 'restarted') {
+    return jsonRes(res, 503, { ok: false, error: 'session_runtime_invalid_result' });
   }
-  // Worker is gone but the session is still active — idle-suspended (over the
-  // per-bot cap), lazy-restored after a daemon restart, or crash-loop-stopped.
-  // Revive it the same way the Feishu card restart does (forkWorker), so the
-  // dashboard isn't a dead-end: a 409 here would leave NO working control to
-  // bring the CLI back (the resume button only shows for closed sessions).
-  forkWorker(ds, '', ds.hasHistory);
-  postRestartNotice(ds, true);
-  jsonRes(res, 200, { ok: true, sessionId: params.sessionId, cliId, revived: true });
+  if (outcome.kind === 'applied') {
+    dashboardControlEffects?.restartNotice({
+      sessionId: params.sessionId,
+      revived: result.revived,
+    });
+  }
+  jsonRes(res, 200, {
+    ok: true,
+    sessionId: params.sessionId,
+    cliId: result.session.cliId ?? 'unknown',
+    revived: result.revived,
   });
 });
 
@@ -1164,32 +1221,37 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) =
  *  the same semantics the idle-worker sweeper applies over the live cap.
  *  Primary use: `botmux suspend --isolated` after a credential rotation, so
  *  isolated bots' next cold spawn re-provisions the freshest creds. */
-ipcRoute('POST', '/api/sessions/:sessionId/suspend', async (_req, res, params) => {
-  const initial = findActiveBySessionId(params.sessionId);
-  if (!initial) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
-  return withBotTurnMutation(initial.larkAppId, () => {
-  const ds = findActiveBySessionId(params.sessionId);
-  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
-  if (isSessionTransferring(ds)) {
-    return jsonRes(res, 409, { ok: false, error: 'session_transferring' });
+ipcRoute('POST', '/api/sessions/:sessionId/suspend', async (req, res, params) => {
+  let body: Record<string, unknown>;
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const operationId = sessionOperationId(req, body);
+  if (!operationId.ok) return jsonRes(res, 400, { ok: false, error: operationId.error });
+  const submitControl = dashboardSessionRuntimeSubmitter;
+  if (!submitControl) return jsonRes(res, 503, { ok: false, error: 'session_runtime_not_ready' });
+  const outcome = await submitControl({
+    target: { kind: 'externalSession', sessionId: params.sessionId },
+    idempotencyKey: operationId.value,
+    command: {
+      kind: 'control.mutate',
+      input: { kind: 'suspend', source: 'dashboard' },
+    },
+  });
+  if (outcome.kind !== 'applied' && outcome.kind !== 'duplicate') {
+    const failure = runtimeMutationWireFailure(outcome, {
+      notFound: 'session_not_active',
+      transitionRejected: { status: 404, error: 'session_not_active' },
+      transitionCodeStatus: code => code === 'session_not_active' ? 404 : 409,
+    });
+    return jsonRes(res, failure.status, failure.body);
   }
-  // Adopt/observed sessions: botmux never owned the CLI — suspending would kill
-  // the user's real tmux/zellij pane. Same guard as /restart.
-  if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
-    return jsonRes(res, 409, { ok: false, error: 'adopt_suspend_unsupported' });
-  }
-  if (rejectProtectedSessionMutation(res, [ds])) return;
-  if (!ds.worker || ds.worker.killed) {
-    // Worker already gone (idle-suspended / crash-stopped) — the goal state is
-    // already reached, so report idempotent success without a live kill.
-    return jsonRes(res, 200, { ok: true, sessionId: params.sessionId, suspended: false, reason: 'no_live_worker' });
-  }
-  if (!suspendWorker(ds, 'manual_suspend')) {
-    // Live worker but a non-suspendable (pty) backend: killing it would drop the
-    // in-memory conversation with no persistent pane to resume from lazily.
-    return jsonRes(res, 409, { ok: false, error: 'backend_not_suspendable' });
-  }
-  jsonRes(res, 200, { ok: true, sessionId: params.sessionId, suspended: true });
+  const result = outcome.result;
+  const suspended = result?.kind === 'suspended' ? result.suspended : false;
+  jsonRes(res, 200, {
+    ok: true,
+    sessionId: params.sessionId,
+    suspended,
+    ...(!suspended ? { reason: 'no_live_worker' } : {}),
   });
 });
 
@@ -1201,16 +1263,14 @@ ipcRoute('POST', '/api/sessions/:sessionId/suspend', async (_req, res, params) =
  * the exact classification the sweep uses so the preview matches a click.
  */
 ipcRoute('GET', '/api/host-overload/counts', (_req, res) => {
-  const stopped = sessionStore.listSessions().filter(s => s.status === 'active' && isSessionStopped(s)).length;
-  let idle = 0;
-  for (const ds of listActiveSessions()) {
-    if (!ds.worker || ds.worker.killed) continue;
-    if (ds.adoptedFrom || ds.initConfig?.adoptMode) continue;
-    if (!isSuspendableBackendType(ds.initConfig?.backendType)) continue;
-    if (ds.lastScreenStatus !== 'idle') continue;
-    idle++;
+  if (!dashboardHostMaintenance) {
+    return jsonRes(res, 503, { ok: false, error: 'session_runtime_not_ready' });
   }
-  jsonRes(res, 200, { ok: true, stopped, idle });
+  const counts = dashboardHostMaintenance.counts();
+  if (counts.kind === 'notReady') {
+    return jsonRes(res, 503, { ok: false, error: 'session_runtime_not_ready' });
+  }
+  jsonRes(res, 200, { ok: true, stopped: counts.stopped, idle: counts.idle });
 });
 
 /**
@@ -1225,48 +1285,36 @@ ipcRoute('GET', '/api/host-overload/counts', (_req, res) => {
  * Returns `{ ok, mode, affected }` — `affected` counts sessions acted on here.
  */
 ipcRoute('POST', '/api/host-overload/sweep', async (req, res) => {
-  let body: { mode?: unknown };
+  let body: { mode?: unknown; operationId?: unknown } & Record<string, unknown>;
   try { body = await readJsonBody(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
   const mode = body?.mode;
-
-  if (mode === 'clean_stopped') {
-    const stopped = sessionStore.listSessions().filter(s => s.status === 'active' && isSessionStopped(s));
-    let affected = 0;
-    for (const s of stopped) {
-      try {
-        const r = await closeSession(s.sessionId);
-        // Only count sessions this call actually closed. A concurrent action in
-        // this daemon may already have closed the same record.
-        if (r.ok && !r.alreadyClosed) affected++;
-      } catch (err) {
-        logger.warn(`[overload-sweep] close failed for ${s.sessionId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
-    logger.info(`[overload-sweep] clean_stopped: closed ${affected}/${stopped.length} zombie session(s)`);
-    return jsonRes(res, 200, { ok: true, mode, affected });
+  const operationId = sessionOperationId(req, body);
+  if (!operationId.ok) return jsonRes(res, 400, { ok: false, error: operationId.error });
+  const maintenance = dashboardHostMaintenance;
+  if (!maintenance) {
+    return jsonRes(res, 503, { ok: false, error: 'session_runtime_not_ready' });
   }
-
-  if (mode === 'suspend_idle') {
-    // This daemon's own idle live workers only. Correctness guards mirror the
-    // idle-worker sweeper: never touch adopt sessions or mid-turn (busy) ones.
-    let affected = 0;
-    for (const ds of listActiveSessions()) {
-      if (!ds.worker || ds.worker.killed) continue;             // no live worker
-      if (ds.adoptedFrom || ds.initConfig?.adoptMode) continue;  // never suspend adopt
-      if (!isSuspendableBackendType(ds.initConfig?.backendType)) continue;
-      if (ds.lastScreenStatus !== 'idle') continue;              // never cut an in-flight reply
-      try {
-        if (suspendWorker(ds, 'host_overload_suspend')) affected++;
-      } catch (err) {
-        logger.warn(`[overload-sweep] suspend failed for ${ds.session.sessionId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
-    logger.info(`[overload-sweep] suspend_idle: suspended ${affected} idle worker(s)`);
-    return jsonRes(res, 200, { ok: true, mode, affected });
+  if (mode !== 'clean_stopped' && mode !== 'suspend_idle') {
+    return jsonRes(res, 400, { ok: false, error: 'bad_mode' });
   }
-
-  return jsonRes(res, 400, { ok: false, error: 'bad_mode' });
+  const outcome = await maintenance.sweep({
+    operationId: operationId.value,
+    mode: mode as DashboardHostMaintenanceMode,
+  });
+  if (outcome.kind === 'conflict') {
+    return jsonRes(res, 409, { ok: false, error: 'operation_conflict' });
+  }
+  if (outcome.kind === 'quarantined') {
+    return jsonRes(res, 503, { ok: false, error: 'dispatch_unknown' });
+  }
+  if (outcome.kind === 'retryable') {
+    return jsonRes(res, 503, { ok: false, error: 'dispatch_retryable' });
+  }
+  logger.info(
+    `[overload-sweep] ${mode}: affected ${outcome.affected}/${outcome.candidates} session(s)`,
+  );
+  return jsonRes(res, 200, { ok: true, mode, affected: outcome.affected });
 });
 
 /** 会话级 CLI IPC（slash/cd）的调用方证明：trusted-host（.dashboard-secret HMAC，
@@ -1278,10 +1326,10 @@ ipcRoute('POST', '/api/host-overload/sweep', async (req, res) => {
  *  同样回 origin_unproven，不提供「哪些 sessionId 活跃」的探针。 */
 function sessionCliIpcAuth(
   req: IncomingMessage,
-  ds: DaemonSession | undefined,
   sessionId: string,
   body: Record<string, unknown> | undefined,
 ): { ok: true } | { ok: false; error: string } {
+  const ds = findActiveBySessionId(sessionId);
   const claimedAttempt = typeof body?.originDispatchAttempt === 'number'
     && Number.isSafeInteger(body.originDispatchAttempt)
     && body.originDispatchAttempt > 0
@@ -1305,102 +1353,89 @@ function sessionCliIpcAuth(
  *  鉴权双路径（见 sessionCliIpcAuth）：trusted-host 签名或本会话 rotating
  *  capability；命令面由 allowlist（默认空=全拒）承担。 */
 ipcRoute('POST', '/api/sessions/:sessionId/slash', async (req, res, params) => {
-  const body = await readJsonBody<{ command?: string } & Record<string, unknown>>(req)
-    .catch(() => ({} as { command?: string } & Record<string, unknown>));
+  let body: { command?: unknown } & Record<string, unknown>;
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const operationId = sessionOperationId(req, body);
+  if (!operationId.ok) return jsonRes(res, 400, { ok: false, error: operationId.error });
   const ds = findActiveBySessionId(params.sessionId);
-  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  const auth = sessionCliIpcAuth(req, params.sessionId, body);
   if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
-  // Adopt/observed 会话是收编的用户自有 pane，用户可能正在里面打字——机器注入
-  // 会与人的输入交错。与 /suspend、/restart 同款排除。
-  if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
-    return jsonRes(res, 409, { ok: false, error: 'adopt_inject_unsupported' });
-  }
-  if ((!ds.worker || ds.worker.killed) && !isSessionTransferring(ds)) {
-    return jsonRes(res, 409, { ok: false, error: 'no_live_worker' });
-  }
   const allow = getBotTuiSlashAllow(ds.larkAppId);
-  const v = validateSlashInjection(body?.command ?? '', allow);
+  const v = validateSlashInjection(typeof body.command === 'string' ? body.command : '', allow);
   if (!v.ok) return jsonRes(res, 403, { ok: false, error: v.error });
-  try {
-    if (!sendWorkerSessionInput(ds, { type: 'inject_command', command: v.command })) {
-      return jsonRes(res, 409, { ok: false, error: 'no_live_worker' });
-    }
-  } catch {
-    // slash 注入无状态（不像 /cd 那样已 repin 记录），send 失败不需要杀进程
-    // 冷启动——直接把失败面报给调用方即可。
-    return jsonRes(res, 502, { ok: false, error: 'worker_send_failed' });
+  const submit = dashboardSessionRuntimeSubmitter;
+  if (!submit) return jsonRes(res, 503, { ok: false, error: 'session_runtime_not_ready' });
+  const outcome = await submit({
+    target: { kind: 'externalSession', sessionId: params.sessionId },
+    idempotencyKey: operationId.value,
+    command: {
+      kind: 'control.mutate',
+      input: { kind: 'injectCommand', command: v.command },
+    },
+  });
+  if (outcome.kind !== 'applied' && outcome.kind !== 'duplicate') {
+    const failure = runtimeMutationWireFailure(outcome, {
+      notFound: 'session_not_active',
+      unknown: { status: 502, error: 'worker_send_failed' },
+    });
+    return jsonRes(res, failure.status, failure.body);
   }
-  jsonRes(res, 200, { ok: true, sessionId: params.sessionId, queued: v.command });
+  const result = outcome.result;
+  if (!result || result.kind !== 'commandInjected') {
+    return jsonRes(res, 503, { ok: false, error: 'session_runtime_invalid_result' });
+  }
+  jsonRes(res, 200, { ok: true, sessionId: params.sessionId, queued: result.command });
 });
-
-const proactiveChatRenameCooldown = new ChatRenameCooldown();
-const chatRenameSerialQueue = new ChatRenameSerialQueue();
 
 /** Session-scoped external mutation used by the botmux-chat-rename Skill. */
 ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params) => {
-  const body = await readJsonBody<{ name?: unknown; proactive?: unknown } & Record<string, unknown>>(req)
-    .catch(() => ({} as { name?: unknown; proactive?: unknown } & Record<string, unknown>));
-  const ds = findActiveBySessionId(params.sessionId);
-  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
-  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
-  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
-  if (sessionTransportDisabled(ds)) return jsonRes(res, 200, { ok: false, error: 'no_feishu_transport' });
-  if (ds.chatType !== 'group') return jsonRes(res, 400, { ok: false, error: 'not_group_chat' });
-  const normalized = normalizeLarkChatName(body.name);
-  if (!normalized.ok) return jsonRes(res, 400, normalized);
-
-  const proactive = body.proactive === true;
-  const trigger = proactive ? 'ai_proactive' : 'user_explicit';
-  const cooldownKey = `${ds.larkAppId}:${ds.chatId}`;
-  await chatRenameSerialQueue.run(cooldownKey, async () => {
-    const result = await groupsStore.renameChat(ds.larkAppId, ds.chatId, normalized.name, {
-      beforeUpdate: proactive
-        ? () => {
-            const cooldown = proactiveChatRenameCooldown.check(cooldownKey);
-            return cooldown.ok
-              ? cooldown
-              : { ...cooldown, error: 'rate_limited' as const };
-          }
-        : undefined,
-    });
-    const botOpenId = getBotOpenId(ds.larkAppId) ?? '-';
-    if (!result.ok) {
-      const status = result.error === 'bot_not_in_chat' ? 403
-        : result.error === 'permission_denied' ? 403
-          : result.error === 'rate_limited' ? 429
-            : 502;
-      logger.warn(
-        `[chat-rename:audit] result=failed session=${ds.session.sessionId} chat=${ds.chatId} `
-        + `app=${ds.larkAppId} botOpenId=${botOpenId} trigger=${trigger} `
-        + `old=${JSON.stringify(result.oldName ?? null)} new=${JSON.stringify(result.newName ?? normalized.name)} `
-        + `error=${result.error} larkCode=${result.larkCode ?? '-'} detail=${result.detail ?? '-'}`,
-      );
-      return jsonRes(res, status, result);
-    }
-    if (result.changed) {
-      if (proactive) proactiveChatRenameCooldown.record(cooldownKey);
-      // FR-7: the Lark write already succeeded, so a local cache-refresh
-      // failure (ENOSPC/EACCES on the session store) must NOT reverse the
-      // outcome into an HTTP 500 — best-effort per session, warn and keep the
-      // rename a success. Catch per-session so one bad write can't skip the rest.
-      for (const active of getActiveSessionsRegistry()?.values() ?? []) {
-        if (active.chatId !== ds.chatId) continue;
-        active.session.chatDisplayName = result.newName;
-        try {
-          sessionStore.updateSession(active.session);
-        } catch (e) {
-          logger.warn(`[chat-rename:audit] cache_refresh_failed session=${active.session.sessionId} chat=${ds.chatId} app=${ds.larkAppId} detail=${e instanceof Error ? e.message : String(e)}`);
-        }
-      }
-      logger.info(
-        `[chat-rename:audit] result=success session=${ds.session.sessionId} chat=${ds.chatId} `
-        + `app=${ds.larkAppId} botOpenId=${botOpenId} trigger=${trigger} `
-        + `old=${JSON.stringify(result.oldName)} new=${JSON.stringify(result.newName)} larkCode=0`,
-      );
-    }
-    return jsonRes(res, 200, { ...result, chatId: ds.chatId });
+  let body: { name?: unknown; proactive?: unknown } & Record<string, unknown>;
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const operationId = sessionOperationId(req, body);
+  if (!operationId.ok) return jsonRes(res, 400, { ok: false, error: operationId.error });
+  const port = dashboardChatRename;
+  if (!port) return jsonRes(res, 503, { ok: false, error: 'session_runtime_not_ready' });
+  const outcome = await port.submit({
+    sessionId: params.sessionId,
+    operationId: operationId.value,
+    name: body.name,
+    proactive: body.proactive,
+    requester: {
+      trustedHost: isTrustedHostIpcRequest(req),
+      originCapability: body.originCapability,
+      originTurnId: body.originTurnId,
+      originDispatchAttempt: body.originDispatchAttempt,
+    },
   });
+  if (outcome.kind === 'completed') return jsonRes(res, 200, outcome.result);
+  if (outcome.kind === 'larkRejected') {
+    const status = outcome.result.error === 'bot_not_in_chat' ? 403
+      : outcome.result.error === 'permission_denied' ? 403
+        : outcome.result.error === 'rate_limited' ? 429
+          : 502;
+    return jsonRes(res, status, outcome.result);
+  }
+  if (outcome.kind === 'conflict') {
+    return jsonRes(res, 409, { ok: false, error: 'operation_conflict' });
+  }
+  if (outcome.kind === 'quarantined') {
+    return jsonRes(res, 503, { ok: false, error: 'dispatch_unknown' });
+  }
+  const status = outcome.reason === 'sessionNotActive' ? 404
+    : outcome.reason === 'noFeishuTransport' ? 200
+      : outcome.reason === 'originUnproven' || outcome.reason === 'managedActionRequired' ? 403
+        : 400;
+  const error = outcome.reason === 'originUnproven' ? 'origin_unproven'
+    : outcome.reason === 'managedActionRequired' ? 'managed_action_required'
+      : outcome.reason === 'sessionNotActive' ? 'session_not_active'
+        : outcome.reason === 'noFeishuTransport' ? 'no_feishu_transport'
+          : outcome.reason === 'notGroupChat' ? 'not_group_chat'
+            : outcome.reason === 'invalidChatName' ? 'invalid_chat_name'
+              : 'bad_operation_id';
+  return jsonRes(res, status, { ok: false, error });
 });
 
 /** 会话内切换工作目录（角色切换专用）：硬校验角色库根 → 更新记录落盘（唯一事实源）
@@ -1421,30 +1456,15 @@ ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params
  *  dev/ino 包含判断，角色库根之外一律拒）。
  *  不发话题消息（AI 自己发角色化确认）。 */
 ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
-  const body = await readJsonBody<{ dir?: string } & Record<string, unknown>>(req)
-    .catch(() => ({} as { dir?: string } & Record<string, unknown>));
+  let body: { dir?: string } & Record<string, unknown>;
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const operationId = sessionOperationId(req, body);
+  if (!operationId.ok) return jsonRes(res, 400, { ok: false, error: operationId.error });
   const ds = findActiveBySessionId(params.sessionId);
-  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  const auth = sessionCliIpcAuth(req, params.sessionId, body);
   if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
-  if (isSessionTransferring(ds)) {
-    return jsonRes(res, 409, { ok: false, error: 'session_transferring' });
-  }
-  // Adopt/observed 会话是收编的用户自有 pane——注入或冷重启都会打断用户自己的
-  // 终端会话。与 /suspend、/restart、/slash 同款排除。
-  if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
-    return jsonRes(res, 409, { ok: false, error: 'adopt_cd_unsupported' });
-  }
-  // Riff restart/kill is intentionally refused to preserve remote task
-  // lineage. Reject before validation/repin so the persisted cwd cannot drift
-  // from the still-running sandbox.
-  if (isRiffBackendSession(ds)) {
-    return jsonRes(res, 409, {
-      ok: false,
-      error: 'riff_cd_unsupported',
-      message: t('cmd.cd.riff_unsupported', undefined, localeForBot(ds.larkAppId)),
-    });
-  }
   // ownAppId 收窄到本 bot 自己的角色库子树：不收窄就能切进别的 bot 的角色目录，
   // 下面 repinSessionWorkingDir 把 ds.workingDir 钉过去之后，那个 bot 的沙盒会话
   // 就拿到了对方整棵角色库的 readWrite（打穿 fs-policy 的跨 bot 隔离）。
@@ -1463,38 +1483,32 @@ ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
     }
     return jsonRes(res, forbidden ? 403 : 400, { ok: false, error: v.error });
   }
-  repinSessionWorkingDir(ds, v.resolvedPath);
-  // ds.initConfig 与 repin 同步，且**无条件**（不只在 live-worker 分支里）：下次
-  // forkWorker 用 initConfig 重建 init 消息，只在有活 worker 时更新的话，no-worker /
-  // worker.killed 两条分支会留下「记录新、initConfig 旧」的分裂状态，冷启动把会话
-  // 带回旧 cwd（= 旧角色，连记忆桶都是旧的）。codex review 抓出的既有 bug，与本 PR
-  // 的收窄同一处理，顺手修掉。
-  if (ds.initConfig) ds.initConfig.workingDir = v.resolvedPath;
-  if (ds.worker && !ds.worker.killed) {
-    // updateWorkingDir 随 restart 带给 worker：respawn 必须收敛到新目录，而不是
-    // 陈旧的 lastInitConfig.workingDir（daemon 侧 initConfig 已在上面同步）。
-    try {
-      ds.workerReady = false;
-      ds.worker.send({ type: 'restart', updateWorkingDir: v.resolvedPath, env: latestPerBotEnvForRestart(ds) } as DaemonToWorker);
-    } catch {
-      // send() 抛异常：worker 进程实际上已经不可达（管道已断），但 above 的
-      // repinSessionWorkingDir 已经把记录改成了新目录——绝不能留下「记录新、
-      // 进程仍在旧目录」的分裂状态。杀掉 worker 让下一条消息冷启动进新目录。
-      killWorker(ds);
-      return jsonRes(res, 200, { ok: true, mode: 'cold-restart', dir: v.resolvedPath });
-    }
-    return jsonRes(res, 200, { ok: true, mode: 'respawn-resume', dir: v.resolvedPath });
+  const submitControl = dashboardSessionRuntimeSubmitter;
+  if (!submitControl) {
+    return jsonRes(res, 503, { ok: false, error: 'session_runtime_not_ready' });
   }
-  // Unconditional (no `ds.worker` guard), matching the IM `/cd` command handler
-  // (src/core/command-handler.ts) — killWorker() already no-ops safely when there
-  // is no live worker. That "no worker" branch is exactly what must run here for a
-  // lazy-restored-after-daemon-restart or crash-stopped TmuxBackend/HerdrBackend/
-  // ZellijBackend session: the persistent backing pane survives the worker's death
-  // and still binds the OLD cwd, so it must be torn down via
-  // destroyOrphanedBackingSession (called from inside killWorker) or the next
-  // resume would silently reattach to it and ignore the just-repinned workingDir.
-  killWorker(ds);
-  jsonRes(res, 200, { ok: true, mode: 'cold-restart', dir: v.resolvedPath });
+  const outcome = await submitControl({
+    target: { kind: 'externalSession', sessionId: params.sessionId },
+    idempotencyKey: operationId.value,
+    command: {
+      kind: 'control.mutate',
+      input: { kind: 'changeWorkingDirectory', resolvedPath: v.resolvedPath },
+    },
+  });
+  if (outcome.kind !== 'applied' && outcome.kind !== 'duplicate') {
+    const failure = runtimeMutationWireFailure(outcome, { notFound: 'session_not_active' });
+    return jsonRes(res, failure.status, {
+      ...failure.body,
+      ...(failure.body.error === 'riff_cd_unsupported'
+        ? { message: t('cmd.cd.riff_unsupported', undefined, localeForBot(ds.larkAppId)) }
+        : {}),
+    });
+  }
+  const result = outcome.result;
+  if (result?.kind !== 'workingDirectoryChanged') {
+    return jsonRes(res, 503, { ok: false, error: 'session_runtime_invalid_result' });
+  }
+  jsonRes(res, 200, { ok: true, mode: result.mode, dir: result.workingDir });
 });
 
 /** 解析 session（活跃优先，已关闭兜底）。活跃会话取 ds.session —— registry 与
@@ -1522,6 +1536,71 @@ function findOwnedSessionRecord(sessionId: string): Session | undefined {
   return findActiveBySessionId(sessionId)?.session ?? sessionStore.getOwnedSession(sessionId);
 }
 
+interface RuntimeMutationWirePolicy {
+  readonly notFound: string;
+  readonly transitionRejected?: { readonly status: number; readonly error: string };
+  readonly transitionCodeStatus?: number | ((code: string) => number);
+  readonly retryable?: { readonly status: number; readonly error: string };
+  readonly unknown?: { readonly status: number; readonly error: string };
+}
+
+interface RuntimeMutationWireFailure {
+  readonly status: number;
+  readonly body: Readonly<Record<string, unknown>>;
+}
+
+function stableRuntimeCode(value: unknown): string | undefined {
+  return typeof value === 'string'
+      && value.length > 0
+      && value.length <= 128
+      && /^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/.test(value)
+    ? value
+    : undefined;
+}
+
+/** Translate internal Runtime outcomes into the stable public HTTP vocabulary.
+ * Runtime reason enums and diagnostic prose are deliberately never emitted as
+ * `error`; structured evidence remains available to callers as response fields. */
+function runtimeMutationWireFailure(
+  outcome: { kind: string; reason?: string; code?: string; details?: Readonly<Record<string, unknown>> },
+  policy: RuntimeMutationWirePolicy,
+): RuntimeMutationWireFailure {
+  const details = outcome.details ?? {};
+  const response = (status: number, error: string): RuntimeMutationWireFailure => ({
+    status,
+    body: { ok: false, ...details, error },
+  });
+  const code = stableRuntimeCode(outcome.code);
+
+  if (outcome.kind === 'rejected') {
+    if (outcome.reason === 'sessionNotFound') return response(404, policy.notFound);
+    if (outcome.reason === 'idempotencyConflict') return response(409, 'idempotency_conflict');
+    if (outcome.reason === 'invalidCommand') return response(400, code ?? 'invalid_command');
+    if (outcome.reason === 'sessionExists') return response(409, code ?? 'session_exists');
+    if (outcome.reason === 'transitionRejected') {
+      if (code) {
+        const status = typeof policy.transitionCodeStatus === 'function'
+          ? policy.transitionCodeStatus(code)
+          : policy.transitionCodeStatus ?? 409;
+        return response(status, code);
+      }
+      const rejected = policy.transitionRejected ?? { status: 409, error: 'operation_rejected' };
+      return response(rejected.status, rejected.error);
+    }
+    return response(409, code ?? 'operation_rejected');
+  }
+  if (outcome.kind === 'staleAddress') return response(409, 'stale_address');
+  if (outcome.kind === 'ambiguous' || outcome.kind === 'quarantined' || outcome.kind === 'unknown') {
+    const unknown = policy.unknown ?? { status: 503, error: 'dispatch_unknown' };
+    return response(unknown.status, unknown.error);
+  }
+  if (outcome.kind === 'retryable' || outcome.kind === 'notWired') {
+    const retryable = policy.retryable ?? { status: 503, error: 'session_runtime_not_ready' };
+    return response(retryable.status, retryable.error);
+  }
+  return response(503, 'session_runtime_unavailable');
+}
+
 /** Four-state async lookup with durable fallback (design A).
  *
  *  In-memory `asyncTriggerResults` lives only on the active DaemonSession and is
@@ -1536,8 +1615,43 @@ function findOwnedSessionRecord(sessionId: string): Session | undefined {
  *
  *  Legacy `action`/`async` fields are still populated so existing webhook
  *  consumers keep working; new callers branch on `state`. */
-function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string): TriggerResponse {
+async function buildAsyncTriggerLookupResponse(
+  sessionId: string,
+  triggerId?: string,
+): Promise<TriggerResponse> {
   const ds = findActiveBySessionId(sessionId);
+  const memTriggerId = triggerId || ds?.latestAsyncTriggerId;
+  const faultEntry = ds && memTriggerId
+    ? ds.idempotentAsyncTurns?.get(memTriggerId)
+    : undefined;
+  if (faultEntry?.postBarrierFault && memTriggerId && dashboardSessionRuntimeSubmitter) {
+    const convergence = await dashboardSessionRuntimeSubmitter({
+      target: { kind: 'externalSession', sessionId },
+      idempotencyKey: `trigger-result-fault:${memTriggerId}`,
+      command: {
+        kind: 'control.mutate',
+        input: { kind: 'convergeAsyncTriggerFault', triggerId: memTriggerId },
+      },
+    });
+    const result = convergence.kind === 'applied' || convergence.kind === 'duplicate'
+      ? convergence.result
+      : undefined;
+    if (result?.kind === 'asyncTriggerFaultConverged' && result.state === 'failed') {
+      return {
+        ok: true,
+        state: 'failed',
+        triggerId: result.triggerId,
+        target: {
+          kind: 'turn',
+          sessionId,
+          ...(result.chatId ? { chatId: result.chatId } : {}),
+        },
+        errorCode: 'no_output',
+        error: 'previous dispatch was interrupted with unknown outcome; not re-run (at-most-once)',
+        message: 'async trigger terminated without output',
+      };
+    }
+  }
   const storedRaw = ds?.session ?? sessionStore.getSession(sessionId);
   const persistedRaw = asyncTriggerStore.lookup(sessionId, triggerId);
 
@@ -1567,55 +1681,7 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
     };
   }
 
-  const memTriggerId = triggerId || ds?.latestAsyncTriggerId;
   const memResult = ds && memTriggerId ? ds.asyncTriggerResults?.get(memTriggerId) : undefined;
-
-  // Best-effort poll-side convergence for the double-fault turn (codex #818 P1-8):
-  // the CONTRACT is that a double-fault returns 5xx and the caller retries with the
-  // same key (that retry path is the authoritative recovery). This block is only a
-  // bonus for a client that happens to poll first — if this turn is flagged
-  // postBarrierFault (post-barrier throw AND the durable terminalize then threw),
-  // nothing dispatched and no durable result exists, yet a live shared worker keeps
-  // `liveActive` true so resolveAsyncTriggerState would otherwise report `running`.
-  // Re-attempt the strict terminalize opportunistically; a persistent EIO simply
-  // falls through to `running` and is converged by a same-key retry or boot reconcile.
-  if (ds && memTriggerId) {
-    const faultEntry = ds.idempotentAsyncTurns?.get(memTriggerId);
-    if (faultEntry?.postBarrierFault) {
-      // COMPLETED-WINS (codex #818 P1-8 race): the AUTHORITATIVE decision is
-      // recordFailedStrict's IN-LOCK outcome (no TOCTOU). A pre-read fast-path
-      // avoids the write when already visibly completed; else the in-lock return
-      // (`already_completed` vs `written_failed`) decides. Never terminalize over a
-      // completion that landed after the pre-read.
-      const durable = asyncTriggerStore.lookup(sessionId, memTriggerId);
-      const ownedCompleted = durable?.result.status === 'completed'
-        && durable.ownerLarkAppId === faultEntry.ownerLarkAppId;
-      if (ownedCompleted) {
-        ds.idempotentAsyncTurns?.delete(memTriggerId);
-        // fall through to normal resolution → reports completed.
-      } else {
-        try {
-          const outcome = asyncTriggerStore.recordFailedStrict(sessionId, memTriggerId, Date.now(), faultEntry.ownerLarkAppId, 'dispatch_unknown');
-          ds.idempotentAsyncTurns?.delete(memTriggerId);
-          if (outcome === 'written_failed') {
-            ds.asyncTriggerResults?.delete(memTriggerId);
-            return {
-              ok: true, state: 'failed', triggerId: memTriggerId,
-              target: { kind: 'turn', sessionId, chatId: ds.chatId ?? stored?.chatId },
-              errorCode: 'no_output',
-              error: 'previous dispatch was interrupted with unknown outcome; not re-run (at-most-once)',
-              message: 'async trigger terminated without output',
-            };
-          }
-          // outcome === 'already_completed': a completion was seen under the lock —
-          // fall through to normal resolution (which reports the completed result).
-        } catch {
-          // Genuine I/O failure — leave the flag for the next poll / retry / boot
-          // reconcile; fall through to `running` rather than a phantom terminal.
-        }
-      }
-    }
-  }
 
   const resolved = resolveAsyncTriggerState({
     sessionId,
@@ -1650,136 +1716,169 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
 // 看板放置：dashboard 看板视图拖拽卡片后持久化列 + 列内排序位置。
 // 改完广播 session.update，所有打开的 dashboard 实时同步。
 ipcRoute('POST', '/api/sessions/:sessionId/board', async (req, res, params) => {
-  let body: { column?: unknown; position?: unknown };
+  let body: { column?: unknown; position?: unknown; operationId?: unknown } & Record<string, unknown>;
   try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const operationId = sessionOperationId(req, body);
+  if (!operationId.ok) return jsonRes(res, 400, { ok: false, error: operationId.error });
   const column = normalizeKanbanColumn(body.column);
   const position = normalizeKanbanPosition(body.position);
   if (!column && position === null) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
-  const session = findOwnedSessionRecord(params.sessionId);
-  if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
-  const larkAppId = session.larkAppId || cachedLarkAppId;
-  if (!larkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
-  return withBotTurnAdmission(larkAppId, async () => {
-  const currentSession = findSessionRecord(params.sessionId);
-  if (!currentSession) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
-  // 待办池(queued)会话被拖到「进行中」= 激活：把暂存内容当首轮发给 CLI 开跑。
-  // activateQueuedSession 内部会清 queued + 把列设成 in_progress + forkWorker。
-  const activeDs = findActiveBySessionId(params.sessionId);
-  let activationTransferred = false;
-  if (column === 'in_progress' && activeDs?.session.queued) {
-    const activated = await activateQueuedSession(activeDs);
-    if (!activated.ok) return jsonRes(res, 500, activated);
-    activationTransferred = true;
-  } else if (column) {
-    currentSession.kanbanColumn = column;
+  if (!dashboardSessionRuntimeSubmitter) {
+    return jsonRes(res, 503, { ok: false, error: 'session_runtime_not_ready' });
   }
-  if (position !== null) currentSession.kanbanPosition = position;
-  try {
-    sessionStore.updateSession(currentSession);
-  } catch (err) {
-    if (!activationTransferred) throw err;
-    logger.error(
-      `[dashboard] board metadata persistence failed after queued activation ownership transferred: `
-      + `${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-  dashboardEventBus.publish({
-    type: 'session.update',
-    body: {
-      sessionId: params.sessionId,
-      // queued 一并下发：激活后 session.queued 已为 false，前端浅合并若不带这个字段
-      // 会残留 queued=true（卡片仍显示「开始」、再点 409）。!!session.queued 始终反映现态。
-      patch: { kanbanColumn: currentSession.kanbanColumn, kanbanPosition: currentSession.kanbanPosition, queued: !!currentSession.queued },
-    },
-  });
+  const outcome = await dashboardSessionRuntimeSubmitter({
+      target: { kind: 'externalSession', sessionId: params.sessionId },
+      idempotencyKey: operationId.value,
+      command: {
+        kind: 'control.mutate',
+        input: {
+          kind: 'setBoardPlacement',
+          ...(column ? { column } : {}),
+          ...(position === null ? {} : { position }),
+        },
+      },
+    });
+    if (outcome.kind !== 'applied' && outcome.kind !== 'duplicate') {
+      const failure = runtimeMutationWireFailure(outcome, { notFound: 'session_not_found' });
+      return jsonRes(res, failure.status, failure.body);
+    }
+    const result = outcome.result;
+    if (outcome.kind === 'applied' && result?.kind === 'boardPlacementUpdated') {
+      dashboardEventBus.publish({
+        type: 'session.update',
+        body: {
+          sessionId: params.sessionId,
+          patch: {
+            kanbanColumn: result.column,
+            kanbanPosition: result.position,
+            queued: result.queued,
+          },
+        },
+      });
+    }
   jsonRes(res, 200, { ok: true });
-  });
 });
 
 // Narrow CLI whiteboard binding mutation. Keeping this daemon-side avoids a
 // short-lived `botmux whiteboard` process rewriting a stale whole Session row
 // over a concurrent Codex App FIFO transition.
 ipcRoute('POST', '/api/sessions/:sessionId/whiteboard', async (req, res, params) => {
-  let body: { whiteboardId?: unknown };
+  let body: { whiteboardId?: unknown; operationId?: unknown } & Record<string, unknown>;
   try { body = await readJsonBody(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const operationId = sessionOperationId(req, body);
+  if (!operationId.ok) return jsonRes(res, 400, { ok: false, error: operationId.error });
   if (typeof body.whiteboardId !== 'string'
     || body.whiteboardId.length === 0
     || body.whiteboardId.length > 256) {
     return jsonRes(res, 400, { ok: false, error: 'bad_whiteboard_id' });
   }
-  const session = findSessionRecord(params.sessionId);
-  if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
-  const larkAppId = session.larkAppId || cachedLarkAppId;
-  if (!larkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
-  return withBotTurnAdmission(larkAppId, async () => {
-    const current = findSessionRecord(params.sessionId);
-    if (!current) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
-    current.whiteboardId = body.whiteboardId as string;
-    sessionStore.updateSession(current);
-    jsonRes(res, 200, { ok: true, whiteboardId: current.whiteboardId });
+  if (!dashboardSessionRuntimeSubmitter) {
+    return jsonRes(res, 503, { ok: false, error: 'session_runtime_not_ready' });
+  }
+  const outcome = await dashboardSessionRuntimeSubmitter({
+      target: { kind: 'externalSession', sessionId: params.sessionId },
+      idempotencyKey: operationId.value,
+      command: {
+        kind: 'control.mutate',
+        input: { kind: 'bindWhiteboard', whiteboardId: body.whiteboardId as string },
+      },
+    });
+    if (outcome.kind !== 'applied' && outcome.kind !== 'duplicate') {
+      const failure = runtimeMutationWireFailure(outcome, { notFound: 'session_not_found' });
+      return jsonRes(res, failure.status, failure.body);
+    }
+    const result = outcome.result;
+    jsonRes(res, 200, {
+      ok: true,
+      whiteboardId: result?.kind === 'whiteboardBound'
+        ? result.whiteboardId
+        : body.whiteboardId,
   });
 });
 
 // 待办池会话「开始」：把 parked 会话激活（发首轮、起 CLI），与拖到「进行中」同义。
-ipcRoute('POST', '/api/sessions/:sessionId/start', async (_req, res, params) => {
-  const initial = findActiveBySessionId(params.sessionId);
-  if (!initial) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
-  return withBotTurnAdmission(initial.larkAppId, async () => {
-  const ds = findActiveBySessionId(params.sessionId);
-  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
-  if (!ds.session.queued) return jsonRes(res, 409, { ok: false, error: 'not_queued' });
-  const r = await activateQueuedSession(ds);
-  if (!r.ok) return jsonRes(res, 500, r);
-  dashboardEventBus.publish({
-    type: 'session.update',
-    body: {
-      sessionId: params.sessionId,
-      patch: { kanbanColumn: ds.session.kanbanColumn, queued: !!ds.session.queued },
-    },
-  });
+ipcRoute('POST', '/api/sessions/:sessionId/start', async (req, res, params) => {
+  let body: Record<string, unknown>;
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const operationId = sessionOperationId(req, body);
+  if (!operationId.ok) return jsonRes(res, 400, { ok: false, error: operationId.error });
+  if (!dashboardSessionRuntimeSubmitter) {
+    return jsonRes(res, 503, { ok: false, error: 'session_runtime_not_ready' });
+  }
+  const submit = dashboardSessionRuntimeSubmitter;
+  const outcome = await submit({
+      target: { kind: 'externalSession', sessionId: params.sessionId },
+      idempotencyKey: operationId.value,
+      command: {
+        kind: 'control.mutate',
+        input: { kind: 'activateQueued', source: 'dashboard' },
+      },
+    });
+    if (outcome.kind !== 'applied' && outcome.kind !== 'duplicate') {
+      const failure = runtimeMutationWireFailure(outcome, { notFound: 'session_not_found' });
+      return jsonRes(res, failure.status, failure.body);
+    }
+    const result = outcome.result;
+    if (outcome.kind === 'applied' && result?.kind === 'queuedActivated') {
+      dashboardEventBus.publish({
+        type: 'session.update',
+        body: {
+          sessionId: params.sessionId,
+          patch: {
+            kanbanColumn: result.column,
+            queued: result.queued,
+          },
+        },
+      });
+    }
   jsonRes(res, 200, { ok: true });
-  });
 });
 
 // Dashboard「创建会话」spawn：在新建的群里为本 daemon 的 bot 拉起/暂存一条 chat-scope
 // 会话。aggregator 建完群后按模式(一起开工/lead 分配)对每个目标 bot 的 daemon 调一次。
 ipcRoute('POST', '/api/sessions/spawn', async (req, res) => {
-  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
-  const activeSessions = getActiveSessionsRegistry();
-  if (!activeSessions) return jsonRes(res, 503, { ok: false, error: 'registry_unavailable' });
   let body: unknown;
   try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json' }); }
+  const operationId = sessionOperationId(req, body);
+  if (!operationId.ok) return jsonRes(res, 400, { ok: false, error: operationId.error });
   const parsed = parseSpawnRequest(body);
   if (!parsed.ok) return jsonRes(res, 400, { ok: false, error: parsed.error });
-  const postBanner = !!(body as any).postBanner;
-  return withBotTurnAdmission(cachedLarkAppId, async () => {
-  let attachments;
-  try {
-    attachments = materializeDashboardImages(cachedLarkAppId, parsed.value.images);
-  } catch (err: any) {
-    logger.error(`[createSession] failed to persist Dashboard images: ${err?.message ?? err}`);
-    return jsonRes(res, 500, { ok: false, error: 'image_store_failed' });
-  }
-  const r = await spawnDashboardSession(activeSessions, undefined, {
-    larkAppId: cachedLarkAppId,
-    chatId: parsed.value.chatId,
-    content: parsed.value.content,
-    column: parsed.value.column,
-    role: parsed.value.role,
-    coworkers: parsed.value.coworkers,
-    attachments,
-    title: parsed.value.title,
-    postBanner,
-    ownerOpenId: parsed.value.ownerOpenId,
-    ownerUnionId: parsed.value.ownerUnionId,
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
+  const submit = dashboardSessionRuntimeSubmitter;
+  if (!submit) return jsonRes(res, 503, { ok: false, error: 'session_runtime_not_ready' });
+  const outcome = await submit({
+    target: { kind: 'route', route: { kind: 'chat', chatId: parsed.value.chatId } },
+    idempotencyKey: operationId.value,
+    command: {
+      kind: 'dashboard.spawn',
+      input: {
+        content: parsed.value.content,
+        column: parsed.value.column,
+        role: parsed.value.role,
+        coworkers: parsed.value.coworkers,
+        images: parsed.value.images,
+        postBanner: (body as Record<string, unknown>).postBanner === true,
+        ...(parsed.value.title === undefined ? {} : { title: parsed.value.title }),
+        ...(parsed.value.ownerOpenId === undefined
+          ? {}
+          : { ownerOpenId: parsed.value.ownerOpenId }),
+        ...(parsed.value.ownerUnionId === undefined
+          ? {}
+          : { ownerUnionId: parsed.value.ownerUnionId }),
+      },
+    },
   });
-  if (!r.ok) {
-    cleanupMaterializedDashboardImages(cachedLarkAppId, attachments);
-    return jsonRes(res, r.error === 'session_exists' ? 409 : 500, r);
+  if (outcome.kind === 'applied' || outcome.kind === 'duplicate') {
+    return jsonRes(res, 200, { ok: true, sessionId: outcome.sessionId });
   }
-  jsonRes(res, 200, r);
+  const failure = runtimeMutationWireFailure(outcome, {
+    notFound: 'session_not_found',
+    transitionRejected: { status: 500, error: 'spawn_rejected' },
+    transitionCodeStatus: 500,
   });
+  return jsonRes(res, failure.status, failure.body);
 });
 
 ipcRoute('POST', '/api/chat-reply-mode', async (req, res) => {
@@ -1882,10 +1981,10 @@ ipcRoute('GET', '/api/sessions/:sessionId/history', async (req, res, params) => 
   }
 });
 
-ipcRoute('GET', '/api/sessions/:sessionId/trigger-result', (req, res, params) => {
+ipcRoute('GET', '/api/sessions/:sessionId/trigger-result', async (req, res, params) => {
   const url = new URL(req.url ?? '/', 'http://localhost');
   const triggerId = url.searchParams.get('triggerId') ?? undefined;
-  const result = buildAsyncTriggerLookupResponse(params.sessionId, triggerId);
+  const result = await buildAsyncTriggerLookupResponse(params.sessionId, triggerId);
   // Four-state semantics: the query itself succeeds (HTTP 200) for every
   // resolved state including not_found — task state lives in `result.state`,
   // not the HTTP status. Only a malformed lookup (ok:false) maps to non-200.
@@ -2005,44 +2104,87 @@ ipcRoute('GET', '/api/owner-profile', async (_req, res) => {
 ipcRoute('POST', '/api/sessions/:sessionId/rename', async (req, res, params) => {
   let body: { title?: unknown; source?: unknown } & Record<string, unknown>;
   try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
-  const active = findActiveBySessionId(params.sessionId);
-  const auth = sessionCliIpcAuth(req, active, params.sessionId, body);
+  const operationId = sessionOperationId(req, body);
+  if (!operationId.ok) return jsonRes(res, 400, { ok: false, error: operationId.error });
+  const auth = sessionCliIpcAuth(req, params.sessionId, body);
   if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
   const title = normalizeSessionTitle(body.title);
   if (!title) return jsonRes(res, 400, { ok: false, error: 'bad_title' });
-  const session = active?.session ?? sessionStore.getOwnedSession(params.sessionId);
-  if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
   const source = normalizeSessionTitleSource(body.source, 'dashboard');
-  const updated = updateSessionTitle(session, title, source);
-  if (!updated.ok) return jsonRes(res, 400, { ok: false, error: updated.error });
-  const agentSync = active
-    ? requestAgentSessionRename(active, updated.title)
-    : { status: 'not_running' as const };
+  if (!dashboardSessionRuntimeSubmitter) {
+    return jsonRes(res, 503, { ok: false, error: 'session_runtime_not_ready' });
+  }
+  const outcome = await dashboardSessionRuntimeSubmitter({
+    target: { kind: 'externalSession', sessionId: params.sessionId },
+    idempotencyKey: operationId.value,
+    command: {
+      kind: 'control.rename',
+      input: { title, source },
+    },
+  });
+  if (outcome.kind !== 'applied' && outcome.kind !== 'duplicate') {
+    const failure = runtimeMutationWireFailure(outcome, { notFound: 'session_not_found' });
+    return jsonRes(res, failure.status, failure.body);
+  }
+  const renameResult = outcome.kind === 'applied'
+    ? outcome
+    : outcome.result;
+  if (!renameResult) {
+    return jsonRes(res, 503, { ok: false, error: 'session_runtime_invalid_result' });
+  }
+  const effectiveTitle = renameResult.title;
+  const effectiveUpdatedAt = renameResult.updatedAt;
+  const effectiveSource = renameResult.source;
+  if (outcome.kind === 'applied') {
+    dashboardEventBus.publish({
+      type: 'session.update',
+      body: {
+        sessionId: params.sessionId,
+        patch: {
+          title: effectiveTitle,
+          titleUpdatedAt: effectiveUpdatedAt,
+          titleSource: effectiveSource,
+        },
+      },
+    });
+  }
   jsonRes(res, 200, {
     ok: true,
-    title: updated.title,
-    titleUpdatedAt: updated.updatedAt,
-    titleSource: updated.source,
-    agentSync: agentSync.status,
+    title: effectiveTitle,
+    titleUpdatedAt: effectiveUpdatedAt,
+    titleSource: effectiveSource,
+    agentSync: renameResult.agentSync.status,
   });
 });
 
 // 会话锁定：保护被锁定会话不被 dashboard「清理空闲」批量关闭。锁定是会话元数据，
 // 不影响用户显式点击关闭/批量关闭，避免把会话变成不可管理状态。
 ipcRoute('POST', '/api/sessions/:sessionId/lock', async (req, res, params) => {
-  let body: { locked?: unknown };
+  let body: { locked?: unknown; operationId?: unknown } & Record<string, unknown>;
   try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const operationId = sessionOperationId(req, body);
+  if (!operationId.ok) return jsonRes(res, 400, { ok: false, error: operationId.error });
   if (typeof body.locked !== 'boolean') return jsonRes(res, 400, { ok: false, error: 'bad_locked' });
-  const session = findOwnedSessionRecord(params.sessionId);
-  if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
-  if (body.locked) session.locked = true;
-  else delete session.locked;
-  sessionStore.updateSession(session);
-  const locked = !!session.locked;
-  dashboardEventBus.publish({
-    type: 'session.update',
-    body: { sessionId: params.sessionId, patch: { locked } },
+  if (!dashboardSessionRuntimeSubmitter) {
+    return jsonRes(res, 503, { ok: false, error: 'session_runtime_not_ready' });
+  }
+  const outcome = await dashboardSessionRuntimeSubmitter({
+    target: { kind: 'externalSession', sessionId: params.sessionId },
+    idempotencyKey: operationId.value,
+    command: { kind: 'control.mutate', input: { kind: 'setLocked', locked: body.locked } },
   });
+  if (outcome.kind !== 'applied' && outcome.kind !== 'duplicate') {
+    const failure = runtimeMutationWireFailure(outcome, { notFound: 'session_not_found' });
+    return jsonRes(res, failure.status, failure.body);
+  }
+  const result = outcome.result;
+  const locked = result?.kind === 'lockUpdated' ? result.locked : body.locked;
+  if (outcome.kind === 'applied') {
+    dashboardEventBus.publish({
+      type: 'session.update',
+      body: { sessionId: params.sessionId, patch: { locked } },
+    });
+  }
   jsonRes(res, 200, { ok: true, locked });
 });
 
@@ -2134,82 +2276,68 @@ function workingDirForSession(sessionId: string): string | undefined {
  * the original Lark thread so users see why the session is alive again.
  */
 ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => {
+  let body: Record<string, unknown>;
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
   const sessionId = params.sessionId;
-  const sourceSession = findSessionRecord(sessionId);
-  if (!sourceSession) return jsonRes(res, 404, { ok: false, error: 'not_found' });
-  // Legacy persisted sessions may carry an empty larkAppId and are hydrated
-  // with this daemon's identity by resumeSession. Use the same fallback for
-  // admission instead of rejecting an otherwise valid recovery record.
-  const larkAppId = sourceSession.larkAppId || cachedLarkAppId || '__legacy_unbound__';
-  return withBotTurnAdmission(larkAppId, async () => {
-  const reg = getActiveSessionsRegistry();
-  if (!reg) return jsonRes(res, 503, { ok: false, error: 'registry_unavailable' });
-  const result = await resumeSession(sessionId, reg);
-  if (!result.ok) {
-    const status = result.error === 'not_found' ? 404 : 409;
-    return jsonRes(res, status, { ok: false, error: result.error, activeSessionId: result.activeSessionId });
-  }
-
-  const ds = result.ds;
+  const operationId = sessionOperationId(req, body);
+  if (!operationId.ok) return jsonRes(res, 400, { ok: false, error: operationId.error });
   // `?wake=1` is an opt-in operational hook (no UI/CLI caller wires it today —
-  // it's meant for direct `curl` recovery): instead of the default lazy
-  // cold-resume on the next inbound message, fork the worker immediately so the
-  // session is usable right away. Off by default keeps every existing caller's
-  // behaviour unchanged.
+  // it's meant for direct recovery). The Current control Adapter performs the
+  // activation through the same Session lifecycle seam.
   const wake = new URL(req.url ?? '/', 'http://localhost').searchParams.get('wake') === '1';
+  if (!dashboardSessionRuntimeSubmitter) {
+    return jsonRes(res, 503, { ok: false, error: 'session_runtime_not_ready' });
+  }
+  const outcome = await dashboardSessionRuntimeSubmitter({
+    target: { kind: 'externalSession', sessionId },
+    idempotencyKey: operationId.value,
+    command: {
+      kind: 'control.mutate',
+      input: { kind: 'reopen', source: 'dashboard', wake },
+    },
+  });
+  if (outcome.kind !== 'applied' && outcome.kind !== 'duplicate') {
+    const failure = runtimeMutationWireFailure(outcome, {
+      notFound: 'not_found',
+      transitionRejected: { status: 409, error: 'not_closed' },
+    });
+    return jsonRes(res, failure.status, failure.body);
+  }
+  const controlResult = outcome.result;
+  if (controlResult?.kind !== 'reopened') {
+    return jsonRes(res, 503, { ok: false, error: 'session_runtime_invalid_result' });
+  }
+  const responseSession = controlResult.session;
+  const woke = controlResult.executor === 'active';
   // Tell the dashboard the row flipped back to active (mirror of session.update
   // emitted by closeSession). Use `null` for closedAt — `undefined` would be
   // dropped by JSON.stringify on the SSE wire and the aggregator's spread
   // (`{...cur, ...patch}`) would leave the stale closedAt in place.
-  dashboardEventBus.publish({
-    type: 'session.update',
-    body: {
-      sessionId,
-      patch: { status: 'active', closedAt: null },
-    },
-  });
-
-  // Notify the original chat so humans see why the session is alive again.
-  // Routing follows session.scope — thread-scope replies into the thread root
-  // (reply_in_thread=true), chat-scope posts a plain message to the chat (any
-  // reply_in_thread call would silently get rejected or land on a stale root).
-  const cliId = ds.session.cliId;
-  const botCfg = ds.larkAppId ? getBot(ds.larkAppId).config : undefined;
-  const cliName = sessionConfiguredRuntimeDisplayName(ds.session, botCfg?.cliRuntime)
-    ?? getCliDisplayName(cliId ?? botCfg?.cliId ?? 'claude-code');
-  const notice = JSON.stringify({ text: `🔄 会话已通过命令行恢复，发条消息继续与 ${cliName} 对话。` });
-  if (ds.larkAppId && !sessionTransportDisabled(ds)) {
-    if (ds.scope === 'chat' && ds.chatId) {
-      getChatMode(ds.larkAppId, ds.chatId, { forceRefresh: true })
-        .then((mode) => mode === 'topic' && ds.session.rootMessageId
-          ? replyMessage(ds.larkAppId, ds.session.rootMessageId, notice, 'text', true)
-          : sendMessage(ds.larkAppId, ds.chatId, notice, 'text'))
-        .catch(err => logger.debug(`[resume] failed to post chat-scope resume notice: ${err}`));
-    } else if (ds.session.rootMessageId) {
-      replyMessage(ds.larkAppId, ds.session.rootMessageId, notice, 'text', true)
-        .catch(err => logger.debug(`[resume] failed to post thread-scope resume notice: ${err}`));
-    }
+  if (outcome.kind === 'applied') {
+    dashboardEventBus.publish({
+      type: 'session.update',
+      body: {
+        sessionId,
+        patch: { status: 'active', closedAt: null },
+      },
+    });
   }
 
-  // Report the EFFECTIVE action, not the raw request flag: only fork when wake
-  // was asked AND there's no live worker to clobber. (resumeSession always hands
-  // back a worker:null ds today, so this matches `wake` in practice — but
-  // reporting the action keeps the response honest if the guard ever broadens.)
-  const woke = wake && (!ds.worker || ds.worker.killed);
-  if (woke) {
-    forkWorker(ds, '', true);
+  const cliId = responseSession.cliId;
+  if (outcome.kind === 'applied') {
+    dashboardControlEffects?.resumeNotice({ sessionId, cliId });
   }
 
   jsonRes(res, 200, {
     ok: true,
     sessionId,
     wake: woke,
-    title: ds.session.title,
-    chatId: ds.chatId,
-    rootMessageId: ds.session.rootMessageId,
-    workingDir: ds.session.workingDir,
+    title: responseSession.title,
+    chatId: responseSession.chatId,
+    rootMessageId: responseSession.rootMessageId,
+    workingDir: responseSession.workingDir,
     cliId,
-  });
   });
 });
 
@@ -2245,20 +2373,39 @@ ipcRoute('POST', '/api/sessions/migrate-to-chat', async (req, res) => {
 
   let body: {
     sourceAnchor?: string;
+    sourceScope?: 'thread' | 'chat';
     targetChatId?: string;
     targetRootMessageId?: string;
     requesterLarkAppId?: string;
     requestingUserOpenId?: string;
     requestingUserUnionId?: string;
-  };
+    operationId?: unknown;
+  } & Record<string, unknown>;
   try {
     body = await readJsonBody(req);
   } catch {
     return jsonRes(res, 400, { ok: false, error: 'invalid_json' });
   }
-  const { sourceAnchor, targetChatId, targetRootMessageId, requesterLarkAppId, requestingUserOpenId, requestingUserUnionId } = body;
-  if (!sourceAnchor || !targetChatId || !targetRootMessageId || !requesterLarkAppId || !requestingUserOpenId) {
+  const operationId = sessionOperationId(req, body);
+  if (!operationId.ok) return jsonRes(res, 400, { ok: false, error: operationId.error });
+  const {
+    sourceAnchor,
+    sourceScope,
+    targetChatId,
+    targetRootMessageId,
+    requesterLarkAppId,
+    requestingUserOpenId,
+    requestingUserUnionId,
+  } = body;
+  if (typeof sourceAnchor !== 'string' || !sourceAnchor
+    || typeof targetChatId !== 'string' || !targetChatId
+    || typeof targetRootMessageId !== 'string' || !targetRootMessageId
+    || typeof requesterLarkAppId !== 'string' || !requesterLarkAppId
+    || typeof requestingUserOpenId !== 'string' || !requestingUserOpenId) {
     return jsonRes(res, 400, { ok: false, error: 'missing_field' });
+  }
+  if (sourceScope !== undefined && sourceScope !== 'thread' && sourceScope !== 'chat') {
+    return jsonRes(res, 400, { ok: false, error: 'bad_source_scope' });
   }
 
   // Requester must be a live botmux daemon — not a random localhost process
@@ -2271,66 +2418,47 @@ ipcRoute('POST', '/api/sessions/migrate-to-chat', async (req, res) => {
   const requesterKnown = listOnlineDaemons().some(d => d.larkAppId === requesterLarkAppId);
   if (!requesterKnown) return jsonRes(res, 403, { ok: false, error: 'unknown_requester' });
 
-  // Locate this daemon's own session at the given source anchor. We match
-  // by anchor (rootMessageId for thread-scope, chatId for chat-scope) AND
-  // larkAppId — multi-bot threads share a rootMessageId but each bot's
-  // session is uniquely keyed by (anchor, larkAppId).
-  const reg = getActiveSessionsRegistry();
-  if (!reg) return jsonRes(res, 503, { ok: false, error: 'registry_unavailable' });
-
-  let ds: ReturnType<typeof findActiveBySessionId> = undefined;
-  for (const candidate of reg.values()) {
-    const candAnchor = sessionAnchorId(candidate);
-    if (candAnchor === sourceAnchor && candidate.larkAppId === cachedLarkAppId) {
-      ds = candidate;
-      break;
-    }
+  const submitControl = dashboardSessionRuntimeSubmitter;
+  if (!submitControl) {
+    return jsonRes(res, 503, { ok: false, error: 'session_runtime_not_ready' });
   }
-  if (!ds) return jsonRes(res, 404, { ok: false, error: 'no_session_at_anchor' });
-
-  // Owner-only: the user who triggered /relay --create must own this peer's
-  // session too. If a peer's session is owned by someone else, we refuse —
-  // the leader summarises this as "skipped: not your session" rather than
-  // forcing a transfer of someone else's work.
-  //
-  // Cross-app identity: Lark `open_id` is app-scoped — the same user has a
-  // different open_id in each bot's namespace, so leader's senderOpenId
-  // and peer's stored ownerOpenId cannot be compared directly. Prefer
-  // `union_id` (stable across apps within a tenant) when both sides have
-  // it. Sessions persisted before ownerUnionId existed fall through to a
-  // lazy backfill: resolve peer's stored open_id → union_id via Lark API
-  // (using PEER's bot client, so the open_id is in the right namespace),
-  // persist for next time, and compare.
-  if (ds.session.ownerOpenId) {
-    let peerOwnerUnionId = ds.session.ownerUnionId;
-    if (!peerOwnerUnionId && requestingUserUnionId) {
-      // Backfill: legacy session, look up the union_id via Lark API once
-      // and persist it so subsequent comparisons (and any other code path
-      // that grows to read it) are fast.
-      const looked = await resolveUnionIdFromOpenId(ds.larkAppId, ds.session.ownerOpenId);
-      if (looked) {
-        peerOwnerUnionId = looked;
-        ds.session.ownerUnionId = looked;
-        sessionStore.updateSession(ds.session);
-      }
-    }
-    const ownerMatch = (peerOwnerUnionId && requestingUserUnionId)
-      ? peerOwnerUnionId === requestingUserUnionId
-      // Same-bot fallback (no union_id on either side): open_id namespaces
-      // match, so direct compare works.
-      : ds.session.ownerOpenId === requestingUserOpenId;
-    if (!ownerMatch) {
-      return jsonRes(res, 403, { ok: false, error: 'not_session_owner' });
-    }
+  const outcome = await submitControl({
+    target: {
+      kind: 'route',
+      route: sourceScope === 'chat'
+        ? { kind: 'chat', chatId: sourceAnchor }
+        : { kind: 'thread', anchorId: sourceAnchor },
+    },
+    idempotencyKey: operationId.value,
+    command: {
+      kind: 'control.mutate',
+      input: {
+        kind: 'relocate',
+        sourceAnchor,
+        targetChatId,
+        targetRootMessageId,
+        requester: {
+          larkAppId: requesterLarkAppId,
+          openId: requestingUserOpenId,
+          ...(typeof requestingUserUnionId === 'string' && requestingUserUnionId
+            ? { unionId: requestingUserUnionId }
+            : {}),
+        },
+      },
+    },
+  });
+  if (outcome.kind === 'applied' || outcome.kind === 'duplicate') {
+    return jsonRes(res, 200, { ok: true, sessionId: outcome.sessionId });
   }
-
-  // Target chat was built by the leader's /relay --create — by
-  // construction a regular group, chat-scope (M1 is the audit anchor).
-  const result = await transferSession(ds.session.sessionId, targetChatId, targetRootMessageId, 'group', 'chat');
-  if (!result.ok) {
-    return jsonRes(res, 500, { ok: false, error: result.error });
+  if (outcome.kind === 'rejected' && outcome.reason === 'sessionNotFound') {
+    return jsonRes(res, 404, { ok: false, error: 'no_session_at_anchor' });
   }
-  jsonRes(res, 200, { ok: true, sessionId: ds.session.sessionId });
+  const failure = runtimeMutationWireFailure(outcome, {
+    notFound: 'no_session_at_anchor',
+    transitionRejected: { status: 500, error: 'migration_rejected' },
+    transitionCodeStatus: code => code === 'not_session_owner' ? 403 : 500,
+  });
+  return jsonRes(res, failure.status, failure.body);
 });
 
 ipcRoute('POST', '/api/sessions/:sessionId/locate', async (_req, res, params) => {
@@ -3873,189 +4001,62 @@ ipcRoute('PUT', '/api/bot-avatar', async (req, res) => {
 // a later lazy resume can't resurrect the old CLI (#346 covered the restart
 // path; this covers the hot-switch path).
 ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
-  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
-  const larkAppId = cachedLarkAppId;
-  let body: { cliId?: unknown; model?: unknown; cliRuntime?: unknown };
-  try { body = await readJsonBody<{ cliId?: unknown; model?: unknown; cliRuntime?: unknown }>(req); }
+  let body: {
+    cliId?: unknown;
+    model?: unknown;
+    cliRuntime?: unknown;
+    operationId?: unknown;
+  } & Record<string, unknown>;
+  try {
+    body = await readJsonBody<typeof body>(req);
+  }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+
+  const operationId = sessionOperationId(req, body);
+  if (!operationId.ok) return jsonRes(res, 400, { ok: false, error: operationId.error });
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
 
   const key = typeof body.cliId === 'string' && body.cliId.trim() ? body.cliId.trim() : '';
   if (!key) return jsonRes(res, 400, { ok: false, error: 'cli_required' });
-  let selected: ReturnType<typeof resolveCliSelection>;
-  try {
-    selected = resolveCliSelection(key);
-  } catch (err: any) {
-    return jsonRes(res, 400, { ok: false, error: 'invalid_cli', message: err?.message ?? String(err) });
-  }
   const model = typeof body.model === 'string' ? body.model.trim() : '';
-  const currentBotConfig = getBot(larkAppId).config;
   const runtimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'cliRuntime');
-  const currentSelectionKey = selectionKeyForBot(currentBotConfig.cliId, currentBotConfig.wrapperCli);
-  const selectionChanged = key !== currentSelectionKey;
-  let nextRuntime: CliRuntimeConfig | undefined;
-  let nextLegacyPath: string | undefined;
-  if (runtimeFieldPresent) {
-    if (body.cliRuntime !== null) {
-      if (selected.cliId !== 'codex') {
-        return jsonRes(res, 400, { ok: false, error: 'runtime_requires_codex' });
-      }
-      if (selected.wrapperCli) {
-        return jsonRes(res, 400, { ok: false, error: 'runtime_wrapper_conflict' });
-      }
-      try {
-        nextRuntime = normalizeCliRuntimeConfig(body.cliRuntime, 'cliRuntime');
-      } catch (err) {
-        return jsonRes(res, 400, {
-          ok: false,
-          error: 'invalid_cli_runtime',
-          message: err instanceof Error ? err.message : String(err),
-        });
-      }
-    }
-    // null explicitly means built-in runtime; both structured and legacy
-    // executable overrides are cleared.
-  } else if (!selectionChanged) {
-    // Old dashboard clients know only `{cliId, model}`. Preserve the runtime on
-    // same-agent saves so editing a model cannot silently erase new config.
-    nextRuntime = currentBotConfig.cliRuntime;
-    nextLegacyPath = nextRuntime ? undefined : currentBotConfig.cliPathOverride;
+  const maintenance = dashboardHostMaintenance;
+  if (!maintenance) {
+    return jsonRes(res, 503, { ok: false, error: 'session_runtime_not_ready' });
   }
-  const effectivePath = nextRuntime?.executable ?? nextLegacyPath;
-  const availability = checkCliAvailability({
-    cliId: selected.cliId,
-    wrapperCli: selected.wrapperCli,
-    cliPathOverride: effectivePath,
+  const outcome = await maintenance.changeAgent({
+    operationId: operationId.value,
+    cliId: key,
+    model,
+    cliRuntimePresent: runtimeFieldPresent,
+    cliRuntime: body.cliRuntime,
   });
-  let runtimeProbe: { version: string; updateProvider: string } | undefined;
-  if (runtimeFieldPresent && nextRuntime) {
-    if (!availability.available) {
-      return jsonRes(res, 400, {
-        ok: false,
-        error: 'runtime_unavailable',
-        message: availability.reason ?? 'runtime executable is unavailable',
-      });
-    }
-    try {
-      const raw = execFileSync(availability.resolvedPath ?? nextRuntime.executable, ['--version'], {
-        encoding: 'utf8',
-        timeout: 5_000,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        maxBuffer: 2 * 1024 * 1024,
-      }).trim();
-      const version = raw.match(/\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?/)?.[0];
-      if (!version) throw new Error(`无法识别 --version 输出：${raw.slice(0, 120)}`);
-      runtimeProbe = { version, updateProvider: nextRuntime.update?.provider ?? 'auto' };
-    } catch (err) {
-      return jsonRes(res, 400, {
-        ok: false,
-        error: 'runtime_version_probe_failed',
-        message: err instanceof Error ? err.message : String(err),
-      });
-    }
+  if (outcome.kind === 'completed') return jsonRes(res, 200, outcome.response);
+  if (outcome.kind === 'conflict') {
+    return jsonRes(res, 409, {
+      ok: false,
+      error: 'idempotency_conflict',
+      message: outcome.message,
+    });
   }
-  // Existing Bot edits remain saveable (operators may intentionally configure
-  // first and install second), but the response is explicit so Dashboard never
-  // claims a missing Agent was saved successfully without qualification.
-  const availabilityWarning = availability.available
-    ? undefined
-    : `配置已保存，但所选 Agent 当前无法启动：${availability.reason ?? '本地启动依赖不可用'}。请先在 daemon 所在机器安装或修正 PATH / CLI 路径。`;
-
-  return withBotTurnMutation(larkAppId, async () => {
-    // Agent selection can replace every live worker generation and may also
-    // auto-clear readIsolation. Close admission and drain in-flight acceptance
-    // before inspecting both the registry and restart source of truth. A
-    // settings mutation is not an explicit abandon boundary: an unsettled
-    // Codex App FIFO must survive unchanged for recovery.
-    const activeBotSessions = listActiveSessions().filter(ds => ds.larkAppId === larkAppId);
-    const persistedActiveBotSessions = sessionStore.listSessions().filter(session =>
-      session.status === 'active'
-      && (session.larkAppId === larkAppId || !session.larkAppId),
-    );
-    if (rejectProtectedSessionMutation(res, [
-      ...activeBotSessions,
-      ...persistedActiveBotSessions,
-    ])) return;
-
-    // If the new CLI/wrapper can no longer enforce a currently-on read isolation,
-    // auto-clear the flag here so the next session doesn't fail-close on it. (The
-    // read-isolation toggle validates at enable time; changing the agent afterwards
-    // is the other way a bot could end up configured-but-unenforceable.)
-    let readIsolationCleared = false;
-    const r = await rmwBotEntry(larkAppId, (entry) => {
-    entry.cliId = selected.cliId;
-    if (selected.wrapperCli) entry.wrapperCli = selected.wrapperCli;
-    else delete entry.wrapperCli;
-    if (nextRuntime) {
-      entry.cliRuntime = nextRuntime;
-      // Downgrade shadow: older BotMux versions ignore cliRuntime but retain
-      // cliPathOverride, so a rollback still launches this distribution.
-      entry.cliPathOverride = nextRuntime.executable;
-    } else if (nextLegacyPath) {
-      entry.cliPathOverride = nextLegacyPath;
-      delete entry.cliRuntime;
-    } else {
-      delete entry.cliRuntime;
-      delete entry.cliPathOverride;
-    }
-    if (model) entry.model = model;
-    else delete entry.model;
-    if (entry.readIsolation === true &&
-        !readIsolationEnforceableFor({ cliId: selected.cliId, cliPathOverride: effectivePath, wrapperCli: selected.wrapperCli })) {
-      delete entry.readIsolation;
-      readIsolationCleared = true;
-    }
-    // cliId=riff → backendType 自动设为 riff（否则 spawn 走 pty 后端找不到本地二进制）。
-    if (selected.cliId === 'riff') {
-      entry.backendType = 'riff';
-    } else if (entry.backendType === 'riff') {
-      // 从 riff 切回其它 CLI：清掉这个自动配对的 backend override，回落 daemon
-      // 默认后端——否则新 CLI 会跑在 RiffBackend 上（PTY 分块输入被当成一串 riff
-      // 任务）。手动的 pty/tmux/herdr/zellij override 不受影响（它们不会是 riff）。
-      delete entry.backendType;
-    }
-    return { write: true, result: null };
+  if (outcome.kind === 'blocked') {
+    return jsonRes(res, 409, {
+      ok: false,
+      error: outcome.error,
+      blockingSessions: outcome.blockingSessions,
     });
-    if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
-
-    const bot = getBot(larkAppId);
-    bot.config.cliId = selected.cliId;
-    bot.config.cliRuntime = nextRuntime;
-    bot.config.cliPathOverride = nextRuntime?.executable ?? nextLegacyPath;
-    if (selected.wrapperCli) bot.config.wrapperCli = selected.wrapperCli;
-    else bot.config.wrapperCli = undefined;
-    bot.config.model = model || undefined;
-    if (readIsolationCleared) bot.config.readIsolation = false;
-    if (selected.cliId === 'riff') {
-      bot.config.backendType = 'riff';
-    } else if (bot.config.backendType === 'riff') {
-      bot.config.backendType = undefined;
-    }
-
-    // 热切后立刻清掉本 bot 名下失配的存量会话——否则它们冻结的旧 CLI 会被下一条
-    // 消息 lazy resume 复活，要等下次 daemon 重启才被 restore 守卫清理。
-    const closedMismatchedSessions = await closeCliMismatchedSessionsForBot(larkAppId);
-
-    const selectionKey = selectionKeyForBot(selected.cliId, selected.wrapperCli);
-    jsonRes(res, 200, {
-      ok: true,
-      cliId: selected.cliId,
-      cliRuntime: nextRuntime ?? null,
-      cliPathOverride: nextRuntime ? null : nextLegacyPath ?? null,
-      wrapperCli: selected.wrapperCli ?? null,
-      model: model || null,
-      selectionKey,
-      closedMismatchedSessions,
-      // Report the (possibly auto-cleared) read-isolation state + whether the new
-      // agent can still enforce it, so the dashboard updates its toggle immediately
-      // instead of showing a stale enabled/supported state until a full refetch.
-      readIsolation: bot.config.readIsolation === true,
-      readIsolationSupported: readIsolationEnforceableFor(bot.config),
-      readIsolationCleared,
-      agentAvailable: availability.available,
-      availabilityWarning,
-      requiredCommand: availability.command,
-      runtimeProbe,
+  }
+  if (outcome.kind === 'invalid') {
+    return jsonRes(res, 400, {
+      ok: false,
+      error: outcome.error,
+      ...(outcome.message ? { message: outcome.message } : {}),
     });
+  }
+  return jsonRes(res, 503, {
+    ok: false,
+    error: outcome.error,
+    message: outcome.message,
   });
 });
 

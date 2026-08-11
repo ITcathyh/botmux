@@ -245,7 +245,7 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     expect(sessGate).toContain('currentBotIsApiOnly(session.larkAppId)');
   });
 
-  it('daemon session-write IPC routes gate no-transport via sessionTransportDisabled', () => {
+  it('daemon session-write IPC routes gate no-transport in their owner-bound mutation seam', () => {
     const ipcSource = readFileSync(resolve('src/core/dashboard-ipc-server.ts'), 'utf8');
     // Central daemon helper keyed on apiOnly bot OR virtual chatId.
     const helper = region(ipcSource, 'function sessionTransportDisabled(', '\n}\n');
@@ -254,7 +254,6 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     // Region-scoped per route (NOT file-wide count): each write route's body
     // must call the gate, so deleting one seam fails.
     const routes: Array<[string, string, string]> = [
-      ['chat-rename', "ipcRoute('POST', '/api/sessions/:sessionId/chat-rename'", 'groupsStore.renameChat('],
       ['write-link-card', "ipcRoute('POST', '/api/sessions/:sessionId/write-link-card'", 'deliverWriteLinkCardToOwners(ds)'],
       ['locate', "ipcRoute('POST', '/api/sessions/:sessionId/locate'", 'replyMessage('],
     ];
@@ -262,17 +261,58 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
       const body = region(ipcSource, start, end);
       expect(body, `${name} route`).toContain('sessionTransportDisabled(');
     }
-    // resume-notice gates its notice block.
-    const resumeNotice = region(ipcSource, '会话已通过命令行恢复', 'getChatMode(ds.larkAppId');
-    expect(resumeNotice).toContain('!sessionTransportDisabled(ds)');
+    // Chat rename moved its policy and Lark effect behind an owner-bound
+    // Current port. The transport handler must only delegate; the port owns the
+    // same central transport predicate before renameChat.
+    const renameSource = readFileSync(resolve('src/core/current-dashboard-chat-rename.ts'), 'utf8');
+    const renameGate = region(renameSource, 'function defaultTransportEnabled(', 'function retainOutcome(');
+    expect(renameGate).toContain('getBot(ownerLarkAppId).config.apiOnly === true');
+    expect(renameGate).toContain('larkTransportEnabled({ chatId, apiOnly })');
+    const renameRoute = region(
+      ipcSource,
+      "ipcRoute('POST', '/api/sessions/:sessionId/chat-rename'",
+      '/** 会话内切换工作目录',
+    );
+    expect(renameRoute).toContain('dashboardChatRename');
+    expect(renameRoute).not.toContain('groupsStore.renameChat(');
+    expect(renameRoute).not.toContain('sessionTransportDisabled(');
+    // Restart/resume notices likewise moved behind an owner-bound Current
+    // effects port, whose single delivery seam owns the transport gate.
+    const effectsSource = readFileSync(resolve('src/core/current-dashboard-control-effects.ts'), 'utf8');
+    const effectsGate = region(effectsSource, 'function transportEnabled(', 'function deliverSessionNotice(');
+    expect(effectsGate).toContain('larkTransportEnabled({');
+    expect(effectsGate).toContain('apiOnly: getBot(ds.larkAppId).config.apiOnly');
+    const delivery = region(effectsSource, 'function deliverSessionNotice(', 'export function createCurrentDashboardControlEffects(');
+    expect(delivery).toContain('!transportEnabled(ds)');
   });
 
-  it('daemon dashboard IPC session-history + restart-notice gate no-transport sessions', () => {
+  it('daemon dashboard IPC session-history and Current notice effects gate no-transport sessions', () => {
     const ipcSource = readFileSync(resolve('src/core/dashboard-ipc-server.ts'), 'utf8');
     const hist = region(ipcSource, "ipcRoute('GET', '/api/sessions/:sessionId/history'", 'listChatMessages(appId');
     expect(hist).toContain('larkTransportEnabled({ chatId: session.chatId, apiOnly: getBot(appId).config.apiOnly })');
-    const notice = region(ipcSource, 'function postRestartNotice(', 'localeForBot(ds.larkAppId)');
-    expect(notice).toContain('larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })');
+    const effectsSource = readFileSync(resolve('src/core/current-dashboard-control-effects.ts'), 'utf8');
+    const notice = region(effectsSource, 'function deliverSessionNotice(', 'export function createCurrentDashboardControlEffects(');
+    expect(notice).toContain('!ds.larkAppId || !transportEnabled(ds)');
+    expect(notice).toContain('replyMessage(');
+    expect(notice).toContain('sendMessage(');
+    const restartRoute = region(
+      ipcSource,
+      "ipcRoute('POST', '/api/sessions/:sessionId/restart'",
+      '/** Manually suspend one active session',
+    );
+    expect(restartRoute).toContain('dashboardControlEffects?.restartNotice(');
+    expect(restartRoute).not.toContain('replyMessage(');
+    expect(restartRoute).not.toContain('sendMessage(');
+    const resumeRoute = region(
+      ipcSource,
+      "ipcRoute('POST', '/api/sessions/:sessionId/resume'",
+      '/**\n * Cross-daemon session transfer endpoint',
+    );
+    expect(resumeRoute).toContain('dashboardControlEffects?.resumeNotice(');
+    expect(resumeRoute).not.toContain('replyMessage(');
+    expect(resumeRoute).not.toContain('sendMessage(');
+    const productionBinding = region(daemonSource, 'registerBot(cfg);', 'ensureVcMeetingDaemonAuthToken(');
+    expect(productionBinding).toContain('setDashboardControlEffects(createCurrentDashboardControlEffects({');
   });
 
   it('createTeamGroup: no-transport (local apiOnly + remote apiOnly) excluded from creator AND members; remote normal kept', () => {

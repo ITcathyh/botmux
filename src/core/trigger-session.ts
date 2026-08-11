@@ -27,7 +27,13 @@ import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
 import { currentDeviceIsolationFreezeLease } from './device-isolation-activation.js';
 import * as messageQueue from '../services/message-queue.js';
 import type { DaemonSession } from './types.js';
-import { activeSessionKey, sessionKey, larkTransportEnabled, isHttpVirtualSession } from './types.js';
+import {
+  activeSessionKey,
+  activeSessionAnchorId,
+  sessionKey,
+  larkTransportEnabled,
+  isHttpVirtualSession,
+} from './types.js';
 import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
 import { logger } from '../utils/logger.js';
 import type { CliTurnPayload } from '../types.js';
@@ -41,6 +47,10 @@ import type {
   SessionRuntime,
 } from './session-runtime.js';
 import type { BotId } from './bot-identity.js';
+import {
+  currentRouteAdmissionKey,
+  reserveCurrentRouteAdmission,
+} from './current-route-admission.js';
 
 export interface TriggerSessionDeps {
   /** Production callers receive this binding from the daemon's startup gate. */
@@ -199,9 +209,82 @@ function activeBySessionId(activeSessions: Map<string, DaemonSession>, sessionId
   return undefined;
 }
 
+type CurrentOwnerLiveSessionCensus =
+  | { kind: 'ready'; bySessionId: Map<string, DaemonSession> }
+  | { kind: 'unreadable'; message: string };
+
+/** Owner/canonical census for decisions that can return before route admission.
+ * A values-only sessionId lookup can otherwise borrow a foreign or malformed
+ * worker as proof that this owner's at-most-once turn is still executing. */
+function currentOwnerLiveSessionCensus(
+  activeSessions: Map<string, DaemonSession>,
+  ownerLarkAppId: string,
+): CurrentOwnerLiveSessionCensus {
+  const bySessionId = new Map<string, DaemonSession>();
+  for (const [key, ds] of activeSessions) {
+    const ownerRelated = ds.larkAppId === ownerLarkAppId
+      || ds.session.larkAppId === ownerLarkAppId;
+    if (!ownerRelated) continue;
+    let canonical = false;
+    try { canonical = key === activeSessionKey(ds); }
+    catch { /* malformed owner evidence keeps this owner's census unreadable */ }
+    if (!canonical
+      || ds.larkAppId !== ownerLarkAppId
+      || (!!ds.session.larkAppId && ds.session.larkAppId !== ownerLarkAppId)
+      || typeof ds.session.sessionId !== 'string'
+      || ds.session.sessionId.length === 0
+      || ds.session.status !== 'active'
+      || ds.session.chatId !== ds.chatId
+      || (!!ds.session.chatType && ds.session.chatType !== ds.chatType)
+      || (ds.session.scope ?? 'thread') !== ds.scope) {
+      return {
+        kind: 'unreadable',
+        message: 'current Session registry found a malformed live owner binding',
+      };
+    }
+    if (bySessionId.has(ds.session.sessionId)) {
+      return {
+        kind: 'unreadable',
+        message: 'current Session registry found multiple live owner bindings for one Session',
+      };
+    }
+    bySessionId.set(ds.session.sessionId, ds);
+  }
+  return { kind: 'ready', bySessionId };
+}
+
+function existingSessionRouteAdmissionKey(
+  ownerLarkAppId: string,
+  activeSessions: ReadonlyMap<string, DaemonSession>,
+  target: DaemonSession,
+): string | undefined {
+  const bindings = [...activeSessions.values()].filter(candidate => (
+    candidate.session.sessionId === target.session.sessionId
+  ));
+  if (bindings.length !== 1 || bindings[0] !== target) return undefined;
+  if (activeSessions.get(activeSessionKey(target)) !== target) return undefined;
+  if (target.larkAppId !== ownerLarkAppId
+      || target.session.larkAppId !== ownerLarkAppId
+      || target.session.status !== 'active'
+      || target.chatId !== target.session.chatId
+      || target.scope !== (target.session.scope ?? 'thread')
+      || (target.session.chatType !== undefined
+        && target.chatType !== target.session.chatType)) {
+    return undefined;
+  }
+  return currentRouteAdmissionKey({
+    ownerLarkAppId,
+    scope: target.scope,
+    canonicalAnchor: activeSessionAnchorId(target),
+    chatId: target.chatId,
+    chatType: target.chatType,
+  });
+}
+
 type IdempotencyHitDecision =
   | { kind: 'reuse'; chatId: string; message: string }
   | { kind: 'terminal'; chatId: string; message: string }
+  | { kind: 'unreadable'; message: string }
   | { kind: 'takeover' };
 
 /** Decide what a same-payload idempotency-key HIT means (at-most-once). The
@@ -214,7 +297,9 @@ export function resolveIdempotencyHit(
   ownerBootId: string,
   activeSessions: Map<string, DaemonSession>,
 ): IdempotencyHitDecision {
-  const live = activeBySessionId(activeSessions, hit.sessionId);
+  const census = currentOwnerLiveSessionCensus(activeSessions, hit.ownerLarkAppId);
+  if (census.kind === 'unreadable') return census;
+  const live = census.bySessionId.get(hit.sessionId);
   // "In flight" for reuse decisions means a genuinely EXECUTING worker, not mere
   // registry presence. A worker that died with no final_output sets ds.worker=null
   // but leaves the DaemonSession in activeSessions (worker-pool.ts exit handler),
@@ -228,7 +313,10 @@ export function resolveIdempotencyHit(
   // process's own bot store, never another bot's sessions-*.json (getSession's
   // cross-file fallback could surface a foreign session and leak its chatId —
   // codex #776 round-4 finding #3).
-  const chatId = live?.chatId ?? sessionStore.getOwnedSession(hit.sessionId)?.chatId ?? '';
+  const chatId = live?.chatId ?? sessionStore.getSessionForOwnerStrict(
+    hit.ownerLarkAppId,
+    hit.sessionId,
+  )?.chatId ?? '';
   // Terminal async evidence is only trustworthy when it was written by the SAME
   // owner as the lease. A cross-bot write to the same sessionId/triggerId (codex
   // deterministically reproduced B's completed suppressing A's dispatch) is
@@ -1036,6 +1124,14 @@ async function triggerSessionTurnAdmitted(
         };
       }
       const decision = resolveIdempotencyHit(hit, ownerBootId, deps.activeSessions);
+      if (decision.kind === 'unreadable') {
+        return {
+          ok: false,
+          errorCode: 'trigger_failed',
+          error: decision.message,
+          turnIdempotencyKey,
+        };
+      }
       if (decision.kind === 'reuse') {
         // Recovery for the double-fault case (P1-8): a live shared-session turn
         // whose post-barrier terminalize failed is `attempting` + live-worker, so
@@ -1147,10 +1243,85 @@ async function triggerSessionTurnAdmitted(
   // group's one chat-scope session. Explicit rootMessageId is a stricter target:
   // it always routes to that thread anchor after daemon-side chat ownership check.
   const regularGroupMode: ChatReplyMode = httpVirtual ? 'chat' : resolveRegularGroupMode(larkAppId, chatId);
-  if (!ds && !req.target.sessionId && !rootMessageId && !httpVirtual
-      && (regularGroupMode !== 'new-topic' || topicMessage === null)) {
-    ds = deps.activeSessions.get(sessionKey(chatId, larkAppId));
-  }
+  const chatMode: ChatMode = httpVirtual
+    ? 'group'
+    : await getChatMode(larkAppId, chatId, { forceRefresh: true });
+  const routeChatType: 'group' | 'p2p' = chatMode === 'p2p' ? 'p2p' : 'group';
+  const routeOpensOwnTopic = !rootMessageId
+    && !httpVirtual
+    && externalEventOpensOwnTopic(chatMode, regularGroupMode);
+  const shouldOpenOwnTopic = routeOpensOwnTopic && topicMessage !== null;
+  let routeAdmission: ReturnType<typeof reserveCurrentRouteAdmission> | undefined;
+  let admittedRouteKey: string | undefined;
+  const acquireRouteAdmission = async (key: string): Promise<void> => {
+    routeAdmission = reserveCurrentRouteAdmission(key);
+    admittedRouteKey = key;
+    await routeAdmission.ready;
+  };
+
+  try {
+    if (req.target.sessionId) {
+      if (!ds) {
+        return { ok: false, errorCode: 'session_not_found', error: `active session not found: ${req.target.sessionId}` };
+      }
+      const key = existingSessionRouteAdmissionKey(larkAppId, deps.activeSessions, ds);
+      if (!key) {
+        return {
+          ok: false,
+          triggerId,
+          errorCode: 'session_not_found',
+          error: `active session ownership is not canonical: ${req.target.sessionId}`,
+        };
+      }
+      await acquireRouteAdmission(key);
+      ds = activeBySessionId(deps.activeSessions, req.target.sessionId);
+      if (!ds || existingSessionRouteAdmissionKey(larkAppId, deps.activeSessions, ds) !== key) {
+        return {
+          ok: false,
+          triggerId,
+          errorCode: 'session_not_found',
+          error: `active session ownership changed before dispatch: ${req.target.sessionId}`,
+        };
+      }
+    } else if (rootMessageId) {
+      const key = currentRouteAdmissionKey({
+        ownerLarkAppId: larkAppId,
+        scope: 'thread',
+        canonicalAnchor: rootMessageId,
+        chatId,
+        chatType: routeChatType,
+      });
+      await acquireRouteAdmission(key);
+      ds = deps.activeSessions.get(sessionKey(rootMessageId, larkAppId));
+      if (ds && existingSessionRouteAdmissionKey(larkAppId, deps.activeSessions, ds) !== key) {
+        return {
+          ok: false,
+          triggerId,
+          errorCode: 'session_not_found',
+          error: `active route ownership is not canonical: ${rootMessageId}`,
+        };
+      }
+    } else if (!shouldOpenOwnTopic) {
+      const key = currentRouteAdmissionKey({
+        ownerLarkAppId: larkAppId,
+        scope: 'chat',
+        canonicalAnchor: chatId,
+        chatId,
+        chatType: routeChatType,
+      });
+      await acquireRouteAdmission(key);
+      ds = deps.activeSessions.get(sessionKey(chatId, larkAppId));
+      if (ds && existingSessionRouteAdmissionKey(larkAppId, deps.activeSessions, ds) !== key) {
+        return {
+          ok: false,
+          triggerId,
+          errorCode: 'session_not_found',
+          error: `active route ownership is not canonical: ${chatId}`,
+        };
+      }
+    } else {
+      ds = undefined;
+    }
 
   if (dryRun) {
     return {
@@ -1163,19 +1334,13 @@ async function triggerSessionTurnAdmitted(
     };
   }
 
-  const deliverToExisting = async (target: DaemonSession): Promise<TriggerResponse> => {
-    // Ownership guard (PR #597): the target must still be the live, registered
-    // occupant before we dispatch. Validate by object identity at its canonical
-    // key AND — because a session can legitimately be reached via a non-canonical
-    // routing key (e.g. an external trigger addressed a chat-scope session by a
-    // fold-back rootMessageId anchor) — accept it if it is still registered
-    // anywhere in the map. This keeps the guard against eviction/replacement
-    // while not rejecting a validly-found session whose canonical key differs
-    // from the lookup key.
-    const targetKey = activeSessionKey(target);
-    const stillRegistered = deps.activeSessions.get(targetKey) === target
-      || [...deps.activeSessions.values()].includes(target);
-    if (!stillRegistered || target.session.status !== 'active') {
+  const deliverToExisting = (target: DaemonSession): TriggerResponse | Promise<TriggerResponse> => {
+    if (!admittedRouteKey
+        || existingSessionRouteAdmissionKey(
+          larkAppId,
+          deps.activeSessions,
+          target,
+        ) !== admittedRouteKey) {
       return {
         ok: false,
         triggerId,
@@ -1255,6 +1420,15 @@ async function triggerSessionTurnAdmitted(
         // No session to close (existing-session append): just resolve from the
         // winner's terminal evidence, never dispatching a second time.
         const decision = resolveIdempotencyHit(winner, ownerBootId, deps.activeSessions);
+        if (decision.kind === 'unreadable') {
+          return {
+            ok: false,
+            triggerId: winner.triggerId,
+            errorCode: 'trigger_failed',
+            error: decision.message,
+            turnIdempotencyKey,
+          };
+        }
         const winnerChatId = (decision.kind !== 'takeover' && decision.chatId) ? decision.chatId : chatId;
         if (decision.kind === 'terminal') {
           return {
@@ -1491,8 +1665,6 @@ async function triggerSessionTurnAdmitted(
       };
     }
 
-    recordAcceptedInput();
-
     // An explicit session target stays bound to that session even while its
     // worker is dormant. The old rootMessageId-only condition accidentally
     // fell through to createSession for chat-scope sessions, which is unsafe
@@ -1513,11 +1685,16 @@ async function triggerSessionTurnAdmitted(
         () => {
           const dispatchAttempt = prepareStableDispatch(target, true);
           armFinalOutputSuppression(target, dispatchAttempt);
-          forkWorker(target, content, {
+          const accepted = forkWorker(target, content, {
             resume: target.hasHistory,
             turnId: triggerId,
             ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
           });
+          if (accepted === false) {
+            if (stableTurnId) target.suppressedFinalOutputTurns?.delete(stableTurnId);
+            throw new Error('worker refused dormant trigger fork before acceptance');
+          }
+          recordAcceptedInput();
         },
       );
     }
@@ -1548,16 +1725,17 @@ async function triggerSessionTurnAdmitted(
       // must NEVER replay onto an auto-restarted CLI. Ride `atMostOnce` on the
       // fork init (mirrors the fresh-session path).
       const atMostOnce = !!(turnLeaseKey && turnLease);
+      let accepted: boolean;
       try {
         beginAsyncTrigger(target, triggerId);
         const dispatchAttempt = prepareStableDispatch(target, true);
         armFinalOutputSuppression(target, dispatchAttempt);
-        forkWorker(target, content, {
+        accepted = forkWorker(target, content, {
           resume: target.hasHistory,
           turnId: triggerId,
           ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
           ...(atMostOnce ? { atMostOnce: true } : {}),
-        });
+        }) !== false;
       } catch (err) {
         // A throw AFTER the attempting barrier (begin/prepare/fork). Terminalize
         // the lease durably so the caller polls a terminal instead of `running`
@@ -1574,6 +1752,34 @@ async function triggerSessionTurnAdmitted(
         }
         throw err;
       }
+      if (!accepted) {
+        if (stableTurnId) target.suppressedFinalOutputTurns?.delete(stableTurnId);
+        if (turnLeaseKey && turnLease) {
+          const settled = terminalizeTurnLeaseOnPostBarrierFault(
+            target,
+            triggerId,
+            turnLeaseKey,
+            turnLease,
+          );
+          return settled ?? {
+            ok: false,
+            triggerId,
+            errorCode: 'trigger_failed',
+            error: 'worker refused dormant async trigger fork and terminal outcome could not be persisted',
+            target: { kind: 'turn', sessionId: target.session.sessionId, chatId },
+            turnIdempotencyKey,
+          };
+        }
+        target.asyncTriggerResults?.delete(triggerId);
+        if (target.latestAsyncTriggerId === triggerId) target.latestAsyncTriggerId = undefined;
+        return {
+          ok: false,
+          triggerId,
+          errorCode: 'trigger_failed',
+          error: 'worker refused dormant async trigger fork before acceptance',
+        };
+      }
+      recordAcceptedInput();
       return {
         ...buildAsyncQueuedResponse(
           triggerId,
@@ -1588,11 +1794,22 @@ async function triggerSessionTurnAdmitted(
     const dispatchAttempt = prepareStableDispatch(target, true);
     armFinalOutputSuppression(target, dispatchAttempt);
     armLoudFinalSuppression(target);
-    forkWorker(target, content, {
+    const accepted = forkWorker(target, content, {
       resume: target.hasHistory,
       turnId: triggerId,
       ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     });
+    if (accepted === false) {
+      if (stableTurnId) target.suppressedFinalOutputTurns?.delete(stableTurnId);
+      disarmLoudFinalSuppression(target);
+      return {
+        ok: false,
+        triggerId,
+        errorCode: 'trigger_failed',
+        error: 'worker refused dormant trigger fork before acceptance',
+      };
+    }
+    recordAcceptedInput();
     return {
       ok: true,
       triggerId,
@@ -1610,17 +1827,35 @@ async function triggerSessionTurnAdmitted(
   }
 
   const bot = getBot(larkAppId);
-  const chatMode: ChatMode = httpVirtual
-    ? 'group'
-    : await getChatMode(larkAppId, chatId, { forceRefresh: true });
   let scope: 'thread' | 'chat' = rootMessageId ? 'thread' : 'chat';
   let anchor = rootMessageId || chatId;
-  const shouldOpenOwnTopic = !rootMessageId
-    && !httpVirtual
-    && externalEventOpensOwnTopic(chatMode, regularGroupMode);
-  if (shouldOpenOwnTopic && topicMessage !== null) {
+  if (shouldOpenOwnTopic) {
     anchor = await sendMessage(larkAppId, chatId, topicMessage);
     scope = 'thread';
+    const key = currentRouteAdmissionKey({
+      ownerLarkAppId: larkAppId,
+      scope,
+      canonicalAnchor: anchor,
+      chatId,
+      chatType: routeChatType,
+    });
+    await acquireRouteAdmission(key);
+    const incumbent = deps.activeSessions.get(sessionKey(anchor, larkAppId));
+    if (incumbent) {
+      if (existingSessionRouteAdmissionKey(
+        larkAppId,
+        deps.activeSessions,
+        incumbent,
+      ) !== key) {
+        return {
+          ok: false,
+          triggerId,
+          errorCode: 'session_not_found',
+          error: `active route ownership is not canonical: ${anchor}`,
+        };
+      }
+      return deliverToExisting(incumbent);
+    }
   }
 
   // 仅默认目录 + auto-worktree：chat 驱动的 webhook 开新会话且落在本 bot 自己的默认目录时，走
@@ -1647,11 +1882,11 @@ async function triggerSessionTurnAdmitted(
     const current = deps.activeSessions.get(key);
     if (current) return { kind: 'existing' as const, ds: current };
 
-    const session = sessionStore.createSession(chatId, anchor, triggerTitle(req), 'group');
+    const session = sessionStore.createSession(chatId, anchor, triggerTitle(req), routeChatType);
     const now = Date.now();
     session.larkAppId = larkAppId;
     session.scope = scope;
-    if (shouldOpenOwnTopic && topicMessage === null) session.externalTriggerTopicless = true;
+    if (routeOpensOwnTopic && topicMessage === null) session.externalTriggerTopicless = true;
     session.lastMessageAt = new Date(now).toISOString();
     session.workingDir = wd.workingDir;
     session.cliId = bot.config.cliId;
@@ -1680,7 +1915,7 @@ async function triggerSessionTurnAdmitted(
       workerToken: null,
       larkAppId,
       chatId,
-      chatType: 'group',
+      chatType: routeChatType,
       scope,
       spawnedAt: Date.parse(session.createdAt) || now,
       cliVersion: getCurrentCliVersion(),
@@ -1811,8 +2046,6 @@ async function triggerSessionTurnAdmitted(
       error: 'new trigger session lost its first-owner reservation before startup',
     };
   }
-  rememberInput(newDs, prompt, promptInput);
-
   const releaseInitialReservation = (): void => {
     newDs.initialStartPending = false;
     newDs.pendingPrompt = undefined;
@@ -1837,9 +2070,14 @@ async function triggerSessionTurnAdmitted(
       () => {
         const dispatchAttempt = prepareStableDispatch(newDs, true);
         armFinalOutputSuppression(newDs, dispatchAttempt);
-        forkWorker(newDs, promptInput, dispatchAttempt === undefined
+        const accepted = forkWorker(newDs, promptInput, dispatchAttempt === undefined
           ? triggerId
           : { turnId: triggerId, dispatchAttempt });
+        if (accepted === false) {
+          if (stableTurnId) newDs.suppressedFinalOutputTurns?.delete(stableTurnId);
+          throw new Error('worker refused dormant trigger fork before acceptance');
+        }
+        rememberInput(newDs, prompt, promptInput);
         releaseInitialReservation();
       },
     );
@@ -1856,7 +2094,20 @@ async function triggerSessionTurnAdmitted(
       const forkArg = dispatchAttempt === undefined
         ? triggerId
         : { turnId: triggerId, dispatchAttempt };
-      forkWorker(newDs, promptInput, forkArg);
+      const accepted = forkWorker(newDs, promptInput, forkArg);
+      if (accepted === false) {
+        if (stableTurnId) newDs.suppressedFinalOutputTurns?.delete(stableTurnId);
+        newDs.asyncTriggerResults?.delete(triggerId);
+        if (newDs.latestAsyncTriggerId === triggerId) newDs.latestAsyncTriggerId = undefined;
+        return {
+          ok: false,
+          triggerId,
+          errorCode: 'trigger_failed',
+          error: 'worker refused dormant async trigger fork before acceptance',
+          target: { kind: 'turn', sessionId: session.sessionId, chatId },
+        };
+      }
+      rememberInput(newDs, prompt, promptInput);
       releaseInitialReservation();
     } catch (err) {
       try { await closeSession(session.sessionId); } catch { /* best-effort for legacy unkeyed dispatch. */ }
@@ -1876,23 +2127,34 @@ async function triggerSessionTurnAdmitted(
     };
   }
 
+  let accepted: boolean;
   if (stableTurnId) {
     const dispatchAttempt = prepareStableDispatch(newDs, true);
     armFinalOutputSuppression(newDs, dispatchAttempt);
-    forkWorker(newDs, promptInput, dispatchAttempt === undefined
+    accepted = forkWorker(newDs, promptInput, dispatchAttempt === undefined
       ? triggerId
-      : { turnId: triggerId, dispatchAttempt });
-    releaseInitialReservation();
+      : { turnId: triggerId, dispatchAttempt }) !== false;
   }
   else if (loudTurnId) {
     armLoudFinalSuppression(newDs);
-    forkWorker(newDs, promptInput, loudTurnId);
-    releaseInitialReservation();
+    accepted = forkWorker(newDs, promptInput, loudTurnId) !== false;
   }
   else {
-    forkWorker(newDs, promptInput);
-    releaseInitialReservation();
+    accepted = forkWorker(newDs, promptInput) !== false;
   }
+  if (!accepted) {
+    if (stableTurnId) newDs.suppressedFinalOutputTurns?.delete(stableTurnId);
+    disarmLoudFinalSuppression(newDs);
+    return {
+      ok: false,
+      triggerId,
+      errorCode: 'trigger_failed',
+      error: 'worker refused dormant trigger fork before acceptance',
+      target: { kind: 'turn', sessionId: session.sessionId, chatId },
+    };
+  }
+  rememberInput(newDs, prompt, promptInput);
+  releaseInitialReservation();
 
   return {
     ok: true,
@@ -1901,6 +2163,9 @@ async function triggerSessionTurnAdmitted(
     target: { kind: 'turn', sessionId: session.sessionId, chatId },
     message: 'queued new session turn',
   };
+  } finally {
+    routeAdmission?.release();
+  }
 }
 
 export async function triggerSessionTurn(

@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import * as idempotencyStore from '../services/idempotency-store.js';
@@ -16,7 +17,13 @@ import {
   type SessionRow,
 } from './dashboard-rows.js';
 import {
+  effectiveSessionCliId,
+  requestAgentSessionRename,
+  type AgentSessionRenameRequest,
+} from './session-rename.js';
+import {
   activeSessionAnchorId,
+  activeSessionKey,
   storedActiveSessionAnchorId,
   type DaemonSession,
 } from './types.js';
@@ -30,9 +37,12 @@ import {
   createCurrentOrdinaryRouteRegistryRuntime,
   type CurrentOrdinaryRouteOpeningCreator,
 } from './current-ordinary-route-registry.js';
+import type { CurrentDashboardRouteOpeningPort } from './current-dashboard-route-opening.js';
 import {
   createSessionRuntimeHost,
   type CommandOutcomeFor,
+  type ControlRenameEffectPort,
+  type ControlMutationPort,
   type KeyedTriggerAuthority,
   type KeyedTriggerBeginResult,
   type KeyedTriggerObservation,
@@ -95,16 +105,109 @@ function sameRecordSnapshot(
     && left.updatedAt === right.updatedAt;
 }
 
-function activeBySessionId(
-  activeSessions: Map<string, DaemonSession>,
+type CurrentOwnerLiveSessionCensus =
+  | { kind: 'ready'; sessions: DaemonSession[]; bySessionId: Map<string, DaemonSession> }
+  | { kind: 'unreadable'; message: string };
+
+function currentOwnerLiveSessionCensus(
+  activeSessions: ReadonlyMap<string, DaemonSession>,
   ownerLarkAppId: string,
-  sessionId: string,
-): DaemonSession | undefined {
-  for (const ds of activeSessions.values()) {
-    if (ds.larkAppId === ownerLarkAppId && ds.session.sessionId === sessionId) return ds;
+): CurrentOwnerLiveSessionCensus {
+  const sessions: DaemonSession[] = [];
+  const bySessionId = new Map<string, DaemonSession>();
+  for (const [key, ds] of activeSessions) {
+    const ownerRelated = ds.larkAppId === ownerLarkAppId
+      || ds.session.larkAppId === ownerLarkAppId;
+    if (!ownerRelated) continue;
+    let canonical = false;
+    try { canonical = key === activeSessionKey(ds); }
+    catch { /* malformed owner evidence keeps the partition unavailable */ }
+    if (!canonical
+      || ds.larkAppId !== ownerLarkAppId
+      || (!!ds.session.larkAppId && ds.session.larkAppId !== ownerLarkAppId)
+      || typeof ds.session.sessionId !== 'string'
+      || ds.session.sessionId.length === 0
+      || ds.session.status !== 'active'
+      || ds.session.chatId !== ds.chatId
+      || (!!ds.session.chatType && ds.session.chatType !== ds.chatType)
+      || (ds.session.scope ?? 'thread') !== ds.scope) {
+      return {
+        kind: 'unreadable',
+        message: 'current Session registry found a malformed live owner binding',
+      };
+    }
+    if (bySessionId.has(ds.session.sessionId)) {
+      return {
+        kind: 'unreadable',
+        message: 'current Session registry found multiple live owner bindings for one Session',
+      };
+    }
+    sessions.push(ds);
+    bySessionId.set(ds.session.sessionId, ds);
   }
-  return undefined;
+  return { kind: 'ready', sessions, bySessionId };
 }
+
+interface CurrentControlRenameIntent {
+  readonly active: DaemonSession;
+  readonly session: DaemonSession['session'];
+  readonly sessionId: string;
+  readonly title: string;
+}
+
+/** Capture the exact owner/canonical worker in-lane, then revalidate that same
+ * binding immediately before the lane-external native rename send. */
+export function createCurrentControlRenameEffectPort(input: {
+  readonly ownerLarkAppId: string;
+  readonly activeSessions: ReadonlyMap<string, DaemonSession>;
+}): ControlRenameEffectPort {
+  const intents = new WeakMap<object, CurrentControlRenameIntent>();
+  return {
+    begin(command) {
+      const census = currentOwnerLiveSessionCensus(
+        input.activeSessions,
+        input.ownerLarkAppId,
+      );
+      if (census.kind === 'unreadable') {
+        return { kind: 'unknown', message: census.message };
+      }
+      const active = census.bySessionId.get(command.sessionId);
+      if (!active) return { kind: 'settled', result: { status: 'not_running' } };
+      const intent = Object.freeze(Object.create(null)) as object;
+      intents.set(intent, {
+        active,
+        session: active.session,
+        sessionId: command.sessionId,
+        title: command.title,
+      });
+      return { kind: 'effect', intent };
+    },
+
+    async execute(intent): Promise<AgentSessionRenameRequest> {
+      if (!intent || typeof intent !== 'object') {
+        return { status: 'failed', error: 'invalid_native_rename_intent' };
+      }
+      const captured = intents.get(intent);
+      if (!captured) return { status: 'failed', error: 'stale_native_rename_intent' };
+      intents.delete(intent);
+      const census = currentOwnerLiveSessionCensus(
+        input.activeSessions,
+        input.ownerLarkAppId,
+      );
+      if (census.kind === 'unreadable') {
+        return { status: 'failed', error: 'owner_binding_unavailable' };
+      }
+      const current = census.bySessionId.get(captured.sessionId);
+      if (current !== captured.active || current.session !== captured.session) {
+        const cliId = effectiveSessionCliId(captured.active);
+        return { status: 'not_running', ...(cliId ? { cliId } : {}) };
+      }
+      return requestAgentSessionRename(captured.active, captured.title);
+    },
+  };
+}
+
+class CurrentKeyedTriggerRegistryInvariantError extends Error {}
 
 /** Current JSON/journal implementation of the keyed at-most-once protocol. */
 class CurrentKeyedTriggerAuthority implements KeyedTriggerAuthority {
@@ -116,7 +219,11 @@ class CurrentKeyedTriggerAuthority implements KeyedTriggerAuthority {
   ) {}
 
   private observeRecord(record: idempotencyStore.IdempotencyRecord): Extract<KeyedTriggerObservation, { kind: 'present' }> {
-    const live = activeBySessionId(this.activeSessions, this.ownerLarkAppId, record.sessionId);
+    const census = currentOwnerLiveSessionCensus(this.activeSessions, this.ownerLarkAppId);
+    if (census.kind === 'unreadable') {
+      throw new CurrentKeyedTriggerRegistryInvariantError(census.message);
+    }
+    const live = census.bySessionId.get(record.sessionId);
     const executorLive = !!live?.worker && !live.worker.killed;
     const persistedOwned = sessionStore.getSessionForOwnerStrict(
       this.ownerLarkAppId,
@@ -279,6 +386,9 @@ class CurrentKeyedTriggerAuthority implements KeyedTriggerAuthority {
       if (error instanceof idempotencyStore.IdempotencyConflictError) {
         return { kind: 'conflict', message: error.message };
       }
+      if (error instanceof CurrentKeyedTriggerRegistryInvariantError) {
+        return { kind: 'unreadable', message: error.message };
+      }
       return this.recoverReserveAfterThrow(input, candidate, error);
     }
   }
@@ -400,6 +510,11 @@ function executorStatusFor(ds: DaemonSession): SessionDirectoryRow['executorStat
   return 'working';
 }
 
+function sameJsonPersistedSession(left: Session, right: Session): boolean {
+  const persisted = (session: Session): unknown => JSON.parse(JSON.stringify(session)) as unknown;
+  return isDeepStrictEqual(persisted(left), persisted(right));
+}
+
 class CurrentSessionDirectory implements SessionDirectory {
   constructor(
     private readonly ownerLarkAppId: string,
@@ -407,10 +522,40 @@ class CurrentSessionDirectory implements SessionDirectory {
     private readonly dashboardProjectionProtocol: CurrentDashboardProjectionProtocol,
   ) {}
 
-  private rows(): SessionDirectoryRow[] {
+  private openingBarrierMatches(
+    query: Extract<SessionDirectoryQuery, { kind: 'byExternalSession' | 'byRoute' }>,
+  ): boolean {
+    const census = currentOwnerLiveSessionCensus(this.activeSessions, this.ownerLarkAppId);
+    if (census.kind === 'unreadable') return false;
+    for (const ds of census.sessions) {
+      if (!ds.dashboardSpawnOpeningPending) continue;
+      if (query.kind === 'byExternalSession') {
+        if (ds.session.sessionId === query.sessionId) return true;
+        continue;
+      }
+      const route = routeFor(ds.session);
+      if (route.kind === 'thread' && query.route.kind === 'thread'
+          && route.anchorId === query.route.anchorId) return true;
+      if (route.kind === 'chat' && query.route.kind === 'chat'
+          && route.chatId === query.route.chatId) return true;
+    }
+    return false;
+  }
+
+  private rows(): Extract<SessionDirectoryRead, { kind: 'list' | 'notReady' }> {
     const rows = new Map<string, SessionDirectoryRow>();
-    for (const ds of this.activeSessions.values()) {
-      if (ds.larkAppId !== this.ownerLarkAppId) continue;
+    const openingBarriers = new Set<string>();
+    const settledLiveSessions = new Map<string, DaemonSession>();
+    const census = currentOwnerLiveSessionCensus(this.activeSessions, this.ownerLarkAppId);
+    if (census.kind === 'unreadable') {
+      return { kind: 'notReady', message: census.message };
+    }
+    for (const ds of census.sessions) {
+      if (ds.dashboardSpawnOpeningPending) {
+        openingBarriers.add(ds.session.sessionId);
+        continue;
+      }
+      settledLiveSessions.set(ds.session.sessionId, ds);
       rows.set(ds.session.sessionId, {
         key: ds.session.sessionId,
         sessionId: ds.session.sessionId,
@@ -424,8 +569,21 @@ class CurrentSessionDirectory implements SessionDirectory {
         executorStatus: executorStatusFor(ds),
       });
     }
-    for (const session of sessionStore.listSessionsForOwnerStrict(this.ownerLarkAppId)) {
-      if (rows.has(session.sessionId)) continue;
+    const durableSessions = sessionStore.listSessionsForOwnerStrict(this.ownerLarkAppId);
+    const durableBySessionId = new Map(
+      durableSessions.map(session => [session.sessionId, session]),
+    );
+    for (const [sessionId, ds] of settledLiveSessions) {
+      const durable = durableBySessionId.get(sessionId);
+      if (!durable || !sameJsonPersistedSession(ds.session, durable)) {
+        return {
+          kind: 'notReady',
+          message: 'current live Session differs from its owner-strict durable row',
+        };
+      }
+    }
+    for (const session of durableSessions) {
+      if (rows.has(session.sessionId) || openingBarriers.has(session.sessionId)) continue;
       rows.set(session.sessionId, {
         key: session.sessionId,
         sessionId: session.sessionId,
@@ -438,17 +596,42 @@ class CurrentSessionDirectory implements SessionDirectory {
         executorStatus: session.queued ? 'idle' : 'dormant',
       });
     }
-    return [...rows.values()];
+    return { kind: 'list', rows: [...rows.values()] };
   }
 
-  private dashboardRows(): SessionRow[] {
+  private dashboardRows():
+    | { kind: 'rows'; rows: SessionRow[] }
+    | Extract<SessionDirectoryRead, { kind: 'notReady' }> {
     const rows = new Map<string, SessionRow>();
-    for (const ds of this.activeSessions.values()) {
-      if (ds.larkAppId !== this.ownerLarkAppId) continue;
+    const openingBarriers = new Set<string>();
+    const settledLiveSessions = new Map<string, DaemonSession>();
+    const census = currentOwnerLiveSessionCensus(this.activeSessions, this.ownerLarkAppId);
+    if (census.kind === 'unreadable') {
+      return { kind: 'notReady', message: census.message };
+    }
+    for (const ds of census.sessions) {
+      if (ds.dashboardSpawnOpeningPending) {
+        openingBarriers.add(ds.session.sessionId);
+        continue;
+      }
+      settledLiveSessions.set(ds.session.sessionId, ds);
       rows.set(ds.session.sessionId, composeRowFromActive(ds));
     }
-    for (const session of sessionStore.listSessionsForOwnerStrict(this.ownerLarkAppId)) {
-      if (rows.has(session.sessionId)) continue;
+    const durableSessions = sessionStore.listSessionsForOwnerStrict(this.ownerLarkAppId);
+    const durableBySessionId = new Map(
+      durableSessions.map(session => [session.sessionId, session]),
+    );
+    for (const [sessionId, ds] of settledLiveSessions) {
+      const durable = durableBySessionId.get(sessionId);
+      if (!durable || !sameJsonPersistedSession(ds.session, durable)) {
+        return {
+          kind: 'notReady',
+          message: 'current live Session differs from its owner-strict durable row',
+        };
+      }
+    }
+    for (const session of durableSessions) {
+      if (rows.has(session.sessionId) || openingBarriers.has(session.sessionId)) continue;
       rows.set(
         session.sessionId,
         session.status === 'closed'
@@ -456,19 +639,29 @@ class CurrentSessionDirectory implements SessionDirectory {
           : composeRowFromPersistedActive(session),
       );
     }
-    return [...rows.values()];
+    return { kind: 'rows', rows: [...rows.values()] };
   }
 
   async read(query: SessionDirectoryQuery): Promise<SessionDirectoryRead> {
     if (query.kind === 'dashboardSnapshot') {
+      const dashboard = this.dashboardRows();
+      if (dashboard.kind === 'notReady') return dashboard;
       // Row rebuild + cursor capture are one JS run-to-completion segment, so
       // no published event can be included in the cursor but absent from rows.
       return {
         kind: 'dashboardSnapshot',
-        snapshot: this.dashboardProjectionProtocol.snapshot(this.dashboardRows()),
+        snapshot: this.dashboardProjectionProtocol.snapshot(dashboard.rows),
       };
     }
-    const rows = this.rows();
+    if (query.kind !== 'list' && this.openingBarrierMatches(query)) {
+      return {
+        kind: 'notReady',
+        message: 'Current Dashboard Session opening has not settled',
+      };
+    }
+    const snapshot = this.rows();
+    if (snapshot.kind === 'notReady') return snapshot;
+    const rows = snapshot.rows;
     if (query.kind === 'list') return { kind: 'list', rows };
     const matches = query.kind === 'byExternalSession'
       ? rows.filter((candidate) => candidate.sessionId === query.sessionId)
@@ -504,12 +697,17 @@ interface CachedCurrentSessionRuntimeHost {
   runtimeEpoch: string;
   ordinaryIngress?: OrdinaryIngressPort;
   ordinaryRouteOpeningCreator?: CurrentOrdinaryRouteOpeningCreator;
+  dashboardRouteOpening?: CurrentDashboardRouteOpeningPort;
   pendingRepoCompletion?: PendingRepoCompletionPort;
   scheduledFire?: ScheduledFirePort;
+  controlMutation?: ControlMutationPort;
+  controlRenameEffect: ControlRenameEffectPort;
   portBindings: {
     ordinaryIngress?: OrdinaryIngressPort;
     pendingRepoCompletion?: PendingRepoCompletionPort;
     scheduledFire?: ScheduledFirePort;
+    controlMutation?: ControlMutationPort;
+    controlRenameEffect?: ControlRenameEffectPort;
   };
   innerHost: CurrentSessionRuntimeHost;
   routeHost?: CurrentSessionRuntimeHost;
@@ -543,6 +741,30 @@ function ownerBotIdForCurrentAdapter(options: {
     byOwner.set(options.ownerLarkAppId, botId);
   }
   return botId;
+}
+
+const controlRenameEffectsByRegistry = new WeakMap<
+  Map<string, DaemonSession>,
+  Map<string, ControlRenameEffectPort>
+>();
+
+function currentControlRenameEffectPort(input: {
+  readonly ownerBotId: BotId;
+  readonly ownerLarkAppId: string;
+  readonly activeSessions: Map<string, DaemonSession>;
+  readonly runtimeEpoch: string;
+}): ControlRenameEffectPort {
+  let byOwnerEpoch = controlRenameEffectsByRegistry.get(input.activeSessions);
+  if (!byOwnerEpoch) {
+    byOwnerEpoch = new Map();
+    controlRenameEffectsByRegistry.set(input.activeSessions, byOwnerEpoch);
+  }
+  const key = `${input.ownerBotId}\0${input.runtimeEpoch}`;
+  const cached = byOwnerEpoch.get(key);
+  if (cached) return cached;
+  const port = createCurrentControlRenameEffectPort(input);
+  byOwnerEpoch.set(key, port);
+  return port;
 }
 
 function leaseCurrentSessionRuntimeHost(
@@ -624,12 +846,18 @@ export function currentSessionRuntimeHost(options: {
   ordinaryIngress?: OrdinaryIngressPort;
   /** Production-owned full opening creation; absent keeps route targets unsupported. */
   ordinaryRouteOpeningCreator?: CurrentOrdinaryRouteOpeningCreator;
+  /** Staged Dashboard chat-route opening; route admission stays in the registry wrapper. */
+  dashboardRouteOpening?: CurrentDashboardRouteOpeningPort;
   /** Staged Current seam for pending-repository first-start completion. */
   pendingRepoCompletion?: PendingRepoCompletionPort;
   /** Internal FI seam; production shares the process-local Current protocol. */
   dashboardProjectionProtocol?: CurrentDashboardProjectionProtocol;
   /** Staged Current seam for scheduled execution. */
   scheduledFire?: ScheduledFirePort;
+  /** Staged Current seam for lifecycle and Dashboard control mutations. */
+  controlMutation?: ControlMutationPort;
+  /** Owner-bound exact-worker native rename seam. */
+  controlRenameEffect?: ControlRenameEffectPort;
 }): CurrentSessionRuntimeHost {
   const runtimeEpoch = options.runtimeEpoch ?? options.ownerBootId;
   // Pre-I1 JavaScript tests can omit the compile-time-required binding. Their
@@ -641,6 +869,13 @@ export function currentSessionRuntimeHost(options: {
     runtimeEpoch,
     activeSessions: options.activeSessions,
   });
+  const controlRenameEffect = options.controlRenameEffect
+    ?? currentControlRenameEffectPort({
+      ownerBotId: stableOwnerKey,
+      ownerLarkAppId: options.ownerLarkAppId,
+      activeSessions: options.activeSessions,
+      runtimeEpoch,
+    });
   const cacheable = options.keyedTriggerTurns === undefined
     && options.dashboardProjectionProtocol === undefined;
   const createInnerHost = (input: {
@@ -648,6 +883,8 @@ export function currentSessionRuntimeHost(options: {
       ordinaryIngress?: OrdinaryIngressPort;
       pendingRepoCompletion?: PendingRepoCompletionPort;
       scheduledFire?: ScheduledFirePort;
+      controlMutation?: ControlMutationPort;
+      controlRenameEffect?: ControlRenameEffectPort;
     };
   } = {}): CurrentSessionRuntimeHost => createSessionRuntimeHost({
     ownerBotId: stableOwnerKey,
@@ -673,6 +910,8 @@ export function currentSessionRuntimeHost(options: {
           ordinaryIngress: options.ordinaryIngress,
           pendingRepoCompletion: options.pendingRepoCompletion,
           scheduledFire: options.scheduledFire,
+          controlMutation: options.controlMutation,
+          controlRenameEffect,
         }),
     sessionStore: sessionStore.createCurrentSessionStore({
       ownerLarkAppId: options.ownerLarkAppId,
@@ -689,6 +928,7 @@ export function currentSessionRuntimeHost(options: {
     innerHost: CurrentSessionRuntimeHost,
     ordinaryIngress: OrdinaryIngressPort | undefined,
     openingCreator: CurrentOrdinaryRouteOpeningCreator | undefined,
+    dashboardRouteOpening: CurrentDashboardRouteOpeningPort | undefined,
   ): CurrentSessionRuntimeHost | undefined => (
     ordinaryIngress && openingCreator
       ? {
@@ -697,6 +937,7 @@ export function currentSessionRuntimeHost(options: {
             ownerLarkAppId: options.ownerLarkAppId,
             activeSessions: options.activeSessions,
             openingCreator,
+            dashboardRouteOpening,
             downstream: innerHost,
           }),
         }
@@ -709,6 +950,7 @@ export function currentSessionRuntimeHost(options: {
       innerHost,
       options.ordinaryIngress,
       options.ordinaryRouteOpeningCreator,
+      options.dashboardRouteOpening,
     ) ?? innerHost;
   }
 
@@ -723,12 +965,19 @@ export function currentSessionRuntimeHost(options: {
       || cached.ordinaryIngress === options.ordinaryIngress;
     const routeCreatorCompatible = options.ordinaryRouteOpeningCreator === undefined
       || cached.ordinaryRouteOpeningCreator === options.ordinaryRouteOpeningCreator;
+    const dashboardRouteCompatible = options.dashboardRouteOpening === undefined
+      || cached.dashboardRouteOpening === options.dashboardRouteOpening;
     const pendingRepoCompatible = options.pendingRepoCompletion === undefined
       || cached.pendingRepoCompletion === options.pendingRepoCompletion;
     const scheduledFireCompatible = options.scheduledFire === undefined
       || cached.scheduledFire === options.scheduledFire;
-    if (ordinaryCompatible && routeCreatorCompatible && pendingRepoCompatible
-        && scheduledFireCompatible) {
+    const controlCompatible = options.controlMutation === undefined
+      || cached.controlMutation === options.controlMutation;
+    const renameEffectCompatible = options.controlRenameEffect === undefined
+      || cached.controlRenameEffect === options.controlRenameEffect;
+    if (ordinaryCompatible && routeCreatorCompatible && dashboardRouteCompatible
+        && pendingRepoCompatible && scheduledFireCompatible
+        && controlCompatible && renameEffectCompatible) {
       return cached.host;
     }
     if (!ordinaryCompatible && cached.ordinaryIngress !== undefined) {
@@ -740,23 +989,50 @@ export function currentSessionRuntimeHost(options: {
     if (!scheduledFireCompatible && cached.scheduledFire !== undefined) {
       throw new Error('Current SessionRuntime owner epoch already has a different scheduled-fire port');
     }
+    if (!controlCompatible && cached.controlMutation !== undefined) {
+      throw new Error('Current SessionRuntime owner epoch already has a different control mutation port');
+    }
+    if (!renameEffectCompatible) {
+      throw new Error('Current SessionRuntime owner epoch already has a different control rename effect port');
+    }
     if (!routeCreatorCompatible && cached.ordinaryRouteOpeningCreator !== undefined) {
       throw new Error('Current SessionRuntime owner epoch already has a different ordinary route opening creator');
+    }
+    if (!dashboardRouteCompatible && cached.dashboardRouteOpening !== undefined) {
+      throw new Error('Current SessionRuntime owner epoch already has a different Dashboard route opening port');
     }
     const ordinaryIngress = options.ordinaryIngress ?? cached.ordinaryIngress;
     const ordinaryRouteOpeningCreator = options.ordinaryRouteOpeningCreator
       ?? cached.ordinaryRouteOpeningCreator;
+    const dashboardRouteOpening = options.dashboardRouteOpening
+      ?? cached.dashboardRouteOpening;
     const pendingRepoCompletion = options.pendingRepoCompletion
       ?? cached.pendingRepoCompletion;
     const scheduledFire = options.scheduledFire ?? cached.scheduledFire;
-    const routeHost = cached.routeHost ?? composeRouteHost(
-      cached.innerHost,
-      ordinaryIngress,
-      ordinaryRouteOpeningCreator,
-    );
+    const controlMutation = options.controlMutation ?? cached.controlMutation;
+    const resolvedControlRenameEffect = options.controlRenameEffect
+      ?? cached.controlRenameEffect;
+    const routeCompositionChanged = ordinaryIngress !== cached.ordinaryIngress
+      || ordinaryRouteOpeningCreator !== cached.ordinaryRouteOpeningCreator
+      || dashboardRouteOpening !== cached.dashboardRouteOpening;
+    const routeHost = routeCompositionChanged
+      ? composeRouteHost(
+          cached.innerHost,
+          ordinaryIngress,
+          ordinaryRouteOpeningCreator,
+          dashboardRouteOpening,
+        )
+      : cached.routeHost ?? composeRouteHost(
+          cached.innerHost,
+          ordinaryIngress,
+          ordinaryRouteOpeningCreator,
+          dashboardRouteOpening,
+        );
     cached.portBindings.ordinaryIngress = ordinaryIngress;
     cached.portBindings.pendingRepoCompletion = pendingRepoCompletion;
     cached.portBindings.scheduledFire = scheduledFire;
+    cached.portBindings.controlMutation = controlMutation;
+    cached.portBindings.controlRenameEffect = resolvedControlRenameEffect;
     const composedHost = routeHost ?? cached.innerHost;
     const lease = { active: true };
     const host = leaseCurrentSessionRuntimeHost(composedHost, lease);
@@ -765,8 +1041,11 @@ export function currentSessionRuntimeHost(options: {
       runtimeEpoch,
       ordinaryIngress,
       ordinaryRouteOpeningCreator,
+      dashboardRouteOpening,
       pendingRepoCompletion,
       scheduledFire,
+      controlMutation,
+      controlRenameEffect: resolvedControlRenameEffect,
       portBindings: cached.portBindings,
       innerHost: cached.innerHost,
       routeHost,
@@ -780,12 +1059,15 @@ export function currentSessionRuntimeHost(options: {
     ordinaryIngress: options.ordinaryIngress,
     pendingRepoCompletion: options.pendingRepoCompletion,
     scheduledFire: options.scheduledFire,
+    controlMutation: options.controlMutation,
+    controlRenameEffect,
   };
   const innerHost = createInnerHost({ portBindings });
   const routeHost = composeRouteHost(
     innerHost,
     options.ordinaryIngress,
     options.ordinaryRouteOpeningCreator,
+    options.dashboardRouteOpening,
   );
   const lease = { active: true };
   const host = leaseCurrentSessionRuntimeHost(routeHost ?? innerHost, lease);
@@ -794,8 +1076,11 @@ export function currentSessionRuntimeHost(options: {
     runtimeEpoch,
     ordinaryIngress: options.ordinaryIngress,
     ordinaryRouteOpeningCreator: options.ordinaryRouteOpeningCreator,
+    dashboardRouteOpening: options.dashboardRouteOpening,
     pendingRepoCompletion: options.pendingRepoCompletion,
     scheduledFire: options.scheduledFire,
+    controlMutation: options.controlMutation,
+    controlRenameEffect,
     portBindings,
     innerHost,
     routeHost,

@@ -455,6 +455,52 @@ defineSessionStoreContract('Current', () => {
 });
 
 describe('Current SessionStore ownership and structural gate', () => {
+  it('changes the working directory and clears stale Riff repository grants atomically', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'session-store-cwd-'));
+    const previousDataDir = process.env.SESSION_DATA_DIR;
+    process.env.SESSION_DATA_DIR = dataDir;
+    try {
+      const state = sessionState({
+        workingDir: '/roles/old',
+        riffRepoDirs: ['/roles/old/repo'],
+      });
+      const file = join(dataDir, 'sessions-owner-a.json');
+      writeFileSync(file, JSON.stringify({
+        [state.sessionId]: currentRow(state, {
+          larkAppId: 'owner-a',
+          workingDir: state.workingDir,
+          riffRepoDirs: state.riffRepoDirs,
+          futureCapability: { enabled: true },
+        }),
+      }, null, 2));
+      const store = createCurrentSessionStore({
+        ownerLarkAppId: 'owner-a',
+        runtimeEpoch: 'epoch-cwd',
+      });
+      const loaded = store.load(state.sessionId);
+      if (loaded.kind !== 'loaded') throw new Error('expected loaded state');
+
+      expect(store.apply({
+        sessionId: state.sessionId,
+        expected: loaded.version,
+        transition: { kind: 'changeWorkingDirectory', workingDir: '/roles/new' },
+      })).toMatchObject({
+        kind: 'applied',
+        state: { workingDir: '/roles/new', riffRepoDirs: undefined },
+      });
+      const persisted = JSON.parse(readFileSync(file, 'utf8')) as Record<string, Record<string, unknown>>;
+      expect(persisted[state.sessionId]).toMatchObject({
+        workingDir: '/roles/new',
+        futureCapability: { enabled: true },
+      });
+      expect(persisted[state.sessionId]).not.toHaveProperty('riffRepoDirs');
+    } finally {
+      if (previousDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = previousDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it('binds one owner file and rejects a row that claims another owner', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'session-store-owner-'));
     const previousDataDir = process.env.SESSION_DATA_DIR;

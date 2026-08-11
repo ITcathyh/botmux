@@ -7,6 +7,8 @@
  * forwards the unchanged command through the downstream Session address/lane.
  */
 
+import { isDeepStrictEqual } from 'node:util';
+
 import { computeInputHash } from '../utils/canonical-input-hash.js';
 import * as sessionStore from '../services/session-store.js';
 import type { Session } from '../types.js';
@@ -16,6 +18,10 @@ import {
 } from './ordinary-im-turn.js';
 import type {
   CommandOutcomeFor,
+  ControlMutationCommand,
+  ControlMutationCommandOutcome,
+  DashboardSpawnCommand,
+  DashboardSpawnCommandOutcome,
   OrdinaryIngressCommand,
   OrdinaryIngressCommandOutcome,
   SessionCommand,
@@ -23,10 +29,16 @@ import type {
   SessionCommandRoute,
   SessionProjection,
   SessionRuntime,
+  SessionRoute,
 } from './session-runtime.js';
+import type {
+  CurrentDashboardRouteOpeningPort,
+  CurrentDashboardRouteOpeningResult,
+} from './current-dashboard-route-opening.js';
 import {
   activeSessionAnchorId,
   activeSessionKey,
+  sessionAnchorId,
   storedActiveSessionAnchorId,
   type DaemonSession,
 } from './types.js';
@@ -34,6 +46,10 @@ import {
   currentRouteAdmissionKey,
   reserveCurrentRouteAdmission,
 } from './current-route-admission.js';
+import {
+  isDisposableCurrentRouteScratch,
+  isDisposableStoredRouteScratch,
+} from './current-route-scratch.js';
 
 declare const currentOrdinaryRouteOpeningPostCommitTokenBrand: unique symbol;
 declare const currentOrdinaryRouteOpeningRollbackTokenBrand: unique symbol;
@@ -102,6 +118,8 @@ export interface CurrentOrdinaryRouteRegistryOptions {
   readonly ownerLarkAppId: string;
   readonly activeSessions: Map<string, DaemonSession>;
   readonly openingCreator: CurrentOrdinaryRouteOpeningCreator;
+  /** Staged Dashboard chat-route creator. Absent keeps dashboard.spawn fail-closed. */
+  readonly dashboardRouteOpening?: CurrentDashboardRouteOpeningPort;
   readonly downstream: DownstreamCurrentSessionHost;
 }
 
@@ -123,6 +141,38 @@ interface RouteBinding {
   readonly current: DaemonSession;
   readonly session: Session;
   readonly route: NormalizedOrdinaryImTurn['route'];
+}
+
+interface CurrentRelocationRouteReservation {
+  readonly ownerLarkAppId: string;
+  readonly activeSessions: Map<string, DaemonSession>;
+  readonly route: SessionRoute;
+}
+
+const currentRelocationRouteReservations = new WeakMap<
+  object,
+  CurrentRelocationRouteReservation
+>();
+
+/** Validate one exact, still-held reservation minted by this Current route
+ * registry. The token has no enumerable authority and becomes invalid before
+ * the waiting ordinary route admission is released. */
+export function isCurrentRelocationRouteReservation(input: {
+  readonly token: unknown;
+  readonly ownerLarkAppId: string;
+  readonly activeSessions: Map<string, DaemonSession>;
+  readonly route: SessionRoute;
+}): boolean {
+  if (!isObject(input.token)) return false;
+  const held = currentRelocationRouteReservations.get(input.token);
+  if (!held
+      || held.ownerLarkAppId !== input.ownerLarkAppId
+      || held.activeSessions !== input.activeSessions
+      || held.route.kind !== input.route.kind) return false;
+  return held.route.kind === 'thread' && input.route.kind === 'thread'
+    ? held.route.anchorId === input.route.anchorId
+    : held.route.kind === 'chat' && input.route.kind === 'chat'
+      && held.route.chatId === input.route.chatId;
 }
 
 interface ProviderAttempt {
@@ -148,6 +198,44 @@ type ProviderRecord =
         OrdinaryIngressCommandOutcome,
         { readonly kind: 'ambiguous' | 'quarantined' }
       >;
+    };
+
+interface RelocationAttempt {
+  readonly terminal: Promise<ControlMutationCommandOutcome>;
+  settle(outcome: ControlMutationCommandOutcome): void;
+}
+
+type RelocationRecord =
+  | {
+      readonly requestHash: string;
+      readonly state: 'received';
+      readonly attempt: RelocationAttempt;
+    }
+  | {
+      readonly requestHash: string;
+      readonly state: 'terminal';
+      readonly outcome: ControlMutationCommandOutcome;
+    };
+
+interface DashboardSpawnAttempt {
+  readonly terminal: Promise<DashboardSpawnCommandOutcome>;
+  settle(outcome: DashboardSpawnCommandOutcome): void;
+}
+
+type DashboardSpawnRecord =
+  | {
+      readonly requestHash: string;
+      readonly state: 'received';
+      readonly attempt: DashboardSpawnAttempt;
+    }
+  | {
+      readonly requestHash: string;
+      readonly state: 'terminal';
+      readonly outcome: DashboardSpawnCommandOutcome;
+    }
+  | {
+      readonly requestHash: string;
+      readonly state: 'retryable';
     };
 
 function message(error: unknown): string {
@@ -279,6 +367,180 @@ function createAttempt(): ProviderAttempt {
       resolveTerminal(outcome);
     },
   };
+}
+
+function createRelocationAttempt(): RelocationAttempt {
+  let resolveTerminal!: (outcome: ControlMutationCommandOutcome) => void;
+  let settled = false;
+  const terminal = new Promise<ControlMutationCommandOutcome>((resolve) => {
+    resolveTerminal = resolve;
+  });
+  return {
+    terminal,
+    settle(outcome) {
+      if (settled) return;
+      settled = true;
+      resolveTerminal(outcome);
+    },
+  };
+}
+
+function createDashboardSpawnAttempt(): DashboardSpawnAttempt {
+  let resolveTerminal!: (outcome: DashboardSpawnCommandOutcome) => void;
+  let settled = false;
+  const terminal = new Promise<DashboardSpawnCommandOutcome>((resolve) => {
+    resolveTerminal = resolve;
+  });
+  return {
+    terminal,
+    settle(outcome) {
+      if (settled) return;
+      settled = true;
+      resolveTerminal(outcome);
+    },
+  };
+}
+
+function duplicateRelocation(
+  outcome: ControlMutationCommandOutcome,
+): ControlMutationCommandOutcome {
+  if (outcome.kind !== 'applied' && outcome.kind !== 'duplicate') return outcome;
+  return {
+    kind: 'duplicate',
+    state: 'controlApplied',
+    policy: 'control-staged-transition',
+    sessionId: outcome.sessionId,
+    result: outcome.result,
+    message: 'route relocation is already reflected by the Current registry',
+  };
+}
+
+function duplicateDashboardSpawn(
+  outcome: DashboardSpawnCommandOutcome,
+  state: 'inFlight' | 'routeOpened',
+): DashboardSpawnCommandOutcome {
+  if (outcome.kind !== 'applied' && outcome.kind !== 'duplicate') return outcome;
+  return {
+    kind: 'duplicate',
+    state,
+    policy: 'route-staged-opening',
+    sessionId: outcome.sessionId,
+    message: 'Dashboard route opening joined the winning stable operation',
+  };
+}
+
+type RelocationTargetInspection =
+  | { readonly kind: 'clear' }
+  | { readonly kind: 'scratches'; readonly sessionIds: readonly string[] }
+  | { readonly kind: 'occupied'; readonly message: string }
+  | { readonly kind: 'quarantined'; readonly message: string };
+
+function samePersistedSession(left: Session, right: Session): boolean {
+  const persisted = (session: Session): Session => (
+    JSON.parse(JSON.stringify(session)) as Session
+  );
+  return isDeepStrictEqual(persisted(left), persisted(right));
+}
+
+/** Resolve only exact owner/canonical target occupants. The returned ids are
+ * still authority-free; callers must project each one into an opaque
+ * SessionAddress before submitting a staged close through SessionRuntime. */
+function inspectRelocationTarget(options: Pick<
+  CurrentOrdinaryRouteRegistryOptions,
+  'ownerLarkAppId' | 'activeSessions'
+>, input: {
+  readonly sourceSessionId: string;
+  readonly targetChatId: string;
+}): RelocationTargetInspection {
+  let persisted: Session[];
+  try {
+    persisted = sessionStore.listSessionsForOwnerStrict(options.ownerLarkAppId);
+  } catch (error) {
+    return {
+      kind: 'quarantined',
+      message: `Current relocate target Store is unreadable: ${message(error)}`,
+    };
+  }
+
+  const persistedById = new Map<string, Session>();
+  for (const session of persisted) {
+    if (persistedById.has(session.sessionId)) {
+      return {
+        kind: 'quarantined',
+        message: 'Current relocate target Store has duplicate Session identities',
+      };
+    }
+    persistedById.set(session.sessionId, session);
+  }
+
+  const liveById = new Map<string, DaemonSession>();
+  for (const [key, current] of options.activeSessions) {
+    if (sessionAnchorId(current) !== input.targetChatId) continue;
+    if (key !== activeSessionKey(current)) {
+      return {
+        kind: 'quarantined',
+        message: 'Current relocate target has an owner under a noncanonical registry key',
+      };
+    }
+    if (current.larkAppId !== options.ownerLarkAppId
+        || current.session.larkAppId !== options.ownerLarkAppId) {
+      return {
+        kind: 'quarantined',
+        message: 'Current relocate target registry owner does not match its Runtime Host',
+      };
+    }
+    if (current.session.status !== 'active'
+        || current.scope !== current.session.scope
+        || current.chatId !== current.session.chatId) {
+      return {
+        kind: 'quarantined',
+        message: 'Current relocate target live binding is internally inconsistent',
+      };
+    }
+    if (current.session.sessionId === input.sourceSessionId) continue;
+    const prior = liveById.get(current.session.sessionId);
+    if (prior && prior !== current) {
+      return {
+        kind: 'quarantined',
+        message: 'Current relocate target has multiple live bindings for one Session',
+      };
+    }
+    liveById.set(current.session.sessionId, current);
+  }
+
+  const targetPersisted = persisted.filter(session => (
+    session.sessionId !== input.sourceSessionId
+    && session.status === 'active'
+    && !session.vcMeetingReceiver
+    && (session.scope === 'chat' ? session.chatId : session.rootMessageId) === input.targetChatId
+  ));
+  const candidateIds = new Set([
+    ...liveById.keys(),
+    ...targetPersisted.map(session => session.sessionId),
+  ]);
+  const scratches: string[] = [];
+  for (const sessionId of candidateIds) {
+    const live = liveById.get(sessionId);
+    const durable = persistedById.get(sessionId);
+    if (live && (!durable || !samePersistedSession(live.session, durable))) {
+      return {
+        kind: 'quarantined',
+        message: 'Current relocate target live and durable Session bindings disagree',
+      };
+    }
+    if (live
+      ? !isDisposableCurrentRouteScratch(live)
+      : !durable || !isDisposableStoredRouteScratch(durable)) {
+      return {
+        kind: 'occupied',
+        message: 'target_chat_has_session',
+      };
+    }
+    scratches.push(sessionId);
+  }
+  return scratches.length === 0
+    ? { kind: 'clear' }
+    : { kind: 'scratches', sessionIds: scratches.sort() };
 }
 
 type OpeningTransitionSnapshot =
@@ -604,20 +866,22 @@ export function createCurrentOrdinaryRouteRegistryRuntime(
 ): SessionRuntime {
   const registry = new CurrentOrdinaryRouteRegistry(options);
   const providerRecords = new Map<string, ProviderRecord>();
+  const relocationRecords = new Map<string, RelocationRecord>();
+  const dashboardSpawnRecords = new Map<string, DashboardSpawnRecord>();
   const pendingPostCommits = new Map<string, CurrentOrdinaryRouteOpeningPostCommitToken>();
   const postCommitKey = (sessionId: string, providerKey: string): string => (
     `${sessionId}\u0000${providerKey}`
   );
   const routeUnknowns = new Map<string, string>();
-  const routeAdmissionKey = (turn: NormalizedOrdinaryImTurn): string => (
-    currentRouteAdmissionKey({
-      ownerLarkAppId: options.ownerLarkAppId,
-      scope: turn.route.scope,
-      canonicalAnchor: turn.route.canonicalAnchor,
-      chatId: turn.route.chatId,
-      chatType: turn.route.chatType,
-    })
-  );
+  const routeAdmissionKey = (input: {
+    readonly scope: 'thread' | 'chat';
+    readonly canonicalAnchor: string;
+    readonly chatId: string;
+    readonly chatType: 'group' | 'p2p';
+  }): string => currentRouteAdmissionKey({
+    ownerLarkAppId: options.ownerLarkAppId,
+    ...input,
+  });
 
   const rollbackOpening = (
     token: CurrentOrdinaryRouteOpeningRollbackToken,
@@ -777,9 +1041,9 @@ export function createCurrentOrdinaryRouteRegistryRuntime(
 
     const attempt = createAttempt();
     providerRecords.set(providerKey, { requestHash, state: 'received', attempt });
-    const routeAdmission = reserveCurrentRouteAdmission(routeAdmissionKey(turn));
+    const routeAdmission = reserveCurrentRouteAdmission(routeAdmissionKey(turn.route));
     await routeAdmission.ready;
-    const admissionKey = routeAdmissionKey(turn);
+    const admissionKey = routeAdmissionKey(turn.route);
     let pendingPostCommitKey: string | undefined;
     let openingRollbackToken: CurrentOrdinaryRouteOpeningRollbackToken | undefined;
     let forwardedPromise: Promise<OrdinaryIngressCommandOutcome> | undefined;
@@ -940,10 +1204,586 @@ export function createCurrentOrdinaryRouteRegistryRuntime(
     }
   };
 
+  const submitDashboardSpawnRoute = async (
+    request: SessionCommandRequest<DashboardSpawnCommand>,
+  ): Promise<DashboardSpawnCommandOutcome> => {
+    if (request.target.kind !== 'route'
+        || request.target.route.kind !== 'chat') {
+      return {
+        kind: 'rejected',
+        reason: 'invalidCommand',
+        message: 'Dashboard spawn requires one concrete chat route',
+      };
+    }
+    if (!request.idempotencyKey.trim()) {
+      return {
+        kind: 'rejected',
+        reason: 'invalidCommand',
+        message: 'Dashboard spawn idempotency key must not be blank',
+      };
+    }
+
+    let requestHash: string;
+    try {
+      requestHash = computeInputHash({
+        route: request.target.route,
+        input: request.command.input,
+      });
+    } catch (error) {
+      return {
+        kind: 'rejected',
+        reason: 'invalidCommand',
+        message: `Dashboard spawn is not canonicalizable: ${message(error)}`,
+      };
+    }
+    const operationKey = request.idempotencyKey;
+    const prior = dashboardSpawnRecords.get(operationKey);
+    if (prior) {
+      if (prior.requestHash !== requestHash) {
+        return {
+          kind: 'rejected',
+          reason: 'idempotencyConflict',
+          message: 'Dashboard spawn operation key belongs to different business input',
+        };
+      }
+      if (prior.state === 'terminal') {
+        return duplicateDashboardSpawn(prior.outcome, 'routeOpened');
+      }
+      if (prior.state === 'received') {
+        return duplicateDashboardSpawn(await prior.attempt.terminal, 'inFlight');
+      }
+    }
+
+    const attempt = createDashboardSpawnAttempt();
+    dashboardSpawnRecords.set(operationKey, {
+      requestHash,
+      state: 'received',
+      attempt,
+    });
+    const finishDashboardSpawn = (
+      outcome: DashboardSpawnCommandOutcome,
+    ): DashboardSpawnCommandOutcome => {
+      const current = dashboardSpawnRecords.get(operationKey);
+      if (current?.state === 'received' && current.attempt === attempt) {
+        dashboardSpawnRecords.set(operationKey,
+          outcome.kind === 'retryable' || outcome.kind === 'notWired'
+            ? { requestHash, state: 'retryable' }
+            : { requestHash, state: 'terminal', outcome });
+      }
+      attempt.settle(outcome);
+      return outcome;
+    };
+
+    const opening = options.dashboardRouteOpening;
+    if (!opening) {
+      return finishDashboardSpawn({
+        kind: 'notWired',
+        command: 'dashboard.spawn',
+        message: 'Dashboard route opening is not connected to this Current Host',
+      });
+    }
+    const route = request.target.route;
+    const admissionKey = routeAdmissionKey({
+      scope: 'chat',
+      canonicalAnchor: route.chatId,
+      chatId: route.chatId,
+      chatType: 'group',
+    });
+    const routeAdmission = reserveCurrentRouteAdmission(admissionKey);
+    await routeAdmission.ready;
+    try {
+      const priorUnknown = routeUnknowns.get(admissionKey);
+      if (priorUnknown) {
+        return finishDashboardSpawn({ kind: 'quarantined', message: priorUnknown });
+      }
+
+      let inspection: unknown;
+      try {
+        inspection = opening.inspect(route);
+      } catch (error) {
+        const unknownMessage = `Current Dashboard route inspection failed: ${message(error)}`;
+        return finishDashboardSpawn({ kind: 'retryable', message: unknownMessage });
+      }
+      if (isThenable(inspection)) {
+        detachThenable(inspection);
+        const unknownMessage = 'Current Dashboard route inspection must return synchronously';
+        return finishDashboardSpawn({ kind: 'retryable', message: unknownMessage });
+      }
+      if (!isObject(inspection)) {
+        const unknownMessage = 'Current Dashboard route inspection returned no result';
+        return finishDashboardSpawn({ kind: 'retryable', message: unknownMessage });
+      }
+      try {
+        if (inspection.kind === 'occupied') {
+          if (typeof inspection.sessionId !== 'string' || !inspection.sessionId) {
+            throw new Error('occupied inspection has no Session identity');
+          }
+          return finishDashboardSpawn({
+            kind: 'rejected',
+            reason: 'sessionExists',
+            code: 'session_exists',
+            message: 'session_exists',
+          });
+        }
+        if (inspection.kind === 'unknown') {
+          if (typeof inspection.message !== 'string') {
+            throw new Error('unknown inspection has no message');
+          }
+          return finishDashboardSpawn({
+            kind: 'retryable',
+            message: inspection.message,
+          });
+        }
+        if (inspection.kind !== 'vacant') {
+          throw new Error('inspection kind is invalid');
+        }
+      } catch (error) {
+        const unknownMessage = `Current Dashboard route inspection is unreadable: ${message(error)}`;
+        return finishDashboardSpawn({ kind: 'retryable', message: unknownMessage });
+      }
+
+      let begun: unknown;
+      try {
+        begun = opening.begin({ route, command: request.command.input });
+      } catch (error) {
+        const unknownMessage = `Current Dashboard opening begin failed: ${message(error)}`;
+        return finishDashboardSpawn({ kind: 'retryable', message: unknownMessage });
+      }
+      if (isThenable(begun)) {
+        detachThenable(begun);
+        const unknownMessage = 'Current Dashboard opening begin must return synchronously';
+        return finishDashboardSpawn({ kind: 'retryable', message: unknownMessage });
+      }
+      if (!isObject(begun)) {
+        const unknownMessage = 'Current Dashboard opening begin returned no result';
+        return finishDashboardSpawn({ kind: 'retryable', message: unknownMessage });
+      }
+      let beginKind: unknown;
+      try {
+        beginKind = begun.kind;
+      } catch (error) {
+        const unknownMessage = `Current Dashboard opening begin is unreadable: ${message(error)}`;
+        return finishDashboardSpawn({ kind: 'retryable', message: unknownMessage });
+      }
+      if (beginKind === 'refused') {
+        return finishDashboardSpawn({
+          kind: 'rejected',
+          reason: 'invalidCommand',
+          message: typeof begun.message === 'string'
+            ? begun.message
+            : 'Current Dashboard opening refused invalid input',
+        });
+      }
+      if (beginKind === 'unknown') {
+        const unknownMessage = typeof begun.message === 'string'
+          ? begun.message
+          : 'Current Dashboard opening begin outcome is unknown';
+        return finishDashboardSpawn({
+          kind: 'retryable',
+          message: unknownMessage,
+        });
+      }
+      if (beginKind !== 'effect'
+          || !isObject(begun.intent)
+          || !isObject(begun.continuation)
+          || begun.intent === begun.continuation) {
+        const unknownMessage = 'Current Dashboard opening begin returned invalid effect capabilities';
+        return finishDashboardSpawn({ kind: 'retryable', message: unknownMessage });
+      }
+
+      let settlement: { kind: 'returned'; value: unknown } | { kind: 'threw'; error: unknown };
+      try {
+        settlement = { kind: 'returned', value: await opening.execute(begun.intent) };
+      } catch (error) {
+        settlement = { kind: 'threw', error };
+      }
+      let resumed: unknown;
+      try {
+        resumed = opening.resume(begun.continuation, settlement);
+      } catch (error) {
+        const unknownMessage = `Current Dashboard opening resume failed: ${message(error)}`;
+        routeUnknowns.set(admissionKey, unknownMessage);
+        return finishDashboardSpawn({
+          kind: 'ambiguous',
+          policy: 'route-staged-opening',
+          message: unknownMessage,
+        });
+      }
+      if (isThenable(resumed)) {
+        detachThenable(resumed);
+        const unknownMessage = 'Current Dashboard opening resume must return synchronously';
+        routeUnknowns.set(admissionKey, unknownMessage);
+        return finishDashboardSpawn({
+          kind: 'ambiguous',
+          policy: 'route-staged-opening',
+          message: unknownMessage,
+        });
+      }
+      if (!isObject(resumed)) {
+        const unknownMessage = 'Current Dashboard opening resume returned no result';
+        routeUnknowns.set(admissionKey, unknownMessage);
+        return finishDashboardSpawn({
+          kind: 'ambiguous',
+          policy: 'route-staged-opening',
+          message: unknownMessage,
+        });
+      }
+
+      let result: CurrentDashboardRouteOpeningResult;
+      try {
+        result = resumed as CurrentDashboardRouteOpeningResult;
+        if (result.kind === 'created') {
+          if (typeof result.sessionId !== 'string' || !result.sessionId) {
+            throw new Error('created result has no Session identity');
+          }
+          return finishDashboardSpawn({
+            kind: 'applied',
+            action: 'dashboard.spawned',
+            policy: 'route-staged-opening',
+            sessionId: result.sessionId,
+          });
+        }
+        if (result.kind === 'refused') {
+          if (typeof result.message !== 'string' || typeof result.code !== 'string') {
+            throw new Error('refused result has no stable error');
+          }
+          return finishDashboardSpawn({
+            kind: 'rejected',
+            reason: result.reason,
+            code: result.code,
+            message: result.message,
+          });
+        }
+        if (result.kind === 'unknown') {
+          if (typeof result.message !== 'string') throw new Error('unknown result has no message');
+          routeUnknowns.set(admissionKey, result.message);
+          return finishDashboardSpawn({
+            kind: 'ambiguous',
+            policy: 'route-staged-opening',
+            message: result.message,
+            ...(result.sessionId === undefined ? {} : { sessionId: result.sessionId }),
+          });
+        }
+        throw new Error('result kind is invalid');
+      } catch (error) {
+        const unknownMessage = `Current Dashboard opening result is unreadable: ${message(error)}`;
+        routeUnknowns.set(admissionKey, unknownMessage);
+        return finishDashboardSpawn({
+          kind: 'ambiguous',
+          policy: 'route-staged-opening',
+          message: unknownMessage,
+        });
+      }
+    } finally {
+      routeAdmission.release();
+    }
+  };
+
+  const cleanupRelocationTargetScratches = async (input: {
+    readonly sourceSessionId: string;
+    readonly targetChatId: string;
+    readonly relocationOperationIdentity: string;
+    readonly relocationRequestHash: string;
+    readonly routeReservation: object;
+  }): Promise<ControlMutationCommandOutcome | undefined> => {
+    const inspected = inspectRelocationTarget(options, input);
+    if (inspected.kind === 'occupied') {
+      return {
+        kind: 'rejected',
+        reason: 'transitionRejected',
+        code: 'target_chat_has_session',
+        message: inspected.message,
+      };
+    }
+    if (inspected.kind === 'quarantined') return inspected;
+    if (inspected.kind === 'clear') return undefined;
+
+    for (const sessionId of inspected.sessionIds) {
+      let projected: Awaited<ReturnType<SessionProjection['read']>>;
+      try {
+        projected = await options.downstream.projection.read({
+          kind: 'byExternalSession',
+          sessionId,
+        });
+      } catch (error) {
+        return {
+          kind: 'quarantined',
+          message: `Current relocate scratch projection failed: ${message(error)}`,
+        };
+      }
+      if (projected.kind === 'notReady') {
+        return { kind: 'retryable', message: projected.message };
+      }
+      if (projected.kind === 'notFound') {
+        // A concurrent exact Session close may have won after inspection. The
+        // final strict target read below is the authority for whether retry is
+        // still needed.
+        continue;
+      }
+      if (projected.kind !== 'one'
+          || projected.session.sessionId !== sessionId
+          || projected.session.recordStatus !== 'active'
+          || projected.session.route.kind !== 'chat'
+          || projected.session.route.chatId !== input.targetChatId) {
+        return {
+          kind: 'quarantined',
+          message: 'Current relocate scratch projection did not preserve its exact target binding',
+        };
+      }
+
+      const closeOperation = `relocate-target-scratch:${computeInputHash({
+        relocationOperationIdentity: input.relocationOperationIdentity,
+        relocationRequestHash: input.relocationRequestHash,
+        sessionId,
+      })}`;
+      let closed: ControlMutationCommandOutcome;
+      try {
+        closed = await options.downstream.runtime.submit({
+          target: {
+            kind: 'session',
+            address: projected.session.address,
+            controlRouteReservation: input.routeReservation,
+          },
+          idempotencyKey: closeOperation,
+          command: {
+            kind: 'control.mutate',
+            input: {
+              kind: 'close',
+              reason: 'relocateScratch',
+              expectedRoute: {
+                scope: 'chat',
+                canonicalAnchor: input.targetChatId,
+                chatId: input.targetChatId,
+                chatType: 'group',
+              },
+            },
+          },
+        });
+      } catch (error) {
+        return {
+          kind: 'quarantined',
+          message: `Current relocate scratch close outcome is unknown: ${message(error)}`,
+        };
+      }
+      if ((closed.kind === 'applied' || closed.kind === 'duplicate')
+          && closed.sessionId === sessionId
+          && closed.result?.kind === 'closed') {
+        continue;
+      }
+      if (closed.kind === 'retryable') return closed;
+      if (closed.kind === 'rejected' && closed.reason === 'sessionNotFound') continue;
+      if (closed.kind === 'rejected' && closed.reason === 'transitionRejected') {
+        return {
+          kind: 'rejected',
+          reason: 'transitionRejected',
+          code: 'target_chat_has_session',
+          message: 'target_chat_has_session',
+          ...(closed.details ? { details: closed.details } : {}),
+        };
+      }
+      if (closed.kind === 'staleAddress') {
+        return {
+          kind: 'retryable',
+          message: 'Current relocate scratch address became stale before close',
+        };
+      }
+      return {
+        kind: 'quarantined',
+        message: closed.kind === 'ambiguous' || closed.kind === 'quarantined'
+          ? `Current relocate scratch close is unresolved: ${closed.message}`
+          : 'Current relocate scratch close returned no exact closed proof',
+      };
+    }
+
+    const after = inspectRelocationTarget(options, input);
+    if (after.kind === 'clear') return undefined;
+    if (after.kind === 'occupied') {
+      return {
+        kind: 'rejected',
+        reason: 'transitionRejected',
+        code: 'target_chat_has_session',
+        message: after.message,
+      };
+    }
+    if (after.kind === 'quarantined') return after;
+    return {
+      kind: 'retryable',
+      message: 'Current relocate scratch close has not left the target route',
+    };
+  };
+
+  const submitRelocateRoute = async (
+    request: SessionCommandRequest<ControlMutationCommand>,
+  ): Promise<ControlMutationCommandOutcome> => {
+    const command = request.command.input;
+    if (command.kind !== 'relocate'
+        || request.target.kind !== 'route'
+        || request.target.route.kind === 'idempotency'
+        || request.target.route.kind === 'schedule') {
+      return {
+        kind: 'rejected',
+        reason: 'invalidCommand',
+        message: 'route-targeted control requires a relocate command and concrete source route',
+      };
+    }
+    const sourceAnchor = request.target.route.kind === 'thread'
+      ? request.target.route.anchorId
+      : request.target.route.chatId;
+    if (sourceAnchor !== command.sourceAnchor) {
+      return {
+        kind: 'rejected',
+        reason: 'invalidCommand',
+        message: 'relocate source route does not match its canonical source anchor',
+      };
+    }
+
+    let requestHash: string;
+    try {
+      requestHash = computeInputHash(command);
+    } catch (error) {
+      return {
+        kind: 'rejected',
+        reason: 'invalidCommand',
+        message: `route relocation is not canonicalizable: ${message(error)}`,
+      };
+    }
+    const relocationKey = `${request.target.route.kind}\u0000${sourceAnchor}`
+      + `\u0000${request.idempotencyKey}`;
+    const prior = relocationRecords.get(relocationKey);
+    if (prior) {
+      if (prior.requestHash !== requestHash) {
+        return {
+          kind: 'rejected',
+          reason: 'idempotencyConflict',
+          message: 'route relocation idempotency key belongs to a different command',
+        };
+      }
+      const terminal = prior.state === 'terminal'
+        ? prior.outcome
+        : await prior.attempt.terminal;
+      return duplicateRelocation(terminal);
+    }
+
+    const attempt = createRelocationAttempt();
+    relocationRecords.set(relocationKey, { requestHash, state: 'received', attempt });
+    const finishRelocation = (
+      outcome: ControlMutationCommandOutcome,
+    ): ControlMutationCommandOutcome => {
+      const current = relocationRecords.get(relocationKey);
+      if (current?.state === 'received' && current.attempt === attempt) {
+        if (outcome.kind === 'applied'
+            || outcome.kind === 'duplicate'
+            || outcome.kind === 'ambiguous'
+            || outcome.kind === 'quarantined') {
+          relocationRecords.set(relocationKey, {
+            requestHash,
+            state: 'terminal',
+            outcome,
+          });
+        } else {
+          relocationRecords.delete(relocationKey);
+        }
+      }
+      attempt.settle(outcome);
+      return outcome;
+    };
+
+    const targetRoute = {
+      kind: 'chat' as const,
+      chatId: command.targetChatId,
+    };
+    const targetAdmission = reserveCurrentRouteAdmission(currentRouteAdmissionKey({
+      ownerLarkAppId: options.ownerLarkAppId,
+      scope: 'chat',
+      canonicalAnchor: command.targetChatId,
+      chatId: command.targetChatId,
+      chatType: 'group',
+    }));
+    await targetAdmission.ready;
+    const reservation = Object.freeze(Object.create(null)) as object;
+    currentRelocationRouteReservations.set(reservation, {
+      ownerLarkAppId: options.ownerLarkAppId,
+      activeSessions: options.activeSessions,
+      route: targetRoute,
+    });
+    try {
+      let projected: Awaited<ReturnType<SessionProjection['read']>>;
+      try {
+        projected = await options.downstream.projection.read({
+          kind: 'byRoute',
+          route: request.target.route,
+        });
+      } catch (error) {
+        return finishRelocation({
+          kind: 'quarantined',
+          message: `Current relocate source projection failed: ${message(error)}`,
+        });
+      }
+      if (projected.kind === 'notFound') {
+        return finishRelocation({
+          kind: 'rejected',
+          reason: 'sessionNotFound',
+          message: 'no_session_at_anchor',
+        });
+      }
+      if (projected.kind === 'notReady') {
+        return finishRelocation({ kind: 'retryable', message: projected.message });
+      }
+      if (projected.kind !== 'one') {
+        return finishRelocation({
+          kind: 'quarantined',
+          message: 'Current relocate source projection did not resolve exactly one Session',
+        });
+      }
+      const cleanupOutcome = await cleanupRelocationTargetScratches({
+        sourceSessionId: projected.session.sessionId,
+        targetChatId: command.targetChatId,
+        relocationOperationIdentity: request.idempotencyKey,
+        relocationRequestHash: requestHash,
+        routeReservation: reservation,
+      });
+      if (cleanupOutcome) return finishRelocation(cleanupOutcome);
+      let forwarded: ControlMutationCommandOutcome;
+      try {
+        forwarded = await options.downstream.runtime.submit({
+          target: {
+            kind: 'session',
+            address: projected.session.address,
+            controlRouteReservation: reservation,
+          },
+          idempotencyKey: request.idempotencyKey,
+          command: request.command,
+        });
+      } catch (error) {
+        forwarded = {
+          kind: 'quarantined',
+          message: `Current route relocation outcome is unknown: ${message(error)}`,
+        };
+      }
+      return finishRelocation(forwarded);
+    } finally {
+      currentRelocationRouteReservations.delete(reservation);
+      targetAdmission.release();
+    }
+  };
+
   return {
     submit<C extends SessionCommand>(
       request: SessionCommandRequest<C>,
     ): Promise<CommandOutcomeFor<C>> {
+      if (request.command.kind === 'control.mutate'
+          && request.command.input.kind === 'relocate'
+          && request.target.kind === 'route') {
+        return submitRelocateRoute(
+          request as SessionCommandRequest<ControlMutationCommand>,
+        ) as Promise<CommandOutcomeFor<C>>;
+      }
+      if (request.command.kind === 'dashboard.spawn'
+          && request.target.kind === 'route') {
+        return submitDashboardSpawnRoute(
+          request as SessionCommandRequest<DashboardSpawnCommand>,
+        ) as Promise<CommandOutcomeFor<C>>;
+      }
       if (request.command.kind !== 'ordinary.ingress'
           || request.target.kind !== 'route') {
         return options.downstream.runtime.submit(request);

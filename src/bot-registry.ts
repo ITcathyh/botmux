@@ -2448,10 +2448,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       continue;
     }
 
-    // cliRuntime is the canonical successor to cliPathOverride. New writers
-    // also persist an exactly-equal path shadow so a rollback to an older
-    // BotMux still launches the same distribution. Any unequal pair would make
-    // old and new versions disagree, so it fails closed below.
+    // cliRuntime and the legacy path selector are alternative authorities.
+    // Accept exactly one so every launch consumer observes the same source.
     const entryCliId = entry.cliId ?? 'claude-code';
     if (entry.cliRuntime !== undefined && entryCliId !== 'codex') {
       throw new Error(`Bot config [${i}]: cliRuntime is currently supported only for cliId "codex"`);
@@ -2462,11 +2460,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const cliRuntime = entry.cliRuntime === undefined
       ? undefined
       : normalizeCliRuntimeConfig(entry.cliRuntime, `Bot config [${i}].cliRuntime`);
-    if (cliRuntime && entry.cliPathOverride === undefined) {
-      throw new Error(`Bot config [${i}]: cliPathOverride is required as an exact downgrade shadow of cliRuntime.executable`);
-    }
-    if (cliRuntime && entry.cliPathOverride !== cliRuntime.executable) {
-      throw new Error(`Bot config [${i}]: cliPathOverride must exactly match cliRuntime.executable`);
+    if (cliRuntime && entry.cliPathOverride !== undefined) {
+      throw new Error(`Bot config [${i}]: cliRuntime cannot be combined with cliPathOverride`);
     }
 
     // Parse workingDirs from comma-separated workingDir if workingDirs not explicitly set
@@ -2704,8 +2699,6 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       displayName: typeof entry.displayName === 'string' && entry.displayName.trim() ? entry.displayName.trim() : undefined,
       cliId: entryCliId,
       cliRuntime,
-      // Compatibility shadow: writers persist it for downgrade safety and the
-      // loader requires an exact match so every accepted config is rollback-safe.
       cliPathOverride: entry.cliPathOverride,
       wrapperCli: typeof entry.wrapperCli === 'string' && entry.wrapperCli.trim()
         ? entry.wrapperCli.trim()

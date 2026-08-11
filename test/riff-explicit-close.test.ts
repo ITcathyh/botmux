@@ -172,13 +172,49 @@ describe('Riff explicit close', () => {
       ok: false,
       alreadyClosed: false,
       error: 'riff_cancel_failed',
-      retryable: true,
+      closeDisposition: 'unknown',
       taskId: 'task-riff-123',
     });
     expect(sessionStore.getSession(fixture.session.sessionId)).toMatchObject({
       status: 'active',
       riffParentTaskId: 'task-riff-123',
     });
+    expect(fixture.registry.get(activeSessionKey(fixture.ds))).toBe(fixture.ds);
+  });
+
+  it('marks a worker-less close unknown when ownership changes after remote cancellation', async () => {
+    const fixture = createFixture();
+    let guardChecks = 0;
+
+    expect(await closeSession(fixture.session.sessionId, {
+      isCurrent: () => ++guardChecks === 1,
+    })).toEqual({
+      ok: false,
+      alreadyClosed: false,
+      error: 'executor_generation_stale',
+      closeDisposition: 'unknown',
+    });
+    expect(cancelRiffTaskMock).toHaveBeenCalledOnce();
+    expect(sessionStore.getSession(fixture.session.sessionId)).toMatchObject({
+      status: 'active',
+      riffParentTaskId: 'task-riff-123',
+    });
+  });
+
+  it('marks a durable-close write failure unknown after remote cancellation', async () => {
+    const fixture = createFixture();
+    vi.spyOn(sessionStore, 'closeSession').mockImplementationOnce(() => {
+      throw new Error('durable close channel lost');
+    });
+
+    expect(await closeSession(fixture.session.sessionId)).toEqual({
+      ok: false,
+      alreadyClosed: false,
+      error: 'riff_durable_close_failed',
+      closeDisposition: 'unknown',
+      taskId: 'task-riff-123',
+    });
+    expect(cancelRiffTaskMock).toHaveBeenCalledOnce();
     expect(fixture.registry.get(activeSessionKey(fixture.ds))).toBe(fixture.ds);
   });
 
@@ -236,7 +272,7 @@ describe('Riff explicit close', () => {
       ok: false,
       alreadyClosed: false,
       error: 'executor_generation_stale',
-      retryable: false,
+      closeDisposition: 'notApplied',
     });
     expect(fixture.worker.send).toHaveBeenCalledWith({
       type: 'close_abort',
@@ -260,7 +296,7 @@ describe('Riff explicit close', () => {
       ok: false,
       alreadyClosed: false,
       error: 'riff_worker_close_failed',
-      retryable: true,
+      closeDisposition: 'notApplied',
       taskId: 'task-riff-123',
     });
     expect(fixture.worker.send).toHaveBeenCalledWith(expect.objectContaining({
@@ -272,6 +308,26 @@ describe('Riff explicit close', () => {
       riffParentTaskId: 'task-riff-123',
     });
     expect(fixture.ds.riffCloseState).toBeUndefined();
+  });
+
+  it('marks a live close result unknown when neither prepare nor abort is acknowledged', async () => {
+    const fixture = createFixture({ liveWorker: true });
+    vi.mocked(fixture.worker.send).mockImplementation(() => {
+      throw new Error('worker channel lost');
+    });
+
+    expect(await closeSession(fixture.session.sessionId)).toEqual({
+      ok: false,
+      alreadyClosed: false,
+      error: 'riff_worker_close_failed',
+      closeDisposition: 'unknown',
+      taskId: 'task-riff-123',
+    });
+    expect(fixture.ds.riffCloseState).toMatchObject({ phase: 'uncertain' });
+    expect(sessionStore.getSession(fixture.session.sessionId)).toMatchObject({
+      status: 'active',
+      riffParentTaskId: 'task-riff-123',
+    });
   });
 
   it('refuses an unprepared generic retirement of a live Riff worker', () => {
@@ -299,7 +355,7 @@ describe('Riff explicit close', () => {
       ok: false,
       alreadyClosed: false,
       error: 'riff_shutdown_fence_in_progress',
-      retryable: true,
+      closeDisposition: 'notApplied',
       taskId: 'task-riff-123',
     });
     expect(fixture.worker.send).not.toHaveBeenCalled();

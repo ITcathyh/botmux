@@ -102,6 +102,10 @@ export interface DaemonSession {
    * reached the first fork yet. Same-anchor turns must buffer into the opening
    * input instead of reforking worker:null and overtaking it. In-memory only. */
   initialStartPending?: boolean;
+  /** A Dashboard route has published this fresh Session but its staged
+   * banner/image/initial-start effect has not settled. Current projection must
+   * not mint a SessionAddress until this barrier clears. In-memory only. */
+  dashboardSpawnOpeningPending?: boolean;
   /** Restore quarantine: a durable activation-tail promotion failed transiently
    * during restoreActiveSessions, so the row was registered with its tail
    * un-promoted. The next fork boundary (toReattach blank fork / daemon inbound

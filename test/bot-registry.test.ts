@@ -228,8 +228,8 @@ describe('parseBotConfigsFromText — brand', () => {
     }
   });
 
-  it('requires a persisted downgrade shadow for cliRuntime configs', () => {
-    expect(() => mod.parseBotConfigsFromText(JSON.stringify([
+  it('accepts cliRuntime as the sole executable authority', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
       {
         larkAppId: 'runtime-without-shadow-app',
         larkAppSecret: 's',
@@ -239,16 +239,17 @@ describe('parseBotConfigsFromText — brand', () => {
           executable: 'vendor-codex',
         },
       },
-    ]))).toThrow(/cliPathOverride is required as an exact downgrade shadow/);
+    ]));
+    expect(cfg.cliRuntime).toMatchObject({ id: 'vendor-codex', executable: 'vendor-codex' });
+    expect(cfg.cliPathOverride).toBeUndefined();
   });
 
-  it('normalizes cliRuntime with its persisted legacy path shadow', () => {
+  it('normalizes cliRuntime without materializing a legacy path shadow', () => {
     const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
       {
         larkAppId: 'runtime-app',
         larkAppSecret: 's',
         cliId: 'codex',
-        cliPathOverride: 'vendor-codex',
         cliRuntime: {
           id: 'vendor-codex',
           displayName: 'VendorCodex',
@@ -264,7 +265,7 @@ describe('parseBotConfigsFromText — brand', () => {
       executable: 'vendor-codex',
       update: { provider: 'auto' },
     });
-    expect(cfg.cliPathOverride).toBe('vendor-codex');
+    expect(cfg.cliPathOverride).toBeUndefined();
   });
 
   it('keeps legacy cliPathOverride configs unchanged when cliRuntime is absent', () => {
@@ -280,8 +281,8 @@ describe('parseBotConfigsFromText — brand', () => {
     expect(cfg.cliPathOverride).toBe('/opt/custom/codex');
   });
 
-  it('accepts only an exactly-equal persisted downgrade shadow', () => {
-    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+  it('rejects any dual runtime and legacy path authority', () => {
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([
       {
         larkAppId: 'shadowed-runtime-app',
         larkAppSecret: 's',
@@ -293,9 +294,7 @@ describe('parseBotConfigsFromText — brand', () => {
           update: { provider: 'none' },
         },
       },
-    ]));
-    expect(cfg.cliRuntime?.id).toBe('vendor-codex');
-    expect(cfg.cliPathOverride).toBe('vendor-codex');
+    ]))).toThrow(/cannot be combined with cliPathOverride/);
 
     expect(() => mod.parseBotConfigsFromText(JSON.stringify([
       {
@@ -309,7 +308,7 @@ describe('parseBotConfigsFromText — brand', () => {
           update: { provider: 'none' },
         },
       },
-    ]))).toThrow(/must exactly match cliRuntime\.executable/);
+    ]))).toThrow(/cannot be combined with cliPathOverride/);
   });
 
   it('rejects cliRuntime outside the plain Codex adapter contract', () => {

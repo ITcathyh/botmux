@@ -18,7 +18,7 @@
  *  1. latestPerBotEnvForRestart 纯函数三分态（最新 / 清空 / 取不到兜底）。
  *  2. daemon behavioral：requestSessionRestart live-worker 分支把 env 放进
  *     发给 worker 的 restart 消息体（含 attemptId）。
- *  3. 其余三个 restart IPC 生产者（dashboard 重启按钮 / dashboard cwd-move /
+ *  3. 其余三个 restart IPC 生产者（Current dashboard restart / cwd-move /
  *     崩溃 auto-restart）同样捎带 env——respawn 即该用最新 env，语义一致。
  *  4. worker wiring（source pin，worker.ts 是进程入口不可 import，同
  *     restart-worker-null-reattach.test.ts 的做法）：env merge 在合并守卫
@@ -47,7 +47,7 @@ import {
 
 const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
 const workerPoolSource = readFileSync(new URL('../src/core/worker-pool.ts', import.meta.url), 'utf8');
-const dashboardIpcSource = readFileSync(new URL('../src/core/dashboard-ipc-server.ts', import.meta.url), 'utf8');
+const currentControlSource = readFileSync(new URL('../src/core/current-session-control.ts', import.meta.url), 'utf8');
 
 let sessionCounter = 0;
 
@@ -165,12 +165,11 @@ describe('every daemon-side restart IPC producer carries env (source wiring)', (
     }
   });
 
-  it('dashboard-ipc-server.ts: every {type:restart} send includes env', () => {
-    const sends = dashboardIpcSource.match(/ds\.worker\.send\(\{ type: 'restart'[^}]*\}/g) ?? [];
-    expect(sends.length).toBe(2); // dashboard restart 按钮 + cwd-move
-    for (const s of sends) {
-      expect(s, `missing env in: ${s}`).toContain('env: latestPerBotEnvForRestart(ds)');
-    }
+  it('current-session-control.ts: both Dashboard restart effects include env', () => {
+    const sends = currentControlSource.match(
+      /type: 'restart',[\s\S]{0,180}?env: latestPerBotEnvForRestart\(active\)/g,
+    ) ?? [];
+    expect(sends).toHaveLength(2); // dashboard restart 按钮 + cwd-move
   });
 
   it('the restart message type declares the three-state env field', () => {

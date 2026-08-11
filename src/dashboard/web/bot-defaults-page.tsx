@@ -22,6 +22,10 @@ import {
   type SubstituteTargetResolution,
 } from './bot-defaults.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
+import {
+  SemanticOperationCoordinator,
+  semanticOperationDisposition,
+} from './operation-id.js';
 import { useT } from './react-hooks.js';
 import { store } from './store.js';
 import type { RoleInjectMode } from './roles.js';
@@ -376,9 +380,16 @@ function ToggleRow(props: {
 }
 
 async function sendJson(method: string, url: string, body?: unknown): Promise<JsonResponse> {
+  const operationId = body && typeof body === 'object' && !Array.isArray(body)
+    && typeof (body as Record<string, unknown>).operationId === 'string'
+    ? (body as Record<string, unknown>).operationId as string
+    : undefined;
   const r = await fetch(url, {
     method,
-    headers: { 'content-type': 'application/json' },
+    headers: {
+      'content-type': 'application/json',
+      ...(operationId ? { 'x-botmux-operation-id': operationId } : {}),
+    },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const parsed = await r.json().catch(() => ({}));
@@ -1293,6 +1304,7 @@ export function BotAgentSection(props: {
   const [runtimeStatus, setRuntimeStatus] = useState<StatusMessage>(null);
   const [agentStatus, setAgentStatus] = useState<StatusMessage>(null);
   const [agentBusy, setAgentBusy] = useState(false);
+  const agentOperations = useRef(new SemanticOperationCoordinator());
   const [skillValue, setSkillValue] = useState(skillInjectionResolved(bot));
   const [skillStatus, setSkillStatus] = useState<StatusMessage>(null);
   const [skillBusy, setSkillBusy] = useState(false);
@@ -1393,14 +1405,31 @@ export function BotAgentSection(props: {
           : { provider: runtimeDraft.updateProvider },
       };
     }
+    const semanticRequest = {
+      cliId: cliKey,
+      model,
+      ...(runtimeTouched ? { cliRuntime } : {}),
+    };
+    const operation = agentOperations.current.begin(
+      'bot-agent',
+      bot.larkAppId,
+      semanticRequest,
+    );
+    if (operation.kind === 'blocked') {
+      setAgentStatus({ text: '✗ Agent change outcome is unknown. Refresh before retrying.' });
+      return;
+    }
     setAgentBusy(true);
     try {
       const body = {
-        cliId: cliKey,
-        model,
-        ...(runtimeTouched ? { cliRuntime } : {}),
+        operationId: operation.operationId,
+        ...semanticRequest,
       };
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, body);
+      agentOperations.current.finish(operation, semanticOperationDisposition({
+        status: res.status,
+        body: res.body,
+      }));
       if (res.ok && res.body.ok) {
         const closedCount = Number.isInteger(res.body.closedMismatchedSessions) && res.body.closedMismatchedSessions > 0
           ? res.body.closedMismatchedSessions as number
@@ -1447,6 +1476,7 @@ export function BotAgentSection(props: {
         if (cliKey === 'codex' && runtimeDraft.mode === 'custom') setRuntimeStatus({ text });
       }
     } catch (e: any) {
+      agentOperations.current.finish(operation, semanticOperationDisposition({ transportError: true }));
       const text = `✗ ${caughtErrorText(e)}`;
       setAgentStatus({ text });
       if (cliKey === 'codex' && runtimeDraft.mode === 'custom') setRuntimeStatus({ text });
@@ -1464,8 +1494,25 @@ export function BotAgentSection(props: {
    */
   async function persistRiffCliSelection(): Promise<boolean> {
     if (bot.cliId === 'riff') return true; // already persisted
+    const semanticRequest = { cliId: 'riff', model: '' };
+    const operation = agentOperations.current.begin(
+      'bot-agent',
+      bot.larkAppId,
+      semanticRequest,
+    );
+    if (operation.kind === 'blocked') {
+      setAgentStatus({ text: '✗ Agent change outcome is unknown. Refresh before retrying.' });
+      return false;
+    }
     try {
-      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, { cliId: 'riff', model: '' });
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, {
+        operationId: operation.operationId,
+        ...semanticRequest,
+      });
+      agentOperations.current.finish(operation, semanticOperationDisposition({
+        status: res.status,
+        body: res.body,
+      }));
       if (res.ok && res.body.ok) {
         patchBot(bot.larkAppId, {
           cliId: res.body.cliId,
@@ -1479,6 +1526,7 @@ export function BotAgentSection(props: {
       setAgentStatus({ text: `✗ ${responseErrorText(res)}` });
       return false;
     } catch (e: any) {
+      agentOperations.current.finish(operation, semanticOperationDisposition({ transportError: true }));
       setAgentStatus({ text: `✗ ${caughtErrorText(e)}` });
       return false;
     }

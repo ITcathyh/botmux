@@ -343,9 +343,22 @@ function directMultiUrl(url: string): Record<string, string> {
   };
 }
 
+let terminalMultiUrlPreferenceProviderForTests: (() => boolean) | undefined;
+
+/** Narrow test seam for card builders that need a deterministic terminal-link
+ * preference without replacing the process HOME or reading the workstation's
+ * real global config. Production always falls through to readGlobalConfig. */
+export function setTerminalMultiUrlPreferenceProviderForTests(
+  provider: (() => boolean) | undefined,
+): void {
+  terminalMultiUrlPreferenceProviderForTests = provider;
+}
+
 /** Shared terminal multi-url behavior for streaming and dashboard cards. */
 export function terminalMultiUrl(url: string): Record<string, string> {
-  return readGlobalConfig().dashboard?.openTerminalInFeishu === true
+  const openInFeishu = terminalMultiUrlPreferenceProviderForTests?.()
+    ?? readGlobalConfig().dashboard?.openTerminalInFeishu === true;
+  return openInFeishu
     ? sidebarMultiUrl(url)
     : directMultiUrl(url);
 }

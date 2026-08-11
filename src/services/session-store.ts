@@ -1,5 +1,5 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { isAbsolute, join, dirname } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { config } from '../config.js';
@@ -11,6 +11,7 @@ import { deleteFrozenCards } from './frozen-card-store.js';
 import type { Session } from '../types.js';
 import type {
   SessionStore,
+  SessionStoreTransition,
   SessionStoreVersion,
   StoredSessionState,
 } from '../core/session-store.js';
@@ -27,12 +28,95 @@ class CorruptCurrentSessionSourceError extends Error {
   override readonly name = 'CorruptCurrentSessionSourceError';
 }
 
+function applyCurrentSessionTransition(
+  row: Session,
+  transition: SessionStoreTransition,
+): { ok: true; next: Session } | { ok: false; message: string } {
+  if (transition.kind === 'rename') {
+    const title = normalizeSessionTitle(transition.title);
+    if (!title
+        || title !== transition.title
+        || !Number.isFinite(Date.parse(transition.updatedAt))) {
+      return { ok: false, message: 'invalid rename transition' };
+    }
+    return {
+      ok: true,
+      next: {
+        ...row,
+        title,
+        nativeSessionTitle: title,
+        nativeSessionTitleUserDefined: true,
+        nativeSessionTitleAwaitingContent: undefined,
+        titleUpdatedAt: transition.updatedAt,
+        titleSource: transition.source,
+      },
+    };
+  }
+  if (transition.kind === 'setBoardPlacement') {
+    if ((transition.column === undefined && transition.position === undefined)
+        || (transition.position !== undefined && !Number.isFinite(transition.position))) {
+      return { ok: false, message: 'invalid board placement transition' };
+    }
+    return {
+      ok: true,
+      next: {
+        ...row,
+        ...(transition.column === undefined ? {} : { kanbanColumn: transition.column }),
+        ...(transition.position === undefined ? {} : { kanbanPosition: transition.position }),
+      },
+    };
+  }
+  if (transition.kind === 'setLocked') {
+    return {
+      ok: true,
+      next: { ...row, locked: transition.locked || undefined },
+    };
+  }
+  if (transition.kind === 'changeWorkingDirectory') {
+    if (!transition.workingDir
+        || !isAbsolute(transition.workingDir)
+        || /[\x00-\x1f\x7f]/.test(transition.workingDir)) {
+      return { ok: false, message: 'invalid changeWorkingDirectory transition' };
+    }
+    return {
+      ok: true,
+      next: {
+        ...row,
+        workingDir: transition.workingDir,
+        riffRepoDirs: undefined,
+      },
+    };
+  }
+  const value = transition.kind === 'bindWhiteboard'
+    ? transition.whiteboardId
+    : transition.kind === 'setChatDisplayName'
+      ? transition.chatDisplayName
+      : transition.ownerUnionId;
+  if (!value || value.length > 1024) {
+    return { ok: false, message: `invalid ${transition.kind} transition` };
+  }
+  if (transition.kind === 'bindWhiteboard') {
+    return { ok: true, next: { ...row, whiteboardId: value } };
+  }
+  if (transition.kind === 'setChatDisplayName') {
+    return { ok: true, next: { ...row, chatDisplayName: value } };
+  }
+  return { ok: true, next: { ...row, ownerUnionId: value } };
+}
+
 /** Injectable fault points for the Adapter contract suite. Production omits it. */
 export interface CurrentSessionStoreFaults {
   beforeLoad?(): void;
   beforePublish?(): void;
   afterPublishBeforeReturn?(): void;
   beforeRecoveryRead?(): void;
+}
+
+function ownerSessionFilePath(ownerLarkAppId: string): string {
+  return join(
+    config.session.dataDir,
+    ownerLarkAppId ? `sessions-${ownerLarkAppId}.json` : 'sessions.json',
+  );
 }
 
 /**
@@ -45,7 +129,7 @@ export function createCurrentSessionStore(input: {
   runtimeEpoch: string;
   faults?: CurrentSessionStoreFaults;
 }): SessionStore {
-  const fp = join(config.session.dataDir, `sessions-${input.ownerLarkAppId}.json`);
+  const fp = ownerSessionFilePath(input.ownerLarkAppId);
   const versions = new WeakMap<object, {
     runtimeEpoch: string;
     sessionId: string;
@@ -68,7 +152,7 @@ export function createCurrentSessionStore(input: {
     return { kind: 'applied' as const, state: next.state, nextVersion: next.version };
   };
   const synchronizeLegacyCache = (sessionId: string, next: Session): void => {
-    if (!loaded || currentAppId !== input.ownerLarkAppId) return;
+    if (!loaded || (currentAppId ?? '') !== input.ownerLarkAppId) return;
     const cached = sessions.get(sessionId);
     if (!cached) return;
     // Legacy callers retain the original Session object by reference. Rotate
@@ -126,25 +210,15 @@ export function createCurrentSessionStore(input: {
               ? { kind: 'conflict' as const, current: loadedResult(request.sessionId, row) }
               : { kind: 'conflict' as const };
           }
-          const title = normalizeSessionTitle(request.transition.title);
-          if (!title
-              || title !== request.transition.title
-              || !Number.isFinite(Date.parse(request.transition.updatedAt))) {
+          const transitioned = applyCurrentSessionTransition(row, request.transition);
+          if (!transitioned.ok) {
             return {
               kind: 'rejected' as const,
               reason: 'invalidTransition' as const,
-              message: 'invalid rename transition',
+              message: transitioned.message,
             };
           }
-          const next: Session = {
-            ...row,
-            title,
-            nativeSessionTitle: title,
-            nativeSessionTitleUserDefined: true,
-            nativeSessionTitleAwaitingContent: undefined,
-            titleUpdatedAt: request.transition.updatedAt,
-            titleSource: request.transition.source,
-          };
+          const next = transitioned.next;
           source.parsed[request.sessionId] = next;
           const json = JSON.stringify(source.parsed, null, 2);
           try {
@@ -235,6 +309,39 @@ function normalizeCurrentSessionStoreState(
       && (typeof raw.titleSource !== 'string' || !titleSources.has(raw.titleSource))) {
     corruptCurrentSessionSource(`Session ${row.sessionId} has an invalid title source`);
   }
+  const kanbanColumns = new Set(['backlog', 'todo', 'in_progress', 'in_review', 'done']);
+  if (raw.kanbanColumn !== undefined
+      && (typeof raw.kanbanColumn !== 'string' || !kanbanColumns.has(raw.kanbanColumn))) {
+    corruptCurrentSessionSource(`Session ${row.sessionId} has an invalid board column`);
+  }
+  if (raw.kanbanPosition !== undefined
+      && (typeof raw.kanbanPosition !== 'number' || !Number.isFinite(raw.kanbanPosition))) {
+    corruptCurrentSessionSource(`Session ${row.sessionId} has an invalid board position`);
+  }
+  for (const [field, value] of [
+    ['whiteboardId', raw.whiteboardId],
+    ['chatDisplayName', raw.chatDisplayName],
+    ['ownerUnionId', raw.ownerUnionId],
+  ] as const) {
+    if (value !== undefined && (typeof value !== 'string' || value.length === 0)) {
+      corruptCurrentSessionSource(`Session ${row.sessionId} has an invalid ${field}`);
+    }
+  }
+  if (raw.queued !== undefined && typeof raw.queued !== 'boolean') {
+    corruptCurrentSessionSource(`Session ${row.sessionId} has an invalid queued flag`);
+  }
+  if (raw.locked !== undefined && typeof raw.locked !== 'boolean') {
+    corruptCurrentSessionSource(`Session ${row.sessionId} has an invalid locked flag`);
+  }
+  if (raw.workingDir !== undefined
+      && (typeof raw.workingDir !== 'string' || raw.workingDir.length === 0)) {
+    corruptCurrentSessionSource(`Session ${row.sessionId} has an invalid workingDir`);
+  }
+  if (raw.riffRepoDirs !== undefined
+      && (!Array.isArray(raw.riffRepoDirs)
+        || raw.riffRepoDirs.some(value => typeof value !== 'string' || value.length === 0))) {
+    corruptCurrentSessionSource(`Session ${row.sessionId} has invalid riffRepoDirs`);
+  }
   return {
     sessionId: row.sessionId,
     route: row.scope === 'chat'
@@ -245,6 +352,15 @@ function normalizeCurrentSessionStoreState(
     titleUpdatedAt: row.titleUpdatedAt,
     titleSource: row.titleSource,
     executorGeneration: row.workerGeneration ?? 0,
+    kanbanColumn: row.kanbanColumn as StoredSessionState['kanbanColumn'],
+    kanbanPosition: row.kanbanPosition,
+    queued: row.queued === true,
+    locked: row.locked === true,
+    whiteboardId: row.whiteboardId,
+    chatDisplayName: row.chatDisplayName,
+    ownerUnionId: row.ownerUnionId,
+    workingDir: row.workingDir,
+    riffRepoDirs: row.riffRepoDirs ? [...row.riffRepoDirs] : undefined,
   };
 }
 
@@ -265,7 +381,7 @@ function readCurrentSessionStoreSourceStrict(
  * owner and validates the same normalized fields as CurrentSessionStore.
  */
 export function listSessionsForOwnerStrict(ownerLarkAppId: string): Session[] {
-  const fp = join(config.session.dataDir, `sessions-${ownerLarkAppId}.json`);
+  const fp = ownerSessionFilePath(ownerLarkAppId);
   mkdirSync(dirname(fp), { recursive: true });
   return withFileLockSync(fp, () => (
     Object.values(readCurrentSessionStoreSourceStrict(fp, ownerLarkAppId).parsed)
@@ -277,7 +393,7 @@ export function getSessionForOwnerStrict(
   ownerLarkAppId: string,
   sessionId: string,
 ): Session | undefined {
-  const fp = join(config.session.dataDir, `sessions-${ownerLarkAppId}.json`);
+  const fp = ownerSessionFilePath(ownerLarkAppId);
   mkdirSync(dirname(fp), { recursive: true });
   return withFileLockSync(fp, () => (
     readCurrentSessionStoreSourceStrict(fp, ownerLarkAppId).parsed[sessionId]
@@ -297,7 +413,7 @@ export function rollbackProvisionalSessionForOwnerStrict(
   ownerLarkAppId: string,
   expected: Session,
 ): ProvisionalSessionRollbackResult {
-  const fp = join(config.session.dataDir, `sessions-${ownerLarkAppId}.json`);
+  const fp = ownerSessionFilePath(ownerLarkAppId);
   mkdirSync(dirname(fp), { recursive: true });
   try {
     const result = withFileLockSync(fp, () => {
@@ -421,6 +537,11 @@ export function init(appId?: string): void {
   currentAppId = appId;
   loaded = false;
   sessions = new Map();
+}
+
+/** Exact owner of the mutable legacy cache in this daemon process. */
+export function currentSessionStoreOwner(): string {
+  return currentAppId ?? '';
 }
 
 function getFilePath(): string {

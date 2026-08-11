@@ -504,7 +504,7 @@ import {
   writeRoleProfileEntry,
 } from '../src/services/role-profile-store.js';
 import type { CommandHandlerDeps } from '../src/core/command-handler.js';
-import { sessionKey } from '../src/core/types.js';
+import { activeSessionKey, sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
@@ -621,6 +621,27 @@ function makeDeps(ds?: DaemonSession): CommandHandlerDeps {
   if (ds) {
     activeSessions.set(sessionKey(ROOT_ID, ds.larkAppId), ds);
   }
+  // Current projection is deliberately owner-strict: a settled live owner is
+  // addressable only when its durable row agrees. Model the mocked Store as a
+  // JSON projection of this fixture registry so pending-repo tests exercise
+  // the production invariant instead of relying on a live-only shortcut.
+  vi.mocked(sessionStore.listSessionsForOwnerStrict).mockImplementation((ownerLarkAppId: string) => (
+    [...activeSessions.values()]
+      .filter(candidate => candidate.larkAppId === ownerLarkAppId)
+      .map(candidate => JSON.parse(JSON.stringify(candidate.session)) as Session)
+  ));
+  vi.mocked(sessionStore.getSessionForOwnerStrict).mockImplementation((
+    ownerLarkAppId: string,
+    sessionId: string,
+  ) => {
+    const candidate = [...activeSessions.values()].find(current => (
+      current.larkAppId === ownerLarkAppId
+      && current.session.sessionId === sessionId
+    ));
+    return candidate
+      ? JSON.parse(JSON.stringify(candidate.session)) as Session
+      : undefined;
+  });
   lastMadeActiveSessions = activeSessions;
   const pendingRepoCompletions: Array<ReturnType<typeof submitCurrentPendingRepoCompletion>> = [];
   const deps: CommandHandlerDeps = {
@@ -636,6 +657,14 @@ function makeDeps(ds?: DaemonSession): CommandHandlerDeps {
     },
   };
   pendingRepoCompletionsByDeps.set(deps, pendingRepoCompletions);
+  return deps;
+}
+
+function makeCurrentPendingRepoDeps(ds: DaemonSession): CommandHandlerDeps {
+  ds.scope ??= ds.session.scope ?? 'thread';
+  const deps = makeDeps(ds);
+  deps.activeSessions.clear();
+  deps.activeSessions.set(activeSessionKey(ds), ds);
   return deps;
 }
 
@@ -2461,9 +2490,10 @@ describe('handleCommand', () => {
       const ds = makeDaemonSession({
         pendingRepo: true,
         scope: 'chat',
+        session: makeSession({ scope: 'chat' }),
         currentReplyTarget: { rootMessageId: 'om_topic_root', turnId: 'msg_prime', updatedAt: new Date().toISOString() },
       } as Partial<DaemonSession>);
-      const deps = makeDeps(ds);
+      const deps = makeCurrentPendingRepoDeps(ds);
       deps.activeSessions.clear();
       deps.activeSessions.set(sessionKey(CHAT_ID, LARK_APP_ID), ds);
       deps.lastRepoScan.set(CHAT_ID, [
@@ -2756,7 +2786,7 @@ describe('handleCommand', () => {
         { name: 'homelab', path: '/home/testuser/homelab', branch: 'main' },
       ]);
       const ds = makeDaemonSession({ pendingRepo: true, pendingPrompt: '', worker: null });
-      const deps = makeDeps(ds);
+      const deps = makeCurrentPendingRepoDeps(ds);
 
       await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo homelab'), deps, LARK_APP_ID);
 
@@ -3000,7 +3030,7 @@ describe('handleCommand', () => {
         pendingPrompt: 'first prompt',
         pendingFollowUps: ['buffered follow-up'],
       });
-      const deps = makeDeps(ds);
+      const deps = makeCurrentPendingRepoDeps(ds);
       vi.mocked(forkWorker).mockImplementationOnce(() => {
         expect(ds.pendingRepo).toBe(true);
         expect(ds.initialStartPending).toBe(true);
@@ -3025,7 +3055,7 @@ describe('handleCommand', () => {
         pendingPrompt: 'first prompt',
         worker: null,
       });
-      const deps = makeDeps(ds);
+      const deps = makeCurrentPendingRepoDeps(ds);
       vi.mocked(forkWorker).mockImplementationOnce(() => {
         ds.session.backendType = 'riff';
         ds.initConfig = { backendType: 'riff' } as any;
@@ -3057,7 +3087,7 @@ describe('handleCommand', () => {
         pendingTurnId: 'om_repo_command_only',
         repoCardMessageId: 'om_card',
       });
-      const deps = makeDeps(ds);
+      const deps = makeCurrentPendingRepoDeps(ds);
 
       await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
 
@@ -3095,7 +3125,7 @@ describe('handleCommand', () => {
       });
       ds.workingDir = undefined;
       ds.session.workingDir = undefined;
-      const deps = makeDeps(ds);
+      const deps = makeCurrentPendingRepoDeps(ds);
 
       await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
 
@@ -3111,7 +3141,7 @@ describe('handleCommand', () => {
         pendingTurnId: 'om_first_turn',
         repoCardMessageId: 'om_card',
       });
-      const deps = makeDeps(ds);
+      const deps = makeCurrentPendingRepoDeps(ds);
       deps.lastRepoScan.set(CHAT_ID, [
         { name: 'project-a', path: '/home/testuser/project-a', branch: 'main' },
         { name: 'project-b', path: '/home/testuser/project-b', branch: 'dev' },
@@ -3161,7 +3191,7 @@ describe('handleCommand', () => {
           fetchStatus: 'ok',
         },
       });
-      const deps = makeDeps(ds);
+      const deps = makeCurrentPendingRepoDeps(ds);
 
       await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
 
@@ -3201,7 +3231,7 @@ describe('handleCommand', () => {
           fetchStatus: 'ok',
         },
       });
-      const deps = makeDeps(ds);
+      const deps = makeCurrentPendingRepoDeps(ds);
 
       await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
 
@@ -3240,7 +3270,7 @@ describe('handleCommand', () => {
         pendingPrompt: '帮我看看这个 bug',
         pendingSubstituteTrigger: substituteTrigger,
       });
-      const deps = makeDeps(ds);
+      const deps = makeCurrentPendingRepoDeps(ds);
 
       await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, CODEX_APP_ID);
 
@@ -3266,7 +3296,7 @@ describe('handleCommand', () => {
         pendingRawInput: '/goal 发布 onboarding',
         pendingRawTurnId: 'om_goal_first',
       });
-      const deps = makeDeps(ds);
+      const deps = makeCurrentPendingRepoDeps(ds);
 
       await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
 
@@ -3292,7 +3322,7 @@ describe('handleCommand', () => {
         pendingRawInput: '/goal 发布 onboarding',
         pendingFollowUps: ['对了顺手看下 CI', '别忘了更新 changelog'],
       });
-      const deps = makeDeps(ds);
+      const deps = makeCurrentPendingRepoDeps(ds);
 
       await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
 
@@ -3314,7 +3344,7 @@ describe('handleCommand', () => {
       // before launch. Keep pendingRepo so the user can `/repo <valid-path>`.
       vi.mocked(statSync).mockImplementation(() => { throw new Error('ENOENT'); });
       const ds = makeDaemonSession({ pendingRepo: true, pendingPrompt: '', workingDir: '/gone' });
-      const deps = makeDeps(ds);
+      const deps = makeCurrentPendingRepoDeps(ds);
 
       try {
         await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
@@ -5297,12 +5327,16 @@ describe('handleCommand', () => {
       const [url, init] = fetchSpy.mock.calls[0];
       expect(url).toMatch(/127\.0\.0\.1:9999\/api\/sessions\/migrate-to-chat$/);
       const body = JSON.parse((init as any).body);
+      expect(body.sourceScope).toBe('thread');
       expect(body.targetChatId).toBe('oc_new_group');
       // Peers also get the placeholder; their session.rootMessageId stays as
       // the chatId (cosmetic — chat-scope routing doesn't use rootMessageId).
       expect(body.targetRootMessageId).toBe('oc_new_group');
       expect(body.requesterLarkAppId).toBe(LARK_APP_ID);
       expect(body.requestingUserOpenId).toBe('ou_sender');
+      expect(body.operationId).toBe(
+        `relay-migrate:${body.sourceAnchor}:oc_new_group:app-2`,
+      );
 
       // Reply contains the new chat name and both bot statuses.
       const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;

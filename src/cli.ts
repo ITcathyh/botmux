@@ -4728,15 +4728,19 @@ async function postOwningDaemonSessionMutation(
   if (!daemon) return 'unavailable';
   let secret: string;
   try { secret = loadDaemonIpcSecret(); } catch { return 'unavailable'; }
+  const mutationBody = {
+    operationId: `cli-${suffix}:${session.sessionId}:${randomUUID()}`,
+    ...body,
+  };
   const res = await fetchDaemonIpc(
     daemon.ipcPort,
     `/api/sessions/${encodeURIComponent(session.sessionId)}/${suffix}`,
     {
       method: 'POST',
-      ...(body
+      ...(mutationBody
         ? {
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify(body),
+            body: JSON.stringify(mutationBody),
           }
         : {}),
     },
@@ -6000,7 +6004,13 @@ async function cmdSuspend(): Promise<void> {
       const res = await fetchDaemonIpc(
         daemon.ipcPort,
         `/api/sessions/${encodeURIComponent(s.sessionId)}/suspend`,
-        { method: 'POST' },
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            operationId: `cli-suspend:${s.sessionId}:${randomUUID()}`,
+          }),
+        },
       );
       const body: any = await res.json().catch(() => ({}));
       if (res.ok && body?.ok) {
@@ -6035,7 +6045,10 @@ async function postSessionCliIpc(
   route: 'slash' | 'cd' | 'close' | 'chat-rename',
   payload: Record<string, unknown>,
 ): Promise<Response> {
-  const requestBody: Record<string, unknown> = { ...payload };
+  const requestBody: Record<string, unknown> = {
+    operationId: `cli-${route}:${sessionId}:${randomUUID()}`,
+    ...payload,
+  };
   let hostSecret: string | undefined;
   if (!process.env.BOTMUX_SEND_RELAY) {
     try { hostSecret = loadDaemonIpcSecret(); } catch { /* sandboxed/read-isolated: capability fallback below */ }
@@ -6735,7 +6748,13 @@ async function cmdResume(): Promise<void> {
     res = await fetchDaemonIpc(
       daemon.ipcPort,
       `/api/sessions/${encodeURIComponent(session.sessionId)}/resume`,
-      { method: 'POST' },
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          operationId: `cli-resume:${session.sessionId}:${randomUUID()}`,
+        }),
+      },
     );
   } catch (err: any) {
     console.error(`❌ 无法连接到 daemon (port=${daemon.ipcPort}): ${err?.message ?? err}`);

@@ -5,6 +5,7 @@ const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 
 const workerPoolSource = readFileSync(new URL('../src/core/worker-pool.ts', import.meta.url), 'utf8');
 const commandHandlerSource = readFileSync(new URL('../src/core/command-handler.ts', import.meta.url), 'utf8');
 const dashboardIpcSource = readFileSync(new URL('../src/core/dashboard-ipc-server.ts', import.meta.url), 'utf8');
+const currentControlSource = readFileSync(new URL('../src/core/current-session-control.ts', import.meta.url), 'utf8');
 
 describe('worker Riff retirement protocol', () => {
   it('refuses Riff generation restart before the local restart helper can run', () => {
@@ -146,10 +147,23 @@ describe('worker Riff retirement protocol', () => {
     const routeStart = dashboardIpcSource.indexOf("ipcRoute('POST', '/api/sessions/:sessionId/cd'");
     const routeEnd = dashboardIpcSource.indexOf('function findSessionRecord(', routeStart);
     const route = dashboardIpcSource.slice(routeStart, routeEnd);
-    const routeGuard = route.indexOf('if (isRiffBackendSession(ds))');
-    expect(routeGuard).toBeGreaterThanOrEqual(0);
-    expect(route.indexOf('validateRoleLibraryPath(', routeGuard)).toBeGreaterThan(routeGuard);
-    expect(route.indexOf('repinSessionWorkingDir(', routeGuard)).toBeGreaterThan(routeGuard);
-    expect(route).toContain("error: 'riff_cd_unsupported'");
+    const rolePathValidation = route.indexOf('validateRoleLibraryPath(');
+    const runtimeSubmit = route.indexOf('const outcome = await submitControl(');
+    expect(rolePathValidation).toBeGreaterThanOrEqual(0);
+    expect(runtimeSubmit).toBeGreaterThan(rolePathValidation);
+    expect(route).not.toContain('repinSessionWorkingDir(');
+
+    const beginStart = currentControlSource.indexOf('begin({ sessionId, operationIdentity, command, routeReservation })');
+    const beginEnd = currentControlSource.indexOf('\n    execute(intent)', beginStart);
+    const begin = currentControlSource.slice(beginStart, beginEnd);
+    const currentRiffGuard = begin.indexOf(
+      "command.kind === 'changeWorkingDirectory' && isRiffBackendSession(active)",
+    );
+    const metadataTransition = begin.indexOf('applyWorkingDirectoryMetadata(', currentRiffGuard);
+    const liveProjection = begin.indexOf('syncCurrentSessionWorkingDir(', metadataTransition);
+    expect(currentRiffGuard).toBeGreaterThanOrEqual(0);
+    expect(metadataTransition).toBeGreaterThan(currentRiffGuard);
+    expect(liveProjection).toBeGreaterThan(metadataTransition);
+    expect(begin).toContain("code: 'riff_cd_unsupported'");
   });
 });

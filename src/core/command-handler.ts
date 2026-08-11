@@ -3269,7 +3269,8 @@ export async function handleCommand(
         // session by this value, and `transferSession()` will overwrite
         // `ds.session.rootMessageId` once it runs. Must capture BEFORE the
         // leader transfer call (caught in review).
-        const sourceAnchor = ds.session.rootMessageId;
+        const sourceAnchor = sessionAnchorId(ds);
+        const sourceScope = ds.scope === 'chat' ? 'chat' as const : 'thread' as const;
 
         // ── M1 deferred: post the announcement AFTER all transfers settle ──
         // Previous flow sent an optimistic "已接力" M1 before running any
@@ -3372,6 +3373,7 @@ export async function handleCommand(
                 headers: { 'content-type': 'application/json' },
                 body: JSON.stringify({
                   sourceAnchor,
+                  sourceScope,
                   targetChatId: newChatId,
                   targetRootMessageId: placeholderRootMessageId,
                   requesterLarkAppId: creatorAppId,
@@ -3381,6 +3383,10 @@ export async function handleCommand(
                   // than translating open_ids per bot. Optional for
                   // backward compat with daemons older than this commit.
                   requestingUserUnionId: senderUnionId,
+                  // Stable across daemon-IPC retries for this exact peer move.
+                  // The target chat is newly created per /relay --create, so a
+                  // later independent relay cannot alias the same operation.
+                  operationId: `relay-migrate:${sourceAnchor}:${newChatId}:${peerAppId}`,
                 }),
                 signal: ctrl.signal,
               },

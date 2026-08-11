@@ -23,7 +23,9 @@ vi.mock('../src/services/session-store.js', () => ({
   updateSessionPid: vi.fn(),
   getSession: vi.fn(),
   getOwnedSession: vi.fn(),
+  currentSessionStoreOwner: vi.fn(() => 'cli_app_test'),
   listSessions: vi.fn(() => []),
+  listSessionsForOwnerStrict: vi.fn(() => []),
   closeSession: vi.fn(),
 }));
 
@@ -172,9 +174,196 @@ describe('transferSession', () => {
     vi.clearAllMocks();
     __testOnly_resetBotTurnMutationGates();
     vi.mocked(sessionStore.listSessions).mockReturnValue([]);
+    vi.mocked(sessionStore.listSessionsForOwnerStrict).mockReturnValue([]);
     resetDeviceIsolationActivationForTest();
     registry = new Map();
     setActiveSessionsRegistry(registry);
+  });
+
+  it('requires a live Runtime target-route reservation for owner-bound transfer', async () => {
+    const ds = makeDs();
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+
+    await expect(transferSession(
+      ds.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+      'group',
+      'chat',
+      {
+        owner: { larkAppId: 'cli_app_test', activeSessions: registry },
+        forkWorkerImpl: forkWorkerSpy as any,
+        detachWorkerImpl: detachWorkerSpy as any,
+      },
+    )).resolves.toEqual({ ok: false, error: 'target_route_not_reserved' });
+    expect(detachWorkerSpy).not.toHaveBeenCalled();
+    expect(registry.get(sessionKey('om_source_root', 'cli_app_test'))).toBe(ds);
+  });
+
+  it('does not enter the bot-wide mutation gate when Runtime holds the target route', async () => {
+    const ds = makeDs();
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    const admissionStarted = deferred<void>();
+    let releaseAdmission!: () => void;
+    const admittedTurn = withBotTurnAdmission('cli_app_test', async () => {
+      admissionStarted.resolve();
+      await new Promise<void>(resolve => { releaseAdmission = resolve; });
+    });
+    await admissionStarted.promise;
+
+    await expect(transferSession(
+      ds.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+      'group',
+      'chat',
+      {
+        owner: { larkAppId: 'cli_app_test', activeSessions: registry },
+        isTargetRouteReservationCurrent: () => true,
+        forkWorkerImpl: forkWorkerSpy as any,
+        detachWorkerImpl: detachWorkerSpy as any,
+      },
+    )).resolves.toEqual({ ok: true });
+    expect(detachWorkerSpy).toHaveBeenCalledOnce();
+
+    releaseAdmission();
+    await admittedTurn;
+  });
+
+  it('rejects foreign-owner and non-canonical source bindings in owner-bound mode', async () => {
+    const foreign = makeDs({ larkAppId: 'other_app' });
+    foreign.session.larkAppId = 'other_app';
+    registry.set(sessionKey('om_source_root', 'other_app'), foreign);
+
+    await expect(transferSession(
+      foreign.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+      'group',
+      'chat',
+      {
+        owner: { larkAppId: 'cli_app_test', activeSessions: registry },
+        isTargetRouteReservationCurrent: () => true,
+      },
+    )).resolves.toEqual({ ok: false, error: 'session_not_active' });
+
+    registry.clear();
+    const aliased = makeDs();
+    registry.set('non-canonical-alias', aliased);
+    await expect(transferSession(
+      aliased.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+      'group',
+      'chat',
+      {
+        owner: { larkAppId: 'cli_app_test', activeSessions: registry },
+        isTargetRouteReservationCurrent: () => true,
+      },
+    )).resolves.toEqual({ ok: false, error: 'session_not_active' });
+    expect(detachWorkerSpy).not.toHaveBeenCalled();
+  });
+
+  it('never bare-closes a live target scratch in owner-bound mode', async () => {
+    const source = makeDs();
+    const scratch = makeDs({
+      session: {
+        ...source.session,
+        sessionId: 'owner-bound-live-target-scratch',
+        chatId: 'oc_target',
+        rootMessageId: 'om_target_scratch',
+        scope: 'chat',
+        cliId: undefined,
+        cliSessionId: undefined,
+        lastCliInput: undefined,
+      },
+      worker: null,
+      chatId: 'oc_target',
+      scope: 'chat',
+      hasHistory: false,
+    });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), source);
+    registry.set(sessionKey('oc_target', 'cli_app_test'), scratch);
+
+    await expect(transferSession(
+      source.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+      'group',
+      'chat',
+      {
+        owner: { larkAppId: 'cli_app_test', activeSessions: registry },
+        isTargetRouteReservationCurrent: () => true,
+        detachWorkerImpl: detachWorkerSpy as any,
+      },
+    )).resolves.toEqual({ ok: false, error: 'target_chat_has_session' });
+    expect(sessionStore.closeSession).not.toHaveBeenCalled();
+    expect(detachWorkerSpy).not.toHaveBeenCalled();
+    expect(registry.get(sessionKey('oc_target', 'cli_app_test'))).toBe(scratch);
+  });
+
+  it('never bare-closes a persisted-only target scratch in owner-bound mode', async () => {
+    const source = makeDs();
+    const scratch: Session = {
+      ...source.session,
+      sessionId: 'owner-bound-persisted-target-scratch',
+      chatId: 'oc_target',
+      rootMessageId: 'om_target_scratch',
+      scope: 'chat',
+      cliId: undefined,
+      cliSessionId: undefined,
+      lastCliInput: undefined,
+    };
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), source);
+    vi.mocked(sessionStore.listSessionsForOwnerStrict).mockReturnValue([scratch]);
+
+    await expect(transferSession(
+      source.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+      'group',
+      'chat',
+      {
+        owner: { larkAppId: 'cli_app_test', activeSessions: registry },
+        isTargetRouteReservationCurrent: () => true,
+        detachWorkerImpl: detachWorkerSpy as any,
+      },
+    )).resolves.toEqual({ ok: false, error: 'target_chat_has_session' });
+    expect(sessionStore.closeSession).not.toHaveBeenCalled();
+    expect(detachWorkerSpy).not.toHaveBeenCalled();
+  });
+
+  it('aborts owner-bound transfer when the source binding is replaced during detach', async () => {
+    const ds = makeDs();
+    const sourceKey = sessionKey('om_source_root', 'cli_app_test');
+    registry.set(sourceKey, ds);
+    let releaseDetach!: (completed: boolean) => void;
+    const detach = vi.fn(() => new Promise<boolean>(resolve => {
+      releaseDetach = resolve;
+    }));
+    const moving = transferSession(
+      ds.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+      'group',
+      'chat',
+      {
+        owner: { larkAppId: 'cli_app_test', activeSessions: registry },
+        isCurrent: () => registry.get(sourceKey) === ds,
+        isTargetRouteReservationCurrent: () => true,
+        forkWorkerImpl: forkWorkerSpy as any,
+        detachWorkerImpl: detach,
+      },
+    );
+    await vi.waitFor(() => expect(detach).toHaveBeenCalledOnce());
+    const replacement = makeDs();
+    registry.set(sourceKey, replacement);
+    releaseDetach(true);
+
+    await expect(moving).resolves.toEqual({ ok: false, error: 'session_not_active' });
+    expect(registry.get(sourceKey)).toBe(replacement);
+    expect(registry.has(sessionKey('oc_target', 'cli_app_test'))).toBe(false);
+    expect(ds.chatId).toBe('oc_source');
   });
 
   it('refuses with target_chat_type_unsupported when target chat type is neither group nor p2p (depth defense)', async () => {
@@ -2110,5 +2299,28 @@ describe('closeSession concurrency', () => {
     expect(sessionStore.getSession).not.toHaveBeenCalled();
     expect(sessionStore.closeSession).not.toHaveBeenCalled();
     expect(dashboardEventBus.publish).not.toHaveBeenCalled();
+  });
+
+  it('refuses an owner-bound close when the daemon JSON cache belongs to another bot', async () => {
+    const registry = new Map<string, DaemonSession>();
+    const ds = makeDs();
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    setActiveSessionsRegistry(registry);
+    vi.mocked(sessionStore.currentSessionStoreOwner).mockReturnValueOnce('other_app');
+    vi.mocked(sessionStore.getOwnedSession).mockReturnValue(ds.session);
+
+    await expect(closeSession(ds.session.sessionId, {
+      owner: { larkAppId: 'cli_app_test', activeSessions: registry },
+    })).resolves.toEqual({
+      ok: false,
+      alreadyClosed: false,
+      error: 'executor_generation_stale',
+      closeDisposition: 'notApplied',
+    });
+
+    expect(sessionStore.getOwnedSession).not.toHaveBeenCalled();
+    expect(sessionStore.closeSession).not.toHaveBeenCalled();
+    expect(ds.session.status).toBe('active');
+    expect(registry.get(sessionKey('om_source_root', 'cli_app_test'))).toBe(ds);
   });
 });

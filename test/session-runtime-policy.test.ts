@@ -1,11 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   createSessionRuntimeHost,
+  type ControlRenameEffectPort,
+  type ControlMutationPort,
   type ExecutorAddress,
   type ExecutorObservationPort,
   type KeyedTriggerAuthority,
   type KeyedTriggerTurnPort,
   type OrdinaryIngressPort,
+  type PendingRepoCompletionPort,
   type SessionAddress,
   type SessionDirectory,
   type SessionDirectoryRow,
@@ -535,6 +538,296 @@ function storedState(overrides: Partial<StoredSessionState> = {}): StoredSession
 }
 
 describe('SessionRuntime control policy', () => {
+  it('holds the Session barrier through native rename settlement and replays the exact effect once', async () => {
+    const states = new Map([
+      ['session-1', storedState({ sessionId: 'session-1' })],
+      ['session-2', storedState({
+        sessionId: 'session-2',
+        route: { kind: 'thread', anchorId: 'om_root_2' },
+      })],
+    ]);
+    let releaseRename!: () => void;
+    const renameGate = new Promise<void>((resolve) => { releaseRename = resolve; });
+    const executeRename = vi.fn<ControlRenameEffectPort['execute']>(async (intent) => {
+      if ((intent as { sessionId: string }).sessionId === 'session-1') await renameGate;
+      return { status: 'requested', cliId: 'codex' };
+    });
+    const beginRename = vi.fn<ControlRenameEffectPort['begin']>((input) => ({
+      kind: 'effect',
+      intent: { sessionId: input.sessionId, title: input.title },
+    }));
+    const controlBegin = vi.fn<ControlMutationPort['begin']>(({ command }) => ({
+      kind: 'committed',
+      result: command.kind === 'close'
+        ? { kind: 'closed', alreadyClosed: false, known: true }
+        : { kind: 'lockUpdated', locked: false },
+    }));
+    const ordinaryBegin = vi.fn<OrdinaryIngressPort['begin']>(() => ({ kind: 'committed' }));
+    const host = createSessionRuntimeHost({
+      directory: new TwoSessionDirectory(),
+      keyedTriggers: unusedKeyedAuthority,
+      keyedTriggerTurns: unusedKeyedTurns,
+      sessionStore: {
+        load: sessionId => ({
+          kind: 'loaded',
+          state: states.get(sessionId)!,
+          version: storeVersion(),
+        }),
+        apply: input => {
+          if (input.transition.kind !== 'rename') throw new Error('expected rename');
+          const next = {
+            ...states.get(input.sessionId)!,
+            title: input.transition.title,
+            titleUpdatedAt: input.transition.updatedAt,
+            titleSource: input.transition.source,
+          };
+          states.set(input.sessionId, next);
+          return { kind: 'applied', state: next, nextVersion: storeVersion() };
+        },
+      },
+      controlRenameEffect: { begin: beginRename, execute: executeRename },
+      controlMutation: {
+        begin: controlBegin,
+        execute: async () => { throw new Error('control effect not expected'); },
+        resume: () => ({ kind: 'unknown', message: 'control continuation not expected' }),
+      },
+      ordinaryIngress: ordinaryPort(ordinaryBegin),
+    });
+    const first = await host.projection.read({ kind: 'byExternalSession', sessionId: 'session-1' });
+    const second = await host.projection.read({ kind: 'byExternalSession', sessionId: 'session-2' });
+    if (first.kind !== 'one' || second.kind !== 'one') throw new Error('expected both Sessions');
+    const request = {
+      target: { kind: 'session' as const, address: first.session.address },
+      idempotencyKey: 'rename-staged-effect',
+      command: {
+        kind: 'control.rename' as const,
+        input: {
+          title: 'After',
+          updatedAt: '2026-08-12T01:00:00.000Z',
+          source: 'dashboard' as const,
+        },
+      },
+    };
+
+    const rename = host.runtime.submit(request);
+    await vi.waitFor(() => expect(executeRename).toHaveBeenCalledTimes(1));
+    const renameFollower = host.runtime.submit(request);
+    const close = host.runtime.submit({
+      target: request.target,
+      idempotencyKey: 'close-after-rename',
+      command: { kind: 'control.mutate', input: { kind: 'close', reason: 'dashboard' } },
+    });
+    const sameSessionOrdinary = host.runtime.submit({
+      target: request.target,
+      idempotencyKey: 'ordinary-after-rename',
+      command: {
+        kind: 'ordinary.ingress',
+        input: {
+          turn: {
+            ...ordinaryTurn('ordinary-after-rename'),
+            route: {
+              scope: 'thread',
+              canonicalAnchor: 'om_root_1',
+              chatId: 'oc_chat_1',
+              chatType: 'group',
+            },
+          },
+        },
+      },
+    });
+    const otherSessionOrdinary = host.runtime.submit({
+      target: { kind: 'session', address: second.session.address },
+      idempotencyKey: 'ordinary-other-session',
+      command: {
+        kind: 'ordinary.ingress',
+        input: {
+          turn: {
+            ...ordinaryTurn('ordinary-other-session'),
+            route: {
+              scope: 'thread',
+              canonicalAnchor: 'om_root_2',
+              chatId: 'oc_chat_2',
+              chatType: 'group',
+            },
+          },
+        },
+      },
+    });
+
+    await expect(otherSessionOrdinary).resolves.toMatchObject({
+      kind: 'applied',
+      sessionId: 'session-2',
+    });
+    let closeSettled = false;
+    let ordinarySettled = false;
+    close.then(() => { closeSettled = true; });
+    sameSessionOrdinary.then(() => { ordinarySettled = true; });
+    await Promise.resolve();
+    expect(closeSettled).toBe(false);
+    expect(ordinarySettled).toBe(false);
+    expect(controlBegin).not.toHaveBeenCalled();
+    expect(ordinaryBegin).toHaveBeenCalledTimes(1);
+
+    releaseRename();
+    const renamed = await rename;
+    await expect(renameFollower).resolves.toMatchObject({
+      kind: 'duplicate',
+      result: { agentSync: { status: 'requested', cliId: 'codex' } },
+    });
+    await expect(close).resolves.toMatchObject({ kind: 'applied', sessionId: 'session-1' });
+    await expect(sameSessionOrdinary).resolves.toMatchObject({ kind: 'applied', sessionId: 'session-1' });
+    expect(renamed).toMatchObject({
+      kind: 'applied',
+      action: 'control.renamed',
+      agentSync: { status: 'requested', cliId: 'codex' },
+    });
+    await expect(host.runtime.submit(request)).resolves.toMatchObject({
+      kind: 'duplicate',
+      result: { agentSync: { status: 'requested', cliId: 'codex' } },
+    });
+    expect(beginRename).toHaveBeenCalledTimes(1);
+    expect(executeRename).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a thrown native rename outcome sticky without sending it twice', async () => {
+    const states = new Map([
+      ['session-1', storedState({ sessionId: 'session-1' })],
+      ['session-2', storedState({
+        sessionId: 'session-2',
+        route: { kind: 'thread', anchorId: 'om_root_2' },
+      })],
+    ]);
+    const execute = vi.fn(async (intent: unknown) => {
+      if ((intent as { sessionId: string }).sessionId === 'session-1') {
+        throw new Error('worker acknowledgement lost');
+      }
+      return { status: 'requested' as const, cliId: 'codex' as const };
+    });
+    const begin = vi.fn<ControlRenameEffectPort['begin']>((input) => ({
+      kind: 'effect',
+      intent: { sessionId: input.sessionId },
+    }));
+    const host = createSessionRuntimeHost({
+      directory: new TwoSessionDirectory(),
+      keyedTriggers: unusedKeyedAuthority,
+      keyedTriggerTurns: unusedKeyedTurns,
+      sessionStore: {
+        load: sessionId => ({
+          kind: 'loaded',
+          state: states.get(sessionId)!,
+          version: storeVersion(),
+        }),
+        apply: input => {
+          if (input.transition.kind !== 'rename') throw new Error('expected rename');
+          const state = {
+            ...states.get(input.sessionId)!,
+            title: input.transition.title,
+            titleUpdatedAt: input.transition.updatedAt,
+            titleSource: input.transition.source,
+          };
+          states.set(input.sessionId, state);
+          return { kind: 'applied', state, nextVersion: storeVersion() };
+        },
+      },
+      controlRenameEffect: {
+        begin,
+        execute,
+      },
+    });
+    const firstProjection = await host.projection.read({ kind: 'byExternalSession', sessionId: 'session-1' });
+    const secondProjection = await host.projection.read({ kind: 'byExternalSession', sessionId: 'session-2' });
+    if (firstProjection.kind !== 'one' || secondProjection.kind !== 'one') {
+      throw new Error('expected both Session projections');
+    }
+    const request = {
+      target: { kind: 'session' as const, address: firstProjection.session.address },
+      idempotencyKey: 'rename-effect-unknown',
+      command: {
+        kind: 'control.rename' as const,
+        input: { title: 'After', source: 'dashboard' as const },
+      },
+    };
+
+    const first = await host.runtime.submit(request);
+    const replay = await host.runtime.submit(request);
+    const differentKey = await host.runtime.submit({
+      ...request,
+      idempotencyKey: 'rename-effect-after-unknown',
+    });
+    const closeAfterUnknown = await host.runtime.submit({
+      target: request.target,
+      idempotencyKey: 'close-after-rename-unknown',
+      command: { kind: 'control.mutate', input: { kind: 'close', reason: 'dashboard' } },
+    });
+    const otherSession = await host.runtime.submit({
+      target: { kind: 'session', address: secondProjection.session.address },
+      idempotencyKey: 'rename-other-after-unknown',
+      command: {
+        kind: 'control.rename',
+        input: { title: 'Other after', source: 'dashboard' },
+      },
+    });
+
+    expect(first).toMatchObject({ kind: 'ambiguous', policy: 'control-semantic-transition' });
+    expect(replay).toEqual(first);
+    expect(differentKey).toMatchObject({ kind: 'quarantined' });
+    expect(closeAfterUnknown).toMatchObject({ kind: 'quarantined' });
+    expect(otherSession).toMatchObject({ kind: 'applied', sessionId: 'session-2' });
+    expect(begin.mock.calls.filter(([input]) => input.sessionId === 'session-1')).toHaveLength(1);
+    expect(execute.mock.calls.filter(([intent]) => (
+      intent as { sessionId: string }
+    ).sessionId === 'session-1')).toHaveLength(1);
+    expect(states.get('session-1')?.title).toBe('After');
+  });
+
+  it.each([
+    { label: 'not running', agentSync: { status: 'not_running' as const, cliId: 'codex' as const } },
+    { label: 'unsupported', agentSync: { status: 'unsupported' as const, cliId: 'codex' as const } },
+    {
+      label: 'known failure',
+      agentSync: { status: 'failed' as const, cliId: 'codex' as const, error: 'worker channel closed' },
+    },
+  ])('keeps the title commit applied when native rename is $label', async ({ agentSync }) => {
+    let state = storedState();
+    const host = createSessionRuntimeHost({
+      directory: new OneSessionDirectory(),
+      keyedTriggers: unusedKeyedAuthority,
+      keyedTriggerTurns: unusedKeyedTurns,
+      sessionStore: {
+        load: () => ({ kind: 'loaded', state, version: storeVersion() }),
+        apply: input => {
+          if (input.transition.kind !== 'rename') throw new Error('expected rename');
+          state = {
+            ...state,
+            title: input.transition.title,
+            titleUpdatedAt: input.transition.updatedAt,
+            titleSource: input.transition.source,
+          };
+          return { kind: 'applied', state, nextVersion: storeVersion() };
+        },
+      },
+      controlRenameEffect: {
+        begin: () => ({ kind: 'effect', intent: Object.freeze({}) }),
+        execute: async () => agentSync,
+      },
+    });
+    const address = await addressFor(host);
+
+    await expect(host.runtime.submit({
+      target: { kind: 'session', address },
+      idempotencyKey: `rename-known-${agentSync.status}`,
+      command: {
+        kind: 'control.rename',
+        input: { title: 'Committed title', source: 'dashboard' },
+      },
+    })).resolves.toMatchObject({
+      kind: 'applied',
+      title: 'Committed title',
+      agentSync,
+    });
+    expect(state.title).toBe('Committed title');
+  });
+
   it('renames only through a semantic Store transition and reads the desired state as a duplicate', async () => {
     let state = storedState();
     let version = storeVersion();
@@ -582,12 +875,21 @@ describe('SessionRuntime control policy', () => {
       policy: 'control-semantic-transition',
       sessionId: 'session-1',
       title: 'After',
+      updatedAt: '2026-08-10T01:00:00.000Z',
+      source: 'dashboard',
+      agentSync: { status: 'not_running' },
     });
     expect(duplicate).toEqual({
       kind: 'duplicate',
       state: 'controlApplied',
       policy: 'control-semantic-transition',
       sessionId: 'session-1',
+      result: {
+        title: 'After',
+        updatedAt: '2026-08-10T01:00:00.000Z',
+        source: 'dashboard',
+        agentSync: { status: 'not_running' },
+      },
       message: 'rename transition is already reflected by the Current Store',
     });
     expect(apply).toHaveBeenCalledTimes(1);
@@ -643,6 +945,9 @@ describe('SessionRuntime control policy', () => {
       policy: 'control-semantic-transition',
       sessionId: 'session-1',
       title: 'Published',
+      updatedAt: '2026-08-10T01:01:00.000Z',
+      source: 'dashboard',
+      agentSync: { status: 'not_running' },
     });
     expect(sessionStore.load).toHaveBeenCalledTimes(2);
     expect('receipt' in result).toBe(false);
@@ -930,6 +1235,627 @@ describe('SessionRuntime control policy', () => {
       policy: 'control-semantic-transition',
     });
     expect('receipt' in result).toBe(false);
+  });
+});
+
+describe('SessionRuntime staged control policy', () => {
+  it('keeps a later control behind an earlier ordinary effect on the same Session', async () => {
+    let releaseOrdinary!: () => void;
+    const ordinaryEffect = new Promise<void>((resolve) => { releaseOrdinary = resolve; });
+    const ordinaryExecute = vi.fn(async () => {
+      await ordinaryEffect;
+      return { kind: 'materialized' };
+    });
+    const ordinaryIngress: OrdinaryIngressPort = {
+      begin: () => ({ kind: 'effect', intent: {}, continuation: {} }),
+      execute: ordinaryExecute,
+      resume: (_continuation, settlement) => settlement.kind === 'returned'
+        ? { kind: 'committed' }
+        : { kind: 'unknown', message: 'ordinary effect threw' },
+    };
+    const controlBegin = vi.fn<ControlMutationPort['begin']>(({ command }) => ({
+      kind: 'committed',
+      result: command.kind === 'setLocked'
+        ? { kind: 'lockUpdated', locked: command.locked }
+        : { kind: 'lockUpdated', locked: false },
+    }));
+    const controlMutation: ControlMutationPort = {
+      begin: controlBegin,
+      execute: async () => { throw new Error('control effect not expected'); },
+      resume: () => ({ kind: 'unknown', message: 'control continuation not expected' }),
+    };
+    const host = createSessionRuntimeHost({
+      directory: new TwoSessionDirectory(),
+      keyedTriggers: unusedKeyedAuthority,
+      keyedTriggerTurns: unusedKeyedTurns,
+      ordinaryIngress,
+      controlMutation,
+    });
+    const first = await host.projection.read({ kind: 'byExternalSession', sessionId: 'session-1' });
+    const second = await host.projection.read({ kind: 'byExternalSession', sessionId: 'session-2' });
+    if (first.kind !== 'one' || second.kind !== 'one') throw new Error('expected Sessions');
+
+    const ordinary = host.runtime.submit({
+      target: { kind: 'session', address: first.session.address },
+      idempotencyKey: 'ordinary-before-control',
+      command: {
+        kind: 'ordinary.ingress',
+        input: {
+          turn: {
+            ...ordinaryTurn('ordinary-before-control'),
+            route: {
+              scope: 'thread',
+              canonicalAnchor: 'om_root_1',
+              chatId: 'oc_chat_1',
+              chatType: 'group',
+            },
+          },
+        },
+      },
+    });
+    await vi.waitFor(() => expect(ordinaryExecute).toHaveBeenCalledTimes(1));
+
+    let sameSessionSettled = false;
+    const sameSessionControl = host.runtime.submit({
+      target: { kind: 'session', address: first.session.address },
+      idempotencyKey: 'control-after-ordinary',
+      command: {
+        kind: 'control.mutate',
+        input: { kind: 'setLocked', locked: true },
+      },
+    }).then((outcome) => {
+      sameSessionSettled = true;
+      return outcome;
+    });
+    const otherSessionControl = host.runtime.submit({
+      target: { kind: 'session', address: second.session.address },
+      idempotencyKey: 'control-other-session',
+      command: {
+        kind: 'control.mutate',
+        input: { kind: 'setLocked', locked: true },
+      },
+    });
+
+    await expect(otherSessionControl).resolves.toMatchObject({
+      kind: 'applied',
+      sessionId: 'session-2',
+    });
+    expect(sameSessionSettled).toBe(false);
+    expect(controlBegin).toHaveBeenCalledTimes(1);
+
+    releaseOrdinary();
+    await expect(ordinary).resolves.toMatchObject({
+      kind: 'applied',
+      sessionId: 'session-1',
+    });
+    await expect(sameSessionControl).resolves.toMatchObject({
+      kind: 'applied',
+      sessionId: 'session-1',
+    });
+    expect(controlBegin).toHaveBeenCalledTimes(2);
+  });
+
+  it('reserves a waiting control ahead of later ordinary input', async () => {
+    let releaseFirst!: () => void;
+    let releaseSecond!: () => void;
+    const firstEffect = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const secondEffect = new Promise<void>((resolve) => { releaseSecond = resolve; });
+    const ordinaryExecute = vi.fn(async (intent: unknown) => {
+      await (intent === 'ordinary-first' ? firstEffect : secondEffect);
+      return { kind: 'materialized' };
+    });
+    const controlBegin = vi.fn<ControlMutationPort['begin']>(({ command }) => ({
+      kind: 'committed',
+      result: command.kind === 'setLocked'
+        ? { kind: 'lockUpdated', locked: command.locked }
+        : { kind: 'lockUpdated', locked: false },
+    }));
+    const host = createSessionRuntimeHost({
+      directory: new OneSessionDirectory(),
+      keyedTriggers: unusedKeyedAuthority,
+      keyedTriggerTurns: unusedKeyedTurns,
+      ordinaryIngress: {
+        begin: ({ turn }) => ({
+          kind: 'effect',
+          intent: turn.messageKey,
+          continuation: {},
+        }),
+        execute: ordinaryExecute,
+        resume: () => ({ kind: 'committed' }),
+      },
+      controlMutation: {
+        begin: controlBegin,
+        execute: async () => { throw new Error('control effect not expected'); },
+        resume: () => ({ kind: 'unknown', message: 'control continuation not expected' }),
+      },
+    });
+    const address = await addressFor(host);
+
+    const firstOrdinary = host.runtime.submit({
+      target: { kind: 'session', address },
+      idempotencyKey: 'ordinary-first',
+      command: {
+        kind: 'ordinary.ingress',
+        input: { turn: ordinaryTurn('ordinary-first') },
+      },
+    });
+    await vi.waitFor(() => expect(ordinaryExecute).toHaveBeenCalledTimes(1));
+
+    const controlRequest = {
+      target: { kind: 'session', address },
+      idempotencyKey: 'control-between-ordinary-effects',
+      command: {
+        kind: 'control.mutate' as const,
+        input: { kind: 'setLocked', locked: true },
+      },
+    };
+    const control = host.runtime.submit(controlRequest);
+    const controlFollower = host.runtime.submit(controlRequest);
+    const secondOrdinary = host.runtime.submit({
+      target: { kind: 'session', address },
+      idempotencyKey: 'ordinary-second',
+      command: {
+        kind: 'ordinary.ingress',
+        input: { turn: ordinaryTurn('ordinary-second') },
+      },
+    });
+    await Promise.resolve();
+    expect(ordinaryExecute).toHaveBeenCalledTimes(1);
+
+    let secondSettled = false;
+    secondOrdinary.then(() => { secondSettled = true; });
+    releaseFirst();
+    await expect(firstOrdinary).resolves.toMatchObject({ kind: 'applied' });
+    await expect(control).resolves.toMatchObject({ kind: 'applied' });
+    await expect(controlFollower).resolves.toMatchObject({ kind: 'duplicate' });
+    expect(secondSettled).toBe(false);
+    expect(controlBegin).toHaveBeenCalledTimes(1);
+
+    await vi.waitFor(() => expect(ordinaryExecute).toHaveBeenCalledTimes(2));
+    releaseSecond();
+    await expect(secondOrdinary).resolves.toMatchObject({ kind: 'applied' });
+  });
+
+  it('keeps a later control behind an earlier pending-repo effect on the same Session', async () => {
+    let releasePendingRepo!: () => void;
+    const pendingRepoEffect = new Promise<void>((resolve) => { releasePendingRepo = resolve; });
+    const pendingRepoExecute = vi.fn(async () => {
+      await pendingRepoEffect;
+      return { kind: 'materialized' };
+    });
+    const pendingRepoCompletion: PendingRepoCompletionPort = {
+      begin: () => ({ kind: 'effect', intent: {}, continuation: {} }),
+      execute: pendingRepoExecute,
+      resume: (_continuation, settlement) => settlement.kind === 'returned'
+        ? { kind: 'committed' }
+        : { kind: 'unknown', message: 'pending-repo effect threw' },
+    };
+    const controlBegin = vi.fn<ControlMutationPort['begin']>(({ command }) => ({
+      kind: 'committed',
+      result: command.kind === 'setLocked'
+        ? { kind: 'lockUpdated', locked: command.locked }
+        : { kind: 'lockUpdated', locked: false },
+    }));
+    const host = createSessionRuntimeHost({
+      directory: new OneSessionDirectory(),
+      keyedTriggers: unusedKeyedAuthority,
+      keyedTriggerTurns: unusedKeyedTurns,
+      pendingRepoCompletion,
+      controlMutation: {
+        begin: controlBegin,
+        execute: async () => { throw new Error('control effect not expected'); },
+        resume: () => ({ kind: 'unknown', message: 'control continuation not expected' }),
+      },
+    });
+    const address = await addressFor(host);
+
+    const pendingRepo = host.runtime.submit({
+      target: { kind: 'session', address },
+      idempotencyKey: 'pending-repo-before-control',
+      command: {
+        kind: 'pendingRepo.complete',
+        input: {
+          selection: { kind: 'directory', path: '/repo', pinWorkingDir: false },
+        },
+      },
+    });
+    await vi.waitFor(() => expect(pendingRepoExecute).toHaveBeenCalledTimes(1));
+
+    let controlSettled = false;
+    const control = host.runtime.submit({
+      target: { kind: 'session', address },
+      idempotencyKey: 'control-after-pending-repo',
+      command: {
+        kind: 'control.mutate',
+        input: { kind: 'setLocked', locked: true },
+      },
+    }).then((outcome) => {
+      controlSettled = true;
+      return outcome;
+    });
+
+    await Promise.resolve();
+    expect(controlSettled).toBe(false);
+    expect(controlBegin).not.toHaveBeenCalled();
+
+    releasePendingRepo();
+    await expect(pendingRepo).resolves.toMatchObject({
+      kind: 'applied',
+      sessionId: 'session-1',
+    });
+    await expect(control).resolves.toMatchObject({
+      kind: 'applied',
+      sessionId: 'session-1',
+    });
+    expect(controlBegin).toHaveBeenCalledTimes(1);
+  });
+
+  it('singleflights duplicate control effects and blocks only the same Session lane', async () => {
+    let release!: (value: unknown) => void;
+    const effect = new Promise<unknown>((resolve) => { release = resolve; });
+    const execute = vi.fn(() => effect);
+    const port: ControlMutationPort = {
+      begin: ({ command }) => ({
+        kind: 'effect',
+        intent: command,
+        continuation: command,
+      }),
+      execute,
+      resume: (continuation, settlement) => {
+        if (settlement.kind === 'threw') return { kind: 'unknown', message: 'effect threw' };
+        const command = continuation as { kind: 'setLocked'; locked: boolean };
+        return {
+          kind: 'committed',
+          result: { kind: 'lockUpdated', locked: command.locked },
+        };
+      },
+    };
+    const ordinaryBegin = vi.fn(() => ({ kind: 'committed' as const }));
+    const host = createSessionRuntimeHost({
+      directory: new TwoSessionDirectory(),
+      keyedTriggers: unusedKeyedAuthority,
+      keyedTriggerTurns: unusedKeyedTurns,
+      controlMutation: port,
+      ordinaryIngress: ordinaryPort(ordinaryBegin),
+    });
+    const first = await host.projection.read({ kind: 'byExternalSession', sessionId: 'session-1' });
+    const second = await host.projection.read({ kind: 'byExternalSession', sessionId: 'session-2' });
+    if (first.kind !== 'one' || second.kind !== 'one') throw new Error('expected Sessions');
+    const controlRequest = {
+      target: { kind: 'session' as const, address: first.session.address },
+      idempotencyKey: 'lock-1',
+      command: {
+        kind: 'control.mutate' as const,
+        input: { kind: 'setLocked' as const, locked: true },
+      },
+    };
+
+    const winning = host.runtime.submit(controlRequest);
+    const duplicate = host.runtime.submit(controlRequest);
+    let sameSessionSettled = false;
+    const sameSession = host.runtime.submit({
+      target: { kind: 'session', address: first.session.address },
+      idempotencyKey: 'ordinary-after-control',
+      command: {
+        kind: 'ordinary.ingress',
+        input: {
+          turn: {
+            ...ordinaryTurn('ordinary-after-control'),
+            route: {
+              scope: 'thread',
+              canonicalAnchor: 'om_root_1',
+              chatId: 'oc_chat_1',
+              chatType: 'group',
+            },
+          },
+        },
+      },
+    }).then((value) => {
+      sameSessionSettled = true;
+      return value;
+    });
+    const otherSession = host.runtime.submit({
+      target: { kind: 'session', address: second.session.address },
+      idempotencyKey: 'ordinary-other-session',
+      command: {
+        kind: 'ordinary.ingress',
+        input: {
+          turn: {
+            ...ordinaryTurn('ordinary-other-session'),
+            route: {
+              scope: 'thread',
+              canonicalAnchor: 'om_root_2',
+              chatId: 'oc_chat_2',
+              chatType: 'group',
+            },
+          },
+        },
+      },
+    });
+
+    await expect(otherSession).resolves.toMatchObject({ kind: 'applied', sessionId: 'session-2' });
+    expect(sameSessionSettled).toBe(false);
+    expect(execute).toHaveBeenCalledTimes(1);
+    release({ ok: true });
+
+    await expect(winning).resolves.toMatchObject({
+      kind: 'applied',
+      action: 'control.mutated',
+      result: { kind: 'lockUpdated', locked: true },
+    });
+    await expect(duplicate).resolves.toMatchObject({
+      kind: 'duplicate',
+      state: 'inFlight',
+    });
+    expect(await sameSession).toEqual({
+      kind: 'applied',
+      action: 'ordinary.inputCommitted',
+      policy: 'ordinary-replayable',
+      durability: 'processLocal',
+      sessionId: 'session-1',
+    });
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps trigger-result consumption behind an in-flight worker command on the same Session', async () => {
+    let release!: () => void;
+    const workerEffect = new Promise<void>((resolve) => { release = resolve; });
+    const begin = vi.fn<ControlMutationPort['begin']>(({ command }) => (
+      command.kind === 'injectCommand'
+        ? { kind: 'effect', intent: command, continuation: command }
+        : {
+            kind: 'committed',
+            result: {
+              kind: 'asyncTriggerFaultConverged',
+              state: 'failed',
+              triggerId: command.kind === 'convergeAsyncTriggerFault'
+                ? command.triggerId
+                : 'unexpected',
+            },
+          }
+    ));
+    const port: ControlMutationPort = {
+      begin,
+      execute: vi.fn(async () => {
+        await workerEffect;
+        return { accepted: true };
+      }),
+      resume: (continuation) => ({
+        kind: 'committed',
+        result: {
+          kind: 'commandInjected',
+          command: (continuation as { command: string }).command,
+        },
+      }),
+    };
+    const host = createSessionRuntimeHost({
+      directory: new OneSessionDirectory(),
+      keyedTriggers: unusedKeyedAuthority,
+      keyedTriggerTurns: unusedKeyedTurns,
+      controlMutation: port,
+    });
+    const address = await addressFor(host);
+
+    const injection = host.runtime.submit({
+      target: { kind: 'session', address },
+      idempotencyKey: 'slash-before-trigger-result',
+      command: {
+        kind: 'control.mutate',
+        input: { kind: 'injectCommand', command: '/status' },
+      },
+    });
+    await vi.waitFor(() => expect(port.execute).toHaveBeenCalledOnce());
+    const convergence = host.runtime.submit({
+      target: { kind: 'session', address },
+      idempotencyKey: 'trigger-result-fault:trigger-one',
+      command: {
+        kind: 'control.mutate',
+        input: { kind: 'convergeAsyncTriggerFault', triggerId: 'trigger-one' },
+      },
+    });
+    await Promise.resolve();
+    expect(begin).toHaveBeenCalledOnce();
+
+    release();
+    await expect(injection).resolves.toMatchObject({
+      kind: 'applied',
+      result: { kind: 'commandInjected' },
+    });
+    await expect(convergence).resolves.toMatchObject({
+      kind: 'applied',
+      result: { kind: 'asyncTriggerFaultConverged', state: 'failed' },
+    });
+    expect(begin).toHaveBeenCalledTimes(2);
+  });
+
+  it('retains an unknown control outcome and never repeats its effect', async () => {
+    const execute = vi.fn(async () => ({ ok: true }));
+    const port: ControlMutationPort = {
+      begin: () => ({ kind: 'effect', intent: {}, continuation: {} }),
+      execute,
+      resume: () => ({ kind: 'unknown', message: 'publication outcome is unknown' }),
+    };
+    const host = createSessionRuntimeHost({
+      directory: new OneSessionDirectory(),
+      keyedTriggers: unusedKeyedAuthority,
+      keyedTriggerTurns: unusedKeyedTurns,
+      controlMutation: port,
+    });
+    const address = await addressFor(host);
+    const request = {
+      target: { kind: 'session' as const, address },
+      idempotencyKey: 'close-unknown',
+      command: {
+        kind: 'control.mutate' as const,
+        input: { kind: 'close' as const, reason: 'dashboard' as const },
+      },
+    };
+
+    await expect(host.runtime.submit(request)).resolves.toMatchObject({
+      kind: 'ambiguous',
+      policy: 'control-staged-transition',
+    });
+    await expect(host.runtime.submit(request)).resolves.toMatchObject({
+      kind: 'ambiguous',
+      policy: 'control-staged-transition',
+    });
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('retains applied control outcomes for the whole Runtime epoch', async () => {
+    const execute = vi.fn(async () => ({ ok: true }));
+    const port: ControlMutationPort = {
+      begin: ({ command }) => ({ kind: 'effect', intent: command, continuation: command }),
+      execute,
+      resume: (continuation) => {
+        const command = continuation as { kind: 'setLocked'; locked: boolean };
+        return {
+          kind: 'committed',
+          result: { kind: 'lockUpdated', locked: command.locked },
+        };
+      },
+    };
+    const host = createSessionRuntimeHost({
+      directory: new OneSessionDirectory(),
+      keyedTriggers: unusedKeyedAuthority,
+      keyedTriggerTurns: unusedKeyedTurns,
+      controlMutation: port,
+    });
+    const address = await addressFor(host);
+    const command = {
+      kind: 'control.mutate' as const,
+      input: { kind: 'setLocked' as const, locked: true },
+    };
+    for (let index = 0; index < 1_025; index += 1) {
+      await expect(host.runtime.submit({
+        target: { kind: 'session', address },
+        idempotencyKey: `lock-${index}`,
+        command,
+      })).resolves.toMatchObject({ kind: 'applied' });
+    }
+
+    await expect(host.runtime.submit({
+      target: { kind: 'session', address },
+      idempotencyKey: 'lock-0',
+      command,
+    })).resolves.toMatchObject({ kind: 'duplicate', state: 'controlApplied' });
+    expect(execute).toHaveBeenCalledTimes(1_025);
+  });
+
+  it('does not repeat the cwd driver for a completed operation identity', async () => {
+    const execute = vi.fn(async () => ({ mode: 'respawn-resume' as const }));
+    const port: ControlMutationPort = {
+      begin: ({ command }) => ({ kind: 'effect', intent: command, continuation: command }),
+      execute,
+      resume: (continuation) => {
+        const command = continuation as { kind: 'changeWorkingDirectory'; resolvedPath: string };
+        return {
+          kind: 'committed',
+          result: {
+            kind: 'workingDirectoryChanged',
+            mode: 'respawn-resume',
+            workingDir: command.resolvedPath,
+          },
+        };
+      },
+    };
+    const host = createSessionRuntimeHost({
+      directory: new OneSessionDirectory(),
+      keyedTriggers: unusedKeyedAuthority,
+      keyedTriggerTurns: unusedKeyedTurns,
+      controlMutation: port,
+    });
+    const address = await addressFor(host);
+    const request = {
+      target: { kind: 'session' as const, address },
+      idempotencyKey: 'cwd-operation-one',
+      command: {
+        kind: 'control.mutate' as const,
+        input: {
+          kind: 'changeWorkingDirectory' as const,
+          resolvedPath: '/roles/new',
+        },
+      },
+    };
+
+    await expect(host.runtime.submit(request)).resolves.toMatchObject({
+      kind: 'applied',
+      result: { kind: 'workingDirectoryChanged', mode: 'respawn-resume' },
+    });
+    await expect(host.runtime.submit(request)).resolves.toMatchObject({
+      kind: 'duplicate',
+      state: 'controlApplied',
+      result: { kind: 'workingDirectoryChanged', mode: 'respawn-resume' },
+    });
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not repeat a relocate effect and preserves its opaque route reservation', async () => {
+    const reservation = Object.freeze({ route: 'target' });
+    const begin = vi.fn(({ command, routeReservation }) => ({
+      kind: 'effect' as const,
+      intent: { command, routeReservation },
+      continuation: command,
+    }));
+    const execute = vi.fn(async (intent: unknown) => {
+      expect((intent as { routeReservation: unknown }).routeReservation).toBe(reservation);
+      return { ok: true };
+    });
+    const port: ControlMutationPort = {
+      begin,
+      execute,
+      resume: (continuation) => {
+        const command = continuation as Extract<
+          Parameters<ControlMutationPort['begin']>[0]['command'],
+          { kind: 'relocate' }
+        >;
+        return {
+          kind: 'committed',
+          result: {
+            kind: 'relocated',
+            targetChatId: command.targetChatId,
+            targetRootMessageId: command.targetRootMessageId,
+          },
+        };
+      },
+    };
+    const host = createSessionRuntimeHost({
+      directory: new OneSessionDirectory(),
+      keyedTriggers: unusedKeyedAuthority,
+      keyedTriggerTurns: unusedKeyedTurns,
+      controlMutation: port,
+    });
+    const address = await addressFor(host);
+    const request = {
+      target: {
+        kind: 'session' as const,
+        address,
+        controlRouteReservation: reservation,
+      },
+      idempotencyKey: 'relocate-operation-one',
+      command: {
+        kind: 'control.mutate' as const,
+        input: {
+          kind: 'relocate' as const,
+          sourceAnchor: 'om_root',
+          targetChatId: 'oc_target',
+          targetRootMessageId: 'om_target_audit',
+          requester: { larkAppId: 'app_leader', openId: 'ou_owner' },
+        },
+      },
+    };
+
+    await expect(host.runtime.submit(request)).resolves.toMatchObject({
+      kind: 'applied',
+      result: { kind: 'relocated', targetChatId: 'oc_target' },
+    });
+    await expect(host.runtime.submit(request)).resolves.toMatchObject({
+      kind: 'duplicate',
+      state: 'controlApplied',
+      result: { kind: 'relocated', targetChatId: 'oc_target' },
+    });
+    expect(begin).toHaveBeenCalledOnce();
+    expect(execute).toHaveBeenCalledOnce();
   });
 });
 
