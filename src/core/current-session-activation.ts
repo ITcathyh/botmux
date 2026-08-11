@@ -18,6 +18,7 @@ import {
 } from './current-session-command-lane.js';
 import {
   forkWorker,
+  getDaemonBootId,
   getActiveSessionsRegistry,
   type ForkResumeOrTurnId,
 } from './worker-pool.js';
@@ -228,12 +229,11 @@ const adapterBotIdsByRegistry = new WeakMap<
   Map<string, DaemonSession>,
   Map<string, BotId>
 >();
-const CURRENT_ACTIVATION_RUNTIME_EPOCH = randomUUID();
-
 function currentActivationRuntime(
   ownerBotId: BotId | undefined,
   ownerLarkAppId: string,
   activeSessionsOverride?: Map<string, DaemonSession>,
+  runtimeEpoch: string = getDaemonBootId(),
 ) {
   const activeSessions = activeSessionsOverride ?? getActiveSessionsRegistry();
   if (!activeSessions) return undefined;
@@ -255,9 +255,9 @@ function currentActivationRuntime(
     byOwner = new Map();
     hostsByRegistry.set(activeSessions, byOwner);
   }
-  let runtime = byOwner.get(ownerLarkAppId);
+  const hostKey = `${stableOwnerBotId}\0${runtimeEpoch}`;
+  let runtime = byOwner.get(hostKey);
   if (!runtime) {
-    const runtimeEpoch = CURRENT_ACTIVATION_RUNTIME_EPOCH;
     runtime = createSessionActivationRuntime({
       commandLane: currentSessionCommandLane,
       laneAddress: sessionId => currentSessionLaneAddress(
@@ -267,7 +267,7 @@ function currentActivationRuntime(
       ),
       port: createCurrentSessionActivationPort({ ownerLarkAppId, activeSessions }),
     });
-    byOwner.set(ownerLarkAppId, runtime);
+    byOwner.set(hostKey, runtime);
   }
   return runtime;
 }
@@ -275,6 +275,8 @@ function currentActivationRuntime(
 export async function ensureCurrentSessionActivation(input: {
   readonly ownerBotId?: BotId;
   readonly ownerLarkAppId: string;
+  /** Must match the owner Host/Executor epoch; production defaults to daemon boot. */
+  readonly runtimeEpoch?: string;
   readonly sessionId: string;
   readonly requestIdentity: string;
   readonly cause: Exclude<SessionActivationRequest['goal'], { kind: 'reconcile' }>['cause'];
@@ -287,6 +289,7 @@ export async function ensureCurrentSessionActivation(input: {
     input.ownerBotId,
     input.ownerLarkAppId,
     input.activeSessions,
+    input.runtimeEpoch,
   );
   if (!runtime) {
     return { kind: 'retryable', message: 'Current active Session registry is not ready' };
@@ -308,6 +311,8 @@ export async function ensureCurrentSessionActivation(input: {
 export async function reconcileCurrentSessionActivation(input: {
   readonly ownerBotId?: BotId;
   readonly ownerLarkAppId: string;
+  /** Must match the owner Host/Executor epoch; production defaults to daemon boot. */
+  readonly runtimeEpoch?: string;
   readonly sessionId: string;
   readonly requestIdentity: string;
   readonly observation: 'exists' | 'missing' | 'unknown';
@@ -319,6 +324,7 @@ export async function reconcileCurrentSessionActivation(input: {
     input.ownerBotId,
     input.ownerLarkAppId,
     input.activeSessions,
+    input.runtimeEpoch,
   );
   if (!runtime) {
     return { kind: 'retryable', message: 'Current active Session registry is not ready' };
@@ -341,11 +347,18 @@ export async function reconcileCurrentSessionActivation(input: {
 export async function retireCurrentSessionActivation(input: {
   readonly ownerBotId?: BotId;
   readonly ownerLarkAppId: string;
+  /** Must match the owner Host/Executor epoch; production defaults to daemon boot. */
+  readonly runtimeEpoch?: string;
   readonly sessionId: string;
   readonly requestIdentity: string;
   readonly reason: SessionRetirementReason;
 }): Promise<SessionRetirementOutcome> {
-  const runtime = currentActivationRuntime(input.ownerBotId, input.ownerLarkAppId);
+  const runtime = currentActivationRuntime(
+    input.ownerBotId,
+    input.ownerLarkAppId,
+    undefined,
+    input.runtimeEpoch,
+  );
   if (!runtime) {
     return { kind: 'retryable', message: 'Current active Session registry is not ready' };
   }
