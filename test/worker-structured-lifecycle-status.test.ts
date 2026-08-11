@@ -511,7 +511,7 @@ describe('worker structured-turn status wiring', () => {
     expect(probe).toContain('if (!backendScreenEvidenceIsAuthoritativeForMutation()) return;');
   });
 
-  it('publishes first-turn working only on an authoritative viewport with a busy marker, as a pure publisher', () => {
+  it('publishes first-turn working from the projected status for argv-baked prompts, as a pure publisher', () => {
     const startScreen = functionSlice('startScreenUpdates', 'stopScreenUpdates');
     const gate = startScreen.indexOf('if (awaitingFirstPrompt) {');
     const gateEnd = startScreen.indexOf('void (async () => {', gate);
@@ -519,22 +519,23 @@ describe('worker structured-turn status wiring', () => {
     expect(gateEnd).toBeGreaterThan(gate);
     const channel = startScreen.slice(gate, gateEnd);
 
-    // B: the authoritative-screen check (ZMX fail-open) must precede any capture,
-    // and a busyPattern is required — a CLI without a marker keeps the bare
-    // return and never captures. Ordering: authoritative gate < capture call.
-    const authGate = channel.indexOf('backendScreenEvidenceIsAuthoritativeForMutation()');
-    const busyRequired = channel.indexOf('cliAdapter?.busyPattern');
-    const capture = channel.indexOf('captureBackendScreen(backend)');
-    expect(authGate).toBeGreaterThanOrEqual(0);
-    expect(busyRequired).toBeGreaterThan(authGate);
-    expect(capture).toBeGreaterThan(busyRequired);
-    // The busy marker itself gates the send, and the channel still ends in the
-    // original bare `return` so the async sampler stays gated during turn one.
-    expect(channel).toContain('cliAdapter.busyPattern.test(busyProbeRegion(content))');
+    // Gated on spawnArgvNeedsWorkingSeed (argv-baked first prompt), NOT on
+    // busyPattern: a non-argv first turn (Claude/Codex/type-ahead) is still booting,
+    // so the publisher must be a no-op there and let the queued prompt flush after
+    // the ready edge.
+    expect(channel).toContain('spawnArgvNeedsWorkingSeed');
+    // It publishes the PROJECTED status ('working' during turn one because
+    // isPromptReady is still false) rather than scraping the screen for a busy
+    // marker — this is the general "sent to the CLI ⇒ working" model.
+    expect(channel).toContain('projectedRuntimeScreenStatus()');
+    expect(channel).toContain("projected === 'working'");
     expect(channel).toContain("status: 'working'");
-    // The channel still ends in the original bare `return;` (last statement
-    // before the gate block closes) so the async sampler stays gated during
-    // turn one exactly as before.
+    // No screen-scraping: the old busyPattern/capture path is gone from this gate.
+    expect(channel).not.toContain('cliAdapter?.busyPattern');
+    expect(channel).not.toContain('busyProbeRegion(content)');
+    expect(channel).not.toContain('captureBackendScreen(');
+    // The channel still ends in the original bare `return;` so the async sampler
+    // stays gated during turn one exactly as before.
     expect(/return;\s*}\s*$/.test(channel.trimEnd())).toBe(true);
 
     // Pure publisher: dedup via the local lastSentStatus only; it must NOT touch
@@ -547,6 +548,26 @@ describe('worker structured-turn status wiring', () => {
     expect(channel).not.toContain('spawnArgvInitialPromptBusy =');
     expect(channel).not.toContain('spawnArgvNeedsWorkingSeed =');
   });
+
+  it('suppresses the markPromptReady generic idle snapshot while the Grok-class busy arm is pending', () => {
+    const body = functionSlice('markPromptReady', 'persistCliSessionId');
+    // The "immediate idle snapshot" fires before the seed consumes
+    // spawnArgvInitialPromptBusy. For a Grok-class pre-execution ready edge that
+    // generic snapshot projects idle (isPromptReady just went true) and would reach
+    // the daemon BEFORE the busy arm re-publishes working — combined with the
+    // first-turn publisher's working, that working→idle fires a premature DONE. The
+    // snapshot must be gated on !spawnArgvInitialPromptBusy so no idle escapes.
+    const idleSnapshot = body.indexOf('Send immediate idle snapshot');
+    const guardedSend = body.indexOf('renderer && !spawnArgvInitialPromptBusy && pendingMessages.length === 0', idleSnapshot);
+    expect(idleSnapshot).toBeGreaterThanOrEqual(0);
+    expect(guardedSend).toBeGreaterThan(idleSnapshot);
+    // The busy arm below still owns the working publish for this path.
+    const busyArm = body.indexOf('if (spawnArgvInitialPromptBusy) {', guardedSend);
+    const armWorking = body.indexOf("publishScreenStatus('working', { force: true })", busyArm);
+    expect(busyArm).toBeGreaterThan(guardedSend);
+    expect(armWorking).toBeGreaterThan(busyArm);
+  });
+
 
   it('carries the structured mark through adopt submit confirmation and exception cleanup', () => {
     const adopt = functionSlice('writeAdoptMessage', 'isWorkflowWorker');
