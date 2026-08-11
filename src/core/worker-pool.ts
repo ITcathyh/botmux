@@ -5207,6 +5207,92 @@ function rollbackAcceptedCodexAppDispatch(
   }
 }
 
+/**
+ * Recovery-seam at-most-once fence for a keyed follow-up turn (turnIdempotencyKey,
+ * PR #818). The turn-level idempotency lease terminalizes an interrupted keyed
+ * turn to a durable `failed(dispatch_unknown)` (worker-exit convergence / boot
+ * reconcile / same-key retry) and — unlike a fresh async-virtual session — LEAVES
+ * the shared session open and un-quarantined (P1-3). So a later refork of that
+ * session must NOT resurrect the interrupted turn: `noReplay` only lives on the
+ * transient input queues (pendingMessages / inflight), NOT on the durable Codex
+ * App dispatch ledger. Without this fence, the recovery path
+ * (codexAppRecoveredDispatches → worker init → recoveredAcceptedInputs, keyed on
+ * `state==='accepted'` alone) would re-issue `turn/start` for a turn the caller
+ * was already told is `failed` at-most-once — the ledger is the third replay
+ * channel the lease's noReplay does not reach (codex #818 recovery-seam finding).
+ *
+ * Fence: for each `accepted` (NEVER `prepared`) ledger entry whose OWNER-MATCHED
+ * async terminal is already `failed(dispatch_unknown)`, durably retire the entry
+ * via cancelCodexAppDispatch (rejects if a prepared successor exists → left for
+ * the generation fence) + persist. Idempotent and re-run at EVERY recovery seam,
+ * so it also covers the window where the durable failed was written but a crash
+ * hit before the exit-time retirement (the durable async truth is authoritative,
+ * re-checked here). A `prepared` entry is never cancelled without proof — the
+ * runner may have crossed the write boundary; those stay on the existing
+ * generation fence. Owner-scoped: only THIS bot's failed evidence counts, so a
+ * foreign/unstamped async record never retires our accepted entry.
+ */
+function retireTerminalizedCodexAppLedgerEntriesForRecovery(ds: DaemonSession): void {
+  const ledger = ds.session.codexAppDispatchLedger;
+  if (!ledger || ledger.length === 0) return;
+  const ownerLarkAppId = ds.larkAppId;
+  const toRetire = ledger.filter(entry =>
+    entry.state === 'accepted'
+    && (() => {
+      const rec = asyncTriggerStore.lookup(ds.session.sessionId, entry.turnId);
+      // ONLY our own durable dispatch_unknown failed counts (async-trigger-store
+      // is keyed by sessionId, so a foreign/unstamped terminal on the same
+      // sessionId/triggerId must not retire our accepted entry — mirrors the
+      // owner-positive-proof gate used everywhere else in the idempotency path).
+      return !!rec
+        && rec.ownerLarkAppId === ownerLarkAppId
+        && rec.result.status === 'failed'
+        && rec.result.reason === 'dispatch_unknown';
+    })());
+  if (toRetire.length === 0) return;
+  const priorLedger = ds.session.codexAppDispatchLedger;
+  let mutated = false;
+  for (const entry of toRetire) {
+    const cancelled = cancelCodexAppDispatch(ds.session.codexAppDispatchLedger ?? [], {
+      dispatchId: entry.dispatchId,
+      turnId: entry.turnId,
+      ...(entry.dispatchAttempt !== undefined ? { dispatchAttempt: entry.dispatchAttempt } : {}),
+    });
+    // prepared_successor_exists / dispatch_not_found → leave it for the generation
+    // fence; never force-remove past a prepared frame.
+    if (!cancelled.ok) continue;
+    ds.session.codexAppDispatchLedger = cancelled.ledger;
+    mutated = true;
+    logger.warn(
+      `[${ds.session.sessionId.slice(0, 8)}] Recovery fence retired at-most-once terminalized `
+      + `Codex App dispatch turn=${entry.turnId.slice(0, 12)} (durable failed:dispatch_unknown; not replayed)`,
+    );
+  }
+  if (!mutated) return;
+  try {
+    sessionStore.updateSession(ds.session);
+    if (!hasUnsettledCodexAppDispatch(ds.session.codexAppDispatchLedger)) {
+      void Promise.resolve(callbacks?.onCodexAppLedgerDrained?.(ds)).catch(err => {
+        logger.error(
+          `[${ds.session.sessionId.slice(0, 8)}] post-recovery-fence ledger-drain cleanup failed: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    }
+  } catch (err) {
+    // Persist failed — restore the in-memory ledger so the recovery snapshot below
+    // still carries the entries and a later seam (next fork / boot reconcile)
+    // re-attempts the retirement. Fail-safe: the accepted entry replaying once is
+    // the pre-fix behavior, so a persist failure degrades to it rather than losing
+    // durable state.
+    ds.session.codexAppDispatchLedger = priorLedger;
+    logger.error(
+      `[${ds.session.sessionId.slice(0, 8)}] Recovery fence could not persist retired ledger; `
+      + `deferring to next seam: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
 type QueuedWorkerForkSnapshot = {
   queued: true;
   queuedPrompt: Session['queuedPrompt'];
@@ -6335,6 +6421,14 @@ export function forkWorker(
   // Snapshot the prior durable FIFO before accepting this fork's new prompt.
   // A pure reattach receives the full snapshot; a refork carrying N+1 restores
   // old N first and reserves N+1 through the normal worker write path.
+  // FIRST fence out any keyed turn already terminalized to a durable
+  // failed(dispatch_unknown): the turn-level idempotency lease (PR #818) leaves
+  // the shared session open, so without this the recovery path would replay an
+  // at-most-once turn the caller was already told failed (the ledger is the third
+  // replay channel `noReplay` does not reach). Idempotent + re-checked here.
+  if (agentCfg.cliId === 'codex-app') {
+    retireTerminalizedCodexAppLedgerEntriesForRecovery(ds);
+  }
   const codexAppRecoveredDispatches = agentCfg.cliId === 'codex-app'
     ? (ds.session.codexAppDispatchLedger ?? []).map(entry => ({ ...entry }))
     : [];
@@ -9818,6 +9912,7 @@ export const __testOnly_setupWorkerHandlers = setupWorkerHandlers;
 export const __testOnly_reserveWorkerGeneration = reserveWorkerGeneration;
 export const __testOnly_finishTurnReactions = finishTurnReactions;
 export const __testOnly_finalOutputDedupeKey = finalOutputDedupeKey;
+export const __testOnly_retireTerminalizedCodexAppLedgerEntriesForRecovery = retireTerminalizedCodexAppLedgerEntriesForRecovery;
 
 // ─── Fork adopt worker ──────────────────────────────────────────────────────
 
