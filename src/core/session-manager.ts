@@ -2352,7 +2352,10 @@ export async function ensureTerminalWorkerPort(ds: DaemonSession): Promise<numbe
       ownerBotId: getBot(ds.larkAppId).botId,
       ownerLarkAppId: ds.larkAppId,
       sessionId: ds.session.sessionId,
-      requestIdentity: `terminal:${ds.session.sessionId}`,
+      // Join concurrent HTML/WS wakes for the same missing generation, while
+      // allowing a later terminal access to re-activate after that worker has
+      // exited and the generation fence advanced.
+      requestIdentity: `terminal:${ds.session.sessionId}:${ds.session.workerGeneration ?? 0}`,
       cause: 'terminal',
       promptInput: '',
       resumeOrTurnId: true,
