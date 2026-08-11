@@ -16,9 +16,9 @@ import {
 } from './session-manager.js';
 import {
   closeSession as closeWorkerSession,
-  forkWorker,
   getCurrentCliVersion,
 } from './worker-pool.js';
+import type { CurrentSessionActivationCoordinator } from './current-session-activation.js';
 import {
   type KeyedTriggerStartInput,
   type KeyedTriggerTurnAcceptResult,
@@ -58,6 +58,7 @@ function token(): object {
 export function createCurrentKeyedTriggerTurnPort(options: {
   ownerLarkAppId: string;
   activeSessions: Map<string, DaemonSession>;
+  activation: Pick<CurrentSessionActivationCoordinator, 'ensure'>;
 }): KeyedTriggerTurnPort {
   const slots = new WeakMap<object, CurrentPreparedKeyedTriggerTurn>();
 
@@ -94,10 +95,10 @@ export function createCurrentKeyedTriggerTurnPort(options: {
     };
   };
 
-  const acceptAtMostOnce = (
+  const acceptAtMostOnce = async (
     preparedToken: unknown,
     context: { key: string; pendingCreatedAt: number },
-  ): KeyedTriggerTurnAcceptResult => {
+  ): Promise<KeyedTriggerTurnAcceptResult> => {
     if (!preparedToken || typeof preparedToken !== 'object') {
       return { kind: 'refused', message: 'invalid keyed-trigger prepared turn token' };
     }
@@ -211,13 +212,25 @@ export function createCurrentKeyedTriggerTurnPort(options: {
         workerGeneration: dispatchedGeneration,
       });
 
-      const accepted = forkWorker(ds, promptInput, {
-        turnId: prepared.triggerId,
-        atMostOnce: true,
+      const activation = await options.activation.ensure({
+        sessionId: ds.session.sessionId,
+        requestIdentity: prepared.triggerId,
+        cause: 'ordinary',
+        promptInput,
+        resumeOrTurnId: {
+          turnId: prepared.triggerId,
+          atMostOnce: true,
+        },
       });
-      if (!accepted) {
+      const terminal = activation.kind === 'duplicate' ? activation.outcome : activation;
+      if (terminal.kind !== 'active' || terminal.action === 'alreadyActive') {
         prepared.phase = 'failed';
-        return { kind: 'refused', message: 'worker refused keyed trigger before acceptance' };
+        return {
+          kind: 'refused',
+          message: 'message' in terminal
+            ? terminal.message
+            : 'worker refused keyed trigger before acceptance',
+        };
       }
 
       ds.initialStartPending = false;

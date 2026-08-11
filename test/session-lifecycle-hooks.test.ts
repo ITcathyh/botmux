@@ -420,6 +420,8 @@ describe('worker-pool lifecycle hook integration', () => {
       reason: 'exit_code_1',
       code: 1,
     }));
+    expect(ds.session.status).toBe('active');
+    expect(ds.worker).toBeNull();
   });
 
   it('suppresses external exit events for an intentional transfer detach', async () => {

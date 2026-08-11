@@ -573,7 +573,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(sessionStore.getSession(closable.sessionId)?.status).toBe('closed');
     expect(closeSession).toHaveBeenCalledWith(closable.sessionId);
     expect(closeSession).not.toHaveBeenCalledWith(blocked.sessionId);
-    expect(events).toContainEqual({
+    expect(events).toContainEqual(expect.objectContaining({
       type: 'session.spawned',
       body: {
         session: expect.objectContaining({
@@ -582,7 +582,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
           quarantined: true,
         }),
       },
-    });
+    }));
     // The uncertain row remains retryable on disk but is not registered or
     // reattached into the live map with its now-mismatched CLI.
     expect(map.size).toBe(0);

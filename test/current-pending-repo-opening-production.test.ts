@@ -52,6 +52,7 @@ import type {
   SessionRuntime,
 } from '../src/core/session-runtime.js';
 import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
+import type { ForkResumeOrTurnId } from '../src/core/worker-pool.js';
 import * as sessionStore from '../src/services/session-store.js';
 import type { CliTurnPayload } from '../src/types.js';
 
@@ -98,13 +99,40 @@ function pendingSession(prompt = ''): DaemonSession {
 
 function externalAdapters(input: {
   availableBots?: CurrentPendingRepoCompletionProductionAdapters['availableBots'];
-  forkWorker: CurrentPendingRepoCompletionProductionAdapters['forkWorker'];
+  forkWorker: (
+    current: DaemonSession,
+    input: string | CliTurnPayload,
+    resumeOrTurnId: ForkResumeOrTurnId,
+  ) => unknown;
 }): CurrentPendingRepoCompletionProductionAdapters {
   // These tests select an already-resolved directory. Keep the test Adapter at
   // the public effects it exercises instead of coupling it to worktree policy.
   return {
     availableBots: input.availableBots ?? vi.fn(async () => []),
-    forkWorker: input.forkWorker,
+    activationFor({ ownerLarkAppId, activeSessions }) {
+      return {
+        async ensure(request) {
+          const matches = [...activeSessions.values()].filter(current => (
+            current.larkAppId === ownerLarkAppId
+            && current.session.sessionId === request.sessionId
+          ));
+          const current = matches.length === 1 ? matches[0] : undefined;
+          if (!current) {
+            return { kind: 'rejected', reason: 'notFound', message: 'test owner is stale' };
+          }
+          const accepted = input.forkWorker(
+            current,
+            request.promptInput,
+            request.resumeOrTurnId ?? false,
+          );
+          if (accepted === true) return { kind: 'active', action: 'activated' };
+          if (accepted === false) {
+            return { kind: 'retryable', message: 'test executor refused activation' };
+          }
+          return { kind: 'quarantined', message: 'test executor returned no acceptance proof' };
+        },
+      };
+    },
   } as CurrentPendingRepoCompletionProductionAdapters;
 }
 

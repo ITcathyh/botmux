@@ -25,6 +25,7 @@ import {
   currentSessionLaneAddress,
 } from './current-session-command-lane.js';
 import { createCurrentKeyedTriggerTurnPort } from './current-keyed-trigger-turn.js';
+import { currentSessionActivationCoordinator } from './current-session-activation.js';
 import {
   createCurrentOrdinaryRouteRegistryRuntime,
   type CurrentOrdinaryRouteOpeningCreator,
@@ -634,6 +635,12 @@ export function currentSessionRuntimeHost(options: {
   // Pre-I1 JavaScript tests can omit the compile-time-required binding. Their
   // adapter identity remains opaque and process-local; production is gated.
   const stableOwnerKey = ownerBotIdForCurrentAdapter(options);
+  const activation = currentSessionActivationCoordinator({
+    ownerBotId: stableOwnerKey,
+    ownerLarkAppId: options.ownerLarkAppId,
+    runtimeEpoch,
+    activeSessions: options.activeSessions,
+  });
   const cacheable = options.keyedTriggerTurns === undefined
     && options.dashboardProjectionProtocol === undefined;
   const createInnerHost = (input: {
@@ -658,6 +665,7 @@ export function currentSessionRuntimeHost(options: {
     keyedTriggerTurns: options.keyedTriggerTurns ?? createCurrentKeyedTriggerTurnPort({
       ownerLarkAppId: options.ownerLarkAppId,
       activeSessions: options.activeSessions,
+      activation,
     }),
     ...(input.portBindings
       ? { portBindings: input.portBindings }

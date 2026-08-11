@@ -14,6 +14,7 @@ import {
 import { config } from '../../config.js';
 import { createCurrentOrdinaryIngressMetadataModule } from '../../core/current-ordinary-ingress-metadata.js';
 import { createCurrentOrdinaryIngressWorkerProcesses } from '../../core/current-ordinary-ingress-worker-processes.js';
+import type { CurrentSessionActivationCoordinator } from '../../core/current-session-activation.js';
 import type { OrdinaryIngressPort } from '../../core/session-runtime.js';
 import {
   downloadResources,
@@ -22,8 +23,6 @@ import {
 } from '../../core/session-manager.js';
 import type { DaemonSession } from '../../core/types.js';
 import {
-  forkAdoptWorker,
-  forkWorker,
   sendWorkerInput,
 } from '../../core/worker-pool.js';
 import { localeForBot } from '../../i18n/index.js';
@@ -41,6 +40,7 @@ import {
 export interface CurrentOrdinaryIngressDaemonOptions {
   readonly ownerLarkAppId: string;
   readonly activeSessions: ReadonlyMap<string, DaemonSession>;
+  readonly activation: Pick<CurrentSessionActivationCoordinator, 'ensure'>;
   readonly checkQuota: (
     input: LarkOrdinaryIngressQuotaInput,
   ) => Promise<LarkOrdinaryIngressMaterializationIoResult<null>>;
@@ -125,8 +125,7 @@ export function createCurrentOrdinaryIngressDaemonPort(
     ownerLarkAppId: options.ownerLarkAppId,
     activeSessions: options.activeSessions,
     sendWorkerInput,
-    forkWorker,
-    forkAdoptWorker,
+    activation: options.activation,
   });
 
   return createLarkCurrentOrdinaryIngressProductionPort({

@@ -11,7 +11,7 @@ import * as sessionStore from '../services/session-store.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
 import {
@@ -98,6 +98,7 @@ function sessionLastMessageAtMs(session: { createdAt?: string; lastMessageAt?: s
 async function resumeRestoredPendingRepoSetup(
   ds: DaemonSession,
   activeSessions: Map<string, DaemonSession>,
+  activation: { readonly reconcile: typeof reconcileCurrentSessionActivation },
 ): Promise<void> {
   const setup = ds.session.pendingRepoSetup;
   if (!setup || ds.session.queuedActivationPending || !ds.pendingRepo) return;
@@ -169,9 +170,10 @@ async function resumeRestoredPendingRepoSetup(
   // selectable repo. Resume the same no-project fallback without replacing N.
   ds.pendingRepo = false;
   ensureSessionWhiteboard(ds);
+  let promptInput: string | CliTurnPayload;
   if (setup.rawInput) {
     rememberLastCliInput(ds, setup.rawInput, setup.rawInput);
-    forkWorker(ds, '', { resume: false, turnId: setup.turnId });
+    promptInput = '';
   } else {
     const bot = getBot(ds.larkAppId);
     const availableBots = await getAvailableBots(ds.larkAppId, ds.chatId);
@@ -198,7 +200,25 @@ async function resumeRestoredPendingRepoSetup(
       },
     );
     rememberLastCliInput(ds, setup.prompt, input);
-    forkWorker(ds, input, { resume: false, turnId: setup.turnId });
+    promptInput = input;
+  }
+  const outcome = await activation.reconcile({
+    ownerBotId: getBot(ds.larkAppId).botId,
+    ownerLarkAppId: ds.larkAppId,
+    sessionId: ds.session.sessionId,
+    requestIdentity: `restore-pending-repo:${setup.turnId}`,
+    observation: 'missing',
+    promptInput,
+    resumeOrTurnId: { resume: false, turnId: setup.turnId },
+    activeSessions,
+  });
+  const terminal = outcome.kind === 'duplicate' ? outcome.outcome : outcome;
+  if (terminal.kind !== 'active' || terminal.action === 'alreadyActive') {
+    throw new Error(
+      `pending-repo restore activation ${terminal.kind}: ${'message' in terminal
+        ? terminal.message
+        : 'opening input was not accepted'}`,
+    );
   }
   logger.info(`[${ds.session.sessionId.substring(0, 8)}] Resumed durable pending repo opening without selectable projects`);
 }
@@ -1746,7 +1766,27 @@ export async function restoreActiveSessions(
         }
         restoredByThisInvocation.push(ds);
         announceSessionRow(ds);
-        forkAdoptWorker(ds, { restoredFromMetadata: true });
+        const adoptActivation = await activation.reconcile({
+          ownerBotId: getBot(ds.larkAppId).botId,
+          ownerLarkAppId: ds.larkAppId,
+          sessionId: ds.session.sessionId,
+          requestIdentity: `restore:${ds.session.sessionId}`,
+          observation: 'exists',
+          promptInput: '',
+          resumeOrTurnId: true,
+          executor: 'adopt',
+          restoredFromMetadata: true,
+          activeSessions,
+        });
+        const adoptTerminal = adoptActivation.kind === 'duplicate'
+          ? adoptActivation.outcome
+          : adoptActivation;
+        if (adoptTerminal.kind !== 'active') {
+          logger.warn(
+            `[${session.sessionId.substring(0, 8)}] Adopt restore activation settled ${adoptTerminal.kind}: `
+            + `${'message' in adoptTerminal ? adoptTerminal.message : 'activation was not accepted'}`,
+          );
+        }
         logger.info(`[${session.sessionId.substring(0, 8)}] Restored adopt session (target: ${adoptTargetLabel(adopted)}, scope: ${scope})`);
         continue;
       }
@@ -1854,7 +1894,7 @@ export async function restoreActiveSessions(
       announceSessionRow(ds);
       if (restoredPendingRepo) {
         try {
-          await resumeRestoredPendingRepoSetup(ds, activeSessions);
+          await resumeRestoredPendingRepoSetup(ds, activeSessions, activation);
         } catch (err) {
           // One unavailable scan/Lark send/worktree import must not abort the
           // entire daemon restore. Rebuild volatile buffers from the retained
@@ -2697,9 +2737,18 @@ export async function executeScheduledTask(
   task: ScheduledTask,
   activeSessions: Map<string, DaemonSession>,
   refreshCliVersion: RefreshCliVersion,
+  activation?: Pick<
+    import('./current-session-activation.js').CurrentSessionActivationCoordinator,
+    'ensure'
+  >,
 ): Promise<void> {
   const { executeScheduledTaskThroughRuntime } = await import('./current-scheduled-fire.js');
-  return executeScheduledTaskThroughRuntime(task, activeSessions, refreshCliVersion);
+  return executeScheduledTaskThroughRuntime(
+    task,
+    activeSessions,
+    refreshCliVersion,
+    activation,
+  );
 }
 
 // ─── Dashboard「创建会话」spawn / activate ───────────────────────────────────

@@ -3,7 +3,7 @@
   "purpose": "Target-A 可执行覆盖台账：由源码和 A0 authority inventory 证明已迁移边界与 remaining bypass，不声明 Target-B durability。",
   "authorityInventory": {
     "path": "docs/architecture/session-authority-inventory.json",
-    "sha256": "c225b2e4c909448906065c7f5f583c62df49e55e30205027a928d7d61f419a21"
+    "sha256": "e456bd63dd19c5bbf5962e6c826065a45d0df06f26d696e73073e852ebcad55d"
   },
   "coverage": [
     {
@@ -151,7 +151,7 @@
       "authoritySites": {
         "recordCount": 91,
         "mutationCount": 93,
-        "digest": "250cd57ce92738a06ae83247ca092e72c21c59be814e17e73e1de7f1fc85ffb1"
+        "digest": "26a575baddbb13b614bfe1ea632bf4d27fb587d4b82c302fa41b23b619bc641a"
       },
       "rawPublisherSelectors": [
         {
@@ -431,12 +431,12 @@
         "deferredPaths": [
           {
             "id": "keyed-route-admission-and-fail-close",
-            "targetMilestone": "A4",
+            "targetMilestone": "Target-A",
             "sourceFile": "src/core/current-keyed-trigger-turn.ts",
             "enclosingFunction": "failClose"
           },
           {
-            "id": "activation-and-long-executor-lifecycle",
+            "id": "activation-provider-effect-outside-lane",
             "targetMilestone": "A4",
             "sourceFile": "src/core/worker-pool.ts",
             "enclosingFunction": "forkWorker"
@@ -516,8 +516,8 @@
     {
       "id": "activation-restore",
       "targetMilestone": "A4",
-      "disposition": "remaining",
-      "description": "activation、restore、reattach、cold-resume 与 generic executor lifetime 尚未由 Runtime singleflight/lifecycle policy 收口；A3 显式保留 forkWorker 长生命周期/I/O 为 A4 remainder。",
+      "disposition": "migrated",
+      "description": "原 A4 343 mutation 已按语义重审：225 条记录 / 226 个 mutation 是 activation/restore/provider protocol，现由 stable BotId + daemon epoch 的 singleflight coordinator 收口；其余 117 个 mutation 属显式 lifecycle/control（53）、active-route maintenance（6）、fresh Session creation（30）与 generation-precommit command creation（28），由 projection/remaining-bypass 精确重分类而不冒充 activation。Current Adapter 保留 Riff/Codex App/adopt/classic provider protocol；unknown 只可由 typed exists/missing re-probe 解 quarantine，worker exit 只退役 executor、不写 closed。",
       "selectors": [
         {
           "sourceFile": "src/core/session-manager.ts",
@@ -535,26 +535,16 @@
           "enclosingFunctions": [
             "admitQueuedActivationTail",
             "clearQueuedActivationJournal",
-            "closeSession",
-            "closeUnregisteredCollisionLoser",
             "forkAdoptWorker",
-            "forkSession",
             "forkWorker",
-            "killWorker",
             "persistActivationAck",
             "reparkQueuedActivationFollowUpTail",
             "reparkUnsubmittedQueuedActivation",
             "releaseReservation",
-            "removeInactiveRegistration",
-            "requestSessionRestart",
             "reserveQueuedActivationTailAdmission",
             "resolveQuarantinedForkPlan",
             "restoreQueuedActivationJournal",
-            "rollbackWorkerForkPreInit",
-            "setActiveSessionIfActive",
-            "setActiveSessionSafe",
-            "suspendWorker",
-            "transferSession"
+            "rollbackWorkerForkPreInit"
           ]
         },
         {
@@ -563,21 +553,112 @@
             "prepareQueuedActivationRecoveryFork",
             "promoteQueuedActivationTailTyped"
           ]
-        },
-        {
-          "sourceFile": "src/core/command-handler.ts",
-          "enclosingFunctions": [
-            "startAdoptSession",
-            "startCodexAppThreadSession",
-            "startForkSubtopicSession",
-            "startResumeImportSession"
-          ]
         }
       ],
       "authoritySites": {
-        "recordCount": 342,
-        "mutationCount": 343,
-        "digest": "14c6d56360abc231f7a03615ff82fe4f9e3865107a0298226f0ad02beba01260"
+        "recordCount": 225,
+        "mutationCount": 226,
+        "digest": "32c738b06336b54eddd780cbe7a563a571f1599383be8fad8e46651aa4651b85"
+      },
+      "productionBinding": {
+        "runtimeSource": "src/core/session-activation-runtime.ts",
+        "runtimeFactory": "createSessionActivationRuntime",
+        "currentAdapterSource": "src/core/current-session-activation.ts",
+        "currentAdapterFactory": "createCurrentSessionActivationPort",
+        "coordinatorFactory": "currentSessionActivationCoordinator",
+        "sharedLaneSource": "src/core/current-session-command-lane.ts",
+        "sharedLaneExport": "currentSessionCommandLane",
+        "laneAddressFactory": "currentSessionLaneAddress",
+        "currentRuntimeSource": "src/core/current-session-runtime.ts",
+        "currentRuntimeFactory": "currentSessionRuntimeHost",
+        "daemonSource": "src/daemon.ts",
+        "daemonFactory": "currentDaemonSessionActivation",
+        "providerSource": "src/core/worker-pool.ts",
+        "managedProvider": "forkWorker",
+        "adoptProvider": "forkAdoptWorker",
+        "typedTailRecovery": "prepareQueuedActivationRecoveryFork",
+        "typedTailPromotion": "promoteQueuedActivationTailTyped",
+        "generationOracle": "test/current-session-executor-runtime.test.ts",
+        "workerExitOracle": "test/session-lifecycle-hooks.test.ts",
+        "restoreOracle": "test/restore-zombie-close.test.ts",
+        "terminalOracle": "test/session-terminal-activation.test.ts",
+        "callerCuts": [
+          {
+            "sourceFile": "src/core/current-ordinary-ingress-worker-processes.ts",
+            "enclosingFunction": "createCurrentOrdinaryIngressWorkerProcesses",
+            "coordinatorCall": "ensure"
+          },
+          {
+            "sourceFile": "src/core/current-keyed-trigger-turn.ts",
+            "enclosingFunction": "createCurrentKeyedTriggerTurnPort",
+            "coordinatorCall": "ensure"
+          },
+          {
+            "sourceFile": "src/core/current-pending-repo-completion-production.ts",
+            "enclosingFunction": "createCurrentPendingRepoCompletionProduction",
+            "coordinatorCall": "ensure"
+          },
+          {
+            "sourceFile": "src/core/current-pending-repo-completion-submit.ts",
+            "enclosingFunction": "submitCurrentPendingRepoCompletion",
+            "coordinatorCall": "currentSessionActivationCoordinator"
+          },
+          {
+            "sourceFile": "src/core/current-scheduled-fire.ts",
+            "enclosingFunction": "createCurrentScheduledFireAdapter",
+            "coordinatorCall": "ensure"
+          },
+          {
+            "sourceFile": "src/core/session-manager.ts",
+            "enclosingFunction": "resumeRestoredPendingRepoSetup",
+            "coordinatorCall": "reconcile"
+          },
+          {
+            "sourceFile": "src/core/session-manager.ts",
+            "enclosingFunction": "restoreActiveSessions",
+            "coordinatorCall": "reconcile"
+          },
+          {
+            "sourceFile": "src/core/session-manager.ts",
+            "enclosingFunction": "ensureTerminalWorkerPort",
+            "coordinatorCall": "reconcileCurrentSessionActivation"
+          },
+          {
+            "sourceFile": "src/daemon.ts",
+            "enclosingFunction": "currentDaemonSessionRuntimeHost",
+            "coordinatorCall": "currentDaemonSessionActivation"
+          },
+          {
+            "sourceFile": "src/daemon.ts",
+            "enclosingFunction": "prewarmDocCommentSession",
+            "coordinatorCall": "ensure"
+          },
+          {
+            "sourceFile": "src/daemon.ts",
+            "enclosingFunction": "handleDocCommentAdmitted",
+            "coordinatorCall": "ensure"
+          },
+          {
+            "sourceFile": "src/im/lark/card-handler.ts",
+            "enclosingFunction": "handleCardAction",
+            "coordinatorCall": "ensure"
+          }
+        ],
+        "retainedDirectCallClasses": [
+          "fresh-session-creation",
+          "generation-precommit-trigger",
+          "provider-internal-recovery",
+          "explicit-control-lifecycle"
+        ],
+        "reviewedLegacyPartition": {
+          "originalMutationCount": 343,
+          "migratedProviderMutationCount": 226,
+          "reclassifiedOtherMutationCount": 117,
+          "explicitLifecycleControl": 53,
+          "activeRouteMaintenance": 6,
+          "freshSessionCreation": 30,
+          "generationPrecommitCreation": 28
+        }
       }
     },
     {
@@ -630,9 +711,9 @@
         }
       ],
       "authoritySites": {
-        "recordCount": 12,
-        "mutationCount": 12,
-        "digest": "fa415c886de97f0a9cc2a2286735f1489ee10c87f63f22a05703a942f153d9b2"
+        "recordCount": 16,
+        "mutationCount": 16,
+        "digest": "7f36bf6841f9417fcc28cf3b77d7fadd304655e869f569c634600b13bb6b6e0a"
       },
       "productionBinding": {
         "protocolSource": "src/core/dashboard-projection.ts",
@@ -657,9 +738,9 @@
         }
       ],
       "authoritySites": {
-        "recordCount": 674,
-        "mutationCount": 677,
-        "digest": "57a3fb87f913a08a4c4de009013c3ffbda87794d800b79fb76e81ef4572fc920"
+        "recordCount": 787,
+        "mutationCount": 790,
+        "digest": "aeee7a1fa18190cf293cff88eb38ed98ab69be266487f8ce2c7905c2c6af10f6"
       },
       "rawPublisherSelectors": [
         {

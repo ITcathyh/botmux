@@ -125,26 +125,41 @@ function adapterWithSelectedPrimitive(input: {
   const sendWorkerInput = (input.kind === 'sendWorkerInput'
     ? selected
     : vi.fn(() => true)) as unknown as CurrentOrdinaryIngressWorkerProcessPrimitives['sendWorkerInput'];
-  const forkWorker = (input.kind === 'forkWorker'
-    ? selected
-    : vi.fn(() => true)) as unknown as CurrentOrdinaryIngressWorkerProcessPrimitives['forkWorker'];
-  const forkAdoptWorker = (input.kind === 'forkAdoptWorker'
-    ? selected
-    : vi.fn(() => true)) as unknown as CurrentOrdinaryIngressWorkerProcessPrimitives['forkAdoptWorker'];
+  const ensure = vi.fn(async () => {
+    if (input.kind === 'sendWorkerInput') return { kind: 'active' as const, action: 'activated' as const };
+    const current = [...input.activeSessions.values()][0]!;
+    let value = selected(current);
+    if (value && typeof (value as PromiseLike<unknown>).then === 'function') value = await value;
+    if (value === false) return { kind: 'retryable' as const, message: 'activation refused' };
+    if (value === true) return { kind: 'active' as const, action: 'activated' as const };
+    const live = current.worker !== null && !current.worker.killed;
+    return live
+      ? { kind: 'active' as const, action: 'activated' as const }
+      : { kind: 'ambiguous' as const, message: 'activation returned without a provable worker lifetime' };
+  });
   return {
     selected,
+    ensure,
     workerProcesses: createCurrentOrdinaryIngressWorkerProcesses({
       ownerLarkAppId: OWNER,
       activeSessions: input.activeSessions,
       sendWorkerInput,
-      forkWorker,
-      forkAdoptWorker,
+      activation: { ensure },
     }),
   };
 }
 
+function activation(
+  implementation: () => Promise<
+    | { kind: 'active'; action: 'activated' }
+    | { kind: 'retryable'; message: string }
+  > = async () => ({ kind: 'active', action: 'activated' }),
+) {
+  return { ensure: vi.fn(implementation) };
+}
+
 describe('Current ordinary ingress worker-process Adapter', () => {
-  it('re-resolves a same-Session replacement before invoking a worker primitive', () => {
+  it('re-resolves a same-Session replacement before invoking a worker primitive', async () => {
     const replaced = daemonSession();
     const current = daemonSession();
     const activeSessions = new Map<string, DaemonSession>([[activeSessionKey(replaced), replaced]]);
@@ -153,12 +168,11 @@ describe('Current ordinary ingress worker-process Adapter', () => {
       ownerLarkAppId: OWNER,
       activeSessions,
       sendWorkerInput,
-      forkWorker: vi.fn(() => true),
-      forkAdoptWorker: vi.fn(),
+      activation: activation(),
     });
     activeSessions.set(activeSessionKey(current), current);
 
-    const result = workerProcesses.dispatch(sendCommand());
+    const result = await workerProcesses.dispatch(sendCommand());
 
     expect(result).toEqual({ kind: 'accepted' });
     expect(sendWorkerInput).toHaveBeenCalledWith(
@@ -171,20 +185,19 @@ describe('Current ordinary ingress worker-process Adapter', () => {
     expect(sendWorkerInput.mock.calls[0]?.[0]).not.toBe(replaced);
   });
 
-  it('forks the exact queued activation with its structured Codex input', () => {
+  it('forks the exact queued activation with its structured Codex input', async () => {
     const current = daemonSession();
     current.worker = null;
     current.session.queuedActivationPending = true;
     current.session.queuedActivationToken = 'activation-token-7';
     current.session.queuedActivationDispatchAttempt = 4;
     const activeSessions = new Map<string, DaemonSession>([[activeSessionKey(current), current]]);
-    const forkWorker = vi.fn(() => true);
+    const ownerActivation = activation();
     const workerProcesses = createCurrentOrdinaryIngressWorkerProcesses({
       ownerLarkAppId: OWNER,
       activeSessions,
       sendWorkerInput: vi.fn(() => true),
-      forkWorker,
-      forkAdoptWorker: vi.fn(),
+      activation: ownerActivation,
     });
     const payload: CliTurnPayload = {
       content: '<user_message>legacy fallback</user_message>',
@@ -197,22 +210,28 @@ describe('Current ordinary ingress worker-process Adapter', () => {
       codexAppSteerable: true,
     };
 
-    const result = workerProcesses.dispatch(forkCommand({
+    const result = await workerProcesses.dispatch(forkCommand({
       payload,
       queuedActivationToken: 'activation-token-7',
       dispatchAttempt: 4,
     }));
 
     expect(result).toEqual({ kind: 'accepted' });
-    expect(forkWorker).toHaveBeenCalledWith(current, payload, {
-      resume: false,
-      turnId: 'om_worker_fork',
-      dispatchAttempt: 4,
-      codexAppInputGateFrozen: true,
+    expect(ownerActivation.ensure).toHaveBeenCalledWith({
+      sessionId: SESSION_ID,
+      requestIdentity: 'om_worker_fork',
+      cause: 'ordinary',
+      promptInput: payload,
+      resumeOrTurnId: {
+        resume: false,
+        turnId: 'om_worker_fork',
+        dispatchAttempt: 4,
+        codexAppInputGateFrozen: true,
+      },
     });
   });
 
-  it('forks only the current adopted binding and proves a void helper by its new worker lifetime', () => {
+  it('forks only the current adopted binding and proves a void helper by its new worker lifetime', async () => {
     const current = daemonSession();
     current.worker = null;
     current.adoptedFrom = {
@@ -222,28 +241,28 @@ describe('Current ordinary ingress worker-process Adapter', () => {
     };
     current.session.adoptedFrom = current.adoptedFrom;
     const activeSessions = new Map<string, DaemonSession>([[activeSessionKey(current), current]]);
-    const forkAdoptWorker = vi.fn((target: DaemonSession) => {
-      target.workerGeneration += 1;
-      target.worker = { killed: false } as DaemonSession['worker'];
-    });
+    const ownerActivation = activation();
     const workerProcesses = createCurrentOrdinaryIngressWorkerProcesses({
       ownerLarkAppId: OWNER,
       activeSessions,
       sendWorkerInput: vi.fn(() => true),
-      forkWorker: vi.fn(() => true),
-      forkAdoptWorker,
+      activation: ownerActivation,
     });
 
-    const result = workerProcesses.dispatch(adoptCommand());
+    const result = await workerProcesses.dispatch(adoptCommand());
 
     expect(result).toEqual({ kind: 'accepted' });
-    expect(forkAdoptWorker).toHaveBeenCalledWith(current, {
-      prompt: 'bridge prompt',
-      turnId: 'om_worker_adopt',
+    expect(ownerActivation.ensure).toHaveBeenCalledWith({
+      sessionId: SESSION_ID,
+      requestIdentity: 'om_worker_adopt',
+      cause: 'ordinary',
+      promptInput: expect.objectContaining({ content: 'bridge prompt' }),
+      resumeOrTurnId: { turnId: 'om_worker_adopt' },
+      executor: 'adopt',
     });
   });
 
-  it('preserves structured Codex send input and its explicit steer authorization', () => {
+  it('preserves structured Codex send input and its explicit steer authorization', async () => {
     const current = daemonSession();
     const activeSessions = new Map<string, DaemonSession>([[activeSessionKey(current), current]]);
     const sendWorkerInput = vi.fn(() => true);
@@ -251,8 +270,7 @@ describe('Current ordinary ingress worker-process Adapter', () => {
       ownerLarkAppId: OWNER,
       activeSessions,
       sendWorkerInput,
-      forkWorker: vi.fn(() => true),
-      forkAdoptWorker: vi.fn(),
+      activation: activation(),
     });
     const payload: CliTurnPayload = {
       content: '<user_message>fallback</user_message>',
@@ -263,13 +281,13 @@ describe('Current ordinary ingress worker-process Adapter', () => {
       codexAppSteerable: true,
     };
 
-    expect(workerProcesses.dispatch(sendCommand(payload))).toEqual({ kind: 'accepted' });
+    expect(await workerProcesses.dispatch(sendCommand(payload))).toEqual({ kind: 'accepted' });
     expect(sendWorkerInput).toHaveBeenCalledWith(current, payload, 'om_worker_send', {
       codexAppSteerable: true,
     });
   });
 
-  it('refuses stale owner, registry key, and worker-generation bindings before send', () => {
+  it('refuses stale owner, registry key, and worker-generation bindings before send', async () => {
     const sendWorkerInput = vi.fn(() => true);
     const foreign = daemonSession({ ownerLarkAppId: 'app-foreign-owner' });
     const wrongKey = daemonSession();
@@ -285,10 +303,9 @@ describe('Current ordinary ingress worker-process Adapter', () => {
         ownerLarkAppId: OWNER,
         activeSessions,
         sendWorkerInput,
-        forkWorker: vi.fn(() => true),
-        forkAdoptWorker: vi.fn(),
+        activation: activation(),
       });
-      expect(workerProcesses.dispatch(sendCommand())).toMatchObject({ kind: 'refused' });
+      expect(await workerProcesses.dispatch(sendCommand())).toMatchObject({ kind: 'refused' });
     }
     expect(sendWorkerInput).not.toHaveBeenCalled();
   });
@@ -297,53 +314,51 @@ describe('Current ordinary ingress worker-process Adapter', () => {
     ['a stale token', 'stale-token', 4],
     ['a stale dispatch attempt', 'activation-token-9', 3],
     ['a missing token', undefined, undefined],
-  ] as const)('refuses queued fork with %s', (_label, token, dispatchAttempt) => {
+  ] as const)('refuses queued fork with %s', async (_label, token, dispatchAttempt) => {
     const current = daemonSession();
     current.worker = null;
     current.session.queuedActivationPending = true;
     current.session.queuedActivationToken = 'activation-token-9';
     current.session.queuedActivationDispatchAttempt = 4;
     const activeSessions = new Map<string, DaemonSession>([[activeSessionKey(current), current]]);
-    const forkWorker = vi.fn(() => true);
+    const ownerActivation = activation();
     const workerProcesses = createCurrentOrdinaryIngressWorkerProcesses({
       ownerLarkAppId: OWNER,
       activeSessions,
       sendWorkerInput: vi.fn(() => true),
-      forkWorker,
-      forkAdoptWorker: vi.fn(),
+      activation: ownerActivation,
     });
 
-    const result = workerProcesses.dispatch(forkCommand({
+    const result = await workerProcesses.dispatch(forkCommand({
       ...(token === undefined ? {} : { queuedActivationToken: token }),
       ...(dispatchAttempt === undefined ? {} : { dispatchAttempt }),
     }));
 
     expect(result).toMatchObject({ kind: 'refused' });
-    expect(forkWorker).not.toHaveBeenCalled();
+    expect(ownerActivation.ensure).not.toHaveBeenCalled();
   });
 
-  it('refuses adopt dispatch for a current non-adopted Session', () => {
+  it('refuses adopt dispatch for a current non-adopted Session', async () => {
     const current = daemonSession();
     current.worker = null;
     const activeSessions = new Map<string, DaemonSession>([[activeSessionKey(current), current]]);
-    const forkAdoptWorker = vi.fn(() => true);
+    const ownerActivation = activation();
     const workerProcesses = createCurrentOrdinaryIngressWorkerProcesses({
       ownerLarkAppId: OWNER,
       activeSessions,
       sendWorkerInput: vi.fn(() => true),
-      forkWorker: vi.fn(() => true),
-      forkAdoptWorker,
+      activation: ownerActivation,
     });
 
-    expect(workerProcesses.dispatch(adoptCommand())).toMatchObject({ kind: 'refused' });
-    expect(forkAdoptWorker).not.toHaveBeenCalled();
+    expect(await workerProcesses.dispatch(adoptCommand())).toMatchObject({ kind: 'refused' });
+    expect(ownerActivation.ensure).not.toHaveBeenCalled();
   });
 
   it.each([
     'sendWorkerInput',
     'forkWorker',
     'forkAdoptWorker',
-  ] as const)('maps an explicit %s primitive refusal to refused', (kind) => {
+  ] as const)('maps an explicit %s primitive refusal to refused', async (kind) => {
     const fixture = fixtureFor(kind);
     const adapter = adapterWithSelectedPrimitive({
       kind,
@@ -351,7 +366,7 @@ describe('Current ordinary ingress worker-process Adapter', () => {
       implementation: () => false,
     });
 
-    const result = adapter.workerProcesses.dispatch(fixture.command);
+    const result = await adapter.workerProcesses.dispatch(fixture.command);
 
     expect(result).toMatchObject({ kind: 'refused' });
     expect(adapter.selected).toHaveBeenCalledTimes(1);
@@ -363,7 +378,7 @@ describe('Current ordinary ingress worker-process Adapter', () => {
     'sendWorkerInput',
     'forkWorker',
     'forkAdoptWorker',
-  ] as const)('maps a throwing %s primitive to unknown', (kind) => {
+  ] as const)('maps a throwing %s primitive to unknown', async (kind) => {
     const fixture = fixtureFor(kind);
     const adapter = adapterWithSelectedPrimitive({
       kind,
@@ -371,7 +386,7 @@ describe('Current ordinary ingress worker-process Adapter', () => {
       implementation: () => { throw new Error(`${kind} failed after entry`); },
     });
 
-    const result = adapter.workerProcesses.dispatch(fixture.command);
+    const result = await adapter.workerProcesses.dispatch(fixture.command);
 
     expect(result).toMatchObject({
       kind: 'unknown',
@@ -384,7 +399,7 @@ describe('Current ordinary ingress worker-process Adapter', () => {
     'sendWorkerInput',
     'forkWorker',
     'forkAdoptWorker',
-  ] as const)('rejects an asynchronous %s primitive result synchronously', (kind) => {
+  ] as const)('accepts asynchronous activation results only outside the Session lane for %s', async (kind) => {
     const fixture = fixtureFor(kind);
     const adapter = adapterWithSelectedPrimitive({
       kind,
@@ -392,21 +407,16 @@ describe('Current ordinary ingress worker-process Adapter', () => {
       implementation: () => Promise.resolve(true),
     });
 
-    const result = adapter.workerProcesses.dispatch(fixture.command);
+    const result = await adapter.workerProcesses.dispatch(fixture.command);
 
-    expect(result).toMatchObject({
-      kind: 'unknown',
-      message: expect.stringMatching(/must return synchronously/i),
-    });
-    expect(result).not.toBeInstanceOf(Promise);
-    expect('then' in result).toBe(false);
+    expect(result).toMatchObject({ kind: kind === 'sendWorkerInput' ? 'unknown' : 'accepted' });
   });
 
   it.each([
     'sendWorkerInput',
     'forkWorker',
     'forkAdoptWorker',
-  ] as const)('returns unknown when %s replaces its Current binding during the call', (kind) => {
+  ] as const)('returns unknown when %s replaces its Current binding during the call', async (kind) => {
     const fixture = fixtureFor(kind);
     const replacement = daemonSession();
     const adapter = adapterWithSelectedPrimitive({
@@ -418,13 +428,13 @@ describe('Current ordinary ingress worker-process Adapter', () => {
       },
     });
 
-    const result = adapter.workerProcesses.dispatch(fixture.command);
+    const result = await adapter.workerProcesses.dispatch(fixture.command);
 
     expect(result).toMatchObject({ kind: 'unknown' });
     expect(adapter.selected).toHaveBeenCalledTimes(1);
   });
 
-  it('returns unknown when a helper changes the Session identity in place', () => {
+  it('returns unknown when a helper changes the Session identity in place', async () => {
     const fixture = fixtureFor('sendWorkerInput');
     const adapter = adapterWithSelectedPrimitive({
       kind: 'sendWorkerInput',
@@ -435,7 +445,7 @@ describe('Current ordinary ingress worker-process Adapter', () => {
       },
     });
 
-    const result = adapter.workerProcesses.dispatch(fixture.command);
+    const result = await adapter.workerProcesses.dispatch(fixture.command);
 
     expect(result).toMatchObject({ kind: 'unknown' });
   });
@@ -444,7 +454,7 @@ describe('Current ordinary ingress worker-process Adapter', () => {
     'sendWorkerInput',
     'forkWorker',
     'forkAdoptWorker',
-  ] as const)('returns unknown when %s replaces the Session record with the same id', (kind) => {
+  ] as const)('returns unknown when %s replaces the Session record with the same id', async (kind) => {
     const fixture = fixtureFor(kind);
     const adapter = adapterWithSelectedPrimitive({
       kind,
@@ -455,13 +465,13 @@ describe('Current ordinary ingress worker-process Adapter', () => {
       },
     });
 
-    const result = adapter.workerProcesses.dispatch(fixture.command);
+    const result = await adapter.workerProcesses.dispatch(fixture.command);
 
     expect(result).toMatchObject({ kind: 'unknown' });
     expect(adapter.selected).toHaveBeenCalledTimes(1);
   });
 
-  it('returns unknown when a helper leaves two exact bindings for the Session identity', () => {
+  it('returns unknown when a helper leaves two exact bindings for the Session identity', async () => {
     const fixture = fixtureFor('sendWorkerInput');
     const duplicate = daemonSession();
     duplicate.session.rootMessageId = 'om_duplicate_current_route';
@@ -474,12 +484,12 @@ describe('Current ordinary ingress worker-process Adapter', () => {
       },
     });
 
-    const result = adapter.workerProcesses.dispatch(fixture.command);
+    const result = await adapter.workerProcesses.dispatch(fixture.command);
 
     expect(result).toMatchObject({ kind: 'unknown' });
   });
 
-  it('returns unknown when a void adopt helper leaves no provable new worker lifetime', () => {
+  it('returns unknown when a void adopt helper leaves no provable new worker lifetime', async () => {
     const fixture = fixtureFor('forkAdoptWorker');
     const adapter = adapterWithSelectedPrimitive({
       kind: 'forkAdoptWorker',
@@ -487,7 +497,7 @@ describe('Current ordinary ingress worker-process Adapter', () => {
       implementation: () => undefined,
     });
 
-    const result = adapter.workerProcesses.dispatch(fixture.command);
+    const result = await adapter.workerProcesses.dispatch(fixture.command);
 
     expect(result).toMatchObject({
       kind: 'unknown',
@@ -495,7 +505,7 @@ describe('Current ordinary ingress worker-process Adapter', () => {
     });
   });
 
-  it('fail-closes a hostile thenable without leaking it from dispatch', () => {
+  it('fail-closes a hostile thenable without leaking it from dispatch', async () => {
     const fixture = fixtureFor('sendWorkerInput');
     const hostile = Object.defineProperty({}, 'then', {
       get() { throw new Error('hostile then getter'); },
@@ -506,13 +516,13 @@ describe('Current ordinary ingress worker-process Adapter', () => {
       implementation: () => hostile,
     });
 
-    const result = adapter.workerProcesses.dispatch(fixture.command);
+    const result = await adapter.workerProcesses.dispatch(fixture.command);
 
     expect(result).toMatchObject({ kind: 'unknown' });
     expect(result).not.toBe(hostile);
   });
 
-  it('never leaks a primitive-returned DaemonSession through the result seam', () => {
+  it('never leaks a primitive-returned DaemonSession through the result seam', async () => {
     const fixture = fixtureFor('sendWorkerInput');
     const adapter = adapterWithSelectedPrimitive({
       kind: 'sendWorkerInput',
@@ -520,7 +530,7 @@ describe('Current ordinary ingress worker-process Adapter', () => {
       implementation: current => current,
     });
 
-    const result = adapter.workerProcesses.dispatch(fixture.command);
+    const result = await adapter.workerProcesses.dispatch(fixture.command);
 
     expect(result).toMatchObject({ kind: 'unknown' });
     expect(result).not.toBe(fixture.current);

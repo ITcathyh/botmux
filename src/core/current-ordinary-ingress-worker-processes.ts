@@ -11,6 +11,7 @@ import type {
 } from './current-ordinary-ingress-production.js';
 import { activeSessionKey, type DaemonSession } from './types.js';
 import type { CliTurnPayload } from '../types.js';
+import type { CurrentSessionActivationCoordinator } from './current-session-activation.js';
 
 export interface CurrentOrdinaryIngressWorkerProcessPrimitives {
   sendWorkerInput(
@@ -19,20 +20,7 @@ export interface CurrentOrdinaryIngressWorkerProcessPrimitives {
     turnId: string,
     options: { readonly codexAppSteerable?: true },
   ): boolean;
-  forkWorker(
-    current: DaemonSession,
-    input: CliTurnPayload,
-    options: {
-      readonly resume: boolean;
-      readonly turnId: string;
-      readonly dispatchAttempt?: number;
-      readonly codexAppInputGateFrozen?: boolean;
-    },
-  ): boolean;
-  forkAdoptWorker(
-    current: DaemonSession,
-    options: { readonly prompt: string; readonly turnId: string },
-  ): boolean | void;
+  readonly activation: Pick<CurrentSessionActivationCoordinator, 'ensure'>;
 }
 
 export interface CurrentOrdinaryIngressWorkerProcessesOptions
@@ -85,6 +73,25 @@ function detachThenable(value: unknown): void {
   } catch {
     // A hostile `then` accessor is already classified as unknown.
   }
+}
+
+function activationResult(
+  outcome: Awaited<ReturnType<CurrentSessionActivationCoordinator['ensure']>>,
+): CurrentOrdinaryIngressWorkerProcessResult {
+  const terminal = outcome.kind === 'duplicate' ? outcome.outcome : outcome;
+  if (terminal.kind === 'active') {
+    return terminal.action === 'alreadyActive'
+      ? { kind: 'stateChanged' }
+      : { kind: 'accepted' };
+  }
+  if (terminal.kind === 'retryable') return refused(terminal.message);
+  if (terminal.kind === 'stale') return { kind: 'stateChanged' };
+  if (terminal.kind === 'rejected') {
+    return terminal.reason === 'conflict'
+      ? unknown(terminal.message)
+      : refused(terminal.message);
+  }
+  return unknown(terminal.message);
 }
 
 function resolveCurrent(
@@ -148,7 +155,7 @@ export function createCurrentOrdinaryIngressWorkerProcesses(
   options: CurrentOrdinaryIngressWorkerProcessesOptions,
 ): CurrentOrdinaryIngressWorkerProcesses {
   return {
-    dispatch(command) {
+    async dispatch(command) {
       const resolved = resolvedOrOutcome(options, command);
       if (!('current' in resolved)) return resolved;
 
@@ -166,68 +173,52 @@ export function createCurrentOrdinaryIngressWorkerProcesses(
           return refused('ordinary ingress queued activation command is missing its exact token');
         }
 
-        let result: unknown;
         try {
-          result = options.forkWorker(resolved.current, command.input, {
-            resume: command.resume,
-            turnId: command.turnId,
-            ...(command.dispatchAttempt === undefined
-              ? {}
-              : { dispatchAttempt: command.dispatchAttempt }),
-            ...(command.queuedActivationToken === undefined
-              ? {}
-              : { codexAppInputGateFrozen: true }),
+          const outcome = await options.activation.ensure({
+            sessionId: resolved.sessionId,
+            requestIdentity: command.turnId,
+            cause: 'ordinary',
+            promptInput: command.input,
+            resumeOrTurnId: {
+              resume: command.resume,
+              turnId: command.turnId,
+              ...(command.dispatchAttempt === undefined
+                ? {}
+                : { dispatchAttempt: command.dispatchAttempt }),
+              ...(command.queuedActivationToken === undefined
+                ? {}
+                : { codexAppInputGateFrozen: true }),
+            },
           });
+          if (!bindingIsStillExact(options, resolved)) {
+            return unknown('Current Session binding changed during ordinary ingress activation');
+          }
+          return activationResult(outcome);
         } catch (error) {
           return unknown(`ordinary ingress fork outcome is unknown: ${message(error)}`);
         }
-        if (isThenable(result)) {
-          detachThenable(result);
-          return unknown('ordinary ingress fork primitive must return synchronously');
-        }
-        if (result === false) return refused('ordinary ingress fork primitive refused the activation');
-        if (result !== true) return unknown('ordinary ingress fork primitive returned no acceptance proof');
-        if (!bindingIsStillExact(options, resolved)) {
-          return unknown('Current Session binding changed during ordinary ingress fork');
-        }
-        return { kind: 'accepted' };
       }
 
       if (command.kind === 'forkAdoptWorker') {
         if (!resolved.current.adoptedFrom) {
           return refused('ordinary ingress adopt fork targets a non-adopted Current Session');
         }
-        const priorWorker = resolved.current.worker;
-        const priorGeneration = resolved.current.workerGeneration;
-        let result: unknown;
         try {
-          result = options.forkAdoptWorker(resolved.current, {
-            prompt: command.input.content,
-            turnId: command.turnId,
+          const outcome = await options.activation.ensure({
+            sessionId: resolved.sessionId,
+            requestIdentity: command.turnId,
+            cause: 'ordinary',
+            promptInput: command.input,
+            resumeOrTurnId: { turnId: command.turnId },
+            executor: 'adopt',
           });
+          if (!bindingIsStillExact(options, resolved) || !resolved.current.adoptedFrom) {
+            return unknown('Current adopted Session binding changed during ordinary ingress activation');
+          }
+          return activationResult(outcome);
         } catch (error) {
           return unknown(`ordinary ingress adopt fork outcome is unknown: ${message(error)}`);
         }
-        if (isThenable(result)) {
-          detachThenable(result);
-          return unknown('ordinary ingress adopt fork primitive must return synchronously');
-        }
-        if (result === false) {
-          return refused('ordinary ingress adopt fork primitive refused the activation');
-        }
-        if (!bindingIsStillExact(options, resolved) || !resolved.current.adoptedFrom) {
-          return unknown('Current adopted Session binding changed during ordinary ingress fork');
-        }
-        if (result === true) return { kind: 'accepted' };
-        if (result !== undefined) {
-          return unknown('ordinary ingress adopt fork primitive returned an invalid result');
-        }
-        const liveWorker = resolved.current.worker !== null && !resolved.current.worker.killed;
-        const lifetimeChanged = resolved.current.worker !== priorWorker
-          || resolved.current.workerGeneration !== priorGeneration;
-        return liveWorker && lifetimeChanged
-          ? { kind: 'accepted' }
-          : unknown('ordinary ingress adopt fork returned without a provable worker lifetime');
       }
 
       if (resolved.current.workerGeneration !== command.workerGeneration) {

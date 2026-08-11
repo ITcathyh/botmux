@@ -11,6 +11,10 @@ import type {
 import { activeSessionKey, type DaemonSession } from './types.js';
 import { getDaemonBootId } from './worker-pool.js';
 import type { BotId } from './bot-identity.js';
+import {
+  currentSessionActivationCoordinator,
+  type CurrentSessionActivationCoordinator,
+} from './current-session-activation.js';
 
 export interface CurrentPendingRepoCompletionSubmitInput {
   /** Production callers receive this binding from the daemon's startup gate. */
@@ -27,6 +31,7 @@ export interface CurrentPendingRepoCompletionPortInput {
   readonly ownerLarkAppId: string;
   readonly activeSessions: Map<string, DaemonSession>;
   readonly ownerBootId: string;
+  readonly activation?: Pick<CurrentSessionActivationCoordinator, 'ensure'>;
 }
 
 interface CachedPort {
@@ -79,6 +84,7 @@ export function currentPendingRepoCompletionPort(
   const port = createCurrentPendingRepoCompletionProduction({
     ownerLarkAppId: input.ownerLarkAppId,
     activeSessions: input.activeSessions,
+    ...(input.activation === undefined ? {} : { activation: input.activation }),
   });
   byOwner.set(input.ownerLarkAppId, { ownerBootId: input.ownerBootId, port });
   return port;
@@ -104,10 +110,17 @@ export async function submitCurrentPendingRepoCompletion(
   if (!isExactCurrentOwner(input, capturedSession)) return { kind: 'staleAddress' };
   const capturedKey = activeSessionKey(captured);
   const ownerBootId = getDaemonBootId();
+  const activation = currentSessionActivationCoordinator({
+    ownerBotId: input.ownerBotId,
+    ownerLarkAppId: input.ownerLarkAppId,
+    runtimeEpoch: ownerBootId,
+    activeSessions: input.activeSessions,
+  });
   const pendingRepoCompletion = currentPendingRepoCompletionPort({
     ownerLarkAppId: input.ownerLarkAppId,
     activeSessions: input.activeSessions,
     ownerBootId,
+    activation,
   });
   let host: ReturnType<typeof currentSessionRuntimeHost>;
   try {

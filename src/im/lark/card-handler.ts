@@ -117,11 +117,16 @@ import {
   type CurrentPendingRepoCompletionSubmitInput,
 } from '../../core/current-pending-repo-completion-submit.js';
 import { withBotTurnAdmission, withBotTurnMutation } from '../../core/bot-turn-mutation-gate.js';
+import type { CurrentSessionActivationCoordinator } from '../../core/current-session-activation.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
 export interface CardHandlerDeps {
   activeSessions: Map<string, DaemonSession>;
+  /** Owner Host activation authority; cold card actions never call worker-pool directly. */
+  activationFor: (
+    ownerLarkAppId: string,
+  ) => Pick<CurrentSessionActivationCoordinator, 'ensure'>;
   sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string) => Promise<string>;
   lastRepoScan: Map<string, ProjectInfo[]>;
   /** v3 humanGate 审批卡点击处理（driveRun 由 daemon 接的 v3 gate runner 提供）. */
@@ -2047,8 +2052,15 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       try {
         if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, voiceInput);
         else {
-          forkWorker(ds, voiceInput, ds.hasHistory);
-          accepted = true;
+          const activation = await deps.activationFor(ds.larkAppId).ensure({
+            sessionId: ds.session.sessionId,
+            requestIdentity: `card:voice:${dedupeKey}`,
+            cause: 'ordinary',
+            promptInput: voiceInput,
+            resumeOrTurnId: ds.hasHistory,
+          });
+          const terminal = activation.kind === 'duplicate' ? activation.outcome : activation;
+          accepted = terminal.kind === 'active' && terminal.action !== 'alreadyActive';
         }
       } catch (err) {
         logger.warn(
@@ -2274,8 +2286,15 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       try {
         if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput);
         else {
-          forkWorker(ds, retryInput, ds.hasHistory);
-          accepted = true;
+          const activation = await deps.activationFor(ds.larkAppId).ensure({
+            sessionId: ds.session.sessionId,
+            requestIdentity: `card:retry:${ds.usageLimit.retryAtMs}`,
+            cause: 'ordinary',
+            promptInput: retryInput,
+            resumeOrTurnId: ds.hasHistory,
+          });
+          const terminal = activation.kind === 'duplicate' ? activation.outcome : activation;
+          accepted = terminal.kind === 'active' && terminal.action !== 'alreadyActive';
         }
       } catch (err) {
         logger.warn(

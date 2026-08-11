@@ -37,6 +37,10 @@ import * as sessionManager from './session-manager.js';
 import type { PendingRepoCompletionPort } from './session-runtime.js';
 import { activeSessionAnchorId, activeSessionKey, type DaemonSession } from './types.js';
 import * as workerPool from './worker-pool.js';
+import {
+  ensureCurrentSessionActivation,
+  type CurrentSessionActivationCoordinator,
+} from './current-session-activation.js';
 
 export interface CurrentPendingRepoCompletionNotice {
   readonly ownerLarkAppId: string;
@@ -60,16 +64,18 @@ export interface CurrentPendingRepoCompletionProductionAdapters {
     input: readonly CurrentPendingRepoWorktreeCleanupTarget[],
     assertCurrent: () => void,
   ) => Promise<CurrentPendingRepoWorktreeCleanupResult>;
-  readonly forkWorker: (
-    ds: DaemonSession,
-    input: string | CliTurnPayload,
-    resumeOrTurnId: Parameters<typeof workerPool.forkWorker>[2],
-  ) => boolean;
+  /** Test-only coordinator factory. Production injects the owner Host coordinator. */
+  readonly activationFor?: (input: {
+    readonly ownerLarkAppId: string;
+    readonly activeSessions: Map<string, DaemonSession>;
+  }) => Pick<CurrentSessionActivationCoordinator, 'ensure'>;
 }
 
 export interface CurrentPendingRepoCompletionProductionOptions {
   readonly ownerLarkAppId: string;
   readonly activeSessions: Map<string, DaemonSession>;
+  /** Stable owner/epoch activation authority from the daemon Host. */
+  readonly activation?: Pick<CurrentSessionActivationCoordinator, 'ensure'>;
   /** Internal true-external seams. Production callers omit this override. */
   readonly adapters?: CurrentPendingRepoCompletionProductionAdapters;
   /** Best-effort presentation effect; authority never depends on its result. */
@@ -210,7 +216,6 @@ const productionAdapters: CurrentPendingRepoCompletionProductionAdapters = {
     }
     return { kind: 'cleaned' };
   },
-  forkWorker: (ds, input, resumeOrTurnId) => workerPool.forkWorker(ds, input, resumeOrTurnId),
 };
 
 function currentOwner(
@@ -317,6 +322,19 @@ export function createCurrentPendingRepoCompletionProduction(
   options: CurrentPendingRepoCompletionProductionOptions,
 ): PendingRepoCompletionPort {
   const adapters = options.adapters ?? productionAdapters;
+  const activation = options.activation ?? adapters.activationFor?.({
+    ownerLarkAppId: options.ownerLarkAppId,
+    activeSessions: options.activeSessions,
+  }) ?? Object.freeze({
+    ensure: (input: Parameters<CurrentSessionActivationCoordinator['ensure']>[0]) => (
+      ensureCurrentSessionActivation({
+        ...input,
+        ownerBotId: getBot(options.ownerLarkAppId).botId,
+        ownerLarkAppId: options.ownerLarkAppId,
+        activeSessions: options.activeSessions,
+      })
+    ),
+  });
   const dispatchPlans = new Map<string, DispatchPlan>();
   let nextDispatchPlanId = 0;
   const retainDispatchPlan = (plan: DispatchPlan): string => {
@@ -790,7 +808,7 @@ export function createCurrentPendingRepoCompletionProduction(
       }
       return result;
     },
-    dispatchWorker(command) {
+    async dispatchWorker(command) {
       const dispatchPlanId = command.dispatchPlanId;
       if (dispatchPlanId === undefined) {
         return {
@@ -839,54 +857,48 @@ export function createCurrentPendingRepoCompletionProduction(
           message: queuedRecovery.message,
         };
       }
-      let accepted: unknown;
-      try {
-        accepted = plan.rawInput
-          ? adapters.forkWorker(ds, '', false)
-          : queuedRecovery
-            ? adapters.forkWorker(
-                ds,
-                queuedRecovery.promptInput,
-                queuedRecovery.resumeOrTurnId,
-              )
-            : plan.emptyStart
-              ? adapters.forkWorker(ds, '', false)
-          : adapters.forkWorker(
-              ds,
-              command.input,
-              command.resume
-                ? { resume: true, turnId: command.turnId }
-                : { turnId: command.turnId },
-            );
-        if (accepted !== null
-          && (typeof accepted === 'object' || typeof accepted === 'function')) {
-          let then: unknown;
-          try {
-            then = (accepted as { readonly then?: unknown }).then;
-          } catch {
-            throw new Error('pending-repo worker primitive returned an unreadable result');
-          }
-          if (typeof then === 'function') {
-            try {
-              void Promise.resolve(accepted).catch(() => undefined);
-            } catch {
-              // The worker outcome is already unknown and remains sticky.
+      const activationInput = plan.rawInput
+        ? { promptInput: '' as const, resumeOrTurnId: false as const }
+        : queuedRecovery
+          ? {
+              promptInput: queuedRecovery.promptInput,
+              resumeOrTurnId: queuedRecovery.resumeOrTurnId,
             }
-            throw new Error('pending-repo worker primitive must return synchronously');
-          }
-        }
+          : plan.emptyStart
+            ? { promptInput: '' as const, resumeOrTurnId: false as const }
+            : {
+                promptInput: command.input,
+                resumeOrTurnId: command.resume
+                  ? { resume: true as const, turnId: command.turnId }
+                  : { turnId: command.turnId },
+              };
+      let outcome: Awaited<ReturnType<CurrentSessionActivationCoordinator['ensure']>>;
+      try {
+        outcome = await activation.ensure({
+          sessionId: command.sessionId,
+          requestIdentity: `pending-repo:${command.claimToken}:${command.turnId}`,
+          cause: 'ordinary',
+          ...activationInput,
+        });
       } catch (error) {
         publishSwitchUncertainty(error);
         throw error;
       }
-      if (accepted === false) {
-        plan.workerRefusalMessage = 'worker refused pending-repo first start';
-        return { kind: 'refused', message: plan.workerRefusalMessage };
+      const terminal = outcome.kind === 'duplicate' ? outcome.outcome : outcome;
+      if (terminal.kind === 'retryable'
+        || (terminal.kind === 'rejected' && terminal.reason !== 'conflict')) {
+        plan.workerRefusalMessage = terminal.message;
+        return { kind: 'refused', message: terminal.message };
       }
-      if (accepted !== true) {
-        const error = new Error('pending-repo worker primitive returned an invalid result');
-        publishSwitchUncertainty(error);
-        throw error;
+      if (terminal.kind !== 'active' || terminal.action === 'alreadyActive') {
+        const uncertainty = terminal.kind === 'active'
+          ? 'pending-repo activation found an unowned live executor'
+          : terminal.message;
+        publishSwitchUncertainty(uncertainty);
+        return {
+          kind: 'unknown',
+          message: uncertainty,
+        };
       }
       if (!bindingIdentityIsCurrent(plan.binding)) {
         return {

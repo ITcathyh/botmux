@@ -200,6 +200,23 @@ function createPort(
   return createCurrentOrdinaryIngressDaemonPort({
     ownerLarkAppId: OWNER,
     activeSessions: new Map([[activeSessionKey(current), current]]),
+    activation: {
+      ensure: vi.fn(async (request) => {
+        if (request.executor === 'adopt') {
+          daemonHelpers.forkAdoptWorker(current, {
+            prompt: typeof request.promptInput === 'string'
+              ? request.promptInput
+              : request.promptInput.content,
+            turnId: typeof request.resumeOrTurnId === 'object'
+              ? request.resumeOrTurnId.turnId
+              : undefined,
+          });
+        } else {
+          daemonHelpers.forkWorker(current, request.promptInput, request.resumeOrTurnId);
+        }
+        return { kind: 'active', action: 'activated' };
+      }),
+    },
     checkQuota: input.checkQuota ?? allowedQuota(),
     notifyDownloadLoginRequired: input.notifyDownloadLoginRequired ?? vi.fn(),
     ...(input.isPeerBot === undefined ? {} : { isPeerBot: input.isPeerBot }),
@@ -212,14 +229,18 @@ async function runOneTurn(
 ): Promise<OrdinaryIngressTransitionResult> {
   const normalized = normalizeOrdinaryImTurn(input);
   if (normalized.kind !== 'normalized') throw new Error(normalized.message);
-  const begun = port.begin({ sessionId: SESSION_ID, turn: normalized.turn });
-  if (begun.kind !== 'effect') throw new Error(`expected materialization, got ${begun.kind}`);
-  try {
-    const value = await port.execute(begun.intent);
-    return port.resume(begun.continuation, { kind: 'returned', value });
-  } catch (error) {
-    return port.resume(begun.continuation, { kind: 'threw', error });
+  let transition = port.begin({ sessionId: SESSION_ID, turn: normalized.turn });
+  if (transition.kind !== 'effect') throw new Error(`expected materialization, got ${transition.kind}`);
+  while (transition.kind === 'effect') {
+    const continuation = transition.continuation;
+    try {
+      const value = await port.execute(transition.intent);
+      transition = port.resume(continuation, { kind: 'returned', value });
+    } catch (error) {
+      transition = port.resume(continuation, { kind: 'threw', error });
+    }
   }
+  return transition;
 }
 
 beforeEach(() => {

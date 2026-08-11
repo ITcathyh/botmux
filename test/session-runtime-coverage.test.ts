@@ -400,6 +400,46 @@ describe('SessionRuntime coverage ledger', () => {
       .toThrow(/activation-restore.*exact typed tail authority selector/i);
   });
 
+  it('locks the reviewed A4 343-site partition and migrated production seam', () => {
+    const ledger = cloneLedger();
+    const activation = ledger.coverage.find((entry: any) => entry.id === 'activation-restore');
+
+    expect(activation).toMatchObject({
+      disposition: 'migrated',
+      authoritySites: { recordCount: 225, mutationCount: 226 },
+      productionBinding: {
+        reviewedLegacyPartition: {
+          originalMutationCount: 343,
+          migratedProviderMutationCount: 226,
+          reclassifiedOtherMutationCount: 117,
+          explicitLifecycleControl: 53,
+          activeRouteMaintenance: 6,
+          freshSessionCreation: 30,
+          generationPrecommitCreation: 28,
+        },
+      },
+    });
+  });
+
+  it('rejects deleting a reviewed A4 production caller cut', () => {
+    const ledger = cloneLedger();
+    const activation = ledger.coverage.find((entry: any) => entry.id === 'activation-restore');
+    activation.productionBinding.callerCuts = activation.productionBinding.callerCuts
+      .filter((caller: any) => caller.enclosingFunction !== 'ensureTerminalWorkerPort');
+
+    expect(() => auditSessionRuntimeCoverage({ ledger }))
+      .toThrow(/callerCuts.*every reviewed activation caller/i);
+  });
+
+  it('rejects changing the A4 BotId/epoch coordinator composition', () => {
+    const ledger = cloneLedger();
+    const activation = ledger.coverage.find((entry: any) => entry.id === 'activation-restore');
+    activation.productionBinding.daemonFactory = 'currentSessionRuntimeHost';
+
+    expect(() => auditSessionRuntimeCoverage({ ledger }))
+      .toThrow(/activation-restore\.productionBinding\.daemonFactory/i);
+  });
+
   it('rejects deleting an existing/route one-submit caller proof', () => {
     const ledger = cloneLedger();
     const ordinary = ledger.coverage.find((entry: any) => entry.id === 'ordinary-im');
@@ -469,16 +509,23 @@ describe('SessionRuntime coverage ledger', () => {
       .toThrow(/reportCallCount.*exact report routes/i);
   });
 
-  it('keeps keyed fail-close and long lifecycle work as named A4 remainders', () => {
+  it('keeps keyed fail-close remaining while A4 provider effects stay outside the lane', () => {
     const ledger = cloneLedger();
     const lane = ledger.coverage.find((entry: any) => entry.id === 'per-session-command-lane');
-    expect(lane.productionBinding.deferredPaths.every(
-      (path: any) => path.targetMilestone === 'A4',
-    )).toBe(true);
+    expect(lane.productionBinding.deferredPaths).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'keyed-route-admission-and-fail-close',
+        targetMilestone: 'Target-A',
+      }),
+      expect.objectContaining({
+        id: 'activation-provider-effect-outside-lane',
+        targetMilestone: 'A4',
+      }),
+    ]));
     lane.productionBinding.deferredPaths = lane.productionBinding.deferredPaths
       .filter((path: any) => path.id !== 'keyed-route-admission-and-fail-close');
 
     expect(() => auditSessionRuntimeCoverage({ ledger }))
-      .toThrow(/deferredPaths.*keyed-route-admission-and-fail-close/i);
+      .toThrow(/deferredPaths.*keyed fail-close/i);
   });
 });

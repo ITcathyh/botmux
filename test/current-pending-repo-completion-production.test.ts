@@ -142,7 +142,7 @@ function externalAdapters(input: {
     readonly baseRef: string;
   }>;
   readonly removeWorktree?: (repoPath: string, worktreePath: string) => Promise<void>;
-  readonly forkWorker: CurrentPendingRepoCompletionProductionAdapters['forkWorker'];
+  readonly forkWorker: (...args: Parameters<typeof workerPool.forkWorker>) => unknown;
 }): CurrentPendingRepoCompletionProductionAdapters {
   return {
     availableBots: input.availableBots ?? vi.fn(async () => []),
@@ -187,7 +187,41 @@ function externalAdapters(input: {
       }
       return { kind: 'cleaned' as const };
     },
-    forkWorker: input.forkWorker,
+    activationFor({ ownerLarkAppId, activeSessions }) {
+      return {
+        async ensure(request) {
+          const matches = [...activeSessions.values()].filter(current => (
+            current.larkAppId === ownerLarkAppId
+            && current.session.sessionId === request.sessionId
+          ));
+          const current = matches.length === 1 ? matches[0] : undefined;
+          if (!current) {
+            return { kind: 'rejected', reason: 'notFound', message: 'test owner is stale' };
+          }
+          const accepted = input.forkWorker(
+            current,
+            request.promptInput,
+            request.resumeOrTurnId ?? false,
+          );
+          if (accepted && (typeof accepted === 'object' || typeof accepted === 'function')) {
+            try {
+              const then = (accepted as { readonly then?: unknown }).then;
+              if (typeof then === 'function') {
+                void Promise.resolve(accepted).catch(() => undefined);
+                return { kind: 'quarantined', message: 'test executor returned a thenable' };
+              }
+            } catch {
+              return { kind: 'quarantined', message: 'test executor result is unreadable' };
+            }
+          }
+          if (accepted === true) return { kind: 'active', action: 'activated' };
+          if (accepted === false) {
+            return { kind: 'retryable', message: 'worker refused pending-repo first start' };
+          }
+          return { kind: 'quarantined', message: 'test executor returned no acceptance proof' };
+        },
+      };
+    },
   };
 }
 
@@ -1366,9 +1400,17 @@ describe('Current pending-repo production composition', () => {
     expect(removeWorktree.mock.calls).toEqual([
       ['/repos/source', '/repos/source-old-plan'],
     ]);
-    expect(completionPort.resume(replacementBegin.continuation, {
+    const replacementDispatch = completionPort.resume(replacementBegin.continuation, {
       kind: 'returned',
       value: replacementMaterialized,
+    });
+    if (replacementDispatch.kind !== 'effect') {
+      throw new Error(`expected replacement dispatch effect, got ${replacementDispatch.kind}`);
+    }
+    const replacementDispatched = await completionPort.execute(replacementDispatch.intent);
+    expect(completionPort.resume(replacementDispatch.continuation, {
+      kind: 'returned',
+      value: replacementDispatched,
     })).toEqual({ kind: 'committed' });
     expect(forkWorker).toHaveBeenCalledTimes(1);
   });
@@ -1445,9 +1487,17 @@ describe('Current pending-repo production composition', () => {
       kind: 'returned',
       value: oldCleaned,
     })).toEqual({ kind: 'staleAddress' });
-    expect(completionPort.resume(replacementBegin.continuation, {
+    const replacementDispatch = completionPort.resume(replacementBegin.continuation, {
       kind: 'returned',
       value: replacementMaterialized,
+    });
+    if (replacementDispatch.kind !== 'effect') {
+      throw new Error(`expected replacement dispatch effect, got ${replacementDispatch.kind}`);
+    }
+    const replacementDispatched = await completionPort.execute(replacementDispatch.intent);
+    expect(completionPort.resume(replacementDispatch.continuation, {
+      kind: 'returned',
+      value: replacementDispatched,
     })).toEqual({ kind: 'committed' });
     expect(removeWorktree.mock.calls).toEqual([
       ['/repos/source', '/repos/source-old-late-cleanup'],

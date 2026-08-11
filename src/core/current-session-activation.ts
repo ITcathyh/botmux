@@ -17,6 +17,7 @@ import {
   currentSessionLaneAddress,
 } from './current-session-command-lane.js';
 import {
+  forkAdoptWorker,
   forkWorker,
   getDaemonBootId,
   getActiveSessionsRegistry,
@@ -24,9 +25,43 @@ import {
 } from './worker-pool.js';
 import { activeSessionKey, type DaemonSession } from './types.js';
 
-export interface CurrentSessionActivationInput {
-  readonly promptInput: string | CliTurnPayload;
-  readonly resumeOrTurnId: ForkResumeOrTurnId;
+export type CurrentSessionActivationInput =
+  | {
+      readonly kind: 'managed';
+      readonly promptInput: string | CliTurnPayload;
+      readonly resumeOrTurnId: ForkResumeOrTurnId;
+    }
+  | {
+      readonly kind: 'adopt';
+      readonly prompt: string;
+      readonly turnId?: string;
+      readonly restoredFromMetadata?: boolean;
+    };
+
+export interface CurrentSessionActivationCoordinator {
+  ensure(input: {
+    readonly sessionId: string;
+    readonly requestIdentity: string;
+    readonly cause: Exclude<SessionActivationRequest['goal'], { kind: 'reconcile' }>['cause'];
+    readonly promptInput: string | CliTurnPayload;
+    readonly resumeOrTurnId?: ForkResumeOrTurnId;
+    readonly executor?: 'managed' | 'adopt';
+    readonly restoredFromMetadata?: boolean;
+  }): Promise<SessionActivationOutcome>;
+  reconcile(input: {
+    readonly sessionId: string;
+    readonly requestIdentity: string;
+    readonly observation: 'exists' | 'missing' | 'unknown';
+    readonly promptInput?: string | CliTurnPayload;
+    readonly resumeOrTurnId?: ForkResumeOrTurnId;
+    readonly executor?: 'managed' | 'adopt';
+    readonly restoredFromMetadata?: boolean;
+  }): Promise<SessionActivationOutcome>;
+  retire(input: {
+    readonly sessionId: string;
+    readonly requestIdentity: string;
+    readonly reason: SessionRetirementReason;
+  }): Promise<SessionRetirementOutcome>;
 }
 
 interface CurrentActivationPlan {
@@ -35,6 +70,8 @@ interface CurrentActivationPlan {
   readonly registryKey: string;
   readonly input: CurrentSessionActivationInput;
   readonly action: 'activated' | 'reattached';
+  readonly priorWorker: DaemonSession['worker'];
+  readonly priorGeneration: number | undefined;
 }
 
 interface CurrentActivationExecution {
@@ -75,7 +112,23 @@ function activationInput(goal: SessionActivationRequest['goal']): CurrentSession
   if (!validResume) return undefined;
   const typedPrompt = promptInput as string | CliTurnPayload;
   const typedResume = resumeOrTurnId as ForkResumeOrTurnId;
+  if (goal.input.executor === 'adopt') {
+    const turnId = isObject(typedResume) && typeof typedResume.turnId === 'string'
+      ? typedResume.turnId
+      : typeof typedResume === 'string'
+        ? typedResume
+        : undefined;
+    return Object.freeze({
+      kind: 'adopt' as const,
+      prompt: promptContent(typedPrompt),
+      ...(turnId === undefined ? {} : { turnId }),
+      ...(goal.input.restoredFromMetadata === true
+        ? { restoredFromMetadata: true }
+        : {}),
+    });
+  }
   return Object.freeze({
+    kind: 'managed' as const,
     promptInput: typeof typedPrompt === 'string'
       ? typedPrompt
       : Object.freeze({
@@ -110,6 +163,7 @@ export function createCurrentSessionActivationPort(options: {
   readonly ownerLarkAppId: string;
   readonly activeSessions: Map<string, DaemonSession>;
   readonly forkWorker?: typeof forkWorker;
+  readonly forkAdoptWorker?: typeof forkAdoptWorker;
 }): SessionActivationPort {
   const intents = new WeakMap<object, CurrentActivationPlan>();
   const continuations = new WeakMap<object, CurrentActivationPlan>();
@@ -176,8 +230,14 @@ export function createCurrentSessionActivationPort(options: {
         return { kind: 'quarantined', message: 'Current activation input is invalid' };
       }
       const live = exact.current.worker !== null && !exact.current.worker.killed;
-      if (live && promptContent(input.promptInput) === '') {
+      if (live && request.goal.kind === 'ensure' && request.goal.cause !== 'replacement') {
         return { kind: 'active', action: 'alreadyActive' };
+      }
+      if (live && input.kind === 'managed' && promptContent(input.promptInput) === '') {
+        return { kind: 'active', action: 'alreadyActive' };
+      }
+      if (input.kind === 'adopt' && !exact.current.adoptedFrom) {
+        return { kind: 'rejected', reason: 'conflict', message: 'Current adopt activation targets a non-adopted Session' };
       }
       const action = request.goal.kind === 'reconcile' && request.goal.observation === 'exists'
         ? 'reattached' as const
@@ -188,6 +248,8 @@ export function createCurrentSessionActivationPort(options: {
         registryKey: exact.key,
         input,
         action,
+        priorWorker: exact.current.worker,
+        priorGeneration: exact.current.workerGeneration,
       });
       const intent = token();
       const continuation = token();
@@ -201,11 +263,27 @@ export function createCurrentSessionActivationPort(options: {
       const plan = intents.get(intent);
       if (!plan) throw new Error('Current activation intent was already consumed');
       intents.delete(intent);
+      if (plan.input.kind === 'managed') {
+        return {
+          accepted: (options.forkWorker ?? forkWorker)(
+            plan.current,
+            plan.input.promptInput,
+            plan.input.resumeOrTurnId,
+          ),
+        };
+      }
+      const result: unknown = (options.forkAdoptWorker ?? forkAdoptWorker)(plan.current, {
+        ...(plan.input.restoredFromMetadata === true ? { restoredFromMetadata: true } : {}),
+        ...(plan.input.prompt === '' ? {} : { prompt: plan.input.prompt }),
+        ...(plan.input.turnId === undefined ? {} : { turnId: plan.input.turnId }),
+      });
+      if (result === false) return { accepted: false };
+      if (result === true) return { accepted: true };
+      const live = plan.current.worker !== null && !plan.current.worker.killed;
       return {
-        accepted: (options.forkWorker ?? forkWorker)(
-          plan.current,
-          plan.input.promptInput,
-          plan.input.resumeOrTurnId,
+        accepted: live && (
+          plan.current.worker !== plan.priorWorker
+          || plan.current.workerGeneration !== plan.priorGeneration
         ),
       };
     },
@@ -223,6 +301,11 @@ export function createCurrentSessionActivationPort(options: {
         return { kind: 'stale', message: 'Current Session binding changed during activation' };
       }
       if (settlement.kind === 'threw') {
+        quarantines.set(plan.session.sessionId, {
+          current: plan.current,
+          session: plan.session,
+          registryKey: plan.registryKey,
+        });
         return {
           kind: 'ambiguous',
           message: `Current worker activation outcome is unknown: ${settlement.error instanceof Error
@@ -232,6 +315,11 @@ export function createCurrentSessionActivationPort(options: {
       }
       const execution = settlement.value as Partial<CurrentActivationExecution> | null;
       if (!execution || typeof execution.accepted !== 'boolean') {
+        quarantines.set(plan.session.sessionId, {
+          current: plan.current,
+          session: plan.session,
+          registryKey: plan.registryKey,
+        });
         return { kind: 'quarantined', message: 'Current activation Adapter returned no acceptance proof' };
       }
       if (!execution.accepted) {
@@ -256,15 +344,110 @@ export function createCurrentSessionActivationPort(options: {
   };
 }
 
-const hostsByRegistry = new WeakMap<
+const coordinatorsByRegistry = new WeakMap<
   Map<string, DaemonSession>,
-  Map<string, ReturnType<typeof createSessionActivationRuntime>>
+  Map<string, CurrentSessionActivationCoordinator>
 >();
 const adapterBotIdsByRegistry = new WeakMap<
   Map<string, DaemonSession>,
   Map<string, BotId>
 >();
-function currentActivationRuntime(
+function createCoordinator(options: {
+  readonly ownerBotId: BotId;
+  readonly ownerLarkAppId: string;
+  readonly runtimeEpoch: string;
+  readonly activeSessions: Map<string, DaemonSession>;
+  readonly forkWorker?: typeof forkWorker;
+  readonly forkAdoptWorker?: typeof forkAdoptWorker;
+}): CurrentSessionActivationCoordinator {
+  const runtime = createSessionActivationRuntime({
+    commandLane: currentSessionCommandLane,
+    laneAddress: sessionId => currentSessionLaneAddress(
+      options.runtimeEpoch,
+      options.ownerBotId,
+      sessionId,
+    ),
+    port: createCurrentSessionActivationPort({
+      ownerLarkAppId: options.ownerLarkAppId,
+      activeSessions: options.activeSessions,
+      ...(options.forkWorker === undefined ? {} : { forkWorker: options.forkWorker }),
+      ...(options.forkAdoptWorker === undefined
+        ? {}
+        : { forkAdoptWorker: options.forkAdoptWorker }),
+    }),
+  });
+  const coordinator: CurrentSessionActivationCoordinator = {
+    ensure(input) {
+      return runtime.ensure({
+        sessionId: input.sessionId,
+        requestIdentity: input.requestIdentity,
+        goal: {
+          kind: 'ensure',
+          cause: input.cause,
+          input: {
+            promptInput: input.promptInput,
+            resumeOrTurnId: input.resumeOrTurnId ?? false,
+            ...(input.executor === undefined ? {} : { executor: input.executor }),
+            ...(input.restoredFromMetadata === undefined
+              ? {}
+              : { restoredFromMetadata: input.restoredFromMetadata }),
+          },
+        },
+      });
+    },
+    reconcile(input) {
+      return runtime.ensure({
+        sessionId: input.sessionId,
+        requestIdentity: input.requestIdentity,
+        goal: {
+          kind: 'reconcile',
+          cause: 'restore',
+          observation: input.observation,
+          input: {
+            promptInput: input.promptInput ?? '',
+            resumeOrTurnId: input.resumeOrTurnId ?? true,
+            ...(input.executor === undefined ? {} : { executor: input.executor }),
+            ...(input.restoredFromMetadata === undefined
+              ? {}
+              : { restoredFromMetadata: input.restoredFromMetadata }),
+          },
+        },
+      });
+    },
+    retire(input) {
+      return runtime.retire(input);
+    },
+  };
+  return Object.freeze(coordinator);
+}
+
+/**
+ * Return the one activation coordinator for an immutable Current owner Host.
+ * Production composition must bind the stable BotId and daemon epoch once and
+ * inject this narrow capability into callers; no caller may mint a parallel
+ * activation truth from the transport App ID.
+ */
+export function currentSessionActivationCoordinator(options: {
+  readonly ownerBotId: BotId;
+  readonly ownerLarkAppId: string;
+  readonly runtimeEpoch: string;
+  readonly activeSessions: Map<string, DaemonSession>;
+}): CurrentSessionActivationCoordinator {
+  let byOwner = coordinatorsByRegistry.get(options.activeSessions);
+  if (!byOwner) {
+    byOwner = new Map();
+    coordinatorsByRegistry.set(options.activeSessions, byOwner);
+  }
+  const hostKey = `${options.ownerBotId}\0${options.runtimeEpoch}`;
+  let coordinator = byOwner.get(hostKey);
+  if (!coordinator) {
+    coordinator = createCoordinator(options);
+    byOwner.set(hostKey, coordinator);
+  }
+  return coordinator;
+}
+
+function currentActivationCoordinator(
   ownerBotId: BotId | undefined,
   ownerLarkAppId: string,
   activeSessionsOverride?: Map<string, DaemonSession>,
@@ -285,26 +468,12 @@ function currentActivationRuntime(
       byOwner.set(ownerLarkAppId, stableOwnerBotId);
     }
   }
-  let byOwner = hostsByRegistry.get(activeSessions);
-  if (!byOwner) {
-    byOwner = new Map();
-    hostsByRegistry.set(activeSessions, byOwner);
-  }
-  const hostKey = `${stableOwnerBotId}\0${runtimeEpoch}`;
-  let runtime = byOwner.get(hostKey);
-  if (!runtime) {
-    runtime = createSessionActivationRuntime({
-      commandLane: currentSessionCommandLane,
-      laneAddress: sessionId => currentSessionLaneAddress(
-        runtimeEpoch,
-        stableOwnerBotId,
-        sessionId,
-      ),
-      port: createCurrentSessionActivationPort({ ownerLarkAppId, activeSessions }),
-    });
-    byOwner.set(hostKey, runtime);
-  }
-  return runtime;
+  return currentSessionActivationCoordinator({
+    ownerBotId: stableOwnerBotId,
+    ownerLarkAppId,
+    runtimeEpoch,
+    activeSessions,
+  });
 }
 
 export async function ensureCurrentSessionActivation(input: {
@@ -320,26 +489,21 @@ export async function ensureCurrentSessionActivation(input: {
   /** Current composition/tests may provide the exact owner registry explicitly. */
   readonly activeSessions?: Map<string, DaemonSession>;
 }): Promise<SessionActivationOutcome> {
-  const runtime = currentActivationRuntime(
+  const coordinator = currentActivationCoordinator(
     input.ownerBotId,
     input.ownerLarkAppId,
     input.activeSessions,
     input.runtimeEpoch,
   );
-  if (!runtime) {
+  if (!coordinator) {
     return { kind: 'retryable', message: 'Current active Session registry is not ready' };
   }
-  return runtime.ensure({
+  return coordinator.ensure({
     sessionId: input.sessionId,
     requestIdentity: input.requestIdentity,
-    goal: {
-      kind: 'ensure',
-      cause: input.cause,
-      input: {
-        promptInput: input.promptInput,
-        resumeOrTurnId: input.resumeOrTurnId ?? false,
-      },
-    },
+    cause: input.cause,
+    promptInput: input.promptInput,
+    resumeOrTurnId: input.resumeOrTurnId,
   });
 }
 
@@ -353,29 +517,27 @@ export async function reconcileCurrentSessionActivation(input: {
   readonly observation: 'exists' | 'missing' | 'unknown';
   readonly promptInput?: string | CliTurnPayload;
   readonly resumeOrTurnId?: ForkResumeOrTurnId;
+  readonly executor?: 'managed' | 'adopt';
+  readonly restoredFromMetadata?: boolean;
   readonly activeSessions?: Map<string, DaemonSession>;
 }): Promise<SessionActivationOutcome> {
-  const runtime = currentActivationRuntime(
+  const coordinator = currentActivationCoordinator(
     input.ownerBotId,
     input.ownerLarkAppId,
     input.activeSessions,
     input.runtimeEpoch,
   );
-  if (!runtime) {
+  if (!coordinator) {
     return { kind: 'retryable', message: 'Current active Session registry is not ready' };
   }
-  return runtime.ensure({
+  return coordinator.reconcile({
     sessionId: input.sessionId,
     requestIdentity: input.requestIdentity,
-    goal: {
-      kind: 'reconcile',
-      cause: 'restore',
-      observation: input.observation,
-      input: {
-        promptInput: input.promptInput ?? '',
-        resumeOrTurnId: input.resumeOrTurnId ?? true,
-      },
-    },
+    observation: input.observation,
+    promptInput: input.promptInput,
+    resumeOrTurnId: input.resumeOrTurnId,
+    executor: input.executor,
+    restoredFromMetadata: input.restoredFromMetadata,
   });
 }
 
@@ -388,14 +550,14 @@ export async function retireCurrentSessionActivation(input: {
   readonly requestIdentity: string;
   readonly reason: SessionRetirementReason;
 }): Promise<SessionRetirementOutcome> {
-  const runtime = currentActivationRuntime(
+  const coordinator = currentActivationCoordinator(
     input.ownerBotId,
     input.ownerLarkAppId,
     undefined,
     input.runtimeEpoch,
   );
-  if (!runtime) {
+  if (!coordinator) {
     return { kind: 'retryable', message: 'Current active Session registry is not ready' };
   }
-  return runtime.retire(input);
+  return coordinator.retire(input);
 }

@@ -136,7 +136,7 @@ export interface CurrentPendingRepoCompletionOptions {
   ) => Promise<CurrentPendingRepoCompletionMaterializeResult>;
   readonly dispatchWorker: (
     command: CurrentPendingRepoWorkerCommand,
-  ) => CurrentPendingRepoWorkerResult;
+  ) => CurrentPendingRepoWorkerResult | Promise<CurrentPendingRepoWorkerResult>;
   readonly cleanupWorktrees?: (input: {
     readonly sessionId: string;
     readonly claimToken: string;
@@ -172,7 +172,21 @@ interface CleanupEffect {
   };
 }
 
-type PendingEffect = MaterializationEffect | CleanupEffect;
+interface WorkerDispatchState {
+  readonly attempt: PendingAttempt;
+  readonly material: CurrentPendingRepoCompletionMaterial;
+  readonly preparedWorktrees: readonly CurrentPendingRepoWorktreeCleanupTarget[];
+  readonly sessionSnapshot: Session;
+  readonly runtimeSnapshot: RuntimeSnapshot;
+  readonly command: CurrentPendingRepoWorkerCommand;
+}
+
+interface WorkerDispatchEffect {
+  readonly kind: 'workerDispatch';
+  readonly dispatch: WorkerDispatchState;
+}
+
+type PendingEffect = MaterializationEffect | WorkerDispatchEffect | CleanupEffect;
 
 interface MaterializationContinuation {
   readonly kind: 'materialization';
@@ -184,7 +198,12 @@ interface CleanupContinuation {
   readonly attemptId: number;
 }
 
-type Continuation = MaterializationContinuation | CleanupContinuation;
+interface WorkerDispatchContinuation {
+  readonly kind: 'workerDispatch';
+  readonly attemptId: number;
+}
+
+type Continuation = MaterializationContinuation | WorkerDispatchContinuation | CleanupContinuation;
 
 type CleanupState =
   | {
@@ -563,6 +582,7 @@ export function createCurrentPendingRepoCompletionPort(
 ): PendingRepoCompletionPort {
   let nextAttemptId = 0;
   const attempts = new Map<number, PendingAttempt>();
+  const dispatches = new Map<number, WorkerDispatchState>();
   const cleanups = new Map<number, CleanupState>();
   const effects = new WeakMap<object, PendingEffect>();
 
@@ -836,6 +856,15 @@ export function createCurrentPendingRepoCompletionPort(
         } catch (error) {
           return Promise.reject(error);
         }
+      } else if (effect.kind === 'workerDispatch') {
+        if (!isExactPendingClaimOwner(effect.dispatch.attempt)) {
+          return Promise.reject(new Error('pending-repo Session owner changed before worker dispatch'));
+        }
+        try {
+          pending = Promise.resolve(options.dispatchWorker(effect.dispatch.command));
+        } catch (error) {
+          return Promise.reject(error);
+        }
       } else {
         if (!options.cleanupWorktrees) {
           return Promise.reject(new Error('pending-repo worktree cleanup effect is not wired'));
@@ -851,7 +880,9 @@ export function createCurrentPendingRepoCompletionPort(
         return Promise.reject(new Error(
           effect.kind === 'materialization'
             ? 'pending-repo materializer must return a native Promise'
-            : 'pending-repo worktree cleanup must return a native Promise',
+            : effect.kind === 'cleanup'
+              ? 'pending-repo worktree cleanup must return a native Promise'
+              : 'pending-repo worker dispatch must return a Promise',
         ));
       }
       return pending;
@@ -863,6 +894,113 @@ export function createCurrentPendingRepoCompletionPort(
     ): PendingRepoCompletionTransitionResult {
       const candidate = continuation as Partial<Continuation> | undefined;
       const attemptId = candidate?.attemptId;
+      if (candidate?.kind === 'workerDispatch') {
+        const dispatch = typeof attemptId === 'number' ? dispatches.get(attemptId) : undefined;
+        if (!dispatch) {
+          return {
+            kind: 'unknown',
+            message: 'pending-repo worker continuation is invalid or already settled',
+          };
+        }
+        dispatches.delete(dispatch.attempt.id);
+        const { attempt, material, preparedWorktrees, sessionSnapshot, runtimeSnapshot } = dispatch;
+        if (settlement.kind === 'threw') {
+          // The activation coordinator may have crossed its executor acceptance
+          // boundary before failing. Preserve the claim and pinned candidate so
+          // recovery can reconcile instead of risking a second first-start.
+          return {
+            kind: 'unknown',
+            message: `pending-repo worker dispatch outcome is unknown: ${message(settlement.error)}`,
+          };
+        }
+        let dispatched: CurrentPendingRepoWorkerResult;
+        try {
+          const inspected = settlement.value as Partial<CurrentPendingRepoWorkerResult> | null;
+          if (!inspected || typeof inspected !== 'object'
+            || (inspected.kind !== 'accepted'
+              && inspected.kind !== 'refused'
+              && inspected.kind !== 'unknown')) {
+            throw new Error('pending-repo worker Adapter returned an invalid result');
+          }
+          dispatched = inspected as CurrentPendingRepoWorkerResult;
+        } catch (error) {
+          return {
+            kind: 'unknown',
+            message: `pending-repo worker dispatch outcome is unknown: ${message(error)}`,
+          };
+        }
+        if (!isExactPendingClaimOwner(attempt)) {
+          return {
+            kind: 'unknown',
+            message: 'pending-repo Session identity changed during worker dispatch',
+          };
+        }
+        if (dispatched.kind === 'unknown') return dispatched;
+        if (dispatched.kind === 'refused') {
+          const rollbackUnknown = rollbackProvenWorkerRefusalCandidate(
+            attempt,
+            sessionSnapshot,
+            runtimeSnapshot,
+          );
+          if (rollbackUnknown) return rollbackUnknown;
+          const cleanup: CleanupState = {
+            kind: 'workerRefusal',
+            attempt,
+            ...(material.dispatchPlanId === undefined
+              ? {}
+              : { dispatchPlanId: material.dispatchPlanId }),
+            refusalMessage: dispatched.message ?? 'pending-repo worker refused the first start',
+          };
+          if (preparedWorktrees.length > 0 || material.dispatchPlanId !== undefined) {
+            if (!isCurrentPendingOwner(attempt)) {
+              return {
+                kind: 'unknown',
+                message: 'pending-repo worker refusal did not preserve a cleanup-safe owner',
+              };
+            }
+            return scheduleCleanup(cleanup, preparedWorktrees);
+          }
+          return settleCleanedCleanup(cleanup);
+        }
+
+        const ds = attempt.ds;
+        if (attempt.selection.kind === 'directory' && !attempt.selection.pinWorkingDir) {
+          const priorWorkingDir = runtimeSnapshot.workingDir;
+          if (!priorWorkingDir.present) delete ds.workingDir;
+          else ds.workingDir = priorWorkingDir.value;
+          if (!Object.hasOwn(sessionSnapshot, 'workingDir')) {
+            delete ds.session.workingDir;
+          } else {
+            ds.session.workingDir = sessionSnapshot.workingDir;
+          }
+          try {
+            sessionStore.updateSession(ds.session);
+          } catch (error) {
+            return {
+              kind: 'unknown',
+              message: `pending-repo unpinned working-directory restoration is unknown: ${message(error)}`,
+            };
+          }
+          if (!isExactPendingClaimOwner(attempt)) {
+            return {
+              kind: 'unknown',
+              message: 'pending-repo Session identity changed during unpinned working-directory restoration',
+            };
+          }
+        }
+        ds.pendingRepo = false;
+        clearExactPendingClaim(ds, attempt.claimToken);
+        ds.initialStartPending = ds.session.queuedActivationPending === true;
+        markRepoCardConsumed(ds, ds.repoCardMessageId);
+        ds.repoCardMessageId = undefined;
+        clearFoldedRuntimeBuffers(ds);
+        try {
+          publishAttentionPatch(ds);
+        } catch {
+          // Rebuilt on the next full hydrate.
+        }
+        return { kind: 'committed' };
+      }
       if (candidate?.kind === 'cleanup') {
         const cleanup = typeof attemptId === 'number' ? cleanups.get(attemptId) : undefined;
         if (!cleanup) {
@@ -967,100 +1105,25 @@ export function createCurrentPendingRepoCompletionPort(
         ...(ds.session.riffRepoDirs ? { riffRepoDirs: [...ds.session.riffRepoDirs] } : {}),
         ...(preparedWorktrees?.length ? { worktrees: preparedWorktrees.map(worktree => ({ ...worktree })) } : {}),
       };
-      let dispatched: CurrentPendingRepoWorkerResult;
-      try {
-        dispatched = options.dispatchWorker(command);
-        if (dispatched && typeof dispatched === 'object'
-          && typeof (dispatched as { then?: unknown }).then === 'function') {
-          throw new Error('pending-repo worker Adapter must return synchronously');
-        }
-        if (!dispatched
-          || (dispatched.kind !== 'accepted'
-            && dispatched.kind !== 'refused'
-            && dispatched.kind !== 'unknown')) {
-          throw new Error('pending-repo worker Adapter returned an invalid result');
-        }
-      } catch (error) {
-        // The process Adapter may have crossed its acceptance boundary before
-        // throwing or returning an invalid/thenable result. Keep the claim and
-        // pinned state sticky; blindly restoring would invite a second fork.
-        return {
-          kind: 'unknown',
-          message: `pending-repo worker dispatch outcome is unknown: ${message(error)}`,
-        };
-      }
-      if (!isExactPendingClaimOwner(attempt)) {
-        return {
-          kind: 'unknown',
-          message: 'pending-repo Session identity changed during worker dispatch',
-        };
-      }
-      if (dispatched.kind === 'unknown') return dispatched;
-      if (dispatched.kind === 'refused') {
-        const rollbackUnknown = rollbackProvenWorkerRefusalCandidate(
-          attempt,
-          sessionSnapshot,
-          runtimeSnapshot,
-        );
-        if (rollbackUnknown) return rollbackUnknown;
-        const cleanup: CleanupState = {
-          kind: 'workerRefusal',
-          attempt,
-          ...(material.dispatchPlanId === undefined
-            ? {}
-            : { dispatchPlanId: material.dispatchPlanId }),
-          refusalMessage: dispatched.message ?? 'pending-repo worker refused the first start',
-        };
-        if ((preparedWorktrees?.length ?? 0) > 0 || material.dispatchPlanId !== undefined) {
-          if (!isCurrentPendingOwner(attempt)) {
-            return {
-              kind: 'unknown',
-              message: 'pending-repo worker refusal did not preserve a cleanup-safe owner',
-            };
-          }
-          return scheduleCleanup(cleanup, preparedWorktrees ?? []);
-        }
-        return settleCleanedCleanup(cleanup);
-      }
-
-      if (attempt.selection.kind === 'directory' && !attempt.selection.pinWorkingDir) {
-        const priorWorkingDir = runtimeSnapshot.workingDir;
-        if (!priorWorkingDir.present) delete ds.workingDir;
-        else ds.workingDir = priorWorkingDir.value;
-        if (!Object.hasOwn(sessionSnapshot, 'workingDir')) {
-          delete ds.session.workingDir;
-        } else {
-          ds.session.workingDir = sessionSnapshot.workingDir;
-        }
-        try {
-          sessionStore.updateSession(ds.session);
-        } catch (error) {
-          return {
-            kind: 'unknown',
-            message: `pending-repo unpinned working-directory restoration is unknown: ${message(error)}`,
-          };
-        }
-        if (!isExactPendingClaimOwner(attempt)) {
-          return {
-            kind: 'unknown',
-            message: 'pending-repo Session identity changed during unpinned working-directory restoration',
-          };
-        }
-      }
-      ds.pendingRepo = false;
-      clearExactPendingClaim(ds, attempt.claimToken);
-      ds.initialStartPending = ds.session.queuedActivationPending === true;
-      markRepoCardConsumed(ds, ds.repoCardMessageId);
-      ds.repoCardMessageId = undefined;
-      clearFoldedRuntimeBuffers(ds);
-      // The needs-you column tracks pendingRepo live; a failed projection
-      // publish must not change the committed completion.
-      try {
-        publishAttentionPatch(ds);
-      } catch {
-        // Rebuilt on the next full hydrate.
-      }
-      return { kind: 'committed' };
+      const dispatch = Object.freeze({
+        attempt,
+        material,
+        preparedWorktrees: Object.freeze(preparedWorktrees ?? []),
+        sessionSnapshot,
+        runtimeSnapshot,
+        command: deepFreeze(command),
+      } satisfies WorkerDispatchState);
+      const intent = Object.freeze(Object.create(null)) as object;
+      dispatches.set(attempt.id, dispatch);
+      effects.set(intent, { kind: 'workerDispatch', dispatch });
+      return {
+        kind: 'effect',
+        intent,
+        continuation: {
+          kind: 'workerDispatch',
+          attemptId: attempt.id,
+        } satisfies Continuation,
+      };
     },
   };
 }

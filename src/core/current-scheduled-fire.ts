@@ -57,6 +57,11 @@ import type {
 } from './session-runtime.js';
 import { createSessionRuntimeHost } from './session-runtime.js';
 import {
+  ensureCurrentSessionActivation,
+  type CurrentSessionActivationCoordinator,
+} from './current-session-activation.js';
+import type { SessionActivationOutcome } from './session-activation-runtime.js';
+import {
   activeSessionAnchorId,
   activeSessionKey,
   sessionKey,
@@ -64,7 +69,6 @@ import {
 } from './types.js';
 import {
   closeSession,
-  forkWorker,
   getCurrentCliVersion,
   isDisposableCommandScratch,
   isRelayableRealSession,
@@ -94,12 +98,20 @@ interface PreparedInput {
 type ScheduledEffect =
   | { readonly kind: 'prepareInput'; readonly plan: CurrentScheduledRoutePlan }
   | { readonly kind: 'sendInput'; readonly prepared: PreparedInput }
-  | { readonly kind: 'fork'; readonly prepared: PreparedInput };
+  | {
+      readonly kind: 'fork';
+      readonly prepared: PreparedInput;
+      readonly replaceCurrent: boolean;
+    };
 
 type ScheduledContinuation =
   | { readonly kind: 'prepared'; readonly plan: CurrentScheduledRoutePlan }
   | { readonly kind: 'sent'; readonly prepared: PreparedInput }
-  | { readonly kind: 'forked'; readonly prepared: PreparedInput };
+  | {
+      readonly kind: 'forked';
+      readonly prepared: PreparedInput;
+      readonly replaceCurrent: boolean;
+    };
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -183,6 +195,8 @@ export function createCurrentScheduledFireAdapter(options: {
   readonly ownerLarkAppId: string;
   readonly activeSessions: Map<string, DaemonSession>;
   readonly refreshCliVersion: RefreshCliVersion;
+  /** Stable owner/epoch activation capability supplied by daemon composition. */
+  readonly activation?: Pick<CurrentSessionActivationCoordinator, 'ensure'>;
   /** Synchronous owner-store revision fence. Omitted only by compatibility tests. */
   readonly readDefinitionRevision?: (scheduleId: string) => number | undefined;
 }): CurrentScheduledFireAdapter {
@@ -221,15 +235,29 @@ export function createCurrentScheduledFireAdapter(options: {
       }
       if (effect.kind === 'fork') {
         const { plan, input } = effect.prepared;
-        if (plan.isContinuation && !plan.newlyCreated) {
-          forkWorker(plan.current, input, {
-            resume: plan.current.hasHistory,
-            turnId: plan.fire.runId,
-          });
-        } else {
-          forkWorker(plan.current, input, plan.fire.runId);
-        }
-        return undefined;
+        const resumeOrTurnId = plan.isContinuation && !plan.newlyCreated
+          ? { resume: plan.current.hasHistory, turnId: plan.fire.runId }
+          : plan.fire.runId;
+        const requestIdentity = effect.replaceCurrent
+          ? `${plan.fire.runId}:replacement`
+          : plan.fire.runId;
+        return options.activation
+          ? options.activation.ensure({
+              sessionId: plan.current.session.sessionId,
+              requestIdentity,
+              cause: effect.replaceCurrent ? 'replacement' : 'scheduler',
+              promptInput: input,
+              resumeOrTurnId,
+            })
+          : ensureCurrentSessionActivation({
+              ownerLarkAppId: options.ownerLarkAppId,
+              activeSessions: options.activeSessions,
+              sessionId: plan.current.session.sessionId,
+              requestIdentity,
+              cause: effect.replaceCurrent ? 'replacement' : 'scheduler',
+              promptInput: input,
+              resumeOrTurnId,
+            });
       }
       throw new Error('unknown scheduled effect');
     },
@@ -280,8 +308,12 @@ export function createCurrentScheduledFireAdapter(options: {
         }
         return {
           kind: 'effect',
-          intent: { kind: 'fork', prepared } satisfies ScheduledEffect,
-          continuation: { kind: 'forked', prepared } satisfies ScheduledContinuation,
+          intent: {
+            kind: 'fork', prepared, replaceCurrent: false,
+          } satisfies ScheduledEffect,
+          continuation: {
+            kind: 'forked', prepared, replaceCurrent: false,
+          } satisfies ScheduledContinuation,
         };
       }
       if (next.kind === 'sent') {
@@ -293,8 +325,12 @@ export function createCurrentScheduledFireAdapter(options: {
         // synchronous IPC seam; preserve the legacy cold-resume fallback.
         return {
           kind: 'effect',
-          intent: { kind: 'fork', prepared: next.prepared } satisfies ScheduledEffect,
-          continuation: { kind: 'forked', prepared: next.prepared } satisfies ScheduledContinuation,
+          intent: {
+            kind: 'fork', prepared: next.prepared, replaceCurrent: true,
+          } satisfies ScheduledEffect,
+          continuation: {
+            kind: 'forked', prepared: next.prepared, replaceCurrent: true,
+          } satisfies ScheduledContinuation,
         };
       }
       if (settlement.kind === 'threw') {
@@ -305,6 +341,37 @@ export function createCurrentScheduledFireAdapter(options: {
         return {
           kind: 'unknown',
           message: `scheduled worker dispatch outcome is unknown: ${errorMessage(settlement.error)}`,
+        };
+      }
+      const activation = settlement.value as SessionActivationOutcome | undefined;
+      const terminal = activation?.kind === 'duplicate' ? activation.outcome : activation;
+      if (!terminal || terminal.kind !== 'active') {
+        if (plan.fire.task.silent === true) {
+          disarmSilentScheduledTurn(plan.current, plan.fire.runId);
+        }
+        finishPlan(plan);
+        if (terminal?.kind === 'retryable'
+            || terminal?.kind === 'stale'
+            || terminal?.kind === 'rejected') {
+          return {
+            kind: 'retryable',
+            message: terminal.kind === 'rejected'
+              ? terminal.message
+              : terminal.message,
+          };
+        }
+        return {
+          kind: 'unknown',
+          message: terminal && 'message' in terminal
+            ? terminal.message
+            : 'scheduled activation returned an invalid outcome',
+        };
+      }
+      if (terminal.action === 'alreadyActive' && !next.replaceCurrent) {
+        return {
+          kind: 'effect',
+          intent: { kind: 'sendInput', prepared: next.prepared } satisfies ScheduledEffect,
+          continuation: { kind: 'sent', prepared: next.prepared } satisfies ScheduledContinuation,
         };
       }
       if (plan.newlyCreated) {
@@ -792,6 +859,7 @@ export async function executeScheduledTaskThroughRuntime(
   task: Parameters<typeof createScheduledFireEnvelope>[1],
   activeSessions: Map<string, DaemonSession>,
   refreshCliVersion: RefreshCliVersion,
+  activation?: Pick<CurrentSessionActivationCoordinator, 'ensure'>,
 ): Promise<void> {
   const ownerLarkAppId = task.larkAppId ?? getAllBots()[0]?.config.larkAppId;
   if (!ownerLarkAppId) return;
@@ -799,6 +867,7 @@ export async function executeScheduledTaskThroughRuntime(
     ownerLarkAppId,
     activeSessions,
     refreshCliVersion,
+    ...(activation === undefined ? {} : { activation }),
   });
   const directory = {
     async read(query: Parameters<SessionProjection['read']>[0]) {
@@ -864,7 +933,7 @@ export async function executeScheduledTaskThroughRuntime(
     },
     keyedTriggerTurns: {
       prepare: () => ({ kind: 'retryable', message: 'not available in schedule bridge' }),
-      acceptAtMostOnce: () => ({ kind: 'refused', message: 'not available in schedule bridge' }),
+      acceptAtMostOnce: async () => ({ kind: 'refused', message: 'not available in schedule bridge' }),
       failClose: async () => ({ kind: 'unreadable', message: 'not available in schedule bridge' }),
     },
     scheduledFire: adapter.port,

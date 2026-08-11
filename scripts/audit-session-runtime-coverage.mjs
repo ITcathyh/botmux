@@ -26,7 +26,7 @@ const expectedCoverage = new Map([
   ['per-session-command-lane', { targetMilestone: 'A3', disposition: 'migrated' }],
   ['scheduler', { targetMilestone: 'C4', disposition: 'migrated' }],
   ['scheduler-retained-projection', { targetMilestone: 'C4', disposition: 'retained' }],
-  ['activation-restore', { targetMilestone: 'A4', disposition: 'remaining' }],
+  ['activation-restore', { targetMilestone: 'A4', disposition: 'migrated' }],
   ['path-specific-retained', { targetMilestone: 'Target-A', disposition: 'retained' }],
   ['projection', { targetMilestone: 'C3', disposition: 'migrated' }],
   ['remaining-bypass', { targetMilestone: 'Target-A', disposition: 'remaining' }],
@@ -203,6 +203,55 @@ const mandatoryActivationTailAuthoritySelector = Object.freeze({
   ]),
 });
 
+const mandatoryActivationProductionBinding = Object.freeze({
+  runtimeSource: 'src/core/session-activation-runtime.ts',
+  runtimeFactory: 'createSessionActivationRuntime',
+  currentAdapterSource: 'src/core/current-session-activation.ts',
+  currentAdapterFactory: 'createCurrentSessionActivationPort',
+  coordinatorFactory: 'currentSessionActivationCoordinator',
+  sharedLaneSource: 'src/core/current-session-command-lane.ts',
+  sharedLaneExport: 'currentSessionCommandLane',
+  laneAddressFactory: 'currentSessionLaneAddress',
+  currentRuntimeSource: 'src/core/current-session-runtime.ts',
+  currentRuntimeFactory: 'currentSessionRuntimeHost',
+  daemonSource: 'src/daemon.ts',
+  daemonFactory: 'currentDaemonSessionActivation',
+  providerSource: 'src/core/worker-pool.ts',
+  managedProvider: 'forkWorker',
+  adoptProvider: 'forkAdoptWorker',
+  typedTailRecovery: 'prepareQueuedActivationRecoveryFork',
+  typedTailPromotion: 'promoteQueuedActivationTailTyped',
+  generationOracle: 'test/current-session-executor-runtime.test.ts',
+  workerExitOracle: 'test/session-lifecycle-hooks.test.ts',
+  restoreOracle: 'test/restore-zombie-close.test.ts',
+  terminalOracle: 'test/session-terminal-activation.test.ts',
+});
+
+const mandatoryActivationCallerCuts = new Map([
+  ['src/core/current-ordinary-ingress-worker-processes.ts#createCurrentOrdinaryIngressWorkerProcesses', 'ensure'],
+  ['src/core/current-keyed-trigger-turn.ts#createCurrentKeyedTriggerTurnPort', 'ensure'],
+  ['src/core/current-pending-repo-completion-production.ts#createCurrentPendingRepoCompletionProduction', 'ensure'],
+  ['src/core/current-pending-repo-completion-submit.ts#submitCurrentPendingRepoCompletion', 'currentSessionActivationCoordinator'],
+  ['src/core/current-scheduled-fire.ts#createCurrentScheduledFireAdapter', 'ensure'],
+  ['src/core/session-manager.ts#resumeRestoredPendingRepoSetup', 'reconcile'],
+  ['src/core/session-manager.ts#restoreActiveSessions', 'reconcile'],
+  ['src/core/session-manager.ts#ensureTerminalWorkerPort', 'reconcileCurrentSessionActivation'],
+  ['src/daemon.ts#currentDaemonSessionRuntimeHost', 'currentDaemonSessionActivation'],
+  ['src/daemon.ts#prewarmDocCommentSession', 'ensure'],
+  ['src/daemon.ts#handleDocCommentAdmitted', 'ensure'],
+  ['src/im/lark/card-handler.ts#handleCardAction', 'ensure'],
+]);
+
+const mandatoryActivationLegacyPartition = Object.freeze({
+  originalMutationCount: 343,
+  migratedProviderMutationCount: 226,
+  reclassifiedOtherMutationCount: 117,
+  explicitLifecycleControl: 53,
+  activeRouteMaintenance: 6,
+  freshSessionCreation: 30,
+  generationPrecommitCreation: 28,
+});
+
 const mandatoryOrdinaryCallers = new Map([
   ['src/daemon.ts#handleNewTopicAdmitted', { sessionSubmitCount: 0, routeSubmitCount: 1 }],
   ['src/daemon.ts#handleThreadReplyAdmitted', { sessionSubmitCount: 1, routeSubmitCount: 1 }],
@@ -255,11 +304,11 @@ const mandatoryForbiddenOrdinaryCallerCalls = [
 
 const mandatorySessionLaneDeferredPaths = new Map([
   ['keyed-route-admission-and-fail-close', {
-    targetMilestone: 'A4',
+    targetMilestone: 'Target-A',
     sourceFile: 'src/core/current-keyed-trigger-turn.ts',
     enclosingFunction: 'failClose',
   }],
-  ['activation-and-long-executor-lifecycle', {
+  ['activation-provider-effect-outside-lane', {
     targetMilestone: 'A4',
     sourceFile: 'src/core/worker-pool.ts',
     enclosingFunction: 'forkWorker',
@@ -461,6 +510,7 @@ function validateLedgerSchema(ledger) {
   validateSchedulerProductionBindingSchema(scheduler.productionBinding);
   const activation = ledger.coverage.find(entry => entry.id === 'activation-restore');
   validateActivationTailAuthoritySelector(activation.selectors);
+  validateActivationProductionBindingSchema(activation.productionBinding);
   const projection = ledger.coverage.find(entry => entry.id === 'projection');
   validateProjectionProductionBindingSchema(projection.productionBinding);
   for (const entry of ledger.coverage) {
@@ -469,9 +519,81 @@ function validateLedgerSchema(ledger) {
       && entry.id !== 'executor-generation'
       && entry.id !== 'per-session-command-lane'
       && entry.id !== 'projection'
-      && entry.id !== 'scheduler') {
+      && entry.id !== 'scheduler'
+      && entry.id !== 'activation-restore') {
       assert(entry.productionBinding === undefined, `${entry.id} must not claim a migrated production binding`);
     }
+  }
+}
+
+function validateActivationProductionBindingSchema(binding) {
+  assert(isPlainObject(binding), 'activation-restore.productionBinding must be an object');
+  const allowedKeys = new Set([
+    ...Object.keys(mandatoryActivationProductionBinding),
+    'callerCuts',
+    'retainedDirectCallClasses',
+    'reviewedLegacyPartition',
+  ]);
+  for (const key of Object.keys(binding)) {
+    assert(allowedKeys.has(key), `activation-restore.productionBinding has unsupported field: ${key}`);
+  }
+  for (const [field, expected] of Object.entries(mandatoryActivationProductionBinding)) {
+    assert(
+      binding[field] === expected,
+      `activation-restore.productionBinding.${field} must be ${expected}`,
+    );
+  }
+  assert(
+    Array.isArray(binding.callerCuts)
+      && binding.callerCuts.length === mandatoryActivationCallerCuts.size,
+    'activation-restore.productionBinding.callerCuts must cover every reviewed activation caller',
+  );
+  const seen = new Set();
+  for (const cut of binding.callerCuts) {
+    assert(isPlainObject(cut), 'activation-restore.productionBinding caller cut must be an object');
+    assert(
+      sameStringSet(Object.keys(cut), ['sourceFile', 'enclosingFunction', 'coordinatorCall']),
+      'activation-restore.productionBinding caller cut has unsupported fields',
+    );
+    const key = `${cut.sourceFile}#${cut.enclosingFunction}`;
+    assert(!seen.has(key), `activation-restore.productionBinding duplicates caller ${key}`);
+    seen.add(key);
+    const expectedCall = mandatoryActivationCallerCuts.get(key);
+    assert(expectedCall, `activation-restore.productionBinding has unknown caller ${key}`);
+    assert(
+      cut.coordinatorCall === expectedCall,
+      `activation-restore.productionBinding ${key}.coordinatorCall must be ${expectedCall}`,
+    );
+  }
+  for (const key of mandatoryActivationCallerCuts.keys()) {
+    assert(seen.has(key), `activation-restore.productionBinding must include ${key}`);
+  }
+  validateStringArray(
+    binding.retainedDirectCallClasses,
+    'activation-restore.productionBinding.retainedDirectCallClasses',
+  );
+  assert(
+    sameStringSet(binding.retainedDirectCallClasses, [
+      'fresh-session-creation',
+      'generation-precommit-trigger',
+      'provider-internal-recovery',
+      'explicit-control-lifecycle',
+    ]),
+    'activation-restore.productionBinding.retainedDirectCallClasses must keep the exact reviewed non-A4 callers',
+  );
+  assert(
+    isPlainObject(binding.reviewedLegacyPartition)
+      && sameStringSet(
+        Object.keys(binding.reviewedLegacyPartition),
+        Object.keys(mandatoryActivationLegacyPartition),
+      ),
+    'activation-restore.productionBinding.reviewedLegacyPartition must keep the exact 343-site split',
+  );
+  for (const [field, expected] of Object.entries(mandatoryActivationLegacyPartition)) {
+    assert(
+      binding.reviewedLegacyPartition[field] === expected,
+      `activation-restore.productionBinding.reviewedLegacyPartition.${field} must be ${expected}`,
+    );
   }
 }
 
@@ -712,6 +834,127 @@ function validateActivationTailAuthoritySelector(selectors) {
   );
 }
 
+function validateActivationProductionBinding(binding) {
+  const runtimeSource = sourceFile(binding.runtimeSource);
+  const runtimeFactory = findNamedFunction(runtimeSource, binding.runtimeFactory);
+  const runtimeEnsure = findNamedFunction(runtimeFactory, 'ensure');
+  assert(
+    containsStringLiteral(runtimeEnsure, 'retryable')
+      && callExpressionsWithin(runtimeEnsure, 'attempts.delete').length > 0,
+    'A4 retryable activation must evict its process-local terminal cache entry',
+  );
+  assert(
+    containsStringLiteral(runtimeEnsure, 'joined')
+      && containsStringLiteral(runtimeEnsure, 'completed')
+      && containsIdentifier(runtimeEnsure, 'state'),
+    'A4 duplicate activation must report joined versus completed state accurately',
+  );
+  assert(
+    containsIdentifier(runtimeFactory, 'lifecycleRevision')
+      && callExpressionsWithin(runtimeFactory, 'commandLane.submit').length > 0,
+    'A4 activation and retirement must share the owner-scoped Session lane',
+  );
+
+  const adapterSource = sourceFile(binding.currentAdapterSource);
+  const adapterFactory = findNamedFunction(adapterSource, binding.currentAdapterFactory);
+  const adapterBegin = findNamedFunction(adapterFactory, 'begin');
+  const adapterExecute = findNamedFunction(adapterFactory, 'execute');
+  assert(
+    containsIdentifier(adapterExecute, binding.managedProvider)
+      && containsIdentifier(adapterExecute, binding.adoptProvider),
+    'A4 Current Adapter must preserve managed and adopt provider protocols behind one seam',
+  );
+  assert(
+    containsStringLiteral(adapterBegin, 'unknown')
+      && containsIdentifier(adapterBegin, 'observation')
+      && callExpressionsWithin(adapterBegin, 'quarantines.set').length > 0
+      && callExpressionsWithin(adapterBegin, 'quarantines.delete').length === 1,
+    'A4 unknown backend evidence must stay quarantined until one typed exists/missing re-probe',
+  );
+
+  const coordinatorFactory = findNamedFunction(adapterSource, binding.coordinatorFactory);
+  assert(
+    containsIdentifier(coordinatorFactory, 'ownerBotId')
+      && containsIdentifier(coordinatorFactory, 'runtimeEpoch')
+      && callExpressionsWithin(coordinatorFactory, 'createCoordinator').length === 1,
+    'A4 coordinator cache must bind the stable BotId and daemon epoch',
+  );
+  const createCoordinator = findNamedFunction(adapterSource, 'createCoordinator');
+  assert(
+    callExpressionsWithin(createCoordinator, binding.runtimeFactory).length === 1
+      && containsIdentifier(createCoordinator, binding.sharedLaneExport)
+      && callExpressionsWithin(createCoordinator, binding.laneAddressFactory).length === 1,
+    'A4 coordinator must use the same Current owner/epoch Session lane',
+  );
+
+  const currentRuntimeSource = sourceFile(binding.currentRuntimeSource);
+  const currentRuntimeFactory = findNamedFunction(
+    currentRuntimeSource,
+    binding.currentRuntimeFactory,
+  );
+  assert(
+    callExpressionsWithin(currentRuntimeFactory, binding.coordinatorFactory).length === 1
+      && callExpressionsWithin(currentRuntimeFactory, binding.laneAddressFactory).length === 1
+      && containsIdentifier(currentRuntimeFactory, 'stableOwnerKey')
+      && containsIdentifier(currentRuntimeFactory, 'runtimeEpoch'),
+    'A4 and SessionRuntime must share one stable BotId/runtime-epoch lane directory',
+  );
+
+  const daemonSource = sourceFile(binding.daemonSource);
+  const daemonFactory = findNamedFunction(daemonSource, binding.daemonFactory);
+  assert(
+    callExpressionsWithin(daemonFactory, binding.coordinatorFactory).length === 1
+      && callExpressionsWithin(daemonFactory, 'requireBotId').length === 1
+      && callExpressionsWithin(daemonFactory, 'getDaemonBootId').length === 1,
+    'A4 daemon composition must inject one stable BotId + boot-epoch coordinator',
+  );
+
+  const providerSource = sourceFile(binding.providerSource);
+  for (const symbol of [
+    binding.managedProvider,
+    binding.adoptProvider,
+    binding.typedTailRecovery,
+    binding.typedTailPromotion,
+  ]) {
+    findNamedFunction(providerSource, symbol);
+  }
+
+  for (const cut of binding.callerCuts) {
+    const caller = findNamedFunction(sourceFile(cut.sourceFile), cut.enclosingFunction);
+    assert(
+      callExpressionsWithin(caller, cut.coordinatorCall).length > 0,
+      `A4 caller ${cut.sourceFile}#${cut.enclosingFunction} must cross the coordinator seam`,
+    );
+    for (const forbidden of [binding.managedProvider, binding.adoptProvider]) {
+      assert(
+        callExpressionsWithin(caller, forbidden).length === 0,
+        `A4 caller ${cut.sourceFile}#${cut.enclosingFunction} must not call ${forbidden} directly`,
+      );
+    }
+  }
+
+  const generationOracle = readFileSync(resolve(repoRoot, binding.generationOracle), 'utf8');
+  const workerExitOracle = readFileSync(resolve(repoRoot, binding.workerExitOracle), 'utf8');
+  const restoreOracle = readFileSync(resolve(repoRoot, binding.restoreOracle), 'utf8');
+  const terminalOracle = readFileSync(resolve(repoRoot, binding.terminalOracle), 'utf8');
+  assert(
+    generationOracle.includes("kind: 'workerExit'")
+      && workerExitOracle.includes("expect(ds.session.status).toBe('active')")
+      && workerExitOracle.includes('expect(ds.worker).toBeNull()'),
+    'A4 worker-exit oracle must keep the Session active while retiring only the executor',
+  );
+  assert(
+    restoreOracle.includes('observation: \'unknown\'')
+      && restoreOracle.includes('without closing or forking'),
+    'A4 restore oracle must cover sticky unknown quarantine without replacement',
+  );
+  assert(
+    terminalOracle.includes('permits a later generation to wake again')
+      && terminalOracle.includes('terminal:terminal-session:4'),
+    'A4 terminal oracle must permit a later worker generation to reactivate',
+  );
+}
+
 function validateExecutorSelectors(selectors) {
   assert(
     selectors.length === mandatoryExecutorSelectors.size,
@@ -928,7 +1171,7 @@ function validateSessionLaneProductionBindingSchema(binding) {
   );
   assert(
     binding.deferredPaths.length === mandatorySessionLaneDeferredPaths.size,
-    'per-session-command-lane.productionBinding.deferredPaths must include keyed-route-admission-and-fail-close and activation-and-long-executor-lifecycle',
+    'per-session-command-lane.productionBinding.deferredPaths must include keyed fail-close and the A4 provider effect kept outside the lane',
   );
   const seen = new Set();
   for (const path of binding.deferredPaths) {
@@ -1885,7 +2128,7 @@ function validateSessionLaneProductionBinding(binding) {
   assert(
     callExpressionsWithin(sessionSubmit, 'keyedTriggerTurns.failClose').length === 1
       && callExpressionsWithin(firstTransitionLaneCall, 'keyedTriggerTurns.failClose').length === 0,
-    'A3 must leave keyed route fail-close outside the resolved-Session lane as an explicit C1 remainder',
+    'A3 must leave keyed route fail-close outside the resolved-Session lane as an explicit Target-A remainder',
   );
 
   const synchronousPortGuard = findNamedFunction(
@@ -2128,14 +2371,14 @@ function validateSessionLaneProductionBinding(binding) {
   assert(
     awaitExpressionsWithin(failClose).length > 0
       && callExpressionsWithin(failClose, 'closeWorkerSession').length > 0,
-    'A3 C1 remainder must continue to identify keyed fail-close long lifecycle work',
+    'A3 Target-A remainder must continue to identify keyed fail-close long lifecycle work',
   );
-  const lifecycleRemainder = binding.deferredPaths.find(
-    path => path.id === 'activation-and-long-executor-lifecycle',
+  const activationProviderEffect = binding.deferredPaths.find(
+    path => path.id === 'activation-provider-effect-outside-lane',
   );
   findNamedFunction(
-    sourceFile(lifecycleRemainder.sourceFile),
-    lifecycleRemainder.enclosingFunction,
+    sourceFile(activationProviderEffect.sourceFile),
+    activationProviderEffect.enclosingFunction,
   );
 }
 
@@ -2340,6 +2583,8 @@ export function auditSessionRuntimeCoverage({ ledger } = {}) {
   validateProjectionProductionBinding(projection.productionBinding);
   const scheduler = coverageLedger.coverage.find(entry => entry.id === 'scheduler');
   validateSchedulerProductionBinding(scheduler.productionBinding, facts.sites);
+  const activation = coverageLedger.coverage.find(entry => entry.id === 'activation-restore');
+  validateActivationProductionBinding(activation.productionBinding);
   return { summary: entryCounts.join(', ') };
 }
 

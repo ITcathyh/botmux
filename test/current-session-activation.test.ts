@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { createCurrentSessionActivationPort } from '../src/core/current-session-activation.js';
+import {
+  createCurrentSessionActivationPort,
+  currentSessionActivationCoordinator,
+} from '../src/core/current-session-activation.js';
+import { parseBotId } from '../src/core/bot-identity.js';
 import type { SessionActivationRequest } from '../src/core/session-activation-runtime.js';
 import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 
@@ -44,6 +48,32 @@ function request(
 }
 
 describe('Current Session activation Adapter', () => {
+  it('shares one BotId + daemon-epoch coordinator across production callers', async () => {
+    const ds = session();
+    const registry = new Map([[activeSessionKey(ds), ds]]);
+    const ownerBotId = parseBotId('bot_activation_owner');
+    const first = currentSessionActivationCoordinator({
+      ownerBotId,
+      ownerLarkAppId: 'cli_owner',
+      runtimeEpoch: 'daemon-epoch-1',
+      activeSessions: registry,
+    });
+    const second = currentSessionActivationCoordinator({
+      ownerBotId,
+      ownerLarkAppId: 'cli_owner',
+      runtimeEpoch: 'daemon-epoch-1',
+      activeSessions: registry,
+    });
+
+    expect(second).toBe(first);
+    expect(currentSessionActivationCoordinator({
+      ownerBotId,
+      ownerLarkAppId: 'cli_owner',
+      runtimeEpoch: 'daemon-epoch-2',
+      activeSessions: registry,
+    })).not.toBe(first);
+  });
+
   it('preserves exists, missing and unknown backend observations', async () => {
     const ds = session();
     const registry = new Map([[activeSessionKey(ds), ds]]);
@@ -121,6 +151,64 @@ describe('Current Session activation Adapter', () => {
     expect(fork).toHaveBeenCalledTimes(1);
   });
 
+  it('quarantines a lost executor acceptance response across request identities', async () => {
+    const ds = session();
+    const registry = new Map([[activeSessionKey(ds), ds]]);
+    const fork = vi.fn(() => {
+      throw new Error('executor acceptance response lost');
+    });
+    const port = createCurrentSessionActivationPort({
+      ownerLarkAppId: 'cli_owner',
+      activeSessions: registry,
+      forkWorker: fork,
+    });
+    const first = port.begin({
+      sessionId: 'session-1',
+      requestIdentity: 'ordinary-lost-response',
+      goal: {
+        kind: 'ensure',
+        cause: 'ordinary',
+        input: { promptInput: 'first', resumeOrTurnId: false },
+      },
+    });
+    if (first.kind !== 'effect') throw new Error('expected effect');
+    await expect(port.execute(first.intent)).rejects.toThrow('executor acceptance response lost');
+    expect(port.resume(first.continuation, {
+      kind: 'threw',
+      error: new Error('executor acceptance response lost'),
+    })).toEqual({
+      kind: 'ambiguous',
+      message: 'Current worker activation outcome is unknown: executor acceptance response lost',
+    });
+
+    expect(port.begin({
+      sessionId: 'session-1',
+      requestIdentity: 'different-caller',
+      goal: {
+        kind: 'ensure',
+        cause: 'scheduler',
+        input: { promptInput: 'must not replay', resumeOrTurnId: false },
+      },
+    })).toEqual({
+      kind: 'quarantined',
+      message: 'persistent backend binding is quarantined pending an explicit re-probe',
+    });
+    expect(fork).toHaveBeenCalledTimes(1);
+
+    fork.mockImplementation(() => {
+      ds.worker = { killed: false } as DaemonSession['worker'];
+      return true;
+    });
+    const reprobe = port.begin(request('missing'));
+    if (reprobe.kind !== 'effect') throw new Error('expected reprobe effect');
+    const value = await port.execute(reprobe.intent);
+    expect(port.resume(reprobe.continuation, { kind: 'returned', value })).toEqual({
+      kind: 'active',
+      action: 'activated',
+    });
+    expect(fork).toHaveBeenCalledTimes(2);
+  });
+
   it('passes adapter-specific activation input unchanged and fences replacement', async () => {
     const ds = session();
     const registry = new Map([[activeSessionKey(ds), ds]]);
@@ -167,5 +255,34 @@ describe('Current Session activation Adapter', () => {
       kind: 'stale',
       message: 'Current Session binding changed during activation',
     });
+  });
+
+  it('does not replace a live executor unless the caller requests replacement', async () => {
+    const ds = session({ worker: { killed: false } as DaemonSession['worker'] });
+    const registry = new Map([[activeSessionKey(ds), ds]]);
+    const fork = vi.fn(() => true);
+    const port = createCurrentSessionActivationPort({
+      ownerLarkAppId: 'cli_owner',
+      activeSessions: registry,
+      forkWorker: fork,
+    });
+    const ordinary: SessionActivationRequest = {
+      sessionId: 'session-1',
+      requestIdentity: 'ordinary-race',
+      goal: {
+        kind: 'ensure',
+        cause: 'ordinary',
+        input: { promptInput: 'must be reclassified as live send', resumeOrTurnId: false },
+      },
+    };
+
+    expect(port.begin(ordinary)).toEqual({ kind: 'active', action: 'alreadyActive' });
+    const replacement = port.begin({
+      ...ordinary,
+      requestIdentity: 'explicit-replacement',
+      goal: { ...ordinary.goal, cause: 'replacement' },
+    });
+    expect(replacement.kind).toBe('effect');
+    expect(fork).not.toHaveBeenCalled();
   });
 });

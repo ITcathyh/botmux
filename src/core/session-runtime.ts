@@ -209,7 +209,7 @@ export interface KeyedTriggerTurnPort {
   acceptAtMostOnce(
     token: unknown,
     context: { key: string; pendingCreatedAt: number },
-  ): KeyedTriggerTurnAcceptResult;
+  ): Promise<KeyedTriggerTurnAcceptResult>;
   failClose(token: unknown): Promise<KeyedTriggerTurnCloseResult>;
 }
 
@@ -1280,6 +1280,12 @@ export function createSessionRuntimeHost(options: {
         token: unknown;
         candidate: PreparedKeyedTriggerTurn;
         outcome: CommandOutcome;
+      }
+    | {
+        kind: 'keyedDispatch';
+        candidate: PreparedKeyedTriggerTurn;
+        begun: Extract<KeyedTriggerBeginResult, { kind: 'started' }>;
+        dispatch: Promise<KeyedTriggerTurnAcceptResult>;
       };
 
   const outcome = (value: CommandOutcome): CriticalResult => ({ kind: 'outcome', outcome: value });
@@ -2623,16 +2629,23 @@ export function createSessionRuntimeHost(options: {
       return outcome(ambiguousFor(candidate, begun.message, begun.durable));
     }
 
+    let dispatch: Promise<KeyedTriggerTurnAcceptResult>;
     try {
-      const accepted = invokeSynchronousPort(
-        'KeyedTriggerTurnPort.acceptAtMostOnce',
-        () => options.keyedTriggerTurns.acceptAtMostOnce(candidate.token, {
-          key: request.idempotencyKey,
-          pendingCreatedAt: begun.pendingCreatedAt,
-        }),
-      );
-      if (accepted.kind === 'refused') throw new Error(accepted.message);
-    } catch (dispatchError) {
+      dispatch = Promise.resolve(options.keyedTriggerTurns.acceptAtMostOnce(candidate.token, {
+        key: request.idempotencyKey,
+        pendingCreatedAt: begun.pendingCreatedAt,
+      }));
+    } catch (error) {
+      dispatch = Promise.reject(error);
+    }
+    return { kind: 'keyedDispatch', candidate, begun, dispatch };
+  };
+
+  const settleKeyedDispatchFailure = (
+    candidate: PreparedKeyedTriggerTurn,
+    begun: Extract<KeyedTriggerBeginResult, { kind: 'started' }>,
+    dispatchError: unknown,
+  ): CriticalResult => {
       let settled: KeyedTriggerSettlementResult;
       try {
         settled = invokeSynchronousPort(
@@ -2668,16 +2681,17 @@ export function createSessionRuntimeHost(options: {
             true,
           );
       return { kind: 'failClose', token: candidate.token, candidate, outcome: failedOutcome };
-    }
+  };
 
-    return outcome({
+  const keyedDispatchApplied = (
+    candidate: PreparedKeyedTriggerTurn,
+  ): CriticalResult => outcome({
       kind: 'applied',
       action: 'keyedTrigger.started',
       sessionId: candidate.sessionId,
       triggerId: candidate.triggerId,
       chatId: candidate.chatId,
     });
-  };
 
   const resumeOrdinaryAttempt = (
     step: OrdinaryEffectStep,
@@ -2927,16 +2941,36 @@ export function createSessionRuntimeHost(options: {
     return terminal;
   };
 
+  const keyedSubmissionTails = new Map<string, Promise<void>>();
+
   const submit = async <C extends SessionCommand>(
     request: SessionCommandRequest<C>,
+    keyedSerialized = false,
   ): Promise<CommandOutcomeFor<C>> => {
+    if (!keyedSerialized
+        && request.command.kind === 'keyedTrigger.start'
+        && request.target.kind === 'route'
+        && request.target.route.kind === 'idempotency') {
+      const key = request.target.route.key;
+      const prior = keyedSubmissionTails.get(key);
+      let release!: () => void;
+      const tail = new Promise<void>((resolve) => { release = resolve; });
+      keyedSubmissionTails.set(key, tail);
+      try {
+        if (prior) await prior.catch(() => undefined);
+        return await submit(request, true);
+      } finally {
+        release();
+        if (keyedSubmissionTails.get(key) === tail) keyedSubmissionTails.delete(key);
+      }
+    }
     // A Session-targeted reducer enters the one owner-scoped FIFO lane. The
     // drain is synchronous, so the reducer still finishes before this submit
     // reaches its first await; re-entrant submissions queue behind it.
     const addressSlot = request.target.kind === 'session'
       ? addressSlots.get(request.target.address)
       : undefined;
-    const result = addressSlot
+    let result = addressSlot
       ? await commandLane.submit(
           sessionLaneAddress(addressSlot.sessionId),
           () => run(request as SessionCommandRequest),
@@ -2945,6 +2979,20 @@ export function createSessionRuntimeHost(options: {
       // Its dispatch-critical fence remains one synchronous run-to-completion
       // segment; C1 moves route creation behind the lane once identity exists.
       : run(request as SessionCommandRequest);
+    if (result.kind === 'keyedDispatch') {
+      const keyed = result;
+      try {
+        const accepted = await keyed.dispatch;
+        result = accepted.kind === 'accepted'
+          ? keyedDispatchApplied(keyed.candidate)
+          : settleKeyedDispatchFailure(keyed.candidate, keyed.begun, new Error(accepted.message));
+      } catch (error) {
+        result = settleKeyedDispatchFailure(keyed.candidate, keyed.begun, error);
+      }
+    }
+    if (result.kind === 'keyedDispatch') {
+      throw new Error('keyed dispatch settlement did not reach a terminal state');
+    }
     if (result.kind === 'outcome') return result.outcome as CommandOutcomeFor<C>;
     if (result.kind === 'ordinaryEffect') {
       return await runOrdinaryEffects(result) as CommandOutcomeFor<C>;

@@ -123,12 +123,13 @@ export type CurrentOrdinaryIngressWorkerProcessCommand =
 export type CurrentOrdinaryIngressWorkerProcessResult =
   | { readonly kind: 'accepted' }
   | { readonly kind: 'refused'; readonly message: string }
-  | { readonly kind: 'unknown'; readonly message: string };
+  | { readonly kind: 'unknown'; readonly message: string }
+  | { readonly kind: 'stateChanged' };
 
 export interface CurrentOrdinaryIngressWorkerProcesses {
   dispatch(
     command: CurrentOrdinaryIngressWorkerProcessCommand,
-  ): CurrentOrdinaryIngressWorkerProcessResult;
+  ): Promise<CurrentOrdinaryIngressWorkerProcessResult>;
 }
 
 export interface CurrentOrdinaryIngressProductionOptions {
@@ -170,6 +171,17 @@ type FrozenMaterial = Readonly<{
 }>;
 
 type ProductionCommandResult = CurrentOrdinaryIngressCommandResult;
+
+interface WorkerDispatchPlan {
+  readonly command: CurrentOrdinaryIngressCommand;
+  readonly workerCommand: CurrentOrdinaryIngressWorkerProcessCommand;
+  readonly dispatchOptions: {
+    readonly durableInput: boolean;
+    readonly restoreTransientGate?: () => void;
+  };
+  readonly current: DaemonSession;
+  readonly selectedMaterial: FrozenMaterial;
+}
 
 function isObject(value: unknown): value is Record<PropertyKey, unknown> {
   return value !== null && typeof value === 'object';
@@ -464,42 +476,18 @@ function admitTail(
   }
 }
 
-function isThenable(value: unknown): boolean {
-  if (!isObject(value)) return false;
-  try {
-    return typeof value.then === 'function';
-  } catch {
-    return true;
-  }
-}
-
-function dispatchWorker(
-  workerProcesses: CurrentOrdinaryIngressWorkerProcesses,
-  command: CurrentOrdinaryIngressWorkerProcessCommand,
+function settleWorkerDispatch(
+  result: CurrentOrdinaryIngressWorkerProcessResult,
   options: {
     readonly durableInput: boolean;
     readonly restoreTransientGate?: () => void;
   },
 ): ProductionCommandResult {
-  let result: CurrentOrdinaryIngressWorkerProcessResult;
-  try {
-    result = workerProcesses.dispatch(deepFreeze(command));
-  } catch (error) {
-    return unknown(`ordinary ingress worker dispatch outcome is unknown: ${message(error)}`);
-  }
-
-  if (isThenable(result)) {
-    try {
-      void Promise.resolve(result).catch(() => undefined);
-    } catch {
-      // A hostile thenable still crossed the dispatch seam; its result is unknown.
-    }
-    return unknown('ordinary ingress worker process Adapter must return synchronously');
-  }
   if (!isObject(result)) {
     return unknown('ordinary ingress worker process Adapter returned an invalid result');
   }
   if (result.kind === 'accepted') return { kind: 'accepted' };
+  if (result.kind === 'stateChanged') return { kind: 'stateChanged' };
   if (result.kind === 'unknown') {
     return unknown(typeof result.message === 'string'
       ? result.message
@@ -599,6 +587,9 @@ export function createCurrentOrdinaryIngressProductionPort(
 ): OrdinaryIngressPort {
   const materials = new WeakMap<PreparedOrdinaryImTurn, FrozenMaterial>();
   const metadataCommitted = new WeakSet<PreparedOrdinaryImTurn>();
+  const workerEffects = new WeakMap<object, WorkerDispatchPlan>();
+  const workerContinuations = new WeakMap<object, WorkerDispatchPlan>();
+  const effectToken = (): object => Object.freeze(Object.create(null)) as object;
 
   return createCurrentOrdinaryIngressPort({
     ownerLarkAppId: options.ownerLarkAppId,
@@ -738,7 +729,18 @@ export function createCurrentOrdinaryIngressProductionPort(
               mode: live ? 'live' : 'refork',
             });
           }
-          return dispatchWorker(options.workerProcesses, workerCommand, dispatchOptions);
+          const plan: WorkerDispatchPlan = {
+            command,
+            workerCommand: deepFreeze(workerCommand),
+            dispatchOptions,
+            current,
+            selectedMaterial,
+          };
+          const intent = effectToken();
+          const continuation = effectToken();
+          workerEffects.set(intent, plan);
+          workerContinuations.set(continuation, plan);
+          return { kind: 'effect', intent, continuation };
         };
 
         let result: ProductionCommandResult;
@@ -937,7 +939,46 @@ export function createCurrentOrdinaryIngressProductionPort(
           result = rememberAcceptedInput(current, selectedMaterial) ?? result;
         }
 
-        if (result.kind !== 'stateChanged') materials.delete(command.input.turn);
+        if (result.kind !== 'stateChanged' && result.kind !== 'effect') {
+          materials.delete(command.input.turn);
+        }
+        return result;
+      },
+      async execute(intent): Promise<unknown> {
+        if (!isObject(intent)) throw new Error('invalid ordinary worker effect token');
+        const plan = workerEffects.get(intent);
+        if (!plan) throw new Error('ordinary worker effect token was already consumed');
+        workerEffects.delete(intent);
+        return options.workerProcesses.dispatch(plan.workerCommand);
+      },
+      resume(continuation, settlement): ProductionCommandResult {
+        if (!isObject(continuation)) {
+          return unknown('invalid ordinary worker continuation token');
+        }
+        const plan = workerContinuations.get(continuation);
+        if (!plan) return unknown('ordinary worker continuation token was already consumed');
+        workerContinuations.delete(continuation);
+        let result: ProductionCommandResult;
+        if (settlement.kind === 'threw') {
+          result = unknown(
+            `ordinary ingress worker dispatch outcome is unknown: ${message(settlement.error)}`,
+          );
+        } else {
+          result = settleWorkerDispatch(
+            settlement.value as CurrentOrdinaryIngressWorkerProcessResult,
+            plan.dispatchOptions,
+          );
+        }
+        if (!resolveCurrent(options, plan.command)) {
+          materials.delete(plan.command.input.turn);
+          return unknown('Current Session identity changed during ordinary worker activation');
+        }
+        if (result.kind === 'accepted'
+            && (plan.command.kind === 'sendLive'
+              || plan.command.kind === 'startColdReplacement')) {
+          result = rememberAcceptedInput(plan.current, plan.selectedMaterial) ?? result;
+        }
+        if (result.kind !== 'stateChanged') materials.delete(plan.command.input.turn);
         return result;
       },
     },

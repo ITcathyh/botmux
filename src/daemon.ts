@@ -128,6 +128,7 @@ import {
   larkTransportEnabled,
 } from './core/types.js';
 import { currentSessionRuntimeHost } from './core/current-session-runtime.js';
+import { currentSessionActivationCoordinator } from './core/current-session-activation.js';
 import {
   createCurrentScheduledFireAdapter,
   toSchedulerSubmitOutcome,
@@ -167,7 +168,6 @@ import {
   initWorkerPool,
   setActiveSessionsRegistry,
   forkWorker,
-  forkAdoptWorker,
   sendWorkerInput,
   promoteQueuedActivationTail,
   prepareQueuedActivationRecoveryFork,
@@ -615,7 +615,10 @@ import {
 const activeSessions = new Map<string, DaemonSession>();
 const currentOrdinaryIngressPorts = new Map<
   string,
-  ReturnType<typeof createCurrentOrdinaryIngressDaemonPort>
+  {
+    ownerBootId: string;
+    port: ReturnType<typeof createCurrentOrdinaryIngressDaemonPort>;
+  }
 >();
 const currentOrdinaryOpeningCreators = new Map<
   string,
@@ -641,12 +644,15 @@ const quotaExemptOrdinaryTurnIds = new Set<string>();
 
 function currentOrdinaryIngressPort(
   ownerLarkAppId: string,
+  ownerBootId: string,
+  activation: ReturnType<typeof currentSessionActivationCoordinator>,
 ): ReturnType<typeof createCurrentOrdinaryIngressDaemonPort> {
   const cached = currentOrdinaryIngressPorts.get(ownerLarkAppId);
-  if (cached) return cached;
+  if (cached?.ownerBootId === ownerBootId) return cached.port;
   const port = createCurrentOrdinaryIngressDaemonPort({
     ownerLarkAppId,
     activeSessions,
+    activation,
     checkQuota: async input => {
       const accepted = await enforceMessageQuotaForCliInput(
         ownerLarkAppId,
@@ -727,7 +733,7 @@ function currentOrdinaryIngressPort(
     },
     isPeerBot: openId => isKnownPeerBot(config.session.dataDir, ownerLarkAppId, openId),
   });
-  currentOrdinaryIngressPorts.set(ownerLarkAppId, port);
+  currentOrdinaryIngressPorts.set(ownerLarkAppId, { ownerBootId, port });
   return port;
 }
 
@@ -1043,8 +1049,20 @@ function currentOrdinaryOpeningCreator(
   return creator;
 }
 
+function currentDaemonSessionActivation(ownerLarkAppId: string) {
+  const ownerBootId = getDaemonBootId();
+  return currentSessionActivationCoordinator({
+    ownerBotId: requireBotId(ownerLarkAppId),
+    ownerLarkAppId,
+    runtimeEpoch: ownerBootId,
+    activeSessions,
+  });
+}
+
 function currentDaemonSessionRuntimeHost(ownerLarkAppId: string) {
   const ownerBootId = getDaemonBootId();
+  const ownerBotId = requireBotId(ownerLarkAppId);
+  const activation = currentDaemonSessionActivation(ownerLarkAppId);
   let scheduled = currentScheduledFireAdapters.get(ownerLarkAppId);
   if (!scheduled || scheduled.ownerBootId !== ownerBootId) {
     scheduled = {
@@ -1053,6 +1071,7 @@ function currentDaemonSessionRuntimeHost(ownerLarkAppId: string) {
         ownerLarkAppId,
         activeSessions,
         refreshCliVersion,
+        activation,
         readDefinitionRevision: scheduleId => (
           scheduleStore.getTask(scheduleId)?.definitionRevision
         ),
@@ -1064,12 +1083,12 @@ function currentDaemonSessionRuntimeHost(ownerLarkAppId: string) {
     // startDaemon binds the durable identity before any route can reach this
     // composition. Pre-start unit adapters may carry no BotState identity;
     // Current then allocates an opaque process-local adapter ID.
-    ownerBotId: getBot(ownerLarkAppId).botId!,
+    ownerBotId,
     ownerLarkAppId,
     activeSessions,
     ownerBootId,
     keyedTriggerAdmissionBlocked: () => currentDeviceIsolationFreezeLease() !== null,
-    ordinaryIngress: currentOrdinaryIngressPort(ownerLarkAppId),
+    ordinaryIngress: currentOrdinaryIngressPort(ownerLarkAppId, ownerBootId, activation),
     ordinaryRouteOpeningCreator: currentOrdinaryOpeningCreator(
       ownerLarkAppId,
       ownerBootId,
@@ -1078,6 +1097,7 @@ function currentDaemonSessionRuntimeHost(ownerLarkAppId: string) {
       ownerLarkAppId,
       activeSessions,
       ownerBootId,
+      activation,
     }),
     scheduledFire: scheduled.adapter.port,
   });
@@ -5021,7 +5041,25 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
     });
     rememberLastCliInput(ds, promptContent, wrappedInput);
     sessionStore.updateSession(ds.session);
-    forkWorker(ds, wrappedInput, ds.hasHistory);
+    const activation = await currentDaemonSessionActivation(ds.larkAppId).ensure({
+      sessionId: ds.session.sessionId,
+      requestIdentity: `doc-watch:prewarm:${turnId}`,
+      cause: 'ordinary',
+      promptInput: wrappedInput,
+      resumeOrTurnId: ds.hasHistory,
+    });
+    const terminal = activation.kind === 'duplicate' ? activation.outcome : activation;
+    if (terminal.kind === 'active' && terminal.action === 'alreadyActive') {
+      if (!sendWorkerInput(ds, wrappedInput, turnId)) {
+        throw new Error('doc-watch warmup activation race was not accepted');
+      }
+    } else if (terminal.kind !== 'active') {
+      throw new Error(
+        `doc-watch warmup activation ${terminal.kind}: ${'message' in terminal
+          ? terminal.message
+          : 'not accepted'}`,
+      );
+    }
   }
   logger.info(`[${tag(ds)}] doc-comment watch prewarm injected file=${sub.fileToken.slice(0, 12)}`);
 }
@@ -5621,6 +5659,7 @@ const handleCodexNotifierCardAction = createCodexNotifierCardActionHandler({
 
 const cardDeps: CardHandlerDeps = {
   activeSessions,
+  activationFor: currentDaemonSessionActivation,
   sessionReply,
   lastRepoScan,
   vcMeetingCardAction: (data, appId) => handleVcMeetingCardAction(data, appId),
@@ -19388,10 +19427,25 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
         throw new Error('worker became active during comment:refork-note');
       }
       sessionStore.updateSession(ds.session);
-      if (ds.adoptedFrom) {
-        forkAdoptWorker(ds, { prompt: wrappedInput.content, turnId });
-      } else {
-        forkWorker(ds, wrappedInput, { resume: ds.hasHistory, turnId });
+      const activation = await currentDaemonSessionActivation(ds.larkAppId).ensure({
+        sessionId: ds.session.sessionId,
+        requestIdentity: `doc-comment:${turnId}`,
+        cause: 'ordinary',
+        promptInput: wrappedInput,
+        resumeOrTurnId: { resume: ds.hasHistory, turnId },
+        ...(ds.adoptedFrom ? { executor: 'adopt' as const } : {}),
+      });
+      const terminal = activation.kind === 'duplicate' ? activation.outcome : activation;
+      if (terminal.kind === 'active' && terminal.action === 'alreadyActive') {
+        if (!sendWorkerInput(ds, wrappedInput, turnId)) {
+          throw new Error('worker became unavailable during comment:activation-race');
+        }
+      } else if (terminal.kind !== 'active') {
+        throw new Error(
+          `doc-comment activation ${terminal.kind}: ${'message' in terminal
+            ? terminal.message
+            : 'not accepted'}`,
+        );
       }
     }, cleanupFailedDelivery);
   } catch (err) {
@@ -20696,7 +20750,19 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
   // Restore active sessions from previous run
   // Restore active sessions from previous run
-  await restoreActiveSessions(activeSessions, idempotencyQuarantinedSessionIds);
+  await restoreActiveSessions(activeSessions, idempotencyQuarantinedSessionIds, {
+    reconcile(input) {
+      return currentDaemonSessionActivation(input.ownerLarkAppId).reconcile({
+        sessionId: input.sessionId,
+        requestIdentity: input.requestIdentity,
+        observation: input.observation,
+        promptInput: input.promptInput,
+        resumeOrTurnId: input.resumeOrTurnId,
+        executor: input.executor,
+        restoredFromMetadata: input.restoredFromMetadata,
+      });
+    },
+  });
   // Restore complete → /api/asks may now safely 403 unknown sessions again; a
   // reconnecting ask hook that raced the restore got retryable 503s until here.
   sessionsRestored = true;

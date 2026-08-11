@@ -85,6 +85,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   killStalePids: vi.fn(),
   sweepDeadPidMarkers: vi.fn(),
   getCurrentCliVersion: vi.fn(() => 'test-cli-v1'),
+  getDaemonBootId: vi.fn(() => 'test-daemon-epoch'),
   restoreUsageLimitRuntimeState: vi.fn(),
   setActiveSessionIfActive: vi.fn((map: Map<string, any>, k: string, ds: any) => {
     if (map.has(k) && map.get(k) !== ds) return false;
@@ -179,6 +180,7 @@ beforeEach(() => {
   store.clear();
   sessionSeq = 0;
   forkWorkerMock.mockClear();
+  forkWorkerMock.mockReturnValue(true);
   sendWorkerInputMock.mockClear();
   sendWorkerInputMock.mockReturnValue(true);
   sendMessageMock.mockClear();
@@ -191,6 +193,28 @@ beforeEach(() => {
 });
 
 describe('executeScheduledTask — silent thread fire', () => {
+  it('hands cold activation to the owner coordinator with the logical run identity', async () => {
+    const active = new Map<string, DaemonSession>();
+    const ensure = vi.fn(async () => ({ kind: 'active' as const, action: 'activated' as const }));
+
+    await executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+      active,
+      refreshCliVersion,
+      { ensure },
+    );
+
+    const ds = active.get(sessionKey(ROOT, APP))!;
+    expect(ensure).toHaveBeenCalledTimes(1);
+    expect(ensure).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: ds.session.sessionId,
+      requestIdentity: expect.stringMatching(/^schedule-run:v1:manual:task0001:1:/),
+      cause: 'scheduler',
+      resumeOrTurnId: expect.stringMatching(/^schedule-run:v1:manual:task0001:1:/),
+    }));
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+  });
+
   it('posts nothing, anchors at rootMessageId, arms the exact forked turn, wraps the prompt', async () => {
     const active = new Map<string, DaemonSession>();
     await executeScheduledTask(baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }), active, refreshCliVersion);

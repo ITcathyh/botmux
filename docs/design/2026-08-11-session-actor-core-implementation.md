@@ -1,7 +1,7 @@
 # Session Actor Core 实施设计（第一步：A0→A3 + C1）
 
 > 本文是 Session Actor 演进提案的**实施摘要**：只保留与已落地代码直接对应的设计决策与改动内容，
-> 供 reviewer 与后续步骤（C2/C4/A4、Target-B）的实施者对照代码阅读。
+> 供 reviewer 与后续步骤（C2、Target-B）的实施者对照代码阅读。
 > 概念调研、术语校准、方案比较与 ROI 论证过程不在本文范围。
 
 ## 1. 目标与本步边界
@@ -18,11 +18,12 @@ Botmux 的 Session 天然具备 Virtual Actor 的全部特征：稳定逻辑身�
 | 步骤 | 内容 | 状态 |
 |---|---|---|
 | 第一步（本次） | A0 census → A1 runtime shell → A2 代际围栏 → A3 per-Session lane → C1 普通 IM 消息一刀切换 | ✅ 本 PR |
-| 第二步 | C2 Dashboard 命令、C4 scheduler producer、C3 projection/readiness、A4 activation/restore 生命周期按各自 ROI gate 迁入同一入口 | C3 ✅；其余后续 |
+| 第二步 | C2 Dashboard 命令、C4 scheduler producer、C3 projection/readiness、A4 activation/restore 生命周期与 I1 BotId 按各自 ROI gate 迁入同一入口 | C3/C4/A4/I1 ✅；C2 待集成 |
 | 第三步 | per-bot SQLite durable store 离线演练与单向 cutover（Target-B），届时才把 ACK 升级为崩溃可恢复的 durable 承诺 | 后续 |
 
 本步明确**不做**：不改变 durability 承诺（所有 outcome 标注 `processLocal`）、不引入 SQLite、
-不迁移 C2/C4 调用方、不分配独立 BotId（I1）。
+第一步本身不迁移 C2/C4 调用方、不分配独立 BotId（I1）；§1.2–§1.3 单独记录其后的第二步增量，
+不得回写 §1.1 的 Stage-1 snapshot。
 
 ### 1.1 第一步 baseline 锁定（2026-08-11）
 
@@ -70,6 +71,38 @@ heartbeat 失效只把 runtime 标为 `stale`，均不反向写 `closed`。daemo
 初始 projection，再从 `restoring` 切为 `ready` 并释放 IPC mutation gate；`Current/v1` capability
 明确不携带 Store Epoch/schema/topology，后者仍属于 Target-B。
 
+### 1.3 第二步增量：C4 / A4 / I1
+
+C4 让 scheduler 只生产 stable run identity 并提交 `scheduled.fire`；20 个 Session mutation 由
+Current scheduler Adapter 收口，13 个 deadline/status/repeat projection mutation 保持 scheduler
+store 自有，不冒充 Session lifecycle 或 durable dispatch receipt。
+
+A4 以 registry + immutable BotId + daemon boot epoch 缓存唯一 activation coordinator，并与
+`SessionRuntime` 共用 `currentSessionCommandLane` 的同一 owner/session 地址。lane 内只做
+begin/resume/retire 短转换，`forkWorker` / `forkAdoptWorker` 及 Riff、Codex App、adopt、classic RPC
+细节仍在 worker-pool provider Adapter 内执行。production caller cuts 覆盖 ordinary cold/adopt、
+keyed fresh、pending-repo first-start、scheduler、restore（含 pending-repo/adopt）、terminal lazy wake、
+doc watch/comment cold 与 card voice/retry；它们不再直接调用 worker provider。
+
+- 同 request identity 的并发 activate singleflight；不同 identity 同 Session 串行，后到者观察
+  live executor 并按自身 policy 转成 live send/refusal。`retryable` 不永久缓存，同 identity 可重试；
+  completed duplicate 仍准确返回 `completed`，在途 join 返回 `joined`。
+- backend `unknown` 与 executor acceptance response-loss 都绑定 exact owner Session 进入 sticky
+  quarantine；普通 ensure 或不同 request identity 都不能再 fork。只有同 binding 的显式
+  `reconcile(exists|missing)` re-probe 可清除 quarantine。
+- terminal request identity 携带 persisted worker generation，同代 HTML/WS join 一次 wake；worker
+  exit 后新 generation 可再次 wake。exit 只清 executor 并保持 Session `active`，不自动写 `closed`。
+
+旧 A4 bucket 的 343 个 mutation 经重新分区：225 条记录 / 226 个 mutation 是上述
+activation/restore/provider protocol；其余 117 个不是 activation——显式 lifecycle/control 53、
+active-route maintenance 6、fresh Session creation 30、generation-precommit command creation 28——
+分别回到 projection/`remaining-bypass`。保留的 direct-call class 只有 fresh creation、需要在 fork
+前提交 executor generation 的 trigger protocol、provider 内部 recovery，以及待 C2 收口的显式
+control lifecycle；台账不会用 wrapper 把它们伪装成 A4 migrated。
+
+I1 为每个 active Bot 提供不可变 BotId；daemon host、SessionRuntime 与 activation coordinator
+均使用同一 BotId + boot epoch，`larkAppId` 只留作 Current transport/owner partition Adapter key。
+
 ## 2. 对实现有直接约束的设计原则
 
 1. **引入 Virtual Actor 语义，不引入 Actor 平台**。Session 是唯一核心 Actor；不因某模块有后台行为就把它也建模成 Actor。
@@ -100,6 +133,8 @@ heartbeat 失效只把 runtime 标为 `stale`，均不反向写 `closed`。daemo
 | route/开话题 | `src/core/current-ordinary-route-registry.ts`、`current-ordinary-route-opening-production.ts` | route resolve、并发 create 单赢家、opening 首开语义 |
 | pending-repo | `src/core/current-pending-repo-completion*.ts`、`current-pending-worktree-preparation.ts` | 选仓/auto-worktree 首启与 follower 暂存 |
 | keyed trigger | `src/core/current-keyed-trigger-turn.ts` | `/api/trigger` at-most-once 语义（`reserved→attempting` barrier） |
+| activation | `src/core/session-activation-runtime.ts`、`current-session-activation.ts` | BotId/epoch singleflight、lifecycle revision、typed reconcile/quarantine；worker-pool 只作 provider Adapter |
+| scheduler | `src/core/current-scheduled-fire.ts` | stable firing 经 `scheduled.fire` 进入 Runtime，worker dispatch 复用 owner activation coordinator |
 | IM 侧生产注入 | `src/im/lark/current-ordinary-ingress-daemon.ts`、`current-ordinary-ingress-production.ts` | Lark 物化上下文、daemon 拥有的副作用注入点（卡片轮转、受理 reaction、失败提示等） |
 
 ### 3.3 A0 census 与构建期审计 gate
@@ -110,8 +145,10 @@ heartbeat 失效只把 runtime 标为 `stale`，均不反向写 `closed`。daemo
   推导比对，未分类或漂移即失败（`--update` 后需人工分类）。
 - `docs/architecture/session-runtime-coverage.json`：Target-A 可执行覆盖台账。按 coverage 条目
   钉住已迁移边界的写点 digest 与 production binding（含 forbidden-calls 扫描），`remaining-bypass`
-  条目如实列出尚未归入具体 milestone 的 Target-A shared/direct-writer remainder（本 baseline 为
-  674 条记录 / 677 个 mutation）；C2/C3/C4/A4 各自另有独立 bucket，不能与它重复计数。
+  条目如实列出尚未归入具体 milestone 的 Target-A shared/direct-writer remainder。Stage-1 baseline
+  仍是 674 条记录 / 677 个 mutation；当前 Stage-2 census 为 1,393 条记录 / 1,401 个 mutation，
+  coverage 精确分为 keyed 21、ordinary 93、control 128、executor 62、scheduler 20 + retained 13、
+  activation 226、path-specific retained 32、projection 16 与 remaining 790。各 bucket 不能重复计数。
   `pnpm audit:session-runtime` 构建期校验。
 - 两份台账均有变异测试防腐化（oracle 测试篡改源码后断言审计必须报警）。
 
@@ -211,7 +248,8 @@ ingress 终态失败（`unknown/ambiguous/quarantined/retryable/staleAddress`）
 
 ## 6. 与未迁移调用方的并存边界
 
-Dashboard close/cancel/activate/rename、scheduler、卡片 mid-session 换仓仍走 Current 写面，
+Dashboard close/cancel/activate/rename、卡片 mid-session 换仓，以及 §1.3 明列的非 activation
+direct-call class 仍走 Current 写面，
 coverage 台账 `remaining-bypass` 如实列出。并存期间的绑定校验让被竞争的在途轮以
 `stateChanged/quarantined` 收场并给出用户提示。新 ingress 与 executor runtime 无任何 `cliId`
 分支；Riff prepare→commit、tmux/zmx 持久 pane、adopt bridge 的后端协议保留在各自 Adapter 内。
@@ -228,10 +266,9 @@ coverage 台账 `remaining-bypass` 如实列出。并存期间的绑定校验让
 
 ## 8. 后续步骤接口
 
-第二步余项把 C2（Dashboard 命令）、C4（scheduler 只算 due/run ID 后 `submit`）、A4
-（singleflight activation、reattach/cold-resume/quarantine）迁入同一入口；C3 已提供可重建
-projection 与 `online/restoring/ready` Current runtime capability，I1 再把 owner binding 提升为不可变
-BotId。第三步（Target-B）在同一 Interface 后用
+第二步余项只剩 C2（Dashboard 命令）与 Target-A roll-up 集成；C3 已提供可重建 projection 与
+`online/restoring/ready` Current runtime capability，C4/A4/I1 已分别完成 stable producer、
+singleflight activation/reattach/cold-resume/quarantine 与不可变 BotId 绑定。第三步（Target-B）在同一 Interface 后用
 per-bot SQLite 替换 production Adapter：短事务提交 accepted turn / mailbox / effect receipt，
 commit 后才对需要 durable admission 的 ingress ACK。届时调用方与全部行为测试不动，`current-*`
 绑定层整体删除。

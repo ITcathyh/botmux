@@ -78,11 +78,18 @@ export type CurrentOrdinaryIngressCommandResult =
   | { readonly kind: 'accepted' }
   | { readonly kind: 'refused'; readonly message: string }
   | { readonly kind: 'unknown'; readonly message: string }
-  | { readonly kind: 'stateChanged' };
+  | { readonly kind: 'stateChanged' }
+  | { readonly kind: 'effect'; readonly intent: unknown; readonly continuation: unknown };
 
 /** Synchronous Adapter for all worker/current mutations selected by policy. */
 export interface CurrentOrdinaryIngressCommandAdapter {
   apply(command: CurrentOrdinaryIngressCommand): CurrentOrdinaryIngressCommandResult;
+  /** Optional only for pure synchronous test Adapters. Production activation uses it. */
+  execute?(intent: unknown): Promise<unknown>;
+  resume?(
+    continuation: unknown,
+    settlement: OrdinaryIngressEffectSettlement,
+  ): CurrentOrdinaryIngressCommandResult;
 }
 
 export interface CurrentOrdinaryIngressPreMaterializationModule {
@@ -135,6 +142,13 @@ interface ContinuationPlan {
   readonly binding: BindingStamp;
   readonly input: CurrentOrdinaryIngressMaterializeInput;
   readonly arrival: ArrivalReservation;
+}
+
+interface CommandContinuationPlan {
+  readonly plan: ContinuationPlan;
+  readonly openingClaimed: boolean;
+  readonly reclassifications: number;
+  readonly continuation: unknown;
 }
 
 const MAX_STATE_RECLASSIFICATIONS = 3;
@@ -255,6 +269,7 @@ export function createCurrentOrdinaryIngressPort(
   const trustedTurnPreparation = createCurrentOrdinaryImTurnPreparationPort();
   const effects = new WeakMap<object, EffectPlan>();
   const continuations = new WeakMap<object, ContinuationPlan>();
+  const commandContinuations = new WeakMap<object, CommandContinuationPlan>();
   const bindingTokens = new WeakMap<DaemonSession, object>();
   const sessionTokens = new WeakMap<object, object>();
   const arrivalQueues = new WeakMap<object, ArrivalQueue>();
@@ -464,7 +479,12 @@ export function createCurrentOrdinaryIngressPort(
       throw new Error('invalid Current ordinary ingress effect token');
     }
     const plan = effects.get(intent);
-    if (!plan) throw new Error('Current ordinary ingress effect token was already consumed');
+    if (!plan) {
+      if (!options.commands.execute) {
+        throw new Error('Current ordinary ingress effect token was already consumed');
+      }
+      return options.commands.execute(intent);
+    }
     effects.delete(intent);
 
     let materialization: Promise<
@@ -485,12 +505,152 @@ export function createCurrentOrdinaryIngressPort(
     return settled.value;
   };
 
+  const finish = (
+    plan: ContinuationPlan,
+    transition: Exclude<ReturnType<OrdinaryIngressPort['resume']>, { kind: 'effect' }>,
+  ): ReturnType<OrdinaryIngressPort['resume']> => {
+    releaseArrival(plan.arrival);
+    return transition;
+  };
+
+  const inspectCommandResult = (
+    plan: ContinuationPlan,
+    openingClaimed: boolean,
+    reclassifications: number,
+    commandResult: CurrentOrdinaryIngressCommandResult,
+  ): ReturnType<OrdinaryIngressPort['resume']> => {
+    if (!isObject(commandResult)) {
+      return finish(plan, { kind: 'unknown', message: 'ordinary ingress command returned an invalid result' });
+    }
+    let then: unknown;
+    let commandResultKind: unknown;
+    let commandResultMessage: unknown;
+    try {
+      then = (commandResult as { readonly then?: unknown }).then;
+      commandResultKind = commandResult.kind;
+      commandResultMessage = 'message' in commandResult ? commandResult.message : undefined;
+    } catch {
+      return finish(plan, {
+        kind: 'unknown', message: 'Current ordinary ingress command returned an unreadable result',
+      });
+    }
+    if (typeof then === 'function') {
+      try { void Promise.resolve(commandResult).catch(() => undefined); }
+      catch { /* outcome remains unknown */ }
+      return finish(plan, {
+        kind: 'unknown', message: 'Current ordinary ingress command Adapter must return synchronously',
+      });
+    }
+    if (!resolveCurrent(plan.binding, plan.input.turn)) {
+      return finish(plan, {
+        kind: 'unknown', message: 'Current Session identity changed during ordinary ingress delivery',
+      });
+    }
+    if (commandResultKind === 'effect') {
+      if (!options.commands.execute || !options.commands.resume
+          || !('intent' in commandResult) || !('continuation' in commandResult)) {
+        return finish(plan, {
+          kind: 'unknown', message: 'Current ordinary ingress command effect is not executable',
+        });
+      }
+      const continuation = frozenToken();
+      commandContinuations.set(continuation, {
+        plan,
+        openingClaimed,
+        reclassifications,
+        continuation: commandResult.continuation,
+      });
+      return { kind: 'effect', intent: commandResult.intent, continuation };
+    }
+    if (commandResultKind === 'accepted') return finish(plan, { kind: 'committed' });
+    if (commandResultKind === 'refused') {
+      releaseOpening(plan, openingClaimed);
+      return finish(plan, {
+        kind: 'notCommitted',
+        message: typeof commandResultMessage === 'string'
+          ? commandResultMessage
+          : 'ordinary ingress command refused the turn',
+      });
+    }
+    if (commandResultKind === 'unknown') {
+      return finish(plan, {
+        kind: 'unknown',
+        message: typeof commandResultMessage === 'string'
+          ? commandResultMessage
+          : 'ordinary ingress command outcome is unknown',
+      });
+    }
+    if (commandResultKind !== 'stateChanged') {
+      return finish(plan, { kind: 'unknown', message: 'ordinary ingress command returned an invalid result' });
+    }
+    if (reclassifications >= MAX_STATE_RECLASSIFICATIONS) {
+      return finish(plan, {
+        kind: 'unknown', message: 'ordinary ingress delivery state did not stabilize before the retry limit',
+      });
+    }
+    return deliver(plan, openingClaimed, reclassifications + 1);
+  };
+
+  const deliver = (
+    plan: ContinuationPlan,
+    priorOpeningClaimed: boolean,
+    reclassifications: number,
+  ): ReturnType<OrdinaryIngressPort['resume']> => {
+    const current = resolveCurrent(plan.binding, plan.input.turn);
+    if (!current) {
+      return finish(plan, {
+        kind: 'unknown', message: 'Current Session identity changed before ordinary ingress delivery',
+      });
+    }
+    const commandKind = classifyCurrentOrdinaryIngress(current);
+    const openingClaimed = priorOpeningClaimed
+      || (canOwnOpening(commandKind) && claimInitialUserTurn(current));
+    const command = Object.freeze({
+      kind: commandKind,
+      input: Object.freeze({ ...plan.input, opening: openingClaimed }),
+      guard: Object.freeze({ workerGeneration: current.workerGeneration }),
+    });
+    let commandResult: CurrentOrdinaryIngressCommandResult;
+    try {
+      commandResult = options.commands.apply(command);
+    } catch (error) {
+      return finish(plan, {
+        kind: 'unknown',
+        message: `ordinary ingress command outcome is unknown: ${error instanceof Error
+          ? error.message
+          : String(error)}`,
+      });
+    }
+    return inspectCommandResult(plan, openingClaimed, reclassifications, commandResult);
+  };
+
   const resume: OrdinaryIngressPort['resume'] = (
     continuation,
     settlement: OrdinaryIngressEffectSettlement,
   ) => {
     if (!isObject(continuation)) {
       return { kind: 'unknown', message: 'invalid Current ordinary ingress continuation token' };
+    }
+    const commandPlan = commandContinuations.get(continuation);
+    if (commandPlan) {
+      commandContinuations.delete(continuation);
+      let result: CurrentOrdinaryIngressCommandResult;
+      try {
+        result = options.commands.resume!(commandPlan.continuation, settlement);
+      } catch (error) {
+        return finish(commandPlan.plan, {
+          kind: 'unknown',
+          message: `ordinary ingress activation settlement is unknown: ${error instanceof Error
+            ? error.message
+            : String(error)}`,
+        });
+      }
+      return inspectCommandResult(
+        commandPlan.plan,
+        commandPlan.openingClaimed,
+        commandPlan.reclassifications,
+        result,
+      );
     }
     const plan = continuations.get(continuation);
     if (!plan) {
@@ -501,149 +661,44 @@ export function createCurrentOrdinaryIngressPort(
     }
     continuations.delete(continuation);
 
-    try {
-      if (!resolveCurrent(plan.binding, plan.input.turn)) {
-        return {
-          kind: 'unknown',
-          message: 'Current Session identity changed while ordinary ingress outcome was in flight',
-        };
-      }
-      if (settlement.kind === 'threw') {
-        return {
-          kind: 'unknown',
-          message: `ordinary ingress materialization outcome is unknown: ${settlement.error instanceof Error
-            ? settlement.error.message
-            : String(settlement.error)}`,
-        };
-      }
-
-      const materialization = settlement.value as Partial<CurrentOrdinaryIngressExternalEffectResult> | null;
-      if (!materialization || typeof materialization !== 'object') {
-        return { kind: 'unknown', message: 'ordinary ingress materializer returned an invalid result' };
-      }
-      if (materialization.kind === 'refused') {
-        return {
-          kind: 'notCommitted',
-          message: typeof materialization.message === 'string'
-            ? materialization.message
-            : 'ordinary ingress materializer refused the turn',
-        };
-      }
-      if (materialization.kind === 'unknown') {
-        return {
-          kind: 'unknown',
-          message: typeof materialization.message === 'string'
-            ? materialization.message
-            : 'ordinary ingress materialization outcome is unknown',
-        };
-      }
-      if (materialization.kind !== 'materialized') {
-        return { kind: 'unknown', message: 'ordinary ingress materializer returned an invalid result' };
-      }
-
-      let openingClaimed = false;
-      for (let reclassifications = 0; ; reclassifications += 1) {
-        const current = resolveCurrent(plan.binding, plan.input.turn);
-        if (!current) {
-          return {
-            kind: 'unknown',
-            message: 'Current Session identity changed before ordinary ingress delivery',
-          };
-        }
-        const commandKind = classifyCurrentOrdinaryIngress(current);
-        if (!openingClaimed && canOwnOpening(commandKind)) {
-          openingClaimed = claimInitialUserTurn(current);
-        }
-        const command = Object.freeze({
-          kind: commandKind,
-          input: Object.freeze({ ...plan.input, opening: openingClaimed }),
-          guard: Object.freeze({ workerGeneration: current.workerGeneration }),
-        });
-        let commandResult: CurrentOrdinaryIngressCommandResult;
-        try {
-          commandResult = options.commands.apply(command);
-        } catch (error) {
-          return {
-            kind: 'unknown',
-            message: `ordinary ingress command outcome is unknown: ${error instanceof Error
-              ? error.message
-              : String(error)}`,
-          };
-        }
-        let commandResultKind: unknown;
-        let commandResultMessage: unknown;
-        if (isObject(commandResult)) {
-          let then: unknown;
-          try {
-            then = (commandResult as { readonly then?: unknown }).then;
-          } catch {
-            return {
-              kind: 'unknown',
-              message: 'Current ordinary ingress command Adapter must return synchronously',
-            };
-          }
-          if (typeof then === 'function') {
-            try {
-              void Promise.resolve(commandResult).catch(() => undefined);
-            } catch {
-              // A hostile thenable can throw during assimilation; the outcome
-              // remains unknown and must never be replayed.
-            }
-            return {
-              kind: 'unknown',
-              message: 'Current ordinary ingress command Adapter must return synchronously',
-            };
-          }
-          try {
-            commandResultKind = (commandResult as { readonly kind?: unknown }).kind;
-            commandResultMessage = (commandResult as { readonly message?: unknown }).message;
-          } catch {
-            return {
-              kind: 'unknown',
-              message: 'Current ordinary ingress command returned an unreadable result',
-            };
-          }
-        }
-        if (!resolveCurrent(plan.binding, plan.input.turn)) {
-          return {
-            kind: 'unknown',
-            message: 'Current Session identity changed during ordinary ingress delivery',
-          };
-        }
-        if (!commandResult || typeof commandResult !== 'object') {
-          return { kind: 'unknown', message: 'ordinary ingress command returned an invalid result' };
-        }
-        if (commandResultKind === 'accepted') return { kind: 'committed' };
-        if (commandResultKind === 'refused') {
-          releaseOpening(plan, openingClaimed);
-          return {
-            kind: 'notCommitted',
-            message: typeof commandResultMessage === 'string'
-              ? commandResultMessage
-              : 'ordinary ingress command refused the turn',
-          };
-        }
-        if (commandResultKind === 'unknown') {
-          return {
-            kind: 'unknown',
-            message: typeof commandResultMessage === 'string'
-              ? commandResultMessage
-              : 'ordinary ingress command outcome is unknown',
-          };
-        }
-        if (commandResultKind !== 'stateChanged') {
-          return { kind: 'unknown', message: 'ordinary ingress command returned an invalid result' };
-        }
-        if (reclassifications >= MAX_STATE_RECLASSIFICATIONS) {
-          return {
-            kind: 'unknown',
-            message: 'ordinary ingress delivery state did not stabilize before the retry limit',
-          };
-        }
-      }
-    } finally {
-      releaseArrival(plan.arrival);
+    if (!resolveCurrent(plan.binding, plan.input.turn)) {
+      return finish(plan, {
+        kind: 'unknown', message: 'Current Session identity changed while ordinary ingress outcome was in flight',
+      });
     }
+    if (settlement.kind === 'threw') {
+      return finish(plan, {
+        kind: 'unknown',
+        message: `ordinary ingress materialization outcome is unknown: ${settlement.error instanceof Error
+          ? settlement.error.message
+          : String(settlement.error)}`,
+      });
+    }
+
+    const materialization = settlement.value as Partial<CurrentOrdinaryIngressExternalEffectResult> | null;
+    if (!materialization || typeof materialization !== 'object') {
+      return finish(plan, { kind: 'unknown', message: 'ordinary ingress materializer returned an invalid result' });
+    }
+    if (materialization.kind === 'refused') {
+      return finish(plan, {
+        kind: 'notCommitted',
+        message: typeof materialization.message === 'string'
+          ? materialization.message
+          : 'ordinary ingress materializer refused the turn',
+      });
+    }
+    if (materialization.kind === 'unknown') {
+      return finish(plan, {
+        kind: 'unknown',
+        message: typeof materialization.message === 'string'
+          ? materialization.message
+          : 'ordinary ingress materialization outcome is unknown',
+      });
+    }
+    if (materialization.kind !== 'materialized') {
+      return finish(plan, { kind: 'unknown', message: 'ordinary ingress materializer returned an invalid result' });
+    }
+    return deliver(plan, false, 0);
   };
 
   return { begin, execute, resume };
