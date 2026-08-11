@@ -1353,6 +1353,131 @@ export function recallFrozenCards(ds: DaemonSession): void {
 }
 
 /**
+ * Post the current turn's starting card as soon as the daemon accepts the
+ * inbound message. Terminal redraw is deliberately not part of this trigger:
+ * some CLIs consume a turn without emitting another screen_update, which used
+ * to leave streamCardPending stuck and suppress cards for every later turn.
+ *
+ * Only one POST may be in flight per session. If another turn arrives during
+ * the request, the generation check preserves that newer pending state and
+ * immediately follows with its card after the first POST settles.
+ */
+export async function postTurnStartingCard(
+  ds: DaemonSession,
+  sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string) => Promise<string>,
+  turnId: string,
+): Promise<boolean> {
+  if (!ds.streamCardPending || ds.streamCardPendingTurnId !== turnId) return false;
+  if (riffRetirementAdmissionPhase(ds)) return false;
+  if (ds.streamCardId === CARD_POSTING_SENTINEL) return false;
+  if (ds.session.vcMeetingReceiver || streamingCardDisabled(ds, turnId)) return false;
+  if (!workerHasInitialized(ds)) return false;
+  if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return false;
+
+  const generation = ds.streamCardTurnGeneration ?? 0;
+  const sessionAtPost = ds.session;
+  const larkAppIdAtPost = ds.larkAppId;
+  const anchorAtPost = sessionAnchorId(ds);
+  const registryKeyAtPost = sessionKey(anchorAtPost, larkAppIdAtPost);
+  const botCfg = getBot(ds.larkAppId).config;
+  const effectiveCliId = sessionCliId(ds, botCfg);
+  const previousCardId = ds.streamCardId;
+  const previousNonce = ds.streamCardNonce;
+  // A newer turn may have arrived while the previous turn's POST was still in
+  // flight, so beginNewTurn could not park that sentinel. Park the now-live
+  // predecessor here before replacing its identity.
+  parkStreamCard(ds);
+  const nonce = randomBytes(4).toString('hex');
+  const status = ds.usageLimit ? 'limited' : 'starting';
+  const cardJson = buildStreamingCard(
+    ds.session.sessionId,
+    sessionAnchorId(ds),
+    readableTerminalUrlFor(ds),
+    ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
+    '',
+    status,
+    effectiveCliId,
+    ds.displayMode ?? 'hidden',
+    nonce,
+    undefined,
+    !!ds.adoptedFrom,
+    false,
+    localeForBot(ds.larkAppId),
+    ds.usageLimit,
+    writableTerminalLinkFor(ds),
+    isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+    getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
+    sessionRuntimeDisplayName(ds, botCfg),
+    codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+  );
+
+  ds.streamCardNonce = nonce;
+  ds.streamCardId = CARD_POSTING_SENTINEL;
+  const ownsPostIdentity = (): boolean =>
+    ds.session === sessionAtPost
+    && ds.session.status === 'active'
+    && ds.larkAppId === larkAppIdAtPost
+    && sessionAnchorId(ds) === anchorAtPost
+    && !isSessionTransferring(ds)
+    && ds.streamCardId === CARD_POSTING_SENTINEL
+    && ds.streamCardNonce === nonce
+    && (!activeSessionsRegistry || activeSessionsRegistry.get(registryKeyAtPost) === ds);
+  const stillOwnsPost = (): boolean =>
+    ownsPostIdentity() && riffRetirementAdmissionPhase(ds) === null;
+  const restorePrePostIdentityForRetirement = (): boolean => {
+    if (riffRetirementAdmissionPhase(ds) === null || !ownsPostIdentity()) return false;
+    ds.streamCardId = previousCardId;
+    ds.streamCardNonce = previousNonce;
+    persistStreamCardState(ds);
+    return true;
+  };
+  try {
+    const messageId = await sessionReply(
+      anchorAtPost, cardJson, 'interactive', larkAppIdAtPost, turnId,
+    );
+    if (!stillOwnsPost()) {
+      void deleteMessage(larkAppIdAtPost, messageId).catch(() => { /* best-effort stale-card cleanup */ });
+      restorePrePostIdentityForRetirement();
+      logger.info(`[${tag(ds)}] Discarded stale starting card for turn ${turnId.substring(0, 12)}`);
+      return false;
+    }
+    ds.streamCardId = messageId;
+    ds.parkedStreamCardNonce = undefined;
+    const superseded = (ds.streamCardTurnGeneration ?? 0) !== generation;
+    if (!superseded) {
+      ds.streamCardPending = false;
+      ds.streamCardPendingTurnId = undefined;
+    }
+    persistStreamCardState(ds);
+    recallFrozenCards(ds);
+    flushPendingLocalCliOpenReadinessPatch(ds);
+    flushPendingRiffUrlPatch(ds);
+    flushPendingActiveRuntimePatch(ds);
+    flushPendingCodexServiceTierPatch(ds);
+    syncUsageRefreshTimer(ds);
+    logger.info(`[${tag(ds)}] Posted starting card for turn ${turnId.substring(0, 12)}`);
+    if (superseded && ds.streamCardPendingTurnId) {
+      void postTurnStartingCard(ds, sessionReply, ds.streamCardPendingTurnId);
+    }
+    return true;
+  } catch (err) {
+    if (!stillOwnsPost()) {
+      restorePrePostIdentityForRetirement();
+      logger.info(`[${tag(ds)}] Ignored stale starting-card failure for turn ${turnId.substring(0, 12)}`);
+      return false;
+    }
+    ds.streamCardId = previousCardId;
+    ds.streamCardNonce = previousNonce;
+    persistStreamCardState(ds);
+    logger.warn(`[${tag(ds)}] Failed to post starting card for turn ${turnId.substring(0, 12)}: ${err}`);
+    if ((ds.streamCardTurnGeneration ?? 0) !== generation && ds.streamCardPendingTurnId) {
+      void postTurnStartingCard(ds, sessionReply, ds.streamCardPendingTurnId);
+    }
+    return false;
+  }
+}
+
+/**
  * Force-post a fresh streaming card for `ds`, bypassing the per-bot
  * `disableStreamingCard` opt-out. Backs the `/card` command: a user can
  * manually summon a live card in an otherwise-quiet session. Parks the current
@@ -7220,6 +7345,7 @@ function setupWorkerHandlers(
         // in-flight. In that case CARD_POSTING_SENTINEL is already set — don't
         // POST a second card; the in-flight POST becomes this turn's card.
         if (ds.streamCardId === CARD_POSTING_SENTINEL) break;
+        const postingGeneration = ds.streamCardTurnGeneration ?? 0;
         ds.streamCardId = CARD_POSTING_SENTINEL;
         try {
           ds.streamCardNonce = randomBytes(4).toString('hex');
@@ -7267,7 +7393,11 @@ function setupWorkerHandlers(
           // this "starting" card is orphaned (never entered frozenCards, so
           // recallFrozenCards can't withdraw it). Mirrors the screen_update POST
           // branch which clears the flag after posting.
-          ds.streamCardPending = false;
+          const superseded = (ds.streamCardTurnGeneration ?? 0) !== postingGeneration;
+          if (!superseded) {
+            ds.streamCardPending = false;
+            ds.streamCardPendingTurnId = undefined;
+          }
           ds.parkedStreamCardNonce = undefined;
           persistStreamCardState(ds);
           // Re-sync worker's display mode (it starts fresh in 'hidden')
@@ -7284,6 +7414,9 @@ function setupWorkerHandlers(
           // resume where the CLI kept running), arm here — same authorized arm
           // point as the reuse branch, now that streamCardId is the real id.
           syncUsageRefreshTimer(ds);
+          if (superseded && ds.streamCardPendingTurnId) {
+            void postTurnStartingCard(ds, cb.sessionReply, ds.streamCardPendingTurnId);
+          }
         } catch (err) {
           if (!ownsLifecycleMutation()) break;
           if (err instanceof MessageWithdrawnError) {
@@ -7539,7 +7672,10 @@ function setupWorkerHandlers(
         // upstream debouncer — by the time we get here, status flips are
         // already coarse-grained.
         if (prevStatus !== ds.lastScreenStatus) {
-          const dashboardRow = composeRowFromActive(ds);
+          // fresh:true —— 这是「状态边沿触发的 refresh 读」，transcript 此刻刚追加完
+          // 本轮输出。绕过 resolver 对懒创建 rollout 的 30s miss 负缓存，否则首轮
+          // (spawn 时 rollout 还没落盘)徽标要等 30s 后某次边沿才出现。
+          const dashboardRow = composeRowFromActive(ds, { fresh: true });
           dashboardEventBus.publish({
             type: 'session.update',
             body: {
@@ -7555,6 +7691,9 @@ function setupWorkerHandlers(
                 previewUserAt: dashboardRow.previewUserAt,
                 previewBotAt: dashboardRow.previewBotAt,
                 previewBotState: dashboardRow.previewBotState,
+                // 任务态随运行态边沿一起推：working→idle 时 todo 往往刚变化，
+                // 不带上会让看板「待办」列停在旧值。?? null 让清空也能同步（patch 合并）。
+                openTodos: dashboardRow.openTodos ?? null,
               },
             },
           });
@@ -7617,6 +7756,7 @@ function setupWorkerHandlers(
           // New turn — create a fresh card, old card freezes at its last state.
           // Generate new nonce so old card buttons are distinguishable.
           const isNewTurn = !!ds.streamCardPending;
+          const postingGeneration = ds.streamCardTurnGeneration ?? 0;
           ds.streamCardNonce = randomBytes(4).toString('hex');
           // New turn → image_key from previous turn no longer valid
           if (isNewTurn) ds.currentImageKey = undefined;
@@ -7652,6 +7792,8 @@ function setupWorkerHandlers(
                 return;
               }
               ds.streamCardId = msgId;
+              const superseded = (ds.streamCardTurnGeneration ?? 0) !== postingGeneration;
+              if (!superseded) ds.streamCardPendingTurnId = undefined;
               ds.parkedStreamCardNonce = undefined;
               persistStreamCardState(ds);
               // New card live — recall any cards parked by previous turns
@@ -7669,6 +7811,9 @@ function setupWorkerHandlers(
               // periodic usage refresh here (once the real card id exists, not
               // the POSTING sentinel). syncUsageRefreshTimer re-checks state.
               syncUsageRefreshTimer(ds);
+              if (superseded && ds.streamCardPendingTurnId) {
+                void postTurnStartingCard(ds, cb.sessionReply, ds.streamCardPendingTurnId);
+              }
             })
             .catch(async err => {
               if (!ownsLifecycleMutation()) return;
@@ -7682,6 +7827,9 @@ function setupWorkerHandlers(
               ds.pendingActiveRuntimeCardRefresh = undefined;
               ds.pendingCodexTierCardRefresh = undefined;
               persistStreamCardState(ds);
+              if ((ds.streamCardTurnGeneration ?? 0) !== postingGeneration && ds.streamCardPendingTurnId) {
+                void postTurnStartingCard(ds, cb.sessionReply, ds.streamCardPendingTurnId);
+              }
             });
         } else {
           // Same turn — PATCH only on status change. Image PATCHes go through
