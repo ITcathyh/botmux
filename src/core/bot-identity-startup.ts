@@ -17,14 +17,15 @@ export class BotIdentityStartupBlockedError extends Error {
   readonly status: BotIdentityStatus;
 
   constructor(status: BotIdentityStatus) {
-    const action: BotIdentityStartupAction = status.kind === 'unmigrated'
+    // needsPromotion = registry truth intact but the active address set moved
+    // on; the fix is a fresh report+apply cycle, never repair (repair only
+    // converges registry artifacts and would not absorb the new address set).
+    const action: BotIdentityStartupAction = status.kind === 'unmigrated' || status.kind === 'needsPromotion'
       ? 'report'
       : status.kind === 'planned' ? 'apply' : 'repair';
-    const operationId = status.kind === 'planned' || status.kind === 'ready'
-      ? status.operationId
-      : status.kind === 'needsRepair' ? status.operationId : undefined;
+    const operationId = status.kind === 'unmigrated' ? undefined : status.operationId;
     const command = action === 'report'
-      ? 'botmux identity report'
+      ? 'botmux identity report && botmux identity apply <operation> --yes'
       : `botmux identity ${action}${operationId ? ` ${operationId}` : ''} --yes`;
     super(`stable Bot identity is not ready; run \`${command}\``);
     this.name = 'BotIdentityStartupBlockedError';
@@ -65,14 +66,17 @@ export function requireReadyDaemonBotIdentities(
   return identities;
 }
 
-/** Stable, secret-free authority bytes for a core-only root without bots.json. */
+/**
+ * Stable, secret-free authority bytes for a core-only root without bots.json.
+ * Address fields only: env-derived launch knobs (cliId, model, workingDir) are
+ * mutable operator choices and must never shift the identity projection.
+ */
 export function coreOnlyBotIdentityAuthorityBytes(
-  configs: readonly Pick<BotConfig, 'apiOnly' | 'cliId' | 'larkAppId'>[],
+  configs: readonly Pick<BotConfig, 'apiOnly' | 'larkAppId'>[],
 ): string {
   return `${JSON.stringify(configs.map(config => ({
     larkAppId: config.larkAppId,
     apiOnly: config.apiOnly === true,
-    cliId: config.cliId,
   })), null, 2)}\n`;
 }
 
@@ -80,7 +84,7 @@ export function createDaemonBotIdentityControlPlane(input: {
   readonly dataDir: string;
   readonly configPath: string | undefined;
   readonly configProvenance: BotsConfigProvenance | undefined;
-  readonly configs: readonly Pick<BotConfig, 'apiOnly' | 'cliId' | 'larkAppId'>[];
+  readonly configs: readonly Pick<BotConfig, 'apiOnly' | 'larkAppId'>[];
 }): BotIdentityControlPlane {
   if (input.configProvenance === 'loaded' && input.configPath) {
     return createBotIdentityControlPlane({

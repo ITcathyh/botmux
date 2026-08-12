@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -33,6 +33,7 @@ describe('BotIdentityControlPlane', () => {
     writeFileSync(configPath, configBytes(['cli_same']));
     return {
       root,
+      configPath,
       control: createBotIdentityControlPlane({
         dataDir: root,
         configPath,
@@ -67,7 +68,6 @@ describe('BotIdentityControlPlane', () => {
     const coreOnly = `${JSON.stringify([{
       larkAppId: 'local_riff',
       apiOnly: true,
-      cliId: 'codex-app',
     }], null, 2)}\n`;
     const makeCore = (botId: string, operationId: string) => {
       const root = mkdtempSync(join(tmpdir(), 'botmux-core-identity-'));
@@ -94,6 +94,31 @@ describe('BotIdentityControlPlane', () => {
     right.control.apply('op_core_right');
     expect(existsSync(join(left.root, 'bots.json'))).toBe(false);
     expect(existsSync(join(right.root, 'bots.json'))).toBe(false);
+  });
+
+  it('keeps a promoted core-only root ready across launch-knob changes to its descriptor', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-core-knob-'));
+    roots.push(root);
+    const descriptor = (extra: Record<string, unknown>) => `${JSON.stringify([{
+      larkAppId: 'local_riff',
+      apiOnly: true,
+      ...extra,
+    }], null, 2)}\n`;
+    let bytes = descriptor({ cliId: 'codex-app' });
+    const control = createBotIdentityControlPlane({
+      dataDir: root,
+      readOnlyConfigBytes: () => bytes,
+      allocateBotId: () => 'bot_core_knob',
+      allocateOperationId: () => 'op_core_knob',
+    });
+    control.apply(control.report().operationId);
+    expect(control.status()).toMatchObject({ kind: 'ready' });
+
+    // Operator switches BOTMUX_CORE_CLI / model / workingDir: identity must not move.
+    bytes = descriptor({ cliId: 'claude', model: 'opus', workingDir: '/elsewhere' });
+    expect(control.status()).toMatchObject({ kind: 'ready' });
+    expect(control.resolveActive({ kind: 'coreOnly', launchId: 'local_riff' }).botId)
+      .toBe('bot_core_knob');
   });
 
   it('promotes only the exact source plan and fails closed if published identity disappears', () => {
@@ -134,24 +159,70 @@ describe('BotIdentityControlPlane', () => {
     expect(control.status()).toMatchObject({ kind: 'ready', revision: 1 });
   });
 
-  it('preserves identity across metadata changes and treats App replacement as retire plus allocate', () => {
-    const { control } = fixture(
-      ['bot_original', 'bot_replacement', 'bot_reintroduced'],
-      ['op_initial', 'op_metadata', 'op_replace', 'op_reintroduce'],
-    );
+  it('stays ready across runtime config writes and never demands repair for them', () => {
+    const { configPath, control } = fixture(['bot_stable_ready'], ['op_stable']);
     control.apply(control.report().operationId);
+    expect(control.status()).toMatchObject({ kind: 'ready' });
 
-    const metadataPlan = control.report(`${JSON.stringify([{
+    // Secret rotation, display rename, and store-style field writes (the
+    // rmwBotEntry family: /config set, dashboard defaults, vcMeeting seed…)
+    // all mutate bots.json bytes without touching the active address set.
+    writeFileSync(configPath, `${JSON.stringify([{
       larkAppId: 'cli_same',
       larkAppSecret: 'rotated-secret',
       displayName: 'renamed',
+      vcMeetingConsumerProfile: { seeded: true },
     }], null, 2)}\n`);
-    expect(metadataPlan.targetRegistry.bindings).toEqual([
-      expect.objectContaining({ botId: 'bot_original', status: 'active' }),
-    ]);
-    control.apply(metadataPlan.operationId);
 
-    const replacementPlan = control.report(configBytes(['cli_new']));
+    expect(control.status()).toMatchObject({ kind: 'ready', revision: 1 });
+    expect(control.resolveActive({ kind: 'lark', larkAppId: 'cli_same' }).botId).toBe('bot_stable_ready');
+    expect(() => control.report()).toThrow(/nothing to promote/i);
+  });
+
+  it('repair converges registry truth only and never rewrites the config authority', () => {
+    const { root, configPath, control } = fixture(['bot_keep_config'], ['op_keep_config']);
+    control.apply(control.report().operationId);
+
+    const rotatedBytes = `${JSON.stringify([{
+      larkAppId: 'cli_same',
+      larkAppSecret: 'rotated-after-promotion',
+      allowedUsers: ['user-added-later'],
+    }], null, 2)}\n`;
+    writeFileSync(configPath, rotatedBytes);
+    writeFileSync(join(root, 'bot-identities.json'), '{bad json');
+    expect(control.status()).toMatchObject({ kind: 'needsRepair' });
+
+    control.repair();
+
+    expect(control.status()).toMatchObject({ kind: 'ready', revision: 1 });
+    expect(readFileSync(configPath, 'utf8')).toBe(rotatedBytes);
+  });
+
+  it('persists no config secrets into identity operation artifacts', () => {
+    const { root, control } = fixture(['bot_no_leakage'], ['op_no_leakage']);
+    control.apply(control.report().operationId);
+    for (const name of readdirSync(join(root, 'bot-identity-ops'))) {
+      expect(readFileSync(join(root, 'bot-identity-ops', name), 'utf8')).not.toContain('secret-cli_same');
+    }
+  });
+
+  it('reports address-set drift as needsPromotion and treats App replacement as retire plus allocate', () => {
+    const { configPath, control } = fixture(
+      ['bot_original', 'bot_replacement', 'bot_reintroduced'],
+      ['op_initial', 'op_replace', 'op_reintroduce'],
+    );
+    control.apply(control.report().operationId);
+
+    writeFileSync(configPath, configBytes(['cli_new']));
+    expect(control.status()).toMatchObject({
+      kind: 'needsPromotion',
+      revision: 1,
+      operationId: 'op_initial',
+    });
+    expect(() => control.resolveActive({ kind: 'lark', larkAppId: 'cli_new' }))
+      .toThrow(/fail closed/i);
+
+    const replacementPlan = control.report();
     expect(replacementPlan.targetRegistry.bindings).toEqual([
       expect.objectContaining({
         botId: 'bot_original',
@@ -165,17 +236,27 @@ describe('BotIdentityControlPlane', () => {
       }),
     ]);
     control.apply(replacementPlan.operationId);
+    expect(control.status()).toMatchObject({ kind: 'ready', revision: 2 });
     expect(control.resolveActive({ kind: 'lark', larkAppId: 'cli_new' }).botId)
       .toBe('bot_replacement');
     expect(() => control.resolveActive({ kind: 'lark', larkAppId: 'cli_same' }))
       .toThrow(/no identity/i);
 
-    const reintroduced = control.report(configBytes(['cli_same']));
+    writeFileSync(configPath, configBytes(['cli_same']));
+    const reintroduced = control.report();
     expect(reintroduced.targetRegistry.bindings).toEqual([
       expect.objectContaining({ botId: 'bot_original', status: 'retired' }),
       expect.objectContaining({ botId: 'bot_replacement', status: 'retired' }),
       expect.objectContaining({ botId: 'bot_reintroduced', status: 'active' }),
     ]);
+  });
+
+  it('fails apply closed when the address set changes between report and apply', () => {
+    const { configPath, control } = fixture(['bot_raced_apply'], ['op_raced']);
+    const plan = control.report();
+    writeFileSync(configPath, configBytes(['cli_same', 'cli_added_meanwhile']));
+    expect(() => control.apply(plan.operationId)).toThrow(/run a fresh report/i);
+    expect(existsSync(join(configPath, '..', 'bot-identities.json'))).toBe(false);
   });
 
   it('resumes a torn promotion, supports pre-commit rollback, and forbids identity rollback after receipt', () => {
@@ -232,7 +313,7 @@ describe('BotIdentityControlPlane', () => {
     let root = '';
     let corruptOnce = true;
     const fixtureValue = fixture(['bot_readback'], ['op_readback'], phase => {
-      if (phase === 'configPublished' && corruptOnce) {
+      if (phase === 'registryPublished' && corruptOnce) {
         corruptOnce = false;
         writeFileSync(join(root, 'bot-identities.json'), '{bad json');
       }

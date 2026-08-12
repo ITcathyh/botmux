@@ -1,5 +1,3 @@
-import { readFileSync } from 'node:fs';
-
 import type { BotIdentityControlPlane } from '../services/bot-identity-control-plane.js';
 
 export interface BotIdentityCommandResult {
@@ -16,7 +14,7 @@ function usage(): BotIdentityCommandResult {
   return {
     code: 2,
     stdout: '',
-    stderr: 'Usage: botmux identity status|report [--target-config PATH]|apply <operation> --yes|repair [operation] --yes|rollback [operation] --yes\n',
+    stderr: 'Usage: botmux identity status|report|apply <operation> --yes|repair [operation] --yes|rollback [operation] --yes\n',
   };
 }
 
@@ -37,20 +35,22 @@ export function runBotIdentityCommand(
       return { code: 0, stdout: json(deps.control.status()), stderr: '' };
     }
     if (subcommand === 'report') {
-      const targetIndex = args.indexOf('--target-config');
-      if (targetIndex >= 0 && !args[targetIndex + 1]) return usage();
-      const targetBytes = targetIndex >= 0
-        ? readFileSync(args[targetIndex + 1]!, 'utf8')
-        : undefined;
-      const plan = deps.control.report(targetBytes);
+      // Identity follows the config authority: the plan is always derived from
+      // the live bots.json / launch descriptor. Editing the bot set belongs to
+      // setup/config flows (owner-identity enforced), never to this command —
+      // reject extra arguments (notably the retired --target-config) instead
+      // of silently ignoring them.
+      if (args.length > 1) return usage();
+      const plan = deps.control.report();
       return {
         code: 0,
         stdout: json({
           kind: 'planned',
           operationId: plan.operationId,
-          source: plan.source,
-          target: plan.target,
           targetRevision: plan.targetRegistry.revision,
+          activeAddresses: plan.targetRegistry.bindings
+            .filter(binding => binding.status === 'active')
+            .map(binding => binding.address),
         }),
         stderr: '',
       };

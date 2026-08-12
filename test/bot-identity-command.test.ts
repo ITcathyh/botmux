@@ -43,4 +43,62 @@ describe('bot identity operator command', () => {
     expect(JSON.parse(runBotIdentityCommand(['status'], { control }).stdout))
       .toMatchObject({ kind: 'ready', revision: 1 });
   });
+
+  it('rejects the retired --target-config bots.json write entry', () => {
+    const control = createBotIdentityControlPlane({ dataDir: root, configPath });
+    const target = join(root, 'foreign-bots.json');
+    writeFileSync(target, `${JSON.stringify([{ larkAppId: 'cli_injected' }])}\n`);
+    const result = runBotIdentityCommand(['report', '--target-config', target], { control });
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain('Usage:');
+    expect(JSON.parse(runBotIdentityCommand(['status'], { control }).stdout))
+      .toMatchObject({ kind: 'unmigrated' });
+  });
+
+  it('dispatches the repair and rollback recovery subcommands through the same gates', () => {
+    const calls: string[] = [];
+    const control = createBotIdentityControlPlane({
+      dataDir: root,
+      configPath,
+      allocateBotId: () => 'bot_identity_recover',
+      allocateOperationId: () => 'op_identity_recover',
+    });
+    const spy = new Proxy(control, {
+      get(targetControl, prop, receiver) {
+        const value = Reflect.get(targetControl, prop, receiver);
+        if (prop === 'repair' || prop === 'rollback') {
+          return (...args: unknown[]) => {
+            calls.push(`${String(prop)}:${String(args[0] ?? '')}`);
+            return (value as (...inner: unknown[]) => unknown).apply(targetControl, args);
+          };
+        }
+        return value;
+      },
+    });
+
+    expect(runBotIdentityCommand(['repair'], { control: spy }))
+      .toMatchObject({ code: 2, stderr: expect.stringMatching(/--yes/) });
+    expect(runBotIdentityCommand(['rollback'], { control: spy }))
+      .toMatchObject({ code: 2, stderr: expect.stringMatching(/--yes/) });
+    expect(calls).toEqual([]);
+
+    runBotIdentityCommand(['report'], { control: spy });
+    // Pre-receipt rollback of the planned operation goes through rollback().
+    const rolledBack = runBotIdentityCommand(['rollback', 'op_identity_recover', '--yes'], { control: spy });
+    expect(calls).toEqual(['rollback:op_identity_recover']);
+    expect(rolledBack.code).toBe(0);
+    expect(JSON.parse(rolledBack.stdout)).toMatchObject({
+      kind: 'planned',
+      operationId: 'op_identity_recover',
+    });
+
+    runBotIdentityCommand(['apply', 'op_identity_recover', '--yes'], { control: spy });
+    const repaired = runBotIdentityCommand(['repair', '--yes'], { control: spy });
+    expect(calls).toEqual(['rollback:op_identity_recover', 'repair:']);
+    expect(repaired).toMatchObject({ code: 0 });
+    expect(JSON.parse(repaired.stdout)).toMatchObject({
+      kind: 'complete',
+      operationId: 'op_identity_recover',
+    });
+  });
 });

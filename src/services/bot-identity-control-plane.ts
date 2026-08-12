@@ -38,20 +38,27 @@ export interface BotIdentityRegistry {
   readonly bindings: readonly BotIdentityBinding[];
 }
 
+/**
+ * Identity only follows the ACTIVE ADDRESS SET of the config authority — never
+ * its full bytes. Display names, secrets, per-bot runtime store fields and any
+ * other mutable configuration are outside the identity plane by design (design
+ * doc: "显示名、secret 等不改变 BotId"), so the control plane digests a canonical
+ * secret-free projection instead of bots.json bytes, and it NEVER writes the
+ * config authority: bots.json mutation stays with setup/config flows that
+ * enforce the owner-identity boundary.
+ */
 export interface BotIdentityPlan {
   readonly schemaVersion: 1;
   readonly operationId: string;
   readonly createdAt: string;
+  /** Canonical secret-free active-address projection this plan was minted for. */
+  readonly identityProjection: string;
   readonly source: {
-    readonly configDigest: string;
     readonly registryDigest: string | null;
   };
   readonly target: {
-    readonly configDigest: string;
     readonly registryDigest: string;
   };
-  readonly sourceConfigBytes: string;
-  readonly targetConfigBytes: string;
   readonly sourceRegistryBytes: string | null;
   readonly targetRegistry: BotIdentityRegistry;
 }
@@ -66,14 +73,13 @@ export interface BotIdentityIntent {
 export type BotIdentityPromotionPhase =
   | 'intentPrepared'
   | 'registryPublished'
-  | 'configPublished'
   | 'receiptPublished';
 
 export interface BotIdentityReceipt {
   readonly schemaVersion: 1;
   readonly operationId: string;
   readonly registryDigest: string;
-  readonly configDigest: string;
+  readonly projectionDigest: string;
   readonly completedAt: string;
 }
 
@@ -81,6 +87,8 @@ export type BotIdentityStatus =
   | { readonly kind: 'unmigrated' }
   | { readonly kind: 'planned'; readonly operationId: string }
   | { readonly kind: 'ready'; readonly revision: number; readonly operationId: string }
+  /** Registry truth is intact but the config's active address set moved on. */
+  | { readonly kind: 'needsPromotion'; readonly revision: number; readonly operationId: string }
   | { readonly kind: 'needsRepair'; readonly reason: string; readonly operationId?: string };
 
 export interface BotIdentityControlPlaneOptions {
@@ -98,9 +106,10 @@ export interface BotIdentityControlPlaneOptions {
 
 export interface BotIdentityControlPlane {
   /** Create and durably persist an immutable plan; never publishes identity truth. */
-  report(targetConfigBytes?: string): BotIdentityPlan;
-  /** Reentrant promotion of one immutable plan. */
+  report(): BotIdentityPlan;
+  /** Reentrant promotion of one immutable plan. Publishes registry truth only. */
   apply(operationId: string): BotIdentityReceipt;
+  /** Converge registry truth to its receipted plan. Never touches the config authority. */
   repair(operationId?: string): BotIdentityReceipt;
   rollback(operationId?: string): BotIdentityStatus;
   status(): BotIdentityStatus;
@@ -165,6 +174,13 @@ function parseActiveAddresses(configBytes: string): BotExternalAddress[] {
   return addresses;
 }
 
+/** Canonical secret-free projection: the sorted active address set, nothing else. */
+function identityProjectionOf(configBytes: string): string {
+  const addresses = [...parseActiveAddresses(configBytes)]
+    .sort((left, right) => (addressKey(left) < addressKey(right) ? -1 : 1));
+  return canonical(addresses);
+}
+
 function parseAddress(value: unknown): BotExternalAddress {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('bot identity address must be an object');
@@ -185,6 +201,20 @@ function parseAddress(value: unknown): BotExternalAddress {
     return { kind: 'coreOnly', launchId: record.launchId };
   }
   throw new Error('unknown bot identity address kind');
+}
+
+function parseProjectionBytes(bytes: string): BotExternalAddress[] {
+  let value: unknown;
+  try { value = JSON.parse(bytes); } catch { throw new Error('bot identity projection is corrupt JSON'); }
+  if (!Array.isArray(value)) throw new Error('bot identity projection must be an array');
+  const seen = new Set<string>();
+  const addresses = value.map(parseAddress);
+  for (const address of addresses) {
+    const key = addressKey(address);
+    if (seen.has(key)) throw new Error(`duplicate address in bot identity projection: ${key}`);
+    seen.add(key);
+  }
+  return addresses;
 }
 
 function parseRegistryBytes(bytes: string): BotIdentityRegistry {
@@ -271,14 +301,13 @@ function assertSameAddressSet(
   const expected = new Set(addresses.map(addressKey));
   const actual = activeAddressSet(registry);
   if (expected.size !== actual.size || [...expected].some(key => !actual.has(key))) {
-    throw new Error(`${label} active addresses do not match config authority`);
+    throw new Error(`${label} active addresses do not match its identity projection`);
   }
 }
 
 function validateRegistryTransition(
   source: BotIdentityRegistry | null,
   target: BotIdentityRegistry,
-  sourceAddresses: readonly BotExternalAddress[],
   targetAddresses: readonly BotExternalAddress[],
 ): void {
   assertSameAddressSet(targetAddresses, target, 'target registry');
@@ -288,7 +317,6 @@ function validateRegistryTransition(
     }
     return;
   }
-  assertSameAddressSet(sourceAddresses, source, 'source registry');
   if (target.revision !== source.revision + 1) {
     throw new Error('bot identity target revision must advance exactly once');
   }
@@ -321,27 +349,25 @@ function parsePlanBytes(bytes: string): BotIdentityPlan {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('bot identity plan must be an object');
   const record = value as Record<string, unknown>;
   exactKeys(record, [
-    'schemaVersion', 'operationId', 'createdAt', 'source', 'target',
-    'sourceConfigBytes', 'targetConfigBytes', 'sourceRegistryBytes', 'targetRegistry',
+    'schemaVersion', 'operationId', 'createdAt', 'identityProjection',
+    'source', 'target', 'sourceRegistryBytes', 'targetRegistry',
   ], 'bot identity plan');
   if (record.schemaVersion !== 1) throw new Error('unsupported bot identity plan schema');
   if (typeof record.operationId !== 'string' || !/^op_[A-Za-z0-9_-]{2,128}$/.test(record.operationId)) {
     throw new Error('invalid bot identity plan operation ID');
   }
   if (typeof record.createdAt !== 'string'
-    || typeof record.sourceConfigBytes !== 'string'
-    || typeof record.targetConfigBytes !== 'string'
+    || typeof record.identityProjection !== 'string'
     || (record.sourceRegistryBytes !== null && typeof record.sourceRegistryBytes !== 'string')) {
     throw new Error('invalid bot identity plan payload');
   }
   for (const [label, raw] of [['source', record.source], ['target', record.target]] as const) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error(`invalid plan ${label}`);
     const part = raw as Record<string, unknown>;
-    exactKeys(part, ['configDigest', 'registryDigest'], `bot identity plan ${label}`);
-    if (typeof part.configDigest !== 'string'
-      || (label === 'source'
-        ? part.registryDigest !== null && typeof part.registryDigest !== 'string'
-        : typeof part.registryDigest !== 'string')) {
+    exactKeys(part, ['registryDigest'], `bot identity plan ${label}`);
+    if (label === 'source'
+      ? part.registryDigest !== null && typeof part.registryDigest !== 'string'
+      : typeof part.registryDigest !== 'string') {
       throw new Error(`invalid bot identity plan ${label} digest`);
     }
   }
@@ -350,8 +376,6 @@ function parsePlanBytes(bytes: string): BotIdentityPlan {
   const source = record.source as BotIdentityPlan['source'];
   const target = record.target as BotIdentityPlan['target'];
   if (targetRegistry.operationId !== record.operationId
-    || digest(record.sourceConfigBytes) !== source.configDigest
-    || digest(record.targetConfigBytes) !== target.configDigest
     || digest(targetRegistryBytes) !== target.registryDigest
     || (record.sourceRegistryBytes === null
       ? source.registryDigest !== null
@@ -364,8 +388,7 @@ function parsePlanBytes(bytes: string): BotIdentityPlan {
   validateRegistryTransition(
     sourceRegistry,
     targetRegistry,
-    parseActiveAddresses(record.sourceConfigBytes),
-    parseActiveAddresses(record.targetConfigBytes),
+    parseProjectionBytes(record.identityProjection),
   );
   return record as unknown as BotIdentityPlan;
 }
@@ -375,9 +398,9 @@ function parseReceiptBytes(bytes: string): BotIdentityReceipt {
   try { value = JSON.parse(bytes); } catch { throw new Error('bot identity receipt is corrupt JSON'); }
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('bot identity receipt must be an object');
   const record = value as Record<string, unknown>;
-  exactKeys(record, ['schemaVersion', 'operationId', 'registryDigest', 'configDigest', 'completedAt'], 'bot identity receipt');
+  exactKeys(record, ['schemaVersion', 'operationId', 'registryDigest', 'projectionDigest', 'completedAt'], 'bot identity receipt');
   if (record.schemaVersion !== 1 || typeof record.operationId !== 'string'
-    || typeof record.registryDigest !== 'string' || typeof record.configDigest !== 'string'
+    || typeof record.registryDigest !== 'string' || typeof record.projectionDigest !== 'string'
     || typeof record.completedAt !== 'string') {
     throw new Error('invalid bot identity receipt');
   }
@@ -463,19 +486,8 @@ export function createBotIdentityControlPlane(
   const readConfigBytes = (): string => options.configPath !== undefined
     ? readFileSync(options.configPath, 'utf8')
     : options.readOnlyConfigBytes!();
-  const configDigestNow = (): string => digest(readConfigBytes());
-  const publishConfigBytes = (bytes: string): void => {
-    if (options.configPath === undefined) {
-      if (digest(bytes) !== configDigestNow()) {
-        throw new Error('core-only launch descriptor is immutable; fail closed');
-      }
-      return;
-    }
-    atomicWriteFileSync(options.configPath, bytes, {
-      durable: true,
-      mode: 0o600,
-    });
-  };
+  const projectionNow = (): string => identityProjectionOf(readConfigBytes());
+  const projectionDigestNow = (): string => digest(projectionNow());
 
   const planPath = (operationId: string) => join(operationsDir, `${operationId}.plan.json`);
   const receiptPath = (operationId: string) => join(operationsDir, `${operationId}.receipt.json`);
@@ -496,7 +508,7 @@ export function createBotIdentityControlPlane(
     const receipt = parseReceiptBytes(readFileSync(receiptPath(plan.operationId), 'utf8'));
     if (receipt.operationId !== plan.operationId
       || receipt.registryDigest !== plan.target.registryDigest
-      || receipt.configDigest !== plan.target.configDigest) {
+      || receipt.projectionDigest !== digest(plan.identityProjection)) {
       throw new Error('bot identity receipt does not match immutable plan');
     }
     return receipt;
@@ -518,16 +530,20 @@ export function createBotIdentityControlPlane(
     return candidates[0]?.operationId;
   };
 
+  const publishRegistry = (registry: BotIdentityRegistry): void => {
+    atomicWriteFileSync(registryPath, canonical(registry), {
+      durable: true,
+      mode: 0o600,
+      followTargetSymlink: false,
+    });
+  };
+
   return {
-    report(targetConfigBytes) {
+    report() {
       mkdirSync(options.dataDir, { recursive: true, mode: 0o700 });
       return withFileLockSync(lockPath, () => {
-        const sourceConfigBytes = readConfigBytes();
-        const targetBytes = targetConfigBytes ?? sourceConfigBytes;
-        if (options.configPath === undefined && targetBytes !== sourceConfigBytes) {
-          throw new Error('core-only identity report cannot mutate its immutable launch descriptor');
-        }
-        const addresses = parseActiveAddresses(targetBytes);
+        const identityProjection = projectionNow();
+        const addresses = parseProjectionBytes(identityProjection);
         const sourceRegistryBytes = existsSync(registryPath)
           ? readFileSync(registryPath, 'utf8')
           : null;
@@ -540,10 +556,13 @@ export function createBotIdentityControlPlane(
           }
           const { plan: sourcePlan } = readPlan(sourceRegistry.operationId);
           const sourceReceipt = exactPublishedReceipt(sourcePlan);
-          if (!sourceReceipt
-            || digest(sourceRegistryBytes!) !== sourceReceipt.registryDigest
-            || digest(sourceConfigBytes) !== sourceReceipt.configDigest) {
-            throw new Error('cannot report from unreceipted or drifted bot identity source');
+          if (!sourceReceipt || digest(sourceRegistryBytes!) !== sourceReceipt.registryDigest) {
+            throw new Error('cannot report from unreceipted or drifted bot identity registry; repair first');
+          }
+          if (digest(identityProjection) === sourceReceipt.projectionDigest) {
+            throw new Error(
+              `active bot address set is unchanged since ${sourceRegistry.operationId}; nothing to promote`,
+            );
           }
         }
         const operationId = allocateOperationId();
@@ -582,16 +601,13 @@ export function createBotIdentityControlPlane(
           schemaVersion: 1,
           operationId,
           createdAt: now(),
+          identityProjection,
           source: {
-            configDigest: digest(sourceConfigBytes),
             registryDigest: sourceRegistryBytes === null ? null : digest(sourceRegistryBytes),
           },
           target: {
-            configDigest: digest(targetBytes),
             registryDigest: digest(targetRegistryBytes),
           },
-          sourceConfigBytes,
-          targetConfigBytes: targetBytes,
           sourceRegistryBytes,
           targetRegistry,
         };
@@ -603,13 +619,15 @@ export function createBotIdentityControlPlane(
       mkdirSync(options.dataDir, { recursive: true, mode: 0o700 });
       return withFileLockSync(lockPath, () => {
         const { plan, bytes: planBytes } = readPlan(operationId);
+        const planProjectionDigest = digest(plan.identityProjection);
         const completed = exactPublishedReceipt(plan);
         const registryDigest = currentDigest(registryPath);
-        const configDigest = configDigestNow();
         if (completed) {
-          if (registryDigest !== plan.target.registryDigest
-            || configDigest !== plan.target.configDigest) {
+          if (registryDigest !== plan.target.registryDigest) {
             throw new Error('completed bot identity promotion is missing or drifted; fail closed and repair');
+          }
+          if (projectionDigestNow() !== planProjectionDigest) {
+            throw new Error('active bot address set moved past this promotion; run a fresh report');
           }
           removeDurably(intentPath);
           return completed;
@@ -621,10 +639,11 @@ export function createBotIdentityControlPlane(
             throw new Error('another bot identity promotion intent is active; fail closed');
           }
         } else {
-          const sourceRegistryMatches = registryDigest === plan.source.registryDigest;
-          const sourceConfigMatches = configDigest === plan.source.configDigest;
-          if (!sourceRegistryMatches || !sourceConfigMatches) {
+          if (registryDigest !== plan.source.registryDigest) {
             throw new Error('bot identity promotion source digest changed; fail closed');
+          }
+          if (projectionDigestNow() !== planProjectionDigest) {
+            throw new Error('active bot address set changed since this plan; run a fresh report');
           }
           writeIntent({
             schemaVersion: 1,
@@ -636,31 +655,18 @@ export function createBotIdentityControlPlane(
         }
 
         const registryNow = currentDigest(registryPath);
-        const configNow = configDigestNow();
         const registryKnown = registryNow === plan.source.registryDigest
           || registryNow === plan.target.registryDigest;
-        const configKnown = configNow === plan.source.configDigest
-          || configNow === plan.target.configDigest;
-        if (!registryKnown || !configKnown) {
+        if (!registryKnown) {
           throw new Error('bot identity promotion state is outside its immutable plan; fail closed');
         }
 
         if (registryNow !== plan.target.registryDigest) {
-          atomicWriteFileSync(registryPath, canonical(plan.targetRegistry), {
-            durable: true,
-            mode: 0o600,
-            followTargetSymlink: false,
-          });
+          publishRegistry(plan.targetRegistry);
         }
         options.afterPhase?.('registryPublished');
 
-        if (configNow !== plan.target.configDigest) {
-          publishConfigBytes(plan.targetConfigBytes);
-        }
-        options.afterPhase?.('configPublished');
-
-        if (currentDigest(registryPath) !== plan.target.registryDigest
-          || configDigestNow() !== plan.target.configDigest) {
+        if (currentDigest(registryPath) !== plan.target.registryDigest) {
           throw new Error('bot identity promotion readback mismatch; fail closed');
         }
         parseRegistryBytes(readFileSync(registryPath, 'utf8'));
@@ -668,7 +674,7 @@ export function createBotIdentityControlPlane(
           schemaVersion: 1,
           operationId,
           registryDigest: plan.target.registryDigest,
-          configDigest: plan.target.configDigest,
+          projectionDigest: planProjectionDigest,
           completedAt: now(),
         };
         writeImmutable(receiptPath(operationId), canonical(receipt));
@@ -683,7 +689,11 @@ export function createBotIdentityControlPlane(
         selected = parseIntentBytes(readFileSync(intentPath, 'utf8')).operationId;
       }
       if (!selected && existsSync(registryPath)) {
-        selected = parseRegistryBytes(readFileSync(registryPath, 'utf8')).operationId;
+        // A corrupt registry is itself a repair target: fall through to the
+        // latest receipted operation instead of failing the selection.
+        try {
+          selected = parseRegistryBytes(readFileSync(registryPath, 'utf8')).operationId;
+        } catch { /* fall through */ }
       }
       if (!selected) selected = latestCompletedOperation();
       if (!selected) throw new Error('no bot identity operation is available to repair');
@@ -704,14 +714,8 @@ export function createBotIdentityControlPlane(
         }
         const reread = exactPublishedReceipt(plan);
         if (receipt && !reread) throw new Error('completed bot identity receipt disappeared; fail closed');
-        atomicWriteFileSync(registryPath, canonical(plan.targetRegistry), {
-          durable: true,
-          mode: 0o600,
-          followTargetSymlink: false,
-        });
-        publishConfigBytes(plan.targetConfigBytes);
-        if (currentDigest(registryPath) !== plan.target.registryDigest
-          || configDigestNow() !== plan.target.configDigest) {
+        publishRegistry(plan.targetRegistry);
+        if (currentDigest(registryPath) !== plan.target.registryDigest) {
           throw new Error('bot identity repair readback mismatch; fail closed');
         }
         parseRegistryBytes(readFileSync(registryPath, 'utf8'));
@@ -719,7 +723,7 @@ export function createBotIdentityControlPlane(
           schemaVersion: 1 as const,
           operationId: chosen,
           registryDigest: plan.target.registryDigest,
-          configDigest: plan.target.configDigest,
+          projectionDigest: digest(plan.identityProjection),
           completedAt: now(),
         };
         if (!reread) writeImmutable(receiptPath(chosen), canonical(result));
@@ -741,9 +745,7 @@ export function createBotIdentityControlPlane(
           throw new Error('completed bot identity operation cannot be rolled back; use forward repair');
         }
         const registryDigest = currentDigest(registryPath);
-        const configDigest = configDigestNow();
-        if (![plan.source.registryDigest, plan.target.registryDigest].includes(registryDigest)
-          || ![plan.source.configDigest, plan.target.configDigest].includes(configDigest ?? '')) {
+        if (![plan.source.registryDigest, plan.target.registryDigest].includes(registryDigest)) {
           throw new Error('bot identity rollback state is outside its immutable plan; fail closed');
         }
         if (plan.sourceRegistryBytes === null) {
@@ -755,7 +757,6 @@ export function createBotIdentityControlPlane(
             followTargetSymlink: false,
           });
         }
-        publishConfigBytes(plan.sourceConfigBytes);
         removeDurably(intentPath);
         return this.status();
       });
@@ -769,13 +770,20 @@ export function createBotIdentityControlPlane(
           if (existsSync(intentPath) || receiptFiles.length > 0) {
             return { kind: 'needsRepair', reason: 'published bot identity registry is missing' };
           }
-          const plans = existsSync(operationsDir)
-            ? readdirSync(operationsDir).filter(name => name.endsWith('.plan.json')).sort()
+          const planFiles = existsSync(operationsDir)
+            ? readdirSync(operationsDir).filter(name => name.endsWith('.plan.json'))
             : [];
-          if (plans.length > 0) {
-            const operationId = plans.at(-1)!.slice(0, -'.plan.json'.length);
-            readPlan(operationId);
-            return { kind: 'planned', operationId };
+          if (planFiles.length > 0) {
+            const plans = planFiles.map(name => {
+              const operationId = name.slice(0, -'.plan.json'.length);
+              return readPlan(operationId).plan;
+            });
+            plans.sort((left, right) => (
+              left.createdAt === right.createdAt
+                ? (left.operationId < right.operationId ? 1 : -1)
+                : (left.createdAt < right.createdAt ? 1 : -1)
+            ));
+            return { kind: 'planned', operationId: plans[0]!.operationId };
           }
           return { kind: 'unmigrated' };
         }
@@ -791,12 +799,17 @@ export function createBotIdentityControlPlane(
         }
         const { plan } = readPlan(registry.operationId);
         const receipt = exactPublishedReceipt(plan);
-        if (!receipt
-          || digest(registryBytes) !== receipt.registryDigest
-          || configDigestNow() !== receipt.configDigest) {
+        if (!receipt || digest(registryBytes) !== receipt.registryDigest) {
           return {
             kind: 'needsRepair',
             reason: 'bot identity registry has no exact completed receipt',
+            operationId: registry.operationId,
+          };
+        }
+        if (projectionDigestNow() !== receipt.projectionDigest) {
+          return {
+            kind: 'needsPromotion',
+            revision: registry.revision,
             operationId: registry.operationId,
           };
         }
