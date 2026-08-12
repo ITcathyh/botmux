@@ -104,6 +104,14 @@ export interface SessionView {
   actorRef?: ActorRef;
   sessionId: string;
   route: SessionRoute;
+  /**
+   * The routing-authority anchor this Session actually occupies. Usually equal
+   * to the route's chatId/anchorId, but a deferredScheduleRun Session is
+   * isolated on its own routingAnchor even though its visible delivery surface
+   * is a chat — occupancy questions (route admission, scratch retirement) must
+   * compare THIS value, exactly like the control Adapter's sessionAnchorId.
+   */
+  canonicalAnchor: string;
   recordStatus: SessionDirectoryRow['recordStatus'];
   executorStatus: SessionDirectoryRow['executorStatus'];
 }
@@ -1675,6 +1683,7 @@ export function createSessionRuntimeHost(options: {
       : { actorRef: sessionActorRef(options.ownerBotId, row.sessionId) }),
     sessionId: row.sessionId,
     route: { ...row.route },
+    canonicalAnchor: row.ordinaryIngressBinding.canonicalAnchor,
     recordStatus: row.recordStatus,
     executorStatus: row.executorStatus,
   });

@@ -21,7 +21,7 @@ const task: ScheduledTask = {
 const updateTask = vi.fn((id: string, patch: Partial<ScheduledTask>) => {
   if (id === task.id) Object.assign(task, patch);
 });
-const markRun = vi.fn();
+const markRun = vi.fn<(...args: unknown[]) => 'applied' | 'superseded' | 'missing'>(() => 'applied');
 const publish = vi.fn();
 const emitHookEvent = vi.fn();
 
@@ -51,6 +51,7 @@ beforeEach(() => {
   task.pendingManualRun = undefined;
   updateTask.mockClear();
   markRun.mockClear();
+  markRun.mockImplementation(() => 'applied');
   publish.mockClear();
   emitHookEvent.mockClear();
 });
@@ -180,5 +181,30 @@ describe('scheduler firing producer', () => {
       }),
     });
     expect(markRun).not.toHaveBeenCalled();
+  });
+
+  it('suppresses the fired event and hook when the store fences the settlement as superseded', async () => {
+    const scheduler = await import('../src/core/scheduler.js');
+    // The task was edited while its fire was in flight: markRun's
+    // definitionRevision fence refuses to write anything.
+    markRun.mockImplementation(() => 'superseded');
+    const submit = vi.fn(async () => ({
+      kind: 'applied' as const,
+      sessionId: 'session-superseded',
+    }));
+    scheduler.setSubmitCallback(submit);
+    scheduler.setOwnerFilter('cli_owner', true);
+
+    scheduler.startScheduler();
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(submit).toHaveBeenCalledTimes(1);
+    expect(markRun).toHaveBeenCalledWith('daily:ops', true, undefined, undefined, 3);
+    // The store recorded nothing, so nothing may become observable: no
+    // schedule.fired ledger entry, no hook emission.
+    expect(publish).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'schedule.fired',
+    }));
+    expect(emitHookEvent).not.toHaveBeenCalledWith('schedule.fired', expect.anything());
   });
 });

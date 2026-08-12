@@ -1396,6 +1396,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
   const operationId = sessionOperationId(req, body);
   if (!operationId.ok) return jsonRes(res, 400, { ok: false, error: operationId.error });
+  // Authenticate at the route boundary like the sibling close/restart routes:
+  // an unauthorized caller must be turned away statelessly, before submit()
+  // can mint a durable operation receipt for its (attacker-chosen) id. The
+  // adapter re-checks origin proof inside its effect as defense in depth.
+  const auth = sessionCliIpcAuth(req, params.sessionId, body);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
   const port = dashboardChatRename;
   if (!port) return jsonRes(res, 503, { ok: false, error: 'session_runtime_not_ready' });
   const outcome = await port.submit({

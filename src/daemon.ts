@@ -20864,13 +20864,25 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     markForwardFollowupsSessionsReady(bot.config.larkAppId);
   }
   // Prove the owner-scoped Dashboard projection can be rebuilt from the same
-  // Current Session Host before advertising it as ready. Failure keeps the IPC
-  // barrier closed instead of publishing a partial/parallel inventory.
-  await readCurrentDashboardSessionSnapshot();
-  currentDashboardProjectionProtocol.markReady();
+  // Current Session Host before advertising it as ready. Failure keeps the
+  // PROJECTION fail-closed — never marked ready, every snapshot read keeps
+  // refusing — without taking the whole daemon down with it: one drifted
+  // restore row must degrade the dashboard inventory, not kill messaging and
+  // every unrelated IPC surface for the owner.
+  try {
+    await readCurrentDashboardSessionSnapshot();
+    currentDashboardProjectionProtocol.markReady();
+  } catch (err) {
+    logger.error(
+      '[dashboard] Session projection boot probe failed; the dashboard session '
+      + 'inventory stays unavailable until the drift is repaired: '
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
   // The descriptor was intentionally published before restore so offline CLI
   // mutations delegate to this daemon.  Release those queued IPC calls only
-  // after every durable owner is visible in the canonical registry.
+  // after every durable owner is visible in the canonical registry — which
+  // restore has established above regardless of the projection probe result.
   markIpcReady();
 
   for (const startDispatcher of startEventDispatchers) startDispatcher();

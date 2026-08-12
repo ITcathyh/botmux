@@ -41,9 +41,16 @@ function message(error: unknown): string {
 }
 
 function matchesRoute(session: SessionView, expected: CurrentRouteAdmissionRoute): boolean {
-  return expected.scope === 'chat'
-    ? session.route.kind === 'chat' && session.route.chatId === expected.canonicalAnchor
-    : session.route.kind === 'thread' && session.route.anchorId === expected.canonicalAnchor;
+  // Occupancy is decided by the CANONICAL anchor, the same value the control
+  // Adapter's routeScratch close guard compares (sessionAnchorId). Matching on
+  // the visible route here would classify a deferredScheduleRun Session —
+  // isolated on its own routingAnchor but delivered into the same chat — as
+  // the route occupant, and the downstream close guard would then reject it as
+  // target_chat_has_session: a phantom `occupied` for an actually-free anchor.
+  return (expected.scope === 'chat'
+    ? session.route.kind === 'chat'
+    : session.route.kind === 'thread')
+    && session.canonicalAnchor === expected.canonicalAnchor;
 }
 
 function childOperationIdentity(input: {

@@ -82,6 +82,36 @@ function claimLogicalRunSettlement(runId: string): boolean {
   return true;
 }
 
+/**
+ * A settlement may only become observable (schedule.fired event + hook) when
+ * the store actually recorded it. `markRun`'s definitionRevision fence returns
+ * 'superseded' — writing NOTHING — when the task was edited mid-flight; the run
+ * then belonged to the retired definition and must stay silent, or dashboards
+ * and hooks would report a ledger the store never held (and a once-task's
+ * disable would be assumed done when it was refused).
+ */
+function recordSettledRun(
+  task: ScheduledTask,
+  success: boolean,
+  error?: string,
+): boolean {
+  const recorded = scheduleStore.markRun(
+    task.id,
+    success,
+    error,
+    undefined,
+    task.definitionRevision,
+  );
+  if (recorded !== 'applied') {
+    logger.warn(
+      `[scheduler] Task "${task.name}" run settlement (${success ? 'ok' : 'error'}) was ${recorded}: `
+      + 'the definition changed mid-flight or the task is gone; suppressing fired event and hook',
+    );
+    return false;
+  }
+  return true;
+}
+
 function settleSubmittedFire(
   task: ScheduledTask,
   runId: string,
@@ -90,7 +120,7 @@ function settleSubmittedFire(
   if (outcome.kind === 'duplicate') return;
   if (!claimLogicalRunSettlement(runId)) return;
   if (outcome.kind === 'applied') {
-    scheduleStore.markRun(task.id, true, undefined, undefined, task.definitionRevision);
+    if (!recordSettledRun(task, true)) return;
     dashboardEventBus.publish({
       type: 'schedule.fired',
       body: { id: task.id, runAt: Date.now(), status: 'ok' },
@@ -99,7 +129,7 @@ function settleSubmittedFire(
     return;
   }
   const error = outcomeMessage(outcome);
-  scheduleStore.markRun(task.id, false, error, undefined, task.definitionRevision);
+  if (!recordSettledRun(task, false, error)) return;
   dashboardEventBus.publish({
     type: 'schedule.fired',
     body: { id: task.id, runAt: Date.now(), status: 'error', error },
@@ -115,13 +145,7 @@ function submitScheduledFire(task: ScheduledTask, fire: ScheduledFireEnvelope): 
       const message = error instanceof Error ? error.message : String(error);
       logger.error(`[scheduler] Task "${task.name}" failed: ${message}`);
       if (!claimLogicalRunSettlement(fire.runId)) return;
-      scheduleStore.markRun(
-        task.id,
-        false,
-        message,
-        undefined,
-        task.definitionRevision,
-      );
+      if (!recordSettledRun(task, false, message)) return;
       dashboardEventBus.publish({
         type: 'schedule.fired',
         body: { id: task.id, runAt: Date.now(), status: 'error', error: message },

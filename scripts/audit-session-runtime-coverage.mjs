@@ -3602,6 +3602,15 @@ function validateProjectionProductionBinding(binding) {
       && containsStringLiteral(readSnapshot, 'dashboardSnapshot'),
     'C3 daemon IPC snapshot must read through SessionProjection exactly once',
   );
+  // One drifted restore row must degrade the dashboard inventory, never the
+  // daemon: the boot probe stays fail-closed for the projection (markReady is
+  // only reached on success) while startDaemon survives the failure and still
+  // releases the IPC barrier restore already earned.
+  assert(
+    /try \{\s*await readCurrentDashboardSessionSnapshot\(\);\s*currentDashboardProjectionProtocol\.markReady\(\);\s*\} catch \(/
+      .test(readFileSync(resolve(repoRoot, 'src/daemon.ts'), 'utf8')),
+    'C3 projection boot probe must fail closed for the projection only, not crash startDaemon',
+  );
 
   const aggregator = sourceFile(binding.aggregatorSource);
   const replace = findNamedFunction(aggregator, 'replaceSessionSnapshot');

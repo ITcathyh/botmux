@@ -171,6 +171,57 @@ describe('Current route scratch retirement', () => {
     expect(commands[0]!.operationIdentity).toMatch(/^route-scratch:/);
   });
 
+  it('does not classify a deferred-anchor Session delivered into the same chat as the route occupant', async () => {
+    // A deferredScheduleRun Session is isolated on its own routingAnchor while
+    // its visible delivery surface is the reopened chat: the census must use
+    // the canonical anchor — matching on the visible route would nominate this
+    // session, the control Adapter's sessionAnchorId guard would then reject
+    // the close, and the reopen would abort with a phantom `occupied` even
+    // though the canonical anchor is free.
+    const rows: RowState[] = [{
+      sessionId: 'deferred-schedule-run',
+      chatId: ROUTE.chatId,
+      anchor: 'schedule-run:isolated-anchor',
+      scope: 'chat',
+      active: true,
+    }];
+    const begin = vi.fn(() => ({
+      kind: 'committed' as const,
+      result: { kind: 'closed' as const, alreadyClosed: false, known: true },
+    }));
+    const host = createSessionRuntimeHost({
+      directory: directoryFor(rows),
+      keyedTriggers: unusedKeyedTriggers,
+      keyedTriggerTurns: unusedKeyedTriggerTurns,
+      controlMutation: {
+        begin,
+        async execute() { throw new Error('unused'); },
+        resume: () => ({ kind: 'unknown', message: 'unused' }),
+      },
+    });
+    const retirement = createCurrentRouteScratchRetirementPort({
+      ownerLarkAppId: OWNER,
+      downstream: () => host,
+    });
+    const admission = reserveCurrentRouteAdmission(currentRouteAdmissionKey({
+      ownerLarkAppId: OWNER,
+      ...ROUTE,
+    }));
+    await admission.ready;
+
+    await expect(retirement.retire({
+      expectedRoute: ROUTE,
+      source: 'resume',
+      parentSessionId: 'closed-parent',
+      parentOperationIdentity: 'reopen-over-deferred-neighbor',
+      heldRouteAdmissionToken: admission.token,
+    })).resolves.toEqual({ kind: 'cleared' });
+    admission.release();
+
+    expect(begin).not.toHaveBeenCalled();
+    expect(rows[0]!.active).toBe(true); // the deferred neighbor is untouched
+  });
+
   it.each(['closed', 'moved'] as const)(
     'treats a candidate that became %s before exact reprojection as departed',
     async (departure) => {
@@ -187,7 +238,13 @@ describe('Current route scratch retirement', () => {
         async read(query) {
           if (query.kind === 'byExternalSession') {
             if (departure === 'closed') candidate.active = false;
-            else candidate.chatId = 'oc_moved_route';
+            else {
+              // Production coupling: a relocated chat-scope session moves its
+              // canonical anchor together with its visible chat.
+              candidate.chatId = 'oc_moved_route';
+          candidate.anchor = 'oc_moved_route';
+              candidate.anchor = 'oc_moved_route';
+            }
           }
           return baseDirectory.read(query);
         },
@@ -251,6 +308,7 @@ describe('Current route scratch retirement', () => {
       async read(query) {
         if (query.kind === 'byExternalSession') {
           candidate.chatId = 'oc_moved_route';
+          candidate.anchor = 'oc_moved_route';
           rows.push(replacement);
         }
         return baseDirectory.read(query);
