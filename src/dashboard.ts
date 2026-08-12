@@ -3974,7 +3974,8 @@ const server = createServer(async (req, res) => {
           busy += results.filter((r: any) => r?.status === 'busy').length;
           rateLimited += results.filter((r: any) => r?.status === 'rate-limited').length;
         } catch (err: any) {
-          lastError = { error: err?.message ?? String(err) };
+          logger.warn(`[dashboard] goal watchdog trigger failed: ${err?.message ?? String(err)}`);
+          lastError = { error: 'goal_watchdog_request_failed' };
         }
       }));
       return jsonRes(res, 200, { ok: true, goalChatId, taskId, contacted, injected, reconciled, revived, reassigned, busy, rateLimited, lastError });
@@ -3998,7 +3999,8 @@ const server = createServer(async (req, res) => {
             triggered = upstream.ok;
             if (!upstream.ok) triggerError = `HTTP ${upstream.status}`;
           } catch (err: any) {
-            triggerError = err?.message ?? String(err);
+            logger.warn(`[dashboard] goal notification retry trigger failed: ${err?.message ?? String(err)}`);
+            triggerError = 'goal_notification_retry_request_failed';
           }
         } else {
           triggerError = 'owner_daemon_offline';
@@ -4038,7 +4040,8 @@ const server = createServer(async (req, res) => {
           if (upstream.ok && json?.ok) return jsonRes(res, 200, json);
           if (json?.error !== 'no_supervisor') lastError = json ?? { status: upstream.status, body: txt };
         } catch (err: any) {
-          lastError = { error: err?.message ?? String(err) };
+          logger.warn(`[dashboard] goal decision delivery failed: ${err?.message ?? String(err)}`);
+          lastError = { error: 'goal_decision_request_failed' };
         }
       }
       return jsonRes(res, 404, {

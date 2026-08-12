@@ -2032,7 +2032,7 @@ function vcMeetingTargetOpenId(larkAppId: string, cfg: VcMeetingAgentConfig): st
 }
 
 function randomVcMeetingNonce(): string {
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  return randomUUID();
 }
 
 function vcMeetingInviteTtlMs(cfg: VcMeetingAgentConfig): number {
@@ -7700,7 +7700,7 @@ ipcRoute('POST', '/api/goal/watchdog', async (req, res) => {
     return jsonRes(res, 200, { ok: true, results });
   } catch (err: any) {
     logger.warn(`[goal-watchdog] IPC trigger failed: ${err?.message ?? err}`);
-    return jsonRes(res, 500, { ok: false, error: err?.message ?? String(err) });
+    return jsonRes(res, 500, { ok: false, error: 'goal_watchdog_failed' });
   }
 });
 
@@ -11361,7 +11361,7 @@ async function submitVcMeetingOutputRequestImpl(input: {
 
   const now = Date.now();
   const req: VcMeetingPendingOutputRequest = {
-    id: `out_${input.channel}_${now.toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+    id: `out_${input.channel}_${randomUUID()}`,
     channel: input.channel,
     nonce: randomVcMeetingNonce(),
     agentAppId: session.selectedAgentAppId,

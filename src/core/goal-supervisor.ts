@@ -9,6 +9,7 @@ import { forkWorker, getCurrentCliVersion } from './worker-pool.js';
 import { sessionKey, type DaemonSession } from './types.js';
 import { markSessionActivity } from './session-activity.js';
 import { claimGoalChatRevive, getGoalChat, registerGoalChat } from '../services/goal-chat-store.js';
+import { logger } from '../utils/logger.js';
 
 export interface GoalSuperviseRequest {
   chatId: string;
@@ -286,10 +287,11 @@ async function startGoalSupervisorInner(
       reopen: req.reopenClosed,
     });
   } catch (err) {
+    logger.warn(`[goal-supervisor] registration failed: ${err instanceof Error ? err.message : String(err)}`);
     return {
       ok: false,
       errorCode: 'goal_register_failed',
-      error: err instanceof Error ? err.message : String(err),
+      error: 'failed to register goal',
     };
   }
   const anchor = chatId;
