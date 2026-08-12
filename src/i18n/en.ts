@@ -916,6 +916,7 @@ export const messages: Record<string, string> = {
   'daemon.cmd_allowed_users_only': '⚠️ {cmd} is restricted to `allowedUsers`.',
   'daemon.download_failed_need_login': '⚠️ Some images/files failed to download (missing User Token). Send `/login` in this topic to authorize, then resend.',
   'daemon.foreign_bot_mention_prefix': '[@mention from {botName}]',
+  'daemon.ordinary_ingress_failed': '⚠️ This message did not reach the CLI. Please resend; if it keeps failing, `/close` and reopen the topic.',
   'daemon.cmd_needs_active_cli': '{cmd} needs an active CLI process; no running session in this topic.',
   'daemon.cmd_activation_pending': '{cmd} cannot be sent yet because the previous turn is still being submitted. Retry shortly.',
   'daemon.force_topic_ready': '💬 New topic created. Send a task in this topic, or use /repo first to choose a project.',

@@ -16838,11 +16838,36 @@ function mergeVcMeetingApplicationContext(
   return `${[...new Set(lines)].join('\n')}\n`;
 }
 
+/**
+ * 普通消息处理链的终态失败收口：transport 已 ACK（用户看到消息发出去了），但
+ * 异常把整条投递链掀翻——此前只剩 dispatcher 的 log-only catch，用户视角就是
+ * 机器人吞消息。best-effort 回一条可行动提示后原样重抛，dispatcher 既有的错误
+ * 日志与调用方语义不变。rejected 类失败（quota/权限拦截）由各自路径回复后正常
+ * return，不会走到这里。
+ */
+async function notifyOrdinaryIngressFailure(ctx: RoutingContext, err: unknown): Promise<never> {
+  const replyAnchor = ctx.scope === 'thread' ? ctx.anchor : ctx.chatId;
+  try {
+    await sessionReply(
+      replyAnchor,
+      tr('daemon.ordinary_ingress_failed', undefined, localeForBot(ctx.larkAppId)),
+      'text',
+      ctx.larkAppId,
+    );
+  } catch (noticeErr) {
+    logger.warn(
+      `[${ctx.larkAppId}] ordinary ingress failure notice for ${ctx.messageId.substring(0, 12)} `
+      + `could not be delivered: ${noticeErr instanceof Error ? noticeErr.message : String(noticeErr)}`,
+    );
+  }
+  throw err;
+}
+
 async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   return withBotTurnAdmission(
     ctx.larkAppId,
     () => handleNewTopicAdmitted(data, ctx),
-  );
+  ).catch(err => notifyOrdinaryIngressFailure(ctx, err));
 }
 
 /**
@@ -18141,7 +18166,7 @@ async function handleThreadReply(
       ctx.larkAppId,
       () => handleThreadReplyAdmitted(data, ctx, prepared),
     ),
-  );
+  ).catch(err => notifyOrdinaryIngressFailure(ctx, err));
 }
 
 async function handleThreadReplyAdmitted(
