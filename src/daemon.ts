@@ -54,8 +54,6 @@ import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-st
 import {
   loadBotConfigAtIndex,
   loadBotConfigs,
-  getLoadedConfigPath,
-  getLoadedConfigProvenance,
   isManagedActivationStartingAtIndex,
   registerBot,
   getBot,
@@ -76,10 +74,6 @@ import {
   type VcMeetingConsumerAgentConfig,
   type VcMeetingConsumerProfileConfig,
 } from './bot-registry.js';
-import {
-  createDaemonBotIdentityControlPlane,
-  ensureReadyDaemonBotIdentities,
-} from './core/bot-identity-startup.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
 import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform } from './services/open-platform-rename.js';
@@ -19929,18 +19923,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   if (botIndex !== undefined) {
     cfg = reloadExactDaemonBotConfig(idx, selectedAppId, loadBotConfigAtIndex);
   }
-  const botIdentityControl = createDaemonBotIdentityControlPlane({
-    dataDir: config.session.dataDir,
-    configPath: getLoadedConfigPath(),
-    configProvenance: getLoadedConfigProvenance(),
-    configs: [cfg],
-  });
-  const botIdentity = ensureReadyDaemonBotIdentities(botIdentityControl, [cfg])
-    .get(cfg.larkAppId);
-  if (!botIdentity) {
-    throw new Error(`Stable Bot identity is missing for selected config: ${cfg.larkAppId}`);
-  }
-  registerBot(cfg, botIdentity.botId);
+  registerBot(cfg);
   selfDaemonLarkAppId = cfg.larkAppId;
   setDashboardControlEffects(createCurrentDashboardControlEffects({
     ownerLarkAppId: cfg.larkAppId,

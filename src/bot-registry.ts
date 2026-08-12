@@ -29,7 +29,7 @@ import type {
   VcMeetingConsumerProfileConfig,
 } from './types.js';
 import type { VcMeetingActivityType } from './vc-agent/types.js';
-import type { BotId } from './core/bot-identity.js';
+import { deriveBotIdForConfig, type BotId } from './core/bot-identity.js';
 
 /**
  * Thrown when any Feishu client is requested for a core-only (`apiOnly`) bot.
@@ -1635,8 +1635,8 @@ export interface BotConfig {
 }
 
 export interface BotState {
-  /** Stable owner identity. Daemon startup always binds this through the I1 gate. */
-  botId?: BotId;
+  /** Stable owner identity, derived from the bot's external address at registration. */
+  botId: BotId;
   config: BotConfig;
   /** The Lark SDK client — NULL for apiOnly (core-only) bots: they have no
    *  Feishu credential (empty appSecret), and the SDK's Client ctor throws
@@ -1794,7 +1794,7 @@ export function vcMeetingAgentConfigActive(
   return cfg.vcMeetingAgent?.enabled === true ? cfg.vcMeetingAgent : undefined;
 }
 
-export function registerBot(cfg: BotConfig, botId?: BotId): BotState {
+export function registerBot(cfg: BotConfig): BotState {
   // apiOnly (core-only) bots have NO Feishu credential (empty appSecret). The Lark
   // SDK Client ctor throws "appSecret or clientAssertionProvider is required" on an
   // empty secret, so constructing it would fatal the whole daemon at boot — the
@@ -1824,7 +1824,7 @@ export function registerBot(cfg: BotConfig, botId?: BotId): BotState {
       : client;
   }
   const state: BotState = {
-    ...(botId === undefined ? {} : { botId }),
+    botId: deriveBotIdForConfig(cfg),
     config: cfg,
     client,
     uploadClient,
@@ -1843,9 +1843,7 @@ export function registerBot(cfg: BotConfig, botId?: BotId): BotState {
 
 /** Production consumers must not silently fall back to the transport address. */
 export function requireBotId(larkAppId: string): BotId {
-  const botId = getBot(larkAppId).botId;
-  if (!botId) throw new Error(`Stable Bot identity is not bound: ${larkAppId}`);
-  return botId;
+  return getBot(larkAppId).botId;
 }
 
 export function getBot(larkAppId: string): BotState {

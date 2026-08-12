@@ -104,6 +104,15 @@ wrapper 把 remainder 伪装成 A4 migrated。
 I1 为每个 active Bot 提供不可变 BotId；daemon host、SessionRuntime 与 activation coordinator
 均使用同一 BotId + boot epoch，`larkAppId` 只留作 Current transport/owner partition Adapter key。
 
+**2026-08-12 减负修订**：I1 最初以分配式身份控制面交付（注册表 + report/apply promotion +
+启动闸门 + `botmux identity` 命令）。评审发现其唯一收益（换址保身份）在没有 rebind 语义的现状下
+无法兑现，而成本（双权威漂移、needsPromotion 阻断、首启迁移、并发首启竞态）已实际发生，且当时
+尚无任何落盘数据按 BotId 寻址。故 BotId 收敛为外部地址的纯推导函数
+（`bot_` + sha256(kind\0id) 前 32 hex，见 `core/bot-identity.ts`），注册表与迁移机械整体移除；
+运行时 BotId 类型与全部 `ownerBotId` 消费面不变。身份仍与展示名/secret/launch 参数无关；
+若未来需要换址保身份，届时以只记例外的显式映射引入，deriveBotId 的 JSDoc 记录了这一边界。
+Target-B 首次将 BotId 写盘前，本决策可零成本复议。
+
 ### 1.4 第二步 baseline：C2 Dashboard caller cut（2026-08-12）
 
 本节锁定第二步完成后的 machine baseline；它新增在 §1.1 之后，不回写 Stage-1 历史。当前 authority

@@ -4,7 +4,7 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { registerBot } from '../src/bot-registry.js';
+import { registerBot, requireBotId } from '../src/bot-registry.js';
 import { handleCommand } from '../src/core/command-handler.js';
 import type { CurrentPendingRepoCompletionSubmitInput } from '../src/core/current-pending-repo-completion-submit.js';
 import { stagePendingRepoSetup } from '../src/core/pending-repo-journal.js';
@@ -92,6 +92,7 @@ describe('pending-repo first-start callers', () => {
     }, '/repos/card-selected', 'card-selected')).resolves.toBe(true);
 
     expect(submit).toHaveBeenCalledWith({
+      ownerBotId: requireBotId(APP),
       ownerLarkAppId: APP,
       activeSessions,
       sessionId: ds.session.sessionId,
@@ -163,6 +164,7 @@ describe('pending-repo first-start callers', () => {
     });
 
     expect(submit).toHaveBeenCalledWith({
+      ownerBotId: requireBotId(APP),
       ownerLarkAppId: APP,
       activeSessions,
       sessionId: ds.session.sessionId,
@@ -209,6 +211,7 @@ describe('pending-repo first-start callers', () => {
     }, APP);
 
     expect(submit).toHaveBeenCalledWith({
+      ownerBotId: requireBotId(APP),
       ownerLarkAppId: APP,
       activeSessions,
       sessionId: ds.session.sessionId,

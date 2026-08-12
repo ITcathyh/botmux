@@ -164,7 +164,6 @@ vi.mock('../src/core/current-session-runtime.js', async () => {
 });
 
 import { getBot, registerBot } from '../src/bot-registry.js';
-import { parseBotId } from '../src/core/bot-identity.js';
 import {
   createSessionRuntimeHost,
   type KeyedTriggerAuthority,
@@ -514,7 +513,7 @@ beforeEach(() => {
     larkAppSecret: 'test-secret',
     cliId: 'claude-code',
     allowedUsers: [OWNER],
-  }, parseBotId('bot_current_one_cut'));
+  });
   bot.resolvedAllowedUsers = [OWNER];
   mocks.downloadResources.mockResolvedValue({ attachments: [], needLogin: false });
   mocks.getAvailableBots.mockResolvedValue([]);
@@ -915,7 +914,7 @@ describe('daemon no-owner ordinary route one-cut', () => {
     const first = mocks.currentSessionRuntimeHost.mock.calls[0]![0] as any;
     const second = mocks.currentSessionRuntimeHost.mock.calls[1]![0] as any;
     expect(first).toMatchObject({
-      ownerBotId: parseBotId('bot_current_one_cut'),
+      ownerBotId: getBot(APP).botId,
       ownerLarkAppId: APP,
       activeSessions,
       ownerBootId: expect.any(String),
