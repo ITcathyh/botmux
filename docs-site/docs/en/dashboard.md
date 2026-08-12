@@ -21,8 +21,15 @@ botmux dashboard rotate   # Rotate the token and print the new URL
 - **Groups**: one-click create a new group (auto @-notifies the invited user), add bots to a group, and auto-transfer group ownership; disband groups and have bots leave groups (associated sessions are cleaned up automatically).
 - **Team / Roles / Bot Defaults**: the Team panel handles [cross-deployment collaboration](/en/roles) (invite someone else's deployment into your team, create cross-deployment groups); Roles manages each bot's per-group persona; Bot Defaults (Bot configuration) sets default behaviors (new-group on-call, card signature, **default role**, etc.).
 - **Workflows control panel**: Run List polling; Run Detail shows the summary / dangling red zone / node-activity / event timeline / concurrent-execution timeline; you can **cancel a run** directly.
+- **Settings / System & Maintenance**: authenticated administrators can manage **Start the botmux background service at boot**.
 
 > **Two things live outside the Dashboard**: a v3 workflow's **humanGate approve / reject** happens on a **Lark approval card** (not clicked in the Dashboard); triggering a workflow with parameters currently goes through the **connector (Webhook)** path (see [Connectors](/en/webhook)) — there is no "Workflow Catalog + parameterized trigger" page in the Dashboard. The Dashboard's Workflows panel focuses on observation and cancel.
+
+## Background-Service Auto-Start
+
+Authenticated administrators can toggle **Start the botmux background service at boot** under **Settings → System & Maintenance**. Both `GET /api/autostart`, which reads the status, and `PUT /api/autostart`, which updates it, require the current Dashboard token. Anonymous users cannot see or change this setting even when `publicReadOnly` is enabled.
+
+The toggle only registers or unregisters the hook for starting the background service at the next boot/login; it does not start, stop, or restart the current daemon. The Desktop App's **Launch App at Login** is a separate feature; avoid enabling both to prevent duplicate starts.
 
 ## External read-only queries
 
