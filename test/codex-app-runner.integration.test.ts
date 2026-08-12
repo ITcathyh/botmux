@@ -1367,6 +1367,50 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     }
   });
 
+  it('settles the grown group when the app-server coalesces response + notifications into ONE chunk (transport-ordering regression)', async () => {
+    // Deterministic reproduction of the recurring CI stall: the steer response,
+    // the non-canonical turn/completed and the Goal-C turn/started arrive in a
+    // SINGLE stdout chunk (FAKE_CODEX_COALESCE=1 — the kernel produces the same
+    // coalescing whenever the reader is scheduled late, which loaded CI runners
+    // made frequent). Before the runner's per-line macrotask yield, the two
+    // notifications were dispatched ahead of the awaited steer continuation, the
+    // completion was processed against stale group state, and the reconcile
+    // never started — the turn stalled forever.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-r4b3-coalesced-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'steer-group-history-match', control.bootstrap.path, {
+      env: { FAKE_CODEX_COALESCE: '1' },
+    });
+
+    const send = (text: string, replyTurnId: string) => {
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(
+        `legacy:${text}`, { text, clientUserMessageId: replyTurnId }, replyTurnId, true,
+      )}\r`);
+    };
+
+    try {
+      await waitFor(harness, () => control.states.some(state => state.busy === false));
+      send('root', 'om_co_root');
+      await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/start'));
+      send('follow', 'om_co_follow');
+
+      await waitFor(harness, () => control.finals.length === 2);
+      const realFinal = control.finals[control.finals.length - 1];
+      expect(realFinal.turnId).toBe('om_co_follow');
+      expect(realFinal.nativeTurnId).toBe('turn-B-full');
+      expect(realFinal.content).toBe('authoritative B answer');
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('fails closed when a grown group finds MULTIPLE full-group history matches (R4-B3 multi)', async () => {
     // R4-B3 boundary: a grown group's non-canonical completion triggers a
     // group-aware bounded-history reconcile. If MORE THAN ONE terminal turn
