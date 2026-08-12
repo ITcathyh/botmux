@@ -78,7 +78,7 @@ import {
 } from './bot-registry.js';
 import {
   createDaemonBotIdentityControlPlane,
-  requireReadyDaemonBotIdentities,
+  ensureReadyDaemonBotIdentities,
 } from './core/bot-identity-startup.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
 import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
@@ -19935,7 +19935,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     configProvenance: getLoadedConfigProvenance(),
     configs: [cfg],
   });
-  const botIdentity = requireReadyDaemonBotIdentities(botIdentityControl, [cfg])
+  const botIdentity = ensureReadyDaemonBotIdentities(botIdentityControl, [cfg])
     .get(cfg.larkAppId);
   if (!botIdentity) {
     throw new Error(`Stable Bot identity is missing for selected config: ${cfg.larkAppId}`);

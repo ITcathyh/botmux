@@ -112,6 +112,14 @@ export interface BotIdentityControlPlane {
   /** Converge registry truth to its receipted plan. Never touches the config authority. */
   repair(operationId?: string): BotIdentityReceipt;
   rollback(operationId?: string): BotIdentityStatus;
+  /**
+   * One-lock first-boot migration for a virgin root: from `unmigrated` it
+   * plans and promotes in place. Every other state — ready, planned (whether
+   * left by an operator report, a rollback, or a torn bootstrap),
+   * needsPromotion, needsRepair — is re-derived under the lock and returned
+   * untouched: those stay explicit operator decisions via report/apply/repair.
+   */
+  bootstrap(): BotIdentityStatus;
   status(): BotIdentityStatus;
   resolveActive(address: BotExternalAddress): BotIdentityBinding;
   actorRef(address: BotExternalAddress, sessionId: string): ActorRef;
@@ -538,149 +546,228 @@ export function createBotIdentityControlPlane(
     });
   };
 
+  const reportLocked = (): BotIdentityPlan => {
+    const identityProjection = projectionNow();
+    const addresses = parseProjectionBytes(identityProjection);
+    const sourceRegistryBytes = existsSync(registryPath)
+      ? readFileSync(registryPath, 'utf8')
+      : null;
+    const sourceRegistry = sourceRegistryBytes === null
+      ? null
+      : parseRegistryBytes(sourceRegistryBytes);
+    if (sourceRegistry !== null) {
+      if (existsSync(intentPath)) {
+        throw new Error('cannot report while a bot identity promotion intent is active');
+      }
+      const { plan: sourcePlan } = readPlan(sourceRegistry.operationId);
+      const sourceReceipt = exactPublishedReceipt(sourcePlan);
+      if (!sourceReceipt || digest(sourceRegistryBytes!) !== sourceReceipt.registryDigest) {
+        throw new Error('cannot report from unreceipted or drifted bot identity registry; repair first');
+      }
+      if (digest(identityProjection) === sourceReceipt.projectionDigest) {
+        throw new Error(
+          `active bot address set is unchanged since ${sourceRegistry.operationId}; nothing to promote`,
+        );
+      }
+    }
+    const operationId = allocateOperationId();
+    if (!/^op_[A-Za-z0-9_-]{2,128}$/.test(operationId)) {
+      throw new Error('invalid bot identity operation ID');
+    }
+    const used = new Set<string>(sourceRegistry?.bindings.map(binding => binding.botId) ?? []);
+    const targetAddressKeys = new Set(addresses.map(addressKey));
+    const existingActive = new Map(
+      sourceRegistry?.bindings
+        .filter(binding => binding.status === 'active')
+        .map(binding => [addressKey(binding.address), binding] as const) ?? [],
+    );
+    const bindings: BotIdentityBinding[] = (sourceRegistry?.bindings ?? []).map(binding => (
+      binding.status === 'active' && !targetAddressKeys.has(addressKey(binding.address))
+        ? { ...binding, status: 'retired' as const }
+        : binding
+    ));
+    for (const address of addresses) {
+      if (existingActive.has(addressKey(address))) continue;
+      bindings.push({
+        botId: allocateOpaqueBotId(allocateBotId, used),
+        status: 'active',
+        address,
+        ...(address.kind === 'lark' ? { legacyOwnerLarkAppId: address.larkAppId } : {}),
+      });
+    }
+    const targetRegistry: BotIdentityRegistry = {
+      schemaVersion: 1,
+      revision: (sourceRegistry?.revision ?? 0) + 1,
+      operationId,
+      bindings,
+    };
+    const targetRegistryBytes = canonical(targetRegistry);
+    const plan: BotIdentityPlan = {
+      schemaVersion: 1,
+      operationId,
+      createdAt: now(),
+      identityProjection,
+      source: {
+        registryDigest: sourceRegistryBytes === null ? null : digest(sourceRegistryBytes),
+      },
+      target: {
+        registryDigest: digest(targetRegistryBytes),
+      },
+      sourceRegistryBytes,
+      targetRegistry,
+    };
+    writeImmutable(join(operationsDir, `${operationId}.plan.json`), canonical(plan));
+    return plan;
+  };
+
+  const applyLocked = (operationId: string): BotIdentityReceipt => {
+    const { plan, bytes: planBytes } = readPlan(operationId);
+    const planProjectionDigest = digest(plan.identityProjection);
+    const completed = exactPublishedReceipt(plan);
+    const registryDigest = currentDigest(registryPath);
+    if (completed) {
+      if (registryDigest !== plan.target.registryDigest) {
+        throw new Error('completed bot identity promotion is missing or drifted; fail closed and repair');
+      }
+      if (projectionDigestNow() !== planProjectionDigest) {
+        throw new Error('active bot address set moved past this promotion; run a fresh report');
+      }
+      removeDurably(intentPath);
+      return completed;
+    }
+
+    if (existsSync(intentPath)) {
+      const intent = parseIntentBytes(readFileSync(intentPath, 'utf8'));
+      if (intent.operationId !== operationId || intent.planDigest !== digest(planBytes)) {
+        throw new Error('another bot identity promotion intent is active; fail closed');
+      }
+    } else {
+      if (registryDigest !== plan.source.registryDigest) {
+        throw new Error('bot identity promotion source digest changed; fail closed');
+      }
+      if (projectionDigestNow() !== planProjectionDigest) {
+        throw new Error('active bot address set changed since this plan; run a fresh report');
+      }
+      writeIntent({
+        schemaVersion: 1,
+        operationId,
+        planDigest: digest(planBytes),
+        preparedAt: now(),
+      });
+      options.afterPhase?.('intentPrepared');
+    }
+
+    const registryNow = currentDigest(registryPath);
+    const registryKnown = registryNow === plan.source.registryDigest
+      || registryNow === plan.target.registryDigest;
+    if (!registryKnown) {
+      throw new Error('bot identity promotion state is outside its immutable plan; fail closed');
+    }
+
+    if (registryNow !== plan.target.registryDigest) {
+      publishRegistry(plan.targetRegistry);
+    }
+    options.afterPhase?.('registryPublished');
+
+    if (currentDigest(registryPath) !== plan.target.registryDigest) {
+      throw new Error('bot identity promotion readback mismatch; fail closed');
+    }
+    parseRegistryBytes(readFileSync(registryPath, 'utf8'));
+    const receipt: BotIdentityReceipt = {
+      schemaVersion: 1,
+      operationId,
+      registryDigest: plan.target.registryDigest,
+      projectionDigest: planProjectionDigest,
+      completedAt: now(),
+    };
+    writeImmutable(receiptPath(operationId), canonical(receipt));
+    options.afterPhase?.('receiptPublished');
+    removeDurably(intentPath);
+    return receipt;
+  };
+
+  const statusOf = (): BotIdentityStatus => {
+    try {
+      const receiptFiles = existsSync(operationsDir)
+        ? readdirSync(operationsDir).filter(name => name.endsWith('.receipt.json')).sort()
+        : [];
+      if (!existsSync(registryPath)) {
+        if (existsSync(intentPath) || receiptFiles.length > 0) {
+          return { kind: 'needsRepair', reason: 'published bot identity registry is missing' };
+        }
+        const planFiles = existsSync(operationsDir)
+          ? readdirSync(operationsDir).filter(name => name.endsWith('.plan.json'))
+          : [];
+        if (planFiles.length > 0) {
+          const plans = planFiles.map(name => {
+            const operationId = name.slice(0, -'.plan.json'.length);
+            return readPlan(operationId).plan;
+          });
+          plans.sort((left, right) => (
+            left.createdAt === right.createdAt
+              ? (left.operationId < right.operationId ? 1 : -1)
+              : (left.createdAt < right.createdAt ? 1 : -1)
+          ));
+          return { kind: 'planned', operationId: plans[0]!.operationId };
+        }
+        return { kind: 'unmigrated' };
+      }
+      const registryBytes = readFileSync(registryPath, 'utf8');
+      const registry = parseRegistryBytes(registryBytes);
+      if (existsSync(intentPath)) {
+        const intent = parseIntentBytes(readFileSync(intentPath, 'utf8'));
+        return {
+          kind: 'needsRepair',
+          reason: 'bot identity promotion intent is active',
+          operationId: intent.operationId,
+        };
+      }
+      const { plan } = readPlan(registry.operationId);
+      const receipt = exactPublishedReceipt(plan);
+      if (!receipt || digest(registryBytes) !== receipt.registryDigest) {
+        return {
+          kind: 'needsRepair',
+          reason: 'bot identity registry has no exact completed receipt',
+          operationId: registry.operationId,
+        };
+      }
+      if (projectionDigestNow() !== receipt.projectionDigest) {
+        return {
+          kind: 'needsPromotion',
+          revision: registry.revision,
+          operationId: registry.operationId,
+        };
+      }
+      return { kind: 'ready', revision: registry.revision, operationId: registry.operationId };
+    } catch (error) {
+      return {
+        kind: 'needsRepair',
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
+  };
+
   return {
     report() {
       mkdirSync(options.dataDir, { recursive: true, mode: 0o700 });
-      return withFileLockSync(lockPath, () => {
-        const identityProjection = projectionNow();
-        const addresses = parseProjectionBytes(identityProjection);
-        const sourceRegistryBytes = existsSync(registryPath)
-          ? readFileSync(registryPath, 'utf8')
-          : null;
-        const sourceRegistry = sourceRegistryBytes === null
-          ? null
-          : parseRegistryBytes(sourceRegistryBytes);
-        if (sourceRegistry !== null) {
-          if (existsSync(intentPath)) {
-            throw new Error('cannot report while a bot identity promotion intent is active');
-          }
-          const { plan: sourcePlan } = readPlan(sourceRegistry.operationId);
-          const sourceReceipt = exactPublishedReceipt(sourcePlan);
-          if (!sourceReceipt || digest(sourceRegistryBytes!) !== sourceReceipt.registryDigest) {
-            throw new Error('cannot report from unreceipted or drifted bot identity registry; repair first');
-          }
-          if (digest(identityProjection) === sourceReceipt.projectionDigest) {
-            throw new Error(
-              `active bot address set is unchanged since ${sourceRegistry.operationId}; nothing to promote`,
-            );
-          }
-        }
-        const operationId = allocateOperationId();
-        if (!/^op_[A-Za-z0-9_-]{2,128}$/.test(operationId)) {
-          throw new Error('invalid bot identity operation ID');
-        }
-        const used = new Set<string>(sourceRegistry?.bindings.map(binding => binding.botId) ?? []);
-        const targetAddressKeys = new Set(addresses.map(addressKey));
-        const existingActive = new Map(
-          sourceRegistry?.bindings
-            .filter(binding => binding.status === 'active')
-            .map(binding => [addressKey(binding.address), binding] as const) ?? [],
-        );
-        const bindings: BotIdentityBinding[] = (sourceRegistry?.bindings ?? []).map(binding => (
-          binding.status === 'active' && !targetAddressKeys.has(addressKey(binding.address))
-            ? { ...binding, status: 'retired' as const }
-            : binding
-        ));
-        for (const address of addresses) {
-          if (existingActive.has(addressKey(address))) continue;
-          bindings.push({
-            botId: allocateOpaqueBotId(allocateBotId, used),
-            status: 'active',
-            address,
-            ...(address.kind === 'lark' ? { legacyOwnerLarkAppId: address.larkAppId } : {}),
-          });
-        }
-        const targetRegistry: BotIdentityRegistry = {
-          schemaVersion: 1,
-          revision: (sourceRegistry?.revision ?? 0) + 1,
-          operationId,
-          bindings,
-        };
-        const targetRegistryBytes = canonical(targetRegistry);
-        const plan: BotIdentityPlan = {
-          schemaVersion: 1,
-          operationId,
-          createdAt: now(),
-          identityProjection,
-          source: {
-            registryDigest: sourceRegistryBytes === null ? null : digest(sourceRegistryBytes),
-          },
-          target: {
-            registryDigest: digest(targetRegistryBytes),
-          },
-          sourceRegistryBytes,
-          targetRegistry,
-        };
-        writeImmutable(join(operationsDir, `${operationId}.plan.json`), canonical(plan));
-        return plan;
-      });
+      return withFileLockSync(lockPath, reportLocked);
     },
     apply(operationId) {
       mkdirSync(options.dataDir, { recursive: true, mode: 0o700 });
+      return withFileLockSync(lockPath, () => applyLocked(operationId));
+    },
+    bootstrap() {
+      mkdirSync(options.dataDir, { recursive: true, mode: 0o700 });
       return withFileLockSync(lockPath, () => {
-        const { plan, bytes: planBytes } = readPlan(operationId);
-        const planProjectionDigest = digest(plan.identityProjection);
-        const completed = exactPublishedReceipt(plan);
-        const registryDigest = currentDigest(registryPath);
-        if (completed) {
-          if (registryDigest !== plan.target.registryDigest) {
-            throw new Error('completed bot identity promotion is missing or drifted; fail closed and repair');
-          }
-          if (projectionDigestNow() !== planProjectionDigest) {
-            throw new Error('active bot address set moved past this promotion; run a fresh report');
-          }
-          removeDurably(intentPath);
-          return completed;
-        }
-
-        if (existsSync(intentPath)) {
-          const intent = parseIntentBytes(readFileSync(intentPath, 'utf8'));
-          if (intent.operationId !== operationId || intent.planDigest !== digest(planBytes)) {
-            throw new Error('another bot identity promotion intent is active; fail closed');
-          }
-        } else {
-          if (registryDigest !== plan.source.registryDigest) {
-            throw new Error('bot identity promotion source digest changed; fail closed');
-          }
-          if (projectionDigestNow() !== planProjectionDigest) {
-            throw new Error('active bot address set changed since this plan; run a fresh report');
-          }
-          writeIntent({
-            schemaVersion: 1,
-            operationId,
-            planDigest: digest(planBytes),
-            preparedAt: now(),
-          });
-          options.afterPhase?.('intentPrepared');
-        }
-
-        const registryNow = currentDigest(registryPath);
-        const registryKnown = registryNow === plan.source.registryDigest
-          || registryNow === plan.target.registryDigest;
-        if (!registryKnown) {
-          throw new Error('bot identity promotion state is outside its immutable plan; fail closed');
-        }
-
-        if (registryNow !== plan.target.registryDigest) {
-          publishRegistry(plan.targetRegistry);
-        }
-        options.afterPhase?.('registryPublished');
-
-        if (currentDigest(registryPath) !== plan.target.registryDigest) {
-          throw new Error('bot identity promotion readback mismatch; fail closed');
-        }
-        parseRegistryBytes(readFileSync(registryPath, 'utf8'));
-        const receipt: BotIdentityReceipt = {
-          schemaVersion: 1,
-          operationId,
-          registryDigest: plan.target.registryDigest,
-          projectionDigest: planProjectionDigest,
-          completedAt: now(),
-        };
-        writeImmutable(receiptPath(operationId), canonical(receipt));
-        options.afterPhase?.('receiptPublished');
-        removeDurably(intentPath);
-        return receipt;
+        // Re-derive state under the lock: a concurrently booting daemon may
+        // have completed — or still be mid-way through — the same first-boot
+        // migration while we queued, so only this locked sample may decide.
+        // An existing plan is never auto-promoted: rollback leaves exactly
+        // that shape, and resuming it would silently override the operator.
+        const state = statusOf();
+        if (state.kind !== 'unmigrated') return state;
+        applyLocked(reportLocked().operationId);
+        return statusOf();
       });
     },
     repair(operationId) {
@@ -762,64 +849,7 @@ export function createBotIdentityControlPlane(
       });
     },
     status() {
-      try {
-        const receiptFiles = existsSync(operationsDir)
-          ? readdirSync(operationsDir).filter(name => name.endsWith('.receipt.json')).sort()
-          : [];
-        if (!existsSync(registryPath)) {
-          if (existsSync(intentPath) || receiptFiles.length > 0) {
-            return { kind: 'needsRepair', reason: 'published bot identity registry is missing' };
-          }
-          const planFiles = existsSync(operationsDir)
-            ? readdirSync(operationsDir).filter(name => name.endsWith('.plan.json'))
-            : [];
-          if (planFiles.length > 0) {
-            const plans = planFiles.map(name => {
-              const operationId = name.slice(0, -'.plan.json'.length);
-              return readPlan(operationId).plan;
-            });
-            plans.sort((left, right) => (
-              left.createdAt === right.createdAt
-                ? (left.operationId < right.operationId ? 1 : -1)
-                : (left.createdAt < right.createdAt ? 1 : -1)
-            ));
-            return { kind: 'planned', operationId: plans[0]!.operationId };
-          }
-          return { kind: 'unmigrated' };
-        }
-        const registryBytes = readFileSync(registryPath, 'utf8');
-        const registry = parseRegistryBytes(registryBytes);
-        if (existsSync(intentPath)) {
-          const intent = parseIntentBytes(readFileSync(intentPath, 'utf8'));
-          return {
-            kind: 'needsRepair',
-            reason: 'bot identity promotion intent is active',
-            operationId: intent.operationId,
-          };
-        }
-        const { plan } = readPlan(registry.operationId);
-        const receipt = exactPublishedReceipt(plan);
-        if (!receipt || digest(registryBytes) !== receipt.registryDigest) {
-          return {
-            kind: 'needsRepair',
-            reason: 'bot identity registry has no exact completed receipt',
-            operationId: registry.operationId,
-          };
-        }
-        if (projectionDigestNow() !== receipt.projectionDigest) {
-          return {
-            kind: 'needsPromotion',
-            revision: registry.revision,
-            operationId: registry.operationId,
-          };
-        }
-        return { kind: 'ready', revision: registry.revision, operationId: registry.operationId };
-      } catch (error) {
-        return {
-          kind: 'needsRepair',
-          reason: error instanceof Error ? error.message : String(error),
-        };
-      }
+      return statusOf();
     },
     resolveActive(address) {
       const state = this.status();

@@ -6,6 +6,7 @@ import type {
   BotIdentityStatus,
 } from '../services/bot-identity-control-plane.js';
 import { createBotIdentityControlPlane } from '../services/bot-identity-control-plane.js';
+import { logger } from '../utils/logger.js';
 import type { BotsConfigProvenance } from './config-dir.js';
 
 export type BotIdentityStartupAction = 'report' | 'apply' | 'repair';
@@ -44,8 +45,37 @@ export function botIdentityAddressForConfig(
 }
 
 /**
+ * Daemon startup gate with first-boot auto-migration: a virgin (unmigrated)
+ * root is bootstrapped in place so a fresh install or a first upgrade onto
+ * the identity control plane can boot without an operator step. Every other
+ * non-ready state still fails closed into the explicit report/apply/repair
+ * flow.
+ */
+export function ensureReadyDaemonBotIdentities(
+  control: BotIdentityControlPlane,
+  configs: readonly Pick<BotConfig, 'apiOnly' | 'larkAppId'>[],
+): ReadonlyMap<string, BotIdentityBinding> {
+  // The lock-free sample is only a fast path for the one stable kind: `ready`
+  // never regresses concurrently (operator identity mutations require an
+  // offline fleet). Every other kind — including the transient mid-promotion
+  // states a sibling daemon's in-flight bootstrap makes visible — must be
+  // re-derived under the control lock inside bootstrap(), never judged here.
+  if (control.status().kind !== 'ready') {
+    const after = control.bootstrap();
+    if (after.kind === 'ready') {
+      logger.info(
+        `[bot-identity] stable Bot identity ready after first-boot bootstrap `
+        + `(operation=${after.operationId}, revision=${after.revision})`,
+      );
+    }
+  }
+  return requireReadyDaemonBotIdentities(control, configs);
+}
+
+/**
  * Read-only daemon startup gate. Identity allocation and promotion remain
- * explicit operator actions through report/apply/repair.
+ * explicit operator actions through report/apply/repair; first-boot
+ * auto-migration composes in via ensureReadyDaemonBotIdentities.
  */
 export function requireReadyDaemonBotIdentities(
   control: BotIdentityControlPlane,

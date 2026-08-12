@@ -290,6 +290,80 @@ describe('BotIdentityControlPlane', () => {
     expect(readFileSync(join(rollback.root, 'bots.json'), 'utf8')).toBe(configBytes(['cli_same']));
   });
 
+  it('bootstrap migrates a virgin root once and never promotes an existing plan', () => {
+    const virgin = fixture(['bot_bootstrap'], ['op_boot']);
+    expect(virgin.control.bootstrap()).toMatchObject({
+      kind: 'ready',
+      revision: 1,
+      operationId: 'op_boot',
+    });
+    expect(virgin.control.resolveActive({ kind: 'lark', larkAppId: 'cli_same' }).botId)
+      .toBe('bot_bootstrap');
+    // Idempotent: a second first-boot mints no new operation.
+    expect(virgin.control.bootstrap()).toMatchObject({ kind: 'ready', operationId: 'op_boot' });
+    expect(readdirSync(join(virgin.root, 'bot-identity-ops')).sort()).toEqual([
+      'op_boot.plan.json',
+      'op_boot.receipt.json',
+    ]);
+
+    // An operator-minted plan stays an explicit operator decision.
+    const planned = fixture(['bot_planned_stays'], ['op_planned']);
+    const plan = planned.control.report();
+    expect(planned.control.bootstrap()).toMatchObject({
+      kind: 'planned',
+      operationId: plan.operationId,
+    });
+    expect(existsSync(join(planned.root, 'bot-identities.json'))).toBe(false);
+    expect(readdirSync(join(planned.root, 'bot-identity-ops'))).toEqual(['op_planned.plan.json']);
+
+    // A rolled-back plan is an operator veto; the next boot must not undo it.
+    const vetoed = fixture(['bot_rollback_veto'], ['op_veto'], phase => {
+      if (phase === 'registryPublished') throw new Error('simulated process death');
+    });
+    const vetoPlan = vetoed.control.report();
+    expect(() => vetoed.control.apply(vetoPlan.operationId)).toThrow(/process death/);
+    expect(vetoed.control.rollback()).toMatchObject({ kind: 'planned' });
+    expect(vetoed.control.bootstrap()).toMatchObject({
+      kind: 'planned',
+      operationId: vetoPlan.operationId,
+    });
+    expect(existsSync(join(vetoed.root, 'bot-identities.json'))).toBe(false);
+  });
+
+  it('bootstrap allocates every configured address in one revision-1 operation', () => {
+    const fleet = fixture(['bot_fleet_alpha', 'bot_fleet_beta'], ['op_fleet']);
+    writeFileSync(fleet.configPath, configBytes(['cli_one', 'cli_two']));
+    expect(fleet.control.bootstrap()).toMatchObject({
+      kind: 'ready',
+      revision: 1,
+      operationId: 'op_fleet',
+    });
+    expect(fleet.control.resolveActive({ kind: 'lark', larkAppId: 'cli_one' }).botId)
+      .toBe('bot_fleet_alpha');
+    expect(fleet.control.resolveActive({ kind: 'lark', larkAppId: 'cli_two' }).botId)
+      .toBe('bot_fleet_beta');
+    expect(readdirSync(join(fleet.root, 'bot-identity-ops')).sort()).toEqual([
+      'op_fleet.plan.json',
+      'op_fleet.receipt.json',
+    ]);
+  });
+
+  it('bootstrap returns promotion drift and repair states untouched', () => {
+    const promoted = fixture(['bot_ready_drift'], ['op_ready_drift']);
+    promoted.control.apply(promoted.control.report().operationId);
+    writeFileSync(join(promoted.root, 'bots.json'), configBytes(['cli_new']));
+    expect(promoted.control.bootstrap()).toMatchObject({ kind: 'needsPromotion', revision: 1 });
+    expect(JSON.parse(readFileSync(join(promoted.root, 'bot-identities.json'), 'utf8')))
+      .toMatchObject({ revision: 1, operationId: 'op_ready_drift' });
+
+    const torn = fixture(['bot_torn_repair'], ['op_torn'], phase => {
+      if (phase === 'registryPublished') throw new Error('simulated process death');
+    });
+    const tornPlan = torn.control.report();
+    expect(() => torn.control.apply(tornPlan.operationId)).toThrow(/process death/);
+    expect(torn.control.bootstrap()).toMatchObject({ kind: 'needsRepair' });
+  });
+
   it('rejects collisions, corrupt truth, and a stale concurrent plan without inventing a winner', () => {
     const collision = fixture(['bot_collision', 'bot_collision'], ['op_collision']);
     writeFileSync(join(collision.root, 'bots.json'), configBytes(['cli_one', 'cli_two']));
