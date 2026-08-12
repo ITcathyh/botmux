@@ -226,7 +226,7 @@ import {
   ensureSessionWhiteboard,
   closeCliMismatchedSessionsForBot,
 } from './core/session-manager.js';
-import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit } from './core/trigger-session.js';
+import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
 import {
   runDetachedBotTurnMutation,
   tryWithBotTurnMutation,
@@ -17796,11 +17796,16 @@ async function handleBotAdded(
     // UserMessage; reuse the localized session title only in its clean sidecar.
     const codexAppText = promptBody || title;
 
-    // Pick scope + anchor. 话题群 → seed a topic and anchor thread-scope there;
-    // 普通群 → chat-scope anchored at chatId.
+    // Pick scope + anchor. 话题群 或 普通群 new-topic 模式 → seed a topic and
+    // anchor thread-scope there；其余普通群 → chat-scope anchored at chatId。
+    // 复用入站 @ 的路由判据（externalEventOpensOwnTopic）：否则「自动进群主动开工」
+    // 会无视群配的 new-topic，把首轮平铺进群顶层 chat-scope，而不是像用户手动 @
+    // 那样开一个独立话题。
+    const regularGroupMode = resolveRegularGroupMode(larkAppId, chatId);
+    const opensOwnTopic = externalEventOpensOwnTopic(mode, regularGroupMode);
     let scope: 'thread' | 'chat';
     let anchor: string;
-    if (mode === 'topic') {
+    if (opensOwnTopic) {
       const seedText = tr('daemon.auto_start_join_seed', undefined, localeForBot(larkAppId));
       anchor = await sendMessage(larkAppId, chatId, seedText, 'text');
       scope = 'thread';
@@ -17814,7 +17819,7 @@ async function handleBotAdded(
       return;
     }
     const needsSharedReply = mode === 'group'
-      && resolveRegularGroupMode(larkAppId, chatId) === 'shared';
+      && regularGroupMode === 'shared';
 
     const { pinnedWorkingDir, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
     const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
