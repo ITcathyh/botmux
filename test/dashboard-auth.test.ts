@@ -69,6 +69,17 @@ describe('generateToken', () => {
 describe('describeDashboardTokenError', () => {
   const TP = '/home/u/.botmux/.dashboard-token';
 
+  // The function branches on process.platform (POSIX command vs prose). Default
+  // the whole block to a POSIX view so the common-case assertions are stable on
+  // any host; the win32 cases override it explicitly and restore after.
+  let platformSpy: ReturnType<typeof vi.spyOn> | undefined;
+  const asPlatform = (p: NodeJS.Platform) => {
+    platformSpy?.mockRestore();
+    platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue(p);
+  };
+  beforeEach(() => asPlatform('linux'));
+  afterEach(() => { platformSpy?.mockRestore(); platformSpy = undefined; });
+
   it('keeps the bare stable code for non-credential errors', () => {
     expect(describeDashboardTokenError('token_unavailable', new Error('boom'), TP))
       .toEqual({ error: 'token_unavailable' });
@@ -77,7 +88,7 @@ describe('describeDashboardTokenError', () => {
       .toEqual({ error: 'token_persist_failed' });
   });
 
-  it('surfaces a group/other-writable dir reason with a chmod 700 hint', () => {
+  it('surfaces a group/other-writable dir reason with a chmod 700 (dir) hint', () => {
     const out = describeDashboardTokenError(
       'token_unavailable',
       new UnsafeHostAuthorityFileError('宿主凭证目录可被组内或其它用户写入'),
@@ -86,6 +97,27 @@ describe('describeDashboardTokenError', () => {
     expect(out.error).toBe('token_unavailable'); // stable code preserved
     expect(out.reason).toBe('宿主凭证目录可被组内或其它用户写入');
     expect(out.hint).toContain('chmod 700 /home/u/.botmux');
+  });
+
+  it('a wrong-owner DIRECTORY gets the chmod 700 dir hint', () => {
+    const out = describeDashboardTokenError(
+      'token_unavailable',
+      new UnsafeHostAuthorityFileError('宿主凭证目录 不属于当前用户'),
+      TP,
+    );
+    expect(out.hint).toContain('chmod 700 /home/u/.botmux');
+  });
+
+  it('a wrong-owner FILE does NOT get a chmod hint (chmod cannot fix ownership) but an rm-to-regenerate hint', () => {
+    const out = describeDashboardTokenError(
+      'token_persist_failed',
+      // secure-host-file throws `${label} 不属于当前用户` with label 宿主凭证文件.
+      new UnsafeHostAuthorityFileError('宿主凭证文件 不属于当前用户'),
+      TP,
+    );
+    expect(out.reason).toBe('宿主凭证文件 不属于当前用户');
+    expect(out.hint).not.toContain('chmod'); // the pre-fix bug: told user to chmod the dir
+    expect(out.hint).toContain(`rm -f ${TP}`);
   });
 
   it('surfaces a wrong-mode token reason with a chmod 600 hint', () => {
@@ -98,13 +130,24 @@ describe('describeDashboardTokenError', () => {
     expect(out.hint).toContain(`chmod 600 ${TP}`);
   });
 
-  it('surfaces a symlink/non-regular token reason with an rm hint', () => {
+  it('a symlink (ELOOP) gets a definite rm -f hint', () => {
     const out = describeDashboardTokenError(
       'token_persist_failed',
       new UnsafeHostAuthorityFileError('宿主凭证拒绝符号链接'),
       TP,
     );
     expect(out.hint).toContain(`rm -f ${TP}`);
+  });
+
+  it('a non-regular file of unknown kind degrades to an inspection step, NOT a blind rm -f (a dir leaf would fail "Is a directory")', () => {
+    const out = describeDashboardTokenError(
+      'token_persist_failed',
+      new UnsafeHostAuthorityFileError('宿主凭证必须是普通文件'),
+      TP,
+    );
+    expect(out.reason).toBe('宿主凭证必须是普通文件');
+    expect(out.hint).not.toContain('rm -f'); // the pre-fix bug: `rm -f` on a dir leaf
+    expect(out.hint).toContain(`ls -ld ${TP}`);
   });
 
   it('surfaces an unsafe-ancestor reason without inventing a chmod on the leaf', () => {
@@ -115,6 +158,46 @@ describe('describeDashboardTokenError', () => {
     );
     expect(out.reason).toBe('宿主凭证目录可被不可信祖先目录替换');
     expect(out.hint).toContain('祖先');
+  });
+
+  it('shell-quotes paths with spaces/metacharacters in the copy-paste command', () => {
+    const spaced = '/home/u/My Botmux/.dashboard-token';
+    const out = describeDashboardTokenError(
+      'token_persist_failed',
+      new UnsafeHostAuthorityFileError('宿主凭证文件权限必须严格为 0600'),
+      spaced,
+    );
+    // Quoted so the command survives a copy-paste; the raw path may still appear
+    // in prose, but the command token itself must be the quoted form.
+    expect(out.hint).toContain(`chmod 600 '${spaced}'`);
+  });
+
+  it('on win32 emits prose, never an unusable chmod/rm one-liner', () => {
+    asPlatform('win32');
+    const chmodCase = describeDashboardTokenError(
+      'token_unavailable',
+      new UnsafeHostAuthorityFileError('宿主凭证目录可被组内或其它用户写入'),
+      'C:\\Users\\u\\.botmux\\.dashboard-token',
+    );
+    expect(chmodCase.hint).toBeTruthy();
+    expect(chmodCase.hint).not.toMatch(/chmod|rm -f/);
+    const rmCase = describeDashboardTokenError(
+      'token_persist_failed',
+      new UnsafeHostAuthorityFileError('宿主凭证拒绝符号链接'),
+      'C:\\Users\\u\\.botmux\\.dashboard-token',
+    );
+    expect(rmCase.hint).toBeTruthy();
+    expect(rmCase.hint).not.toMatch(/chmod|rm -f/);
+  });
+
+  it('an unmapped credential reason still surfaces the reason verbatim with no hint', () => {
+    const out = describeDashboardTokenError(
+      'token_persist_failed',
+      new UnsafeHostAuthorityFileError('宿主凭证文件大小异常'),
+      TP,
+    );
+    expect(out.reason).toBe('宿主凭证文件大小异常');
+    expect(out.hint).toBeUndefined();
   });
 });
 
