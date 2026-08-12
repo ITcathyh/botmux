@@ -44,15 +44,19 @@ function runCli(args: string[], env: NodeJS.ProcessEnv): Promise<{
 }
 
 describe('cmdSend hook context wiring', () => {
-  it('repairs scope-less chat records in both CLI session file loaders', () => {
+  it('delegates CLI session snapshot loading to the session-store gate (scope repair lives behind it)', () => {
     const loadSessionsStart = cliSource.indexOf('function loadSessions()');
-    const saveSessionStart = cliSource.indexOf('function saveSession(', loadSessionsStart);
-    const loadSessions = cliSource.slice(loadSessionsStart, saveSessionStart);
-
     expect(loadSessionsStart).toBeGreaterThanOrEqual(0);
-    expect(loadSessions.match(/repairMissingChatScope\(/g)).toHaveLength(2);
-    expect(loadSessions).toMatch(/repairMissingChatScope\(s\);[\s\S]*?sessions\.set\(s\.sessionId, s\)/);
-    expect(loadSessions).toMatch(/repairMissingChatScope\(session\);[\s\S]*?sessions\.set\(session\.sessionId, session\)/);
+    const loadSessionsEnd = cliSource.indexOf('\nfunction ', loadSessionsStart);
+    const loadSessions = cliSource.slice(loadSessionsStart, loadSessionsEnd);
+
+    // The scope repair moved behind the store gate together with the loader
+    // itself — repair-on-load behavior is asserted in test/session-store.test.ts
+    // (loadAllSessionsSnapshot). The CLI must not regrow a parallel reader or
+    // the unlocked whole-file writer it once had.
+    expect(loadSessions).toContain('loadAllSessionsSnapshot(');
+    expect(loadSessions).not.toContain('readFileSync');
+    expect(cliSource).not.toContain('function saveSession(');
   });
 
   it('passes the current session id into outbound send/reply hooks', () => {

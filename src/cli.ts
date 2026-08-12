@@ -234,7 +234,7 @@ import {
   writeManualIntentIfAbsentTo,
   writeRestartAttemptIntentTo,
 } from './services/restart-intent-store.js';
-import { repairMissingChatScope, stripLegacyPendingCardFields } from './services/session-store.js';
+import { loadAllSessionsSnapshot, mutateSessionRowOffline } from './services/session-store.js';
 import {
   evaluateVcMeetingManagedSend,
   isTrustedVcMeetingHostRelayParent,
@@ -4426,156 +4426,42 @@ function resolveDataDir(): string {
   return resolveBotmuxDataDir();
 }
 
-/** Load sessions from all session files (legacy + per-bot). */
+/** Load sessions from all session files (legacy + per-bot). Snapshot mechanics
+ * live in session-store; the CLI only supplies its own data-dir resolution and
+ * the sandbox fallback appId (the file sandbox exposes sessions-<self>.json
+ * but not a listing of data/). */
 function loadSessions(): Map<string, SessionData> {
-  const dataDir = resolveDataDir();
-  const sessions = new Map<string, SessionData>();
-
-  // Read legacy sessions.json
-  const legacyFp = join(dataDir, 'sessions.json');
-  let legacyData: Record<string, SessionData> = {};
-  if (existsSync(legacyFp)) {
-    try {
-      legacyData = JSON.parse(readFileSync(legacyFp, 'utf-8'));
-      for (const [, v] of Object.entries(legacyData)) {
-        const s = v as SessionData;
-        if (!s || typeof s !== 'object' || !s.sessionId) continue;
-        repairMissingChatScope(s);
-        sessions.set(s.sessionId, s);
-      }
-    } catch { /* ignore */ }
-  }
-
-  // Read per-bot session files (sessions-{appId}.json).
-  const loadPerBot = (appId: string) => {
-    try {
-      const data = JSON.parse(readFileSync(join(dataDir, `sessions-${appId}.json`), 'utf-8'));
-      for (const [, v] of Object.entries(data)) {
-        const session = v as SessionData;
-        if (!session || typeof session !== 'object' || !session.sessionId) continue;
-        repairMissingChatScope(session);
-        if (!session.larkAppId) session.larkAppId = appId;  // stamp so saveSession writes back correctly
-        sessions.set(session.sessionId, session);
-      }
-    } catch { /* ignore */ }
-  };
-  try {
-    for (const file of readdirSync(dataDir)) {
-      if (file.startsWith('sessions-') && file.endsWith('.json')) {
-        loadPerBot(file.slice('sessions-'.length, -'.json'.length));
-      }
-    }
-  } catch {
-    // readdir(dataDir) EPERMs under the file sandbox (the deny-by-default policy
-    // exposes sessions-<self>.json but NOT a listing of data/). Fall back to the
-    // OWN per-bot file directly via the injected appId — the sandboxed agent only
-    // ever operates its own session, so no enumeration is needed.
-    if (process.env.BOTMUX_LARK_APP_ID) loadPerBot(process.env.BOTMUX_LARK_APP_ID);
-  }
-
-  // Deliberately read-only. Older CLIs opportunistically migrated legacy rows
-  // here, which made even `botmux list` a whole-file writer capable of racing a
-  // daemon ledger save. Durable migration belongs to daemon startup under the
-  // session-store lock; this generic discovery path only composes snapshots.
-
-  return sessions;
-}
-
-function loadSessionFresh(session: SessionData): SessionData | undefined {
-  return loadSessions().get(session.sessionId);
-}
-
-/** Save a single session back to its appropriate file based on larkAppId. */
-function saveSession(session: SessionData): void {
-  const dataDir = resolveDataDir();
-  const fileName = session.larkAppId ? `sessions-${session.larkAppId}.json` : 'sessions.json';
-  const fp = join(dataDir, fileName);
-
-  // Read current file, update session, write back
-  let data: Record<string, SessionData> = {};
-  if (existsSync(fp)) {
-    try { data = JSON.parse(readFileSync(fp, 'utf-8')); } catch { /* start fresh */ }
-  }
-  data[session.sessionId] = session;
-
-  // Clean up entries where file key doesn't match the entry's sessionId (data
-  // corruption), and strip legacy placeholder-card fields so the file converges
-  // to clean (see stripLegacyPendingCardFields in services/session-store).
-  for (const [key, val] of Object.entries(data)) {
-    if (val && typeof val === 'object' && 'sessionId' in val && (val as SessionData).sessionId !== key) {
-      delete data[key];
-      continue;
-    }
-    if (val && typeof val === 'object') stripLegacyPendingCardFields(val as unknown as Record<string, unknown>);
-  }
-
-  const tmpFp = fp + '.tmp';
-  writeFileSync(tmpFp, JSON.stringify(data, null, 2), 'utf-8');
-  renameSync(tmpFp, fp);
-
-  // Remove duplicate from legacy file if session moved to per-bot file (or vice versa)
-  const otherFile = session.larkAppId ? 'sessions.json' : null;
-  if (otherFile) {
-    const otherFp = join(dataDir, otherFile);
-    if (existsSync(otherFp)) {
-      try {
-        const otherData: Record<string, SessionData> = JSON.parse(readFileSync(otherFp, 'utf-8'));
-        if (otherData[session.sessionId]) {
-          delete otherData[session.sessionId];
-          const otherTmp = otherFp + '.tmp';
-          writeFileSync(otherTmp, JSON.stringify(otherData, null, 2), 'utf-8');
-          renameSync(otherTmp, otherFp);
-        }
-      } catch { /* ignore */ }
-    }
-  }
+  return loadAllSessionsSnapshot({
+    dataDir: resolveDataDir(),
+    fallbackAppId: process.env.BOTMUX_LARK_APP_ID,
+  }) as unknown as Map<string, SessionData>;
 }
 
 /** Offline-only narrow session mutation. Callers must prefer the owning daemon
- * while it is available; rereading the exact row here prevents stale CLI
- * snapshots from copying FIFO fields during offline maintenance. */
+ * while it is available; session-store rereads the exact row under the shared
+ * session-file lock so stale CLI snapshots can never be written back. The
+ * daemon-liveness probe runs under that same lock (entry + pre-publication) so
+ * two CLIs cannot race each other and an already-published daemon cannot be
+ * bypassed by the offline fallback. */
 function mutateSessionOffline(
   session: SessionData,
   mutate: (current: SessionData) => boolean,
 ): SessionData | undefined {
-  const dataDir = resolveDataDir();
-  const fileName = session.larkAppId ? `sessions-${session.larkAppId}.json` : 'sessions.json';
-  const fp = join(dataDir, fileName);
-  return withFileLockSync(fp, () => {
-    // The owning daemon uses the same session-file lock for every save. Check
-    // absence while holding it so two CLIs cannot race each other and an
-    // already-published daemon cannot be bypassed by the offline fallback.
-    if (session.larkAppId) {
-      try { if (findDaemon(session.larkAppId)) return undefined; } catch { /* offline */ }
-    }
-    let data: Record<string, SessionData> = {};
-    if (existsSync(fp)) {
-      try { data = JSON.parse(readFileSync(fp, 'utf-8')); } catch { /* start fresh */ }
-    }
-    const current = data[session.sessionId];
-    if (!current || !mutate(current)) return current;
-    data[session.sessionId] = current;
-
-    // Clean up entries where file key doesn't match the entry's sessionId
-    // (data corruption), and strip removed placeholder-card fields.
-    for (const [key, val] of Object.entries(data)) {
-      if (val && typeof val === 'object' && 'sessionId' in val && (val as SessionData).sessionId !== key) {
-        delete data[key];
-        continue;
-      }
-      if (val && typeof val === 'object') stripLegacyPendingCardFields(val as unknown as Record<string, unknown>);
-    }
-
-    // Recheck immediately before publication. A daemon that appears during
-    // the read/decision phase becomes authoritative; leave the file untouched.
-    if (session.larkAppId) {
-      try { if (findDaemon(session.larkAppId)) return undefined; } catch { /* offline */ }
-    }
-    const tmpFp = `${fp}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
-    writeFileSync(tmpFp, JSON.stringify(data, null, 2), 'utf-8');
-    renameSync(tmpFp, fp);
-    return current;
-  });
+  const larkAppId = session.larkAppId;
+  return mutateSessionRowOffline(
+    { sessionId: session.sessionId, ...(larkAppId ? { larkAppId } : {}) },
+    current => mutate(current as unknown as SessionData),
+    {
+      dataDir: resolveDataDir(),
+      ...(larkAppId
+        ? {
+            abortIf: () => {
+              try { return !!findDaemon(larkAppId); } catch { return false; /* offline */ }
+            },
+          }
+        : {}),
+    },
+  ) as unknown as SessionData | undefined;
 }
 
 type OfflineAbandonResult =
@@ -4998,113 +4884,6 @@ function isAdoptedSession(s: SessionData): s is SessionData & { adoptedFrom: Ado
 function adoptedCliPid(s: SessionData): number | undefined {
   const pid = isAdoptedSession(s) ? s.adoptedFrom.originalCliPid : undefined;
   return typeof pid === 'number' && pid > 0 ? pid : undefined;
-}
-
-type SessionDeleteCloseResult =
-  | { ok: true; via: 'daemon' | 'offline' }
-  | { ok: false; error: string };
-
-/** Offline-only fallback for `botmux delete`. When the owning daemon is live,
- *  it must own the whole close transition so its activeSessions registry,
- *  persistent row, lifecycle hooks, subscriptions, and backend teardown stay
- *  coherent. This legacy local path is safe only when there is no daemon
- *  process whose in-memory state could be stranded. */
-function closeSessionOffline(s: SessionData): SessionDeleteCloseResult {
-  const originalPid = adoptedCliPid(s);
-  // Adopted sessions own only the botmux worker/viewer, never the user's CLI.
-  if (s.pid && s.pid !== originalPid && isProcessAlive(s.pid)) {
-    killProcess(s.pid);
-  }
-
-  // Adopted panes belong to the user. Ordinary bmx-* sessions are botmux-owned
-  // and still need direct cleanup when no daemon exists to run killWorker().
-  if (!isAdoptedSession(s)) {
-    if (isSuspendableBackendType(s.backendType)) {
-      const target = resolvePersistentBackendTarget(
-        s.backendType,
-        s.sessionId,
-        s.persistentBackendTarget,
-      );
-      try {
-        killPersistentBackendTarget(target, s.sessionId);
-      } catch (err) {
-        // ZMX destruction is identity-verified against the complete botmux
-        // session UUID and waits for confirmed disappearance. Swallowing an
-        // inconclusive/mismatched kill would hide the sole control row while
-        // its CLI remains alive. Older mux backends retain their historical
-        // best-effort offline-close compatibility.
-        if (target.backendType === 'zmx') {
-          return {
-            ok: false,
-            error: `ZMX 离线删除未完成：${err instanceof Error ? err.message : String(err)}`,
-          };
-        }
-      }
-    } else {
-      // Legacy rows without backendType were historically tmux-backed.
-      const tmuxName = `bmx-${s.sessionId.substring(0, 8)}`;
-      try {
-        execSync(`tmux kill-session -t '${tmuxName}' 2>/dev/null`, {
-          stdio: 'ignore',
-          env: tmuxEnv(),
-        });
-      } catch { /* no tmux session */ }
-    }
-  }
-
-  s.status = 'closed';
-  s.closedAt = new Date().toISOString();
-  saveSession(s);
-  return { ok: true, via: 'offline' };
-}
-
-/** Close through the owning daemon whenever it is online. The IPC request is
- *  deliberately sent BEFORE any local kill: deleting the current bmx-* tmux
- *  first would terminate this very CLI before it can evict daemon memory.
- *
- *  Trusted host callers use the dashboard HMAC. A sandboxed/read-isolated CLI
- *  can only authorize the exact current session with its rotating per-turn
- *  capability, so `delete <other-id>` remains fail-closed. */
-async function closeSessionForDelete(
-  s: SessionData,
-  online = listOnlineDaemons(),
-): Promise<SessionDeleteCloseResult> {
-  // Legacy sessions without larkAppId live in sessions.json. A per-bot daemon
-  // writes only its own sessions-<appId>.json and silently no-ops on close
-  // (sessionStore.closeSession only touches the current file), so routing a
-  // legacy session to it yields "200 OK" with no actual state change. This must
-  // hold on BOTH ways a daemon port is discovered — the descriptor lookup AND
-  // the injected-port current-session fallback below — so gate the whole daemon
-  // path on larkAppId with one authoritative guard. A live daemon-spawned
-  // session always carries larkAppId, so this never diverts the legitimate
-  // sandboxed current-session close (which reaches its daemon via the injected
-  // port); it only keeps larkAppId-less legacy records on the offline fallback,
-  // whose saveSession() persists to the legacy file correctly.
-  if (!s.larkAppId) {
-    return closeSessionOffline(s);
-  }
-
-  const daemon = online.find(d => d.larkAppId === s.larkAppId);
-  const isCurrentSession = process.env.BOTMUX_SESSION_ID === s.sessionId;
-  const injectedPort = isCurrentSession
-    ? resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT)
-    : undefined;
-  const ipcPort = daemon?.ipcPort ?? injectedPort;
-
-  if (ipcPort) {
-    try {
-      const res = await postSessionCliIpc(ipcPort, s.sessionId, 'close', {});
-      const body: any = await res.json().catch(() => ({}));
-      if (res.ok && body?.ok) return { ok: true, via: 'daemon' };
-      return { ok: false, error: body?.error ?? `HTTP ${res.status}` };
-    } catch (err: any) {
-      // A fresh daemon descriptor means there may still be authoritative
-      // in-memory state. Never fall back to a partial local kill in this case.
-      return { ok: false, error: `连接 daemon 失败: ${err?.message ?? err}` };
-    }
-  }
-
-  return closeSessionOffline(s);
 }
 
 function adoptTargetLabel(s: SessionData): string {

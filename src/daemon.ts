@@ -3123,21 +3123,6 @@ function receivedReactionEmojiFor(ds: DaemonSession): string {
   } catch { return RECEIVED_REACTION_EMOJI_TYPE; }
 }
 
-function readSessionFreshFromDisk(sessionId: string, larkAppId: string): import('./types.js').Session | undefined {
-  const paths = [
-    join(config.session.dataDir, `sessions-${larkAppId}.json`),
-    join(config.session.dataDir, 'sessions.json'),
-  ];
-  for (const fp of paths) {
-    if (!existsSync(fp)) continue;
-    try {
-      const data = JSON.parse(readFileSync(fp, 'utf-8')) as Record<string, import('./types.js').Session>;
-      if (data[sessionId]) return data[sessionId];
-    } catch { /* ignore corrupt/racing session file */ }
-  }
-  return undefined;
-}
-
 export async function noteTurnReceived(
   ds: DaemonSession,
   triggerMessageId: string,
@@ -3342,7 +3327,7 @@ async function sessionReply(
       return replyWithHookPolicy(root.rootMessageId, content, msgType, true, opts.uuid);
     }
     if (ds?.scope === 'chat') {
-      const fresh = readSessionFreshFromDisk(ds.session.sessionId, ds.larkAppId);
+      const fresh = sessionStore.readSessionRowFromDisk(ds.session.sessionId, ds.larkAppId);
       if (fresh) syncReplyTargetState(ds, fresh);
       // Resolve through fallbackTurnId so daemon-side sends that carry no turn of
       // their own (the repo-select card, skip/switch confirmations, crash notices)
