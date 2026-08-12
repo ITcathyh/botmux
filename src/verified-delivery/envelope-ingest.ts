@@ -1,5 +1,6 @@
 import type { LedgerHandle } from './ledger.js';
 import type { EnvelopeEvidence, ParsedEnvelope } from './envelope.js';
+import { isHttpEvidenceUrl } from './invariants.js';
 import type { Evidence } from './types.js';
 
 export type DeliveryEnvelopeIngestResult =
@@ -12,6 +13,7 @@ export type DeliveryEnvelopeIngestResult =
       allowedUnionIds: string[];
     }
   | { outcome: 'report_without_evidence'; taskId: string }
+  | { outcome: 'invalid_evidence'; taskId: string; reason: string }
   | { outcome: 'report'; taskId: string; reportId: string; deduped: boolean }
   | { outcome: 'help'; taskId: string; deduped: boolean };
 
@@ -60,6 +62,9 @@ export function ingestParsedDeliveryEnvelope(input: {
   if (envelope.kind === 'report') {
     if (envelope.evidence.length === 0) {
       return { outcome: 'report_without_evidence', taskId: envelope.taskId };
+    }
+    if (envelope.evidence.some((item) => item.kind === 'url' && !isHttpEvidenceUrl(item.url))) {
+      return { outcome: 'invalid_evidence', taskId: envelope.taskId, reason: 'url evidence must use http or https' };
     }
     const reportId = envelope.reportId?.trim() || `msg:${messageId}`;
     const evidence = envelope.evidence.map((item) => toLedgerEvidence(item, ledger));

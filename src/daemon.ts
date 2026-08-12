@@ -3314,7 +3314,6 @@ async function handleGoalReviveFailure(event: GoalWatchdogReviveFailureEvent): P
   const now = Date.now();
   const last = reviveBudgetAttentionAt.get(event.goalChatId) ?? 0;
   if (last > 0 && now - last < REVIVE_BUDGET_ATTENTION_COOLDOWN_MS) return;
-  reviveBudgetAttentionAt.set(event.goalChatId, now);
 
   const rec = getGoalChat(event.goalChatId);
   if (!rec?.parentChatId) {
@@ -3323,9 +3322,7 @@ async function handleGoalReviveFailure(event: GoalWatchdogReviveFailureEvent): P
   }
 
   const parent = findActiveSessionById(rec.parentSessionId);
-  const ownerOpenId = goalNotifyOwnerOpenId(parent);
   const candidates = goalParentSenderCandidates(parent?.larkAppId, rec.larkAppId, currentDaemonLarkAppId);
-  const goalLink = chatAppLink(event.goalChatId, getBotBrand(candidates[0] ?? rec.larkAppId ?? currentDaemonLarkAppId));
   const summary = [
     `监工连续自动复活失败，已达到预算上限。`,
     `原因: ${event.error}`,
@@ -3343,43 +3340,34 @@ async function handleGoalReviveFailure(event: GoalWatchdogReviveFailureEvent): P
     });
   }
 
-  let lastError: string | undefined;
-  for (const larkAppId of candidates) {
-    const mention = ownerOpenId ? `<at user_id="${ownerOpenId}"></at> ` : '';
-    const text = [
-      `${mention}[goal] Goal 监工反复崩溃，需要你处理`,
-      rec.title ? `Goal: ${rec.title}` : undefined,
-      `goalChatId: ${event.goalChatId}`,
-      `打开 goal 群: ${goalLink}`,
-      '',
-      summary,
-    ].filter(Boolean).join('\n');
-    try {
-      const messageId = await sendMessage(larkAppId, rec.parentChatId, text, 'text');
-      if (messageId) {
-        rememberGoalParentNotification({
-          messageId,
-          larkAppId,
-          parentChatId: rec.parentChatId,
-          parentRoot: rec.parentRoot,
-          parentSessionId: rec.parentSessionId,
-          goalChatId: event.goalChatId,
-          goalTitle: rec.title,
-          summary,
-          attentionKind: 'blocked',
-          attentionReason: 'goal_supervisor_revive_budget_exhausted',
-          done: false,
-          createdAt: now,
-        });
-      }
-      logger.warn(`[goal-watchdog] revive budget exhausted goal=${event.goalChatId}; human attention sent via ${larkAppId}`);
-      return;
-    } catch (err: any) {
-      lastError = err?.message ?? String(err);
-      logger.warn(`[goal-watchdog] revive budget human attention via ${larkAppId} failed: ${lastError}`);
-    }
+  const record: GoalNotificationRetryRecord = {
+    id: `revive-budget:${event.goalChatId}`,
+    ownerLarkAppId: currentDaemonLarkAppId,
+    kind: 'human-attention',
+    candidates,
+    parentChatId: rec.parentChatId,
+    parentRoot: rec.parentRoot,
+    parentSessionId: rec.parentSessionId,
+    goalChatId: event.goalChatId,
+    goalTitle: rec.title,
+    summary,
+    attentionKind: 'blocked',
+    attentionReason: 'goal_supervisor_revive_budget_exhausted',
+    done: false,
+    ownerOpenId: goalNotifyOwnerOpenId(parent),
+    attempts: 0,
+    nextAttemptAt: now + 60_000,
+    createdAt: now,
+    updatedAt: now,
+  };
+  const result = await sendGoalHumanAttentionRecord(record);
+  if (!result.sent) {
+    upsertGoalNotificationRetry({ ...record, lastError: result.error });
+    logger.warn(`[goal-watchdog] revive budget exhausted goal=${event.goalChatId}; human attention queued: ${result.error}`);
+  } else {
+    logger.warn(`[goal-watchdog] revive budget exhausted goal=${event.goalChatId}; human attention sent`);
   }
-  logger.warn(`[goal-watchdog] revive budget exhausted goal=${event.goalChatId}; human attention failed: ${lastError ?? 'no_sender_available'}`);
+  reviveBudgetAttentionAt.set(event.goalChatId, now);
 }
 
 type LocalGoalWorkerHealth = GoalWorkerHealthEntry;
@@ -20193,6 +20181,10 @@ async function maybeIngestDeliveryEnvelope(input: {
   }
   if (result.outcome === 'report_without_evidence') {
     logger.warn(`[delivery-envelope] report without evidence ignored task=${result.taskId} msg=${input.parsed.messageId}`);
+    return true;
+  }
+  if (result.outcome === 'invalid_evidence') {
+    logger.warn(`[delivery-envelope] invalid evidence ignored task=${result.taskId} msg=${input.parsed.messageId}: ${result.reason}`);
     return true;
   }
   if (result.outcome === 'report') {

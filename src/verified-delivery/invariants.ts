@@ -37,6 +37,15 @@ function nonEmpty(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
+export function isHttpEvidenceUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
 function validateStringArray(value: unknown, field: string, errors: string[], opts: { allowEmptyItems?: boolean } = {}): string[] | undefined {
   if (value === undefined) return undefined;
   if (!Array.isArray(value)) {
@@ -73,14 +82,7 @@ function validateEvidenceItem(raw: unknown, field: string, errors: string[]): vo
       errors.push(`${field}.url must be non-empty`);
       return;
     }
-    try {
-      const u = new URL(evidence.url);
-      if (u.protocol !== 'http:' && u.protocol !== 'https:') {
-        errors.push(`${field}.url must use http or https`);
-      }
-    } catch {
-      errors.push(`${field}.url must be a valid URL`);
-    }
+    if (!isHttpEvidenceUrl(evidence.url)) errors.push(`${field}.url must be a valid http or https URL`);
     return;
   }
   errors.push(`${field}.kind is unknown`);

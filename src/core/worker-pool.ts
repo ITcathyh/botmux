@@ -7815,7 +7815,6 @@ function setupWorkerHandlers(
             ...((ds.session.queuedActivationTurnId ?? rawTurnId)
               ? { turnId: ds.session.queuedActivationTurnId ?? rawTurnId }
               : {}),
-            ...(rawTurnId ? { turnId: rawTurnId } : {}),
             followUpContent: followUp?.cliInput,
             ...(followUp?.turnId ? { followUpTurnId: followUp.turnId } : {}),
             ...(followUpCodexAppInput ? { followUpCodexAppInput } : {}),

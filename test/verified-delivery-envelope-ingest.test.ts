@@ -42,4 +42,32 @@ describe('delivery envelope ingestion', () => {
     })).toEqual({ outcome: 'task_not_dispatched', taskId: 'downstream' });
     expect(ledger.read().map((event) => event.type)).toEqual(['TaskDispatched', 'TaskPlanned']);
   });
+
+  it('returns an explicit outcome for unsafe URL evidence instead of throwing during append', () => {
+    const ledger = openLedger({ baseDir });
+    ledger.append({
+      type: 'TaskDispatched', actor: 'orchestrator', taskId: 'task-url', chatId: 'oc_goal', ts: 1,
+      idempotencyKey: 'dispatched:task-url',
+      payload: { taskId: 'task-url', workerOpenIds: ['ou_worker'] },
+    });
+
+    expect(ingestParsedDeliveryEnvelope({
+      ledger,
+      goalChatId: 'oc_goal',
+      senderOpenId: 'ou_worker',
+      messageId: 'om_bad_url',
+      now: 2,
+      envelope: {
+        kind: 'report',
+        taskId: 'task-url',
+        summary: 'done',
+        evidence: [{ kind: 'url', url: 'javascript:alert(1)' }],
+      },
+    })).toEqual({
+      outcome: 'invalid_evidence',
+      taskId: 'task-url',
+      reason: 'url evidence must use http or https',
+    });
+    expect(ledger.read().map((event) => event.type)).toEqual(['TaskDispatched']);
+  });
 });

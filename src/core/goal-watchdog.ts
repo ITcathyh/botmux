@@ -20,6 +20,7 @@ export const DEFAULT_GOAL_WATCHDOG_REPORT_GRACE_MS = 15_000;
 export const DEFAULT_GOAL_WATCHDOG_REASSIGN_GRACE_MS = 5 * 60_000;
 
 type GoalWatchdogStatus =
+  | 'error'
   | 'injected'
   | 'reconciled'
   | 'no-l2'
@@ -318,6 +319,8 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
 
   for (const [goalChatId, tasks] of byGoal) {
     if (goalFilter && !goalFilter.has(goalChatId)) continue;
+    const resultCountBeforeGoal = results.length;
+    try {
     if (tasks.length === 0) {
       results.push({ goalChatId, status: 'empty', pendingTaskIds: [] });
       continue;
@@ -523,6 +526,13 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
       throw err;
     }
     results.push({ goalChatId, status: 'injected', pendingTaskIds, sessionId: ds.session.sessionId });
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      logger.warn(`[goal-watchdog] goal tick failed goal=${goalChatId}: ${reason}`);
+      if (results.length === resultCountBeforeGoal) {
+        results.push({ goalChatId, status: 'error', pendingTaskIds: tasks.map((task) => task.taskId), reason });
+      }
+    }
   }
 
   return results;

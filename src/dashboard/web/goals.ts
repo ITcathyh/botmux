@@ -12,6 +12,7 @@
 // verification — exactly the gap the goal-watchdog fills, made visible.
 import { escapeHtml, relTime, loadNameMaps, botNameForOpenId, botNameForAppId, chatNameForId } from './ui.js';
 import { isMissingRepoBlocker } from '../../core/repo-help.js';
+import { isHttpEvidenceUrl } from '../../verified-delivery/invariants.js';
 
 interface AcceptanceCheck { type: 'exists' | 'contains'; text?: string }
 interface AcceptanceArtifact { path: string; kind?: string; checks: AcceptanceCheck[] }
@@ -290,6 +291,16 @@ function dependenciesHtml(t: BoardTask): string {
   return `<div class="gb-sec gb-sec-deps"><h3>前置任务</h3><div class="gb-deps">${t.dependsOnTaskIds.map((taskId) =>
     `<span class="gb-dep" title="${escapeHtml(taskId)}">${escapeHtml(shortId(taskId))}</span>`).join('')}</div><p class="gb-muted">全部验收通过后，系统自动派发本任务。</p></div>`;
 }
+export function evidenceHtml(e: BoardEvidence): string {
+  if (e.kind === 'path') return `<code>${escapeHtml(e.label)}</code>`;
+  if (e.kind === 'url') {
+    const label = escapeHtml(e.label);
+    return isHttpEvidenceUrl(e.label)
+      ? `🔗 <a href="${label}" target="_blank" rel="noopener noreferrer">${label}</a>`
+      : `🔗 ${label}`;
+  }
+  return `📎 ${escapeHtml(e.label)}${e.preview ? ` <span class="gb-muted">${escapeHtml(e.preview.slice(0, 48))}</span>` : ''}`;
+}
 function trailHtml(t: BoardTask): string {
   if (!t.checkedBy && !t.evidenceChecked?.length && !t.ranCommands?.length && !t.evidence?.length) {
     return t.reportCount ? '<p class="gb-muted">尚未验收</p>' : '<p class="gb-muted">执行者尚未提交结果</p>';
@@ -305,12 +316,7 @@ function trailHtml(t: BoardTask): string {
   }
   if (t.evidenceChecked?.length) parts.push(`<div class="gb-kv"><span>核验了</span><ul>${t.evidenceChecked.map(e => `<li>${escapeHtml(e)}</li>`).join('')}</ul></div>`);
   if (t.ranCommands?.length) parts.push(`<div class="gb-kv"><span>跑了命令</span><ul>${t.ranCommands.map(c => `<li><code>${escapeHtml(c)}</code></li>`).join('')}</ul></div>`);
-  if (t.evidence?.length) parts.push(`<div class="gb-kv"><span>产物证据</span><ul>${t.evidence.map(e =>
-    `<li>${e.kind === 'path'
-      ? `<code>${escapeHtml(e.label)}</code>`
-      : e.kind === 'url'
-        ? `🔗 <a href="${escapeHtml(e.label)}" target="_blank" rel="noopener noreferrer">${escapeHtml(e.label)}</a>`
-        : `📎 ${escapeHtml(e.label)}${e.preview ? ` <span class="gb-muted">${escapeHtml(e.preview.slice(0, 48))}</span>` : ''}`}</li>`).join('')}</ul></div>`);
+  if (t.evidence?.length) parts.push(`<div class="gb-kv"><span>产物证据</span><ul>${t.evidence.map(e => `<li>${evidenceHtml(e)}</li>`).join('')}</ul></div>`);
   return parts.join('');
 }
 function attemptsHtml(t: BoardTask): string {

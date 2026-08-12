@@ -144,6 +144,34 @@ describe('goal watchdog', () => {
     expect(injected[0].prompt).toContain('next=等执行者提交结果');
   });
 
+  it('isolates one goal failure so later goals still run in the same tick', async () => {
+    const activeSessions = new Map<string, DaemonSession>();
+    activeSessions.set(sessionKey('oc_bad', 'cli_main'), ds({ chatId: 'oc_bad', larkAppId: 'cli_main' }));
+    activeSessions.set(sessionKey('oc_good', 'cli_main'), ds({ chatId: 'oc_good', larkAppId: 'cli_main' }));
+    const injected: string[] = [];
+
+    const results = await runGoalWatchdogOnce({
+      larkAppId: 'cli_main',
+      activeSessions,
+      ledger: ledger([
+        task('t-bad', 'oc_bad', 'dispatched'),
+        task('t-good', 'oc_good', 'dispatched'),
+      ]),
+      now: 10_000,
+      lastInjectedAt: new Map(),
+      inject: (target) => {
+        if (target.chatId === 'oc_bad') throw new Error('bad goal');
+        injected.push(target.chatId);
+      },
+    });
+
+    expect(results).toMatchObject([
+      { goalChatId: 'oc_bad', status: 'error', reason: 'bad goal' },
+      { goalChatId: 'oc_good', status: 'injected' },
+    ]);
+    expect(injected).toEqual(['oc_good']);
+  });
+
   it('falls back to L2 prompt for legacy free-text acceptance hints', async () => {
     const activeSessions = new Map<string, DaemonSession>();
     activeSessions.set(sessionKey('oc_goal', 'cli_main'), ds({ chatId: 'oc_goal', larkAppId: 'cli_main' }));
