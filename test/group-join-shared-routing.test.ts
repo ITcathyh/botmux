@@ -3,6 +3,7 @@
  *
  * Run: pnpm vitest run test/group-join-shared-routing.test.ts
  */
+import { randomUUID } from 'node:crypto';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -104,7 +105,8 @@ async function loadModules() {
   const sessionStore = await import('../src/services/session-store.js');
   const daemon = await import('../src/daemon.js');
   const types = await import('../src/core/types.js');
-  return { daemon, registry, sessionStore, types };
+  const identity = await import('../src/core/bot-identity.js');
+  return { daemon, registry, sessionStore, types, identity };
 }
 
 /**
@@ -117,7 +119,12 @@ async function loadModules() {
 function registerJoinBot(
   cfg: Parameters<typeof modules.registry.registerBot>[0],
 ): ReturnType<typeof modules.registry.registerBot> {
-  const bot = modules.registry.registerBot(cfg);
+  // Bind a stable BotId exactly like daemon startup does: the Current runtime
+  // host fails closed (requireBotId) for identity-less bots.
+  const bot = modules.registry.registerBot(
+    cfg,
+    modules.identity.parseBotId(`bot_${randomUUID().replaceAll('-', '')}`),
+  );
   modules.sessionStore.init(cfg.larkAppId);
   return bot;
 }
@@ -133,7 +140,13 @@ function attachLiveWorker(ds: any, worker: any): void {
   const generation = Math.max(ds.workerGeneration ?? 0, ds.session?.workerGeneration ?? 0) + 1;
   ds.worker = worker;
   ds.workerGeneration = generation;
-  if (ds.session) ds.session.workerGeneration = generation;
+  if (ds.session) {
+    ds.session.workerGeneration = generation;
+    // Production reserveWorkerGeneration persists the bumped generation; the
+    // owner-strict projection refuses delivery when the live session drifts
+    // from its durable row, so the fixture must write through like prod does.
+    modules.sessionStore.updateSession(ds.session);
+  }
 }
 
 /** Stand in for a real fork: attach the worker and prove acceptance with `true`. */

@@ -18,13 +18,13 @@ import {
   currentSessionCommandLane,
   currentSessionLaneAddress,
 } from './current-session-command-lane.js';
-import {
-  forkAdoptWorker,
-  forkWorker,
-  getDaemonBootId,
-  getActiveSessionsRegistry,
-  type ForkResumeOrTurnId,
-} from './worker-pool.js';
+// Type-only: this Adapter is the composition target of worker-pool's own
+// import graph (worker-pool → session-manager → … → here), so a static VALUE
+// import of worker-pool would close a runtime cycle that silently disables
+// partial vi.mock(worker-pool) for every test importing the graph. Effect
+// executors are composition-injected (or lazily imported as the production
+// default) instead.
+import type { forkAdoptWorker, forkWorker, ForkResumeOrTurnId } from './worker-pool.js';
 import { activeSessionKey, type DaemonSession } from './types.js';
 
 export type CurrentSessionActivationInput =
@@ -342,15 +342,19 @@ export function createCurrentSessionActivationPort(options: {
       if (!plan) throw new Error('Current activation intent was already consumed');
       intents.delete(intent);
       if (plan.input.kind === 'managed') {
+        const fork = options.forkWorker
+          ?? (await import('./worker-pool.js')).forkWorker;
         return {
-          accepted: (options.forkWorker ?? forkWorker)(
+          accepted: fork(
             plan.current,
             plan.input.promptInput,
             plan.input.resumeOrTurnId,
           ),
         };
       }
-      const result: unknown = (options.forkAdoptWorker ?? forkAdoptWorker)(plan.current, {
+      const forkAdopt = options.forkAdoptWorker
+        ?? (await import('./worker-pool.js')).forkAdoptWorker;
+      const result: unknown = forkAdopt(plan.current, {
         ...(plan.input.restoredFromMetadata === true ? { restoredFromMetadata: true } : {}),
         ...(plan.input.prompt === '' ? {} : { prompt: plan.input.prompt }),
         ...(plan.input.turnId === undefined ? {} : { turnId: plan.input.turnId }),
@@ -612,13 +616,15 @@ export function currentSessionActivationCoordinator(options: {
   return coordinator;
 }
 
-function currentActivationCoordinator(
+async function currentActivationCoordinator(
   ownerBotId: BotId | undefined,
   ownerLarkAppId: string,
   activeSessionsOverride?: Map<string, DaemonSession>,
-  runtimeEpoch: string = getDaemonBootId(),
+  runtimeEpochOverride?: string,
 ) {
-  const activeSessions = activeSessionsOverride ?? getActiveSessionsRegistry();
+  const workerPool = await import('./worker-pool.js');
+  const runtimeEpoch = runtimeEpochOverride ?? workerPool.getDaemonBootId();
+  const activeSessions = activeSessionsOverride ?? workerPool.getActiveSessionsRegistry();
   if (!activeSessions) return undefined;
   let stableOwnerBotId = ownerBotId;
   if (!stableOwnerBotId) {
@@ -654,7 +660,7 @@ export async function ensureCurrentSessionActivation(input: {
   /** Current composition/tests may provide the exact owner registry explicitly. */
   readonly activeSessions?: Map<string, DaemonSession>;
 }): Promise<SessionActivationOutcome> {
-  const coordinator = currentActivationCoordinator(
+  const coordinator = await currentActivationCoordinator(
     input.ownerBotId,
     input.ownerLarkAppId,
     input.activeSessions,
@@ -686,7 +692,7 @@ export async function reconcileCurrentSessionActivation(input: {
   readonly restoredFromMetadata?: boolean;
   readonly activeSessions?: Map<string, DaemonSession>;
 }): Promise<SessionActivationOutcome> {
-  const coordinator = currentActivationCoordinator(
+  const coordinator = await currentActivationCoordinator(
     input.ownerBotId,
     input.ownerLarkAppId,
     input.activeSessions,
@@ -715,7 +721,7 @@ export async function retireCurrentSessionActivation(input: {
   readonly requestIdentity: string;
   readonly reason: SessionRetirementReason;
 }): Promise<SessionRetirementOutcome> {
-  const coordinator = currentActivationCoordinator(
+  const coordinator = await currentActivationCoordinator(
     input.ownerBotId,
     input.ownerLarkAppId,
     undefined,
@@ -737,7 +743,7 @@ export async function settleCurrentSessionRetirement(input: {
   readonly reason: SessionRetirementReason;
   readonly disposition: SessionRetirementDisposition;
 }): Promise<SessionRetirementSettlementOutcome> {
-  const coordinator = currentActivationCoordinator(
+  const coordinator = await currentActivationCoordinator(
     input.ownerBotId,
     input.ownerLarkAppId,
     undefined,

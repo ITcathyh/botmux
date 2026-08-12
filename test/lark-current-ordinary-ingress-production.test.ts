@@ -143,14 +143,21 @@ async function runOneTurn(
 ): Promise<OrdinaryIngressTransitionResult> {
   const normalized = normalizeOrdinaryImTurn(input);
   if (normalized.kind !== 'normalized') throw new Error(normalized.message);
-  const begun = port.begin({ sessionId: SESSION_ID, turn: normalized.turn });
-  if (begun.kind !== 'effect') throw new Error(`expected materialization, got ${begun.kind}`);
-  try {
-    const value = await port.execute(begun.intent);
-    return port.resume(begun.continuation, { kind: 'returned', value });
-  } catch (error) {
-    return port.resume(begun.continuation, { kind: 'threw', error });
+  let transition = port.begin({ sessionId: SESSION_ID, turn: normalized.turn });
+  if (transition.kind !== 'effect') throw new Error(`expected materialization, got ${transition.kind}`);
+  // One turn spans MULTIPLE effect round-trips (materialization, then worker
+  // activation) — drive until a terminal transition, mirroring the production
+  // runOrdinaryEffects loop.
+  while (transition.kind === 'effect') {
+    const continuation = transition.continuation;
+    try {
+      const value = await port.execute(transition.intent);
+      transition = port.resume(continuation, { kind: 'returned', value });
+    } catch (error) {
+      transition = port.resume(continuation, { kind: 'threw', error });
+    }
   }
+  return transition;
 }
 
 async function deliver(

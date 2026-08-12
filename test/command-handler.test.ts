@@ -1756,8 +1756,12 @@ describe('handleCommand', () => {
       expect(killWorker).not.toHaveBeenCalled();
       expect(sessionStore.closeSession).not.toHaveBeenCalled();
       expect(deps.activeSessions.has(sessionKey(ROOT_ID, LARK_APP_ID))).toBe(false);
+      // C3 stamps every session.* event with a top-level process position
+      // (projectionEpoch + sequence) on publish.
       expect(events).toContainEqual({
         type: 'session.update',
+        projectionEpoch: expect.any(String),
+        sequence: expect.any(Number),
         body: {
           sessionId: 'sess-001',
           patch: expect.objectContaining({

@@ -77,9 +77,12 @@ import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
 import { getAttachmentsDir } from './attachment-path.js';
 import { readDeferredTopicBinding, removeDeferredTopicBinding } from './deferred-topic-binding.js';
 import { escapeXmlTagLikeTokens } from '../utils/xml.js';
-import {
-  reconcileCurrentSessionActivation,
-} from './current-session-activation.js';
+// Type-only: a static VALUE import here would close a runtime module cycle
+// (worker-pool → session-manager → current-session-activation → worker-pool)
+// that breaks partial vi.mock(worker-pool) in every test importing this graph.
+// The value is composition-injected by daemon.ts, or lazily imported where a
+// module-level default is still wanted.
+import type { reconcileCurrentSessionActivation } from './current-session-activation.js';
 
 export { getAttachmentsDir } from './attachment-path.js';
 
@@ -1540,10 +1543,13 @@ export async function staggeredRecoveryFork(
 export async function restoreActiveSessions(
   activeSessions: Map<string, DaemonSession>,
   quarantinedSessionIds: ReadonlySet<string> = new Set(),
-  activation: {
+  activation?: {
     readonly reconcile: typeof reconcileCurrentSessionActivation;
-  } = { reconcile: reconcileCurrentSessionActivation },
+  },
 ): Promise<void> {
+  activation ??= {
+    reconcile: (await import('./current-session-activation.js')).reconcileCurrentSessionActivation,
+  };
   const sessions = sessionStore.listSessions();
   const restorePriority = (session: Session): number => {
     if (session.adoptedFrom || session.cliId || session.lastCliInput || session.backendType) return 2;
@@ -2368,6 +2374,7 @@ export async function ensureTerminalWorkerPort(ds: DaemonSession): Promise<numbe
     // still fails — waking a blank worker beside an unpromoted tail would wedge
     // the FIFO gate. Report unavailable (the terminal retries / 502s) instead of
     // blocking 10s for a port that will never arrive.
+    const { reconcileCurrentSessionActivation } = await import('./current-session-activation.js');
     const activation = await reconcileCurrentSessionActivation({
       ownerBotId: getBot(ds.larkAppId).botId,
       ownerLarkAppId: ds.larkAppId,

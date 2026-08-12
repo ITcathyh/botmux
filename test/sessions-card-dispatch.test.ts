@@ -171,7 +171,7 @@ describe('handleCardAction → sessions dispatch returns { card } only on succes
 
     const data: CardActionData = {
       operator: { open_id: INVOKER },
-      action: { value: { action: 'dash_sessions_close', invoker_open_id: INVOKER, session_id: 'sess_close' } },
+      action: { value: { action: 'dash_sessions_close', invoker_open_id: INVOKER, session_id: 'sess_close', operation_id: 'dashboard-card:test-close-op' } },
       context: { open_message_id: 'om_card' },
     };
     const result = await handleCardAction(data, makeDeps(), LARK_APP_ID);
@@ -208,7 +208,7 @@ describe('handleCardAction → sessions dispatch returns { card } only on succes
 
     const data: CardActionData = {
       operator: { open_id: INVOKER },
-      action: { value: { action: 'dash_sessions_close', invoker_open_id: INVOKER, session_id: 'sess_close' } },
+      action: { value: { action: 'dash_sessions_close', invoker_open_id: INVOKER, session_id: 'sess_close', operation_id: 'dashboard-card:test-close-op' } },
       context: { open_message_id: 'om_card' },
     };
     const result = await handleCardAction(data, makeDeps(), LARK_APP_ID);

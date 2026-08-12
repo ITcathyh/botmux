@@ -80,9 +80,36 @@ vi.mock('../src/im/lark/client.js', async () => {
   };
 });
 
+// Late-bound handle to worker-pool's live registry: the session-store mock
+// below needs it, but importing worker-pool inside that factory would recurse
+// through the very module graph being mocked. Bound after imports settle.
+const liveRegistryRef = vi.hoisted(() => ({
+  current: undefined as undefined | Map<string, { larkAppId: string; session: any }>,
+}));
+
 vi.mock('../src/services/session-store.js', async () => {
   const actual = await vi.importActual<any>('../src/services/session-store.js');
-  return { ...actual, createSession: mocks.createSession, updateSession: mocks.updateSession };
+  return {
+    ...actual,
+    createSession: mocks.createSession,
+    updateSession: mocks.updateSession,
+    // Current projection is deliberately owner-strict: a settled live owner is
+    // addressable only when its durable row agrees (JSON deep-equality). Model
+    // the owner-strict reads as a JSON projection of the live registry so
+    // fixture-seeded sessions satisfy the production invariant instead of
+    // tripping the whole owner partition into notReady.
+    listSessionsForOwnerStrict: (ownerLarkAppId: string) => (
+      [...(liveRegistryRef.current?.values() ?? [])]
+        .filter(candidate => candidate.larkAppId === ownerLarkAppId)
+        .map(candidate => JSON.parse(JSON.stringify(candidate.session)))
+    ),
+    getSessionForOwnerStrict: (ownerLarkAppId: string, sessionId: string) => {
+      const match = [...(liveRegistryRef.current?.values() ?? [])].find(candidate => (
+        candidate.larkAppId === ownerLarkAppId && candidate.session.sessionId === sessionId
+      ));
+      return match ? JSON.parse(JSON.stringify(match.session)) : undefined;
+    },
+  };
 });
 
 vi.mock('../src/im/lark/identity-cache.js', async () => {
@@ -126,6 +153,8 @@ import {
   __testOnly_activeSessions as activeSessions,
   __testOnly_handleThreadReply as handleThreadReply,
 } from '../src/daemon.js';
+
+liveRegistryRef.current = activeSessions;
 
 const APP = 'initial_turn_app';
 const CHAT = 'oc_initial_turn_chat';

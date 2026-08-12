@@ -81,6 +81,7 @@ const mocks = vi.hoisted(() => {
     }),
     forkWorker: vi.fn((ds: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      return true;
     }),
     scanMultipleProjects: vi.fn(() => [] as any[]),
     getAvailableBots: vi.fn(async () => [] as any[]),
@@ -320,6 +321,31 @@ function makeCtx(anchor: string, messageId: string): any {
     larkAppId: APP,
   };
 }
+
+// Current projection is deliberately owner-strict: a settled live owner is
+// addressable only when its durable row agrees (JSON deep-equality). Model the
+// mocked Store's owner-strict reads as a JSON projection of the live registry,
+// unioned with durable-only rows, so routing tests exercise the production
+// invariant instead of tripping notReady on fixture-seeded live sessions.
+// (Implementations set here survive vi.clearAllMocks(), which resets calls
+// only.)
+mocks.listSessionsForOwnerStrict.mockImplementation((ownerLarkAppId: string) => {
+  const rows = new Map<string, any>();
+  for (const candidate of activeSessions.values()) {
+    if (candidate.larkAppId !== ownerLarkAppId) continue;
+    rows.set(candidate.session.sessionId, JSON.parse(JSON.stringify(candidate.session)));
+  }
+  for (const stored of mocks.sessions.values()) {
+    if (rows.has(stored.sessionId)) continue;
+    if (stored.larkAppId && stored.larkAppId !== ownerLarkAppId) continue;
+    rows.set(stored.sessionId, JSON.parse(JSON.stringify(stored)));
+  }
+  return [...rows.values()];
+});
+mocks.getSessionForOwnerStrict.mockImplementation((ownerLarkAppId: string, sessionId: string) => (
+  (mocks.listSessionsForOwnerStrict(ownerLarkAppId) as any[])
+    .find(row => row.sessionId === sessionId)
+));
 
 function seedThreadSession(anchor: string, title: string): DaemonSession {
   const ds = {
@@ -2260,6 +2286,7 @@ describe('document comment canonical ownership and single-flight delivery', () =
     mocks.sessions.clear();
     mocks.forkWorker.mockImplementation((ds: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      return true;
     });
     mocks.getAvailableBots.mockResolvedValue([]);
     activeSessions.clear();
@@ -2435,7 +2462,13 @@ describe('document comment canonical ownership and single-flight delivery', () =
     const fileToken = `doc-failure-${Date.now()}`;
     const sub = docSub(fileToken);
     const ctx = docCtx(sub, 'same');
-    mocks.forkWorker.mockImplementationOnce(() => { throw new Error('simulated fork failure'); });
+    // A refused fork (returns false — no side effects) is the production
+    // failure shape and settles retryable, so a later poll retry can deliver.
+    // A THROWN fork is a different contract: outcome unknown → the activation
+    // Adapter quarantines the session fail-closed (covered by the
+    // current-session-activation port tests), which is exactly why this
+    // recovery property must be modeled as refusal, not a throw.
+    mocks.forkWorker.mockImplementationOnce(() => false);
 
     const results = await Promise.all([
       handleDocComment(ctx),
@@ -2448,6 +2481,7 @@ describe('document comment canonical ownership and single-flight delivery', () =
     // Failure was not recorded as completed: a later poll retry can deliver.
     mocks.forkWorker.mockImplementation((ds: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      return true;
     });
     await expect(handleDocComment(ctx)).resolves.toBe(true);
     expect(mocks.forkWorker).toHaveBeenCalledTimes(2);

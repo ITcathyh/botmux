@@ -69,7 +69,18 @@ vi.mock('../src/core/worker-pool.js', async () => {
   return { ...actual, forkWorker: (...args: any[]) => mocks.forkWorker(...args) };
 });
 
-import { registerBot } from '../src/bot-registry.js';
+import { randomUUID } from 'node:crypto';
+import { registerBot as registerBotWithIdentity } from '../src/bot-registry.js';
+import { parseBotId } from '../src/core/bot-identity.js';
+
+// Bind a stable BotId exactly like daemon startup does: the Current runtime
+// host fails closed (requireBotId) for identity-less bots.
+function registerBot(config: Parameters<typeof registerBotWithIdentity>[0]) {
+  return registerBotWithIdentity(
+    config,
+    parseBotId(`bot_${randomUUID().replaceAll('-', '')}`),
+  );
+}
 import { sessionKey } from '../src/core/types.js';
 import { getSessionForOwnerStrict, init as initSessionStore } from '../src/services/session-store.js';
 import {

@@ -179,12 +179,20 @@ async function runOneTurn(
       : undefined,
   ).toBe('effect');
   if (begun.kind !== 'effect') return begun;
-  try {
-    const value = await port.execute(begun.intent);
-    return port.resume(begun.continuation, { kind: 'returned', value });
-  } catch (error) {
-    return port.resume(begun.continuation, { kind: 'threw', error });
+  // One turn spans MULTIPLE effect round-trips (materialization, then worker
+  // activation) — drive until a terminal transition, mirroring the production
+  // runOrdinaryEffects loop.
+  let transition: OrdinaryIngressTransitionResult = begun;
+  while (transition.kind === 'effect') {
+    const continuation = transition.continuation;
+    try {
+      const value = await port.execute(transition.intent);
+      transition = port.resume(continuation, { kind: 'returned', value });
+    } catch (error) {
+      transition = port.resume(continuation, { kind: 'threw', error });
+    }
   }
+  return transition;
 }
 
 async function materialize(input: {

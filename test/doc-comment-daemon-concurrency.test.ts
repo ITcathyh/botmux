@@ -411,7 +411,11 @@ describe('document-comment routing integration', () => {
     expect(guard).toBeGreaterThanOrEqual(0);
     expect(region.indexOf('beginNewTurn(ds, title, turnId)')).toBeGreaterThan(guard);
     expect(region.indexOf('sendWorkerInput(ds, cliInput', guard)).toBeGreaterThan(guard);
-    expect(region.indexOf('forkWorker(ds, wrappedInput', guard)).toBeGreaterThan(guard);
+    // Cold refork dispatches through the activation coordinator now; the
+    // invariant is unchanged — the generation guard precedes the dispatch.
+    expect(
+      region.indexOf('currentDaemonSessionActivation(ds.larkAppId).ensure(', guard),
+    ).toBeGreaterThan(guard);
   });
 
   it('revalidates comment delivery after every key await and before send/fork', () => {
@@ -420,7 +424,7 @@ describe('document-comment routing integration', () => {
     expect(region).toMatch(/await addCommentReaction[\s\S]*ensureCurrentRoutingGeneration\(generation, 'comment:reaction'\)/);
     expect(region).toMatch(/await resolveSender[\s\S]*ensureCurrentRoutingGeneration\(generation, 'comment:sender'\)/);
     expect(region).toMatch(/await noteTurnReceived[\s\S]*ensureCurrentRoutingGeneration\(generation, 'comment:live-note'\)[\s\S]*sendWorkerInput/);
-    expect(region).toMatch(/await noteTurnReceived[\s\S]*ensureCurrentRoutingGeneration\(generation, 'comment:refork-note'\)[\s\S]*forkWorker/);
+    expect(region).toMatch(/await noteTurnReceived[\s\S]*ensureCurrentRoutingGeneration\(generation, 'comment:refork-note'\)[\s\S]*currentDaemonSessionActivation\(ds\.larkAppId\)\.ensure\(/);
   });
 
   it('rolls back only this turn target and an already-landed Typing reaction before releasing the claim', () => {
