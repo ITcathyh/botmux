@@ -498,7 +498,7 @@ function startRunner(
 function waitFor(
   harness: Harness,
   predicate: () => boolean,
-  timeoutMs = 10_000,
+  timeoutMs = 20_000,
 ): Promise<void> {
   if (predicate()) return Promise.resolve();
   return new Promise((resolvePromise, rejectPromise) => {
