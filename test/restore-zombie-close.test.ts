@@ -715,7 +715,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(forkWorker).not.toHaveBeenCalled();
   });
 
-  it('"unknown" → enters the activation quarantine without closing or forking', async () => {
+  it('"unknown" → keeps the record for lazy re-attach without closing, forking, or quarantining', async () => {
     probe.result = 'unknown';
     const s = makeActivePersistentSession('om_unknown');
     const map = new Map<string, DaemonSession>();
@@ -726,10 +726,14 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(closeSession).not.toHaveBeenCalled();
     const ds = map.get(sessionKey('om_unknown', 'app_test'));
     expect(ds).toBeDefined();              // active record retained…
-    expect(ds!.worker).toBeNull();         // …worker-less and fenced until a typed re-probe
+    expect(ds!.worker).toBeNull();         // …worker-less, re-attaches on next message
     expect(sessionStore.getSession(s.sessionId)!.status).toBe('active'); // NOT closed
     expect(forkWorker).not.toHaveBeenCalled();
-    expect(restoreActivationRequests).toEqual([{ observation: 'unknown' }]);
+    // Crucially NO reconcile('unknown'): that would enter the activation
+    // quarantine, which only a typed re-probe (Web-terminal open / close) can
+    // release — one transient probe error must never cost the session its
+    // ordinary-message recovery path for the daemon's whole lifetime.
+    expect(restoreActivationRequests).toEqual([]);
   });
 
   it('"exists" → auto-forks to re-attach, does not close', async () => {

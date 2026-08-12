@@ -256,13 +256,27 @@ export function createCurrentSessionActivationPort(options: {
       if (exact.current.session.status === 'closed') {
         return { kind: 'rejected', reason: 'closed', message: 'Current Session is closed' };
       }
-      const quarantined = quarantines.get(request.sessionId);
+      let quarantined = quarantines.get(request.sessionId);
       if (quarantined) {
         if (!sameQuarantinedBinding(quarantined, exact)) {
-          return {
-            kind: 'quarantined',
-            message: 'persistent backend quarantine is bound to a superseded Current Session',
+          // The danger this record encodes (a possibly-live backend pane keyed
+          // by sessionId) survives re-registration, so the quarantine must
+          // follow the Session onto its live binding instead of wedging the
+          // sessionId forever on a superseded object graph. Rebinding keeps the
+          // fail-closed state and, crucially, restores the release paths (typed
+          // re-probe / retirement settlement) on the current binding. The
+          // pendingRetirements Set is carried by reference: in-flight
+          // retirement plans hold the same Set and their settlement must keep
+          // clearing the gate.
+          const rebound: CurrentActivationQuarantine = {
+            current: exact.current,
+            session: exact.current.session,
+            registryKey: exact.key,
+            backendUnknown: quarantined.backendUnknown,
+            pendingRetirements: quarantined.pendingRetirements,
           };
+          quarantines.set(request.sessionId, rebound);
+          quarantined = rebound;
         }
         if (quarantined.pendingRetirements.size > 0) {
           return {

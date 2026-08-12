@@ -2222,16 +2222,20 @@ export async function restoreActiveSessions(
       // server still warming up on restart. We can't tell whether the session
       // survived, so we must NOT close it: a transient failure would otherwise
       // permanently tear down a still-alive session (context lost, pane leaked,
-      // store closed → no lazy recovery). Keep the worker-less active record and
-      // let it re-attach on the next message, exactly like the old behaviour.
+      // store closed → no lazy recovery). Equally we must NOT reconcile an
+      // 'unknown' observation into the activation port: that quarantine is only
+      // releasable by a typed exists/missing re-probe (Web-terminal open or a
+      // full close), so one transient probe error would wedge the session for
+      // the daemon's whole lifetime. Keep the worker-less active record and let
+      // the next message re-attach through a normal activation — persistent
+      // backends attach by session name, so a surviving pane is re-entered,
+      // never duplicated — exactly like the old behaviour.
       const tag = ds.session.sessionId.substring(0, 8);
       logger.warn(
         `[${tag}] ${backendType} backing session "${backendName}" probe inconclusive`
         + `${hasProtectedSessionMutationOwnership(ds) ? ' with unsettled activation ownership' : ''}`
-        + ' — entering the activation quarantine',
+        + ' — keeping active for lazy re-attach on the next message',
       );
-      toReattach.push(ds);
-      restoreObservation.set(ds, 'unknown');
       continue;
     }
 

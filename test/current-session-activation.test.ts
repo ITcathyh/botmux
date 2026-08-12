@@ -214,6 +214,57 @@ describe('Current Session activation Adapter', () => {
     expect(fork).toHaveBeenCalledTimes(1);
   });
 
+  it('carries an unknown backend quarantine onto a re-registered binding and stays releasable', async () => {
+    const original = session();
+    const registry = new Map([[activeSessionKey(original), original]]);
+    const replacement = session();
+    const fork = vi.fn(() => {
+      replacement.worker = { killed: false } as DaemonSession['worker'];
+      return true;
+    });
+    const port = createCurrentSessionActivationPort({
+      ownerLarkAppId: 'cli_owner',
+      activeSessions: registry,
+      forkWorker: fork,
+    });
+
+    expect(port.begin(request('unknown'))).toEqual({
+      kind: 'quarantined',
+      message: 'persistent backend observation is unknown',
+    });
+
+    // resumeSession-style re-registration: same sessionId, brand-new object graph.
+    registry.clear();
+    registry.set(activeSessionKey(replacement), replacement);
+
+    // The fail-closed state follows the Session onto its live binding…
+    expect(port.begin({
+      sessionId: 'session-1',
+      requestIdentity: 'ordinary-after-rebind',
+      goal: {
+        kind: 'ensure',
+        cause: 'ordinary',
+        input: { promptInput: 'must not fork', resumeOrTurnId: true },
+      },
+    })).toEqual({
+      kind: 'quarantined',
+      message: 'persistent backend binding is quarantined pending an explicit re-probe',
+    });
+    expect(fork).not.toHaveBeenCalled();
+
+    // …and the typed re-probe release path works on the new binding instead of
+    // wedging the sessionId forever on the superseded object graph.
+    const reprobe = port.begin(request('exists'));
+    expect(reprobe.kind).toBe('effect');
+    if (reprobe.kind !== 'effect') throw new Error('expected effect');
+    const value = await port.execute(reprobe.intent);
+    expect(port.resume(reprobe.continuation, { kind: 'returned', value })).toEqual({
+      kind: 'active',
+      action: 'reattached',
+    });
+    expect(fork).toHaveBeenCalledTimes(1);
+  });
+
   it('does not erase an unknown backend quarantine when retirement sees ambiguous owner bindings', () => {
     const ds = session();
     const registry = new Map([[activeSessionKey(ds), ds]]);

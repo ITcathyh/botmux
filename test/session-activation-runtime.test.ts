@@ -388,6 +388,68 @@ describe('SessionActivation runtime', () => {
     expect(begins).toBe(2);
   });
 
+  it('keeps the effect-outcome fence armed when a re-probe itself fails to land', async () => {
+    let begins = 0;
+    const port: SessionActivationPort = {
+      begin: () => {
+        begins += 1;
+        // 1st: the effect whose outcome ends unknown. 2nd: a re-probe the
+        // Adapter rejects (session not resolvable mid-recovery). 3rd on: the
+        // re-probe that finally lands / the recovered ordinary activation.
+        if (begins === 1) {
+          return { kind: 'effect', intent: Object.freeze({}), continuation: Object.freeze({}) };
+        }
+        if (begins === 2) {
+          return { kind: 'rejected', reason: 'notFound', message: 'not registered right now' };
+        }
+        return { kind: 'active', action: 'reattached' };
+      },
+      execute: async () => undefined,
+      resume: () => ({
+        kind: 'unknownAfterEffect',
+        message: 'binding changed after the effect started',
+      }),
+      retire: () => ({ kind: 'retired', action: 'retired' }),
+      settleRetirement,
+    };
+    const { runtime } = harness(port);
+
+    await expect(runtime.ensure({
+      sessionId: 's1',
+      requestIdentity: 'effect-goes-unknown',
+      goal: { kind: 'ensure', cause: 'dashboard' },
+    })).resolves.toMatchObject({ kind: 'unknownAfterEffect' });
+
+    // A re-probe the Adapter REJECTED produced no evidence about the unknown
+    // effect: the fence must survive it instead of being consumed on entry.
+    await expect(runtime.ensure({
+      sessionId: 's1',
+      requestIdentity: 'reprobe-that-fails',
+      goal: { kind: 'reconcile', cause: 'restore', observation: 'exists' },
+    })).resolves.toMatchObject({ kind: 'rejected', reason: 'notFound' });
+    await expect(runtime.ensure({
+      sessionId: 's1',
+      requestIdentity: 'ordinary-after-failed-reprobe',
+      goal: { kind: 'ensure', cause: 'ordinary' },
+    })).resolves.toEqual({
+      kind: 'quarantined',
+      message: 'activation effect outcome is quarantined pending an explicit re-probe',
+    });
+    expect(begins).toBe(2); // the fenced ordinary ensure never reached the Adapter
+
+    await expect(runtime.ensure({
+      sessionId: 's1',
+      requestIdentity: 'reprobe-that-lands',
+      goal: { kind: 'reconcile', cause: 'restore', observation: 'exists' },
+    })).resolves.toEqual({ kind: 'active', action: 'reattached' });
+    await expect(runtime.ensure({
+      sessionId: 's1',
+      requestIdentity: 'ordinary-after-landed-reprobe',
+      goal: { kind: 'ensure', cause: 'ordinary' },
+    })).resolves.toEqual({ kind: 'active', action: 'reattached' });
+    expect(begins).toBe(4);
+  });
+
   it('does not admit a queued pre-retirement identity into the replacement lifecycle', async () => {
     const firstEffect = deferred<unknown>();
     const begins: string[] = [];

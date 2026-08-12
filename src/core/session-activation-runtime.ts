@@ -219,17 +219,24 @@ export function createSessionActivationRuntime(options: {
           message: 'activation attempt was superseded before admission',
         };
       }
-      if (unknownEffectQuarantines.has(request.sessionId)) {
-        if (request.goal.kind !== 'reconcile' || request.goal.observation === 'unknown') {
-          return {
-            kind: 'quarantined' as const,
-            message: 'activation effect outcome is quarantined pending an explicit re-probe',
-          };
-        }
-        unknownEffectQuarantines.delete(request.sessionId);
+      const fenced = unknownEffectQuarantines.has(request.sessionId);
+      if (fenced && (request.goal.kind !== 'reconcile' || request.goal.observation === 'unknown')) {
+        return {
+          kind: 'quarantined' as const,
+          message: 'activation effect outcome is quarantined pending an explicit re-probe',
+        };
       }
       try {
-        return inspectTransition(options.port.begin(request));
+        const opened = inspectTransition(options.port.begin(request));
+        // The fence promises "an effect may already have spawned something for
+        // this session". Only a re-probe the port actually ACCEPTED on the
+        // exact binding ('active', or a fresh 'effect' now tracked by this
+        // attempt) produces the evidence that promise demands — a rejected or
+        // quarantined begin proved nothing, so the fence must survive it.
+        if (fenced && (opened.kind === 'active' || opened.kind === 'effect')) {
+          unknownEffectQuarantines.delete(request.sessionId);
+        }
+        return opened;
       } catch (error) {
         return {
           kind: 'quarantined' as const,

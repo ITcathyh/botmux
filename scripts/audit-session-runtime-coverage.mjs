@@ -1394,9 +1394,9 @@ function validateActivationProductionBinding(binding) {
     'A4 worker-exit oracle must keep the Session active while retiring only the executor',
   );
   assert(
-    restoreOracle.includes('observation: \'unknown\'')
-      && restoreOracle.includes('without closing or forking'),
-    'A4 restore oracle must cover sticky unknown quarantine without replacement',
+    restoreOracle.includes('without closing, forking, or quarantining')
+      && restoreOracle.includes('expect(restoreActivationRequests).toEqual([])'),
+    'A4 restore oracle must keep an unknown probe recoverable: no close, no fork, and no activation quarantine',
   );
   assert(
     terminalOracle.includes('permits a later generation to wake again')
