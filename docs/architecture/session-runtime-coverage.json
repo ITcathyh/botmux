@@ -3,7 +3,7 @@
   "purpose": "Target-A 可执行覆盖台账：由源码和 A0 authority inventory 证明已迁移边界与 remaining bypass，不声明 Target-B durability。",
   "authorityInventory": {
     "path": "docs/architecture/session-authority-inventory.json",
-    "sha256": "7d8ff6cc8c6a305f92d6880fac631b48ed74eafd9557c5877f96f3786363c004"
+    "sha256": "5c571572c20e87a0ebfd22ed887ce85855989b33ab31e9f9050b10e304ce8758"
   },
   "coverage": [
     {
@@ -607,7 +607,7 @@
       "authoritySites": {
         "recordCount": 674,
         "mutationCount": 677,
-        "digest": "574b806c3b1aac4f9c0ab5681aa15b89f835ad0c87997591265fa7e666e1df41"
+        "digest": "a53f32fdda3f8c827806aeda64eba0db9347e901f82e73db0b082665d3725e8e"
       },
       "rawPublisherSelectors": [
         {
