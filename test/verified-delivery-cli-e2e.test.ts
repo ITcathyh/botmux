@@ -20,17 +20,25 @@ const TS = 1_700_000_000_000;
 
 let dataDir: string;     // SESSION_DATA_DIR handed to the CLI subprocess
 let ledgerBase: string;  // dataDir/verified-delivery — where seeding writes
+let botsConfig: string;
 
 beforeEach(() => {
   dataDir = mkdtempSync(join(tmpdir(), 'vd-cli-e2e-'));
   ledgerBase = join(dataDir, 'verified-delivery');
+  botsConfig = join(dataDir, 'bots.json');
+  writeFileSync(botsConfig, JSON.stringify([{
+    larkAppId: 'cli_sup',
+    larkAppSecret: 'test-secret',
+    cliId: 'codex',
+    name: 'Supervisor',
+  }]));
 });
 afterEach(() => { rmSync(dataDir, { recursive: true, force: true }); });
 
 function cli(command: string, args: string[]): { json: any; status: number; raw: string } {
   try {
     const raw = execFileSync('node', [CLI_PATH, command, ...args], {
-      env: { ...process.env, SESSION_DATA_DIR: dataDir },
+      env: { ...process.env, SESSION_DATA_DIR: dataDir, BOTS_CONFIG: botsConfig },
       stdio: ['ignore', 'pipe', 'pipe'],
       encoding: 'utf-8',
     });
