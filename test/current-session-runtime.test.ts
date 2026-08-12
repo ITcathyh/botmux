@@ -654,6 +654,80 @@ describe('Current SessionRuntime projection adapter', () => {
     expect(result).toMatchObject({ kind: 'one', session: { sessionId: active.sessionId } });
   });
 
+  it('treats a route with only closed history as unoccupied', async () => {
+    for (const title of ['closed one', 'closed two']) {
+      const session = sessionStore.createSession(
+        'oc_closed_history',
+        'om_closed_history',
+        title,
+        'group',
+      );
+      session.larkAppId = APP;
+      session.scope = 'thread';
+      sessionStore.updateSession(session);
+      sessionStore.closeSession(session.sessionId);
+    }
+    const host = currentSessionRuntimeHost({
+      ownerLarkAppId: APP,
+      activeSessions: new Map(),
+      ownerBootId: 'boot-closed-history',
+      keyedTriggerAdmissionBlocked: () => false,
+    });
+
+    await expect(host.projection.read({
+      kind: 'byRoute',
+      route: { kind: 'thread', anchorId: 'om_closed_history' },
+    })).resolves.toEqual({ kind: 'notFound' });
+  });
+
+  it('excludes isolated chat-scoped slots from the visible chat route census', async () => {
+    const chatId = 'oc_isolated_chat_slots';
+    const deferred = sessionStore.createSession(chatId, chatId, 'deferred', 'group');
+    deferred.larkAppId = APP;
+    deferred.scope = 'chat';
+    deferred.deferredScheduleRun = {
+      taskId: 'deferred-task',
+      turnId: 'deferred-turn',
+      routingAnchor: 'schedule-run:deferred-turn',
+      createdAt: deferred.createdAt,
+    };
+    sessionStore.updateSession(deferred);
+    const receiver = sessionStore.createSession(chatId, chatId, 'receiver', 'group');
+    receiver.larkAppId = APP;
+    receiver.scope = 'chat';
+    receiver.vcMeetingReceiver = {
+      listenerAppId: 'listener-app',
+      meetingId: 'meeting-1',
+      memberId: 'member-1',
+      memberEpoch: 1,
+    };
+    sessionStore.updateSession(receiver);
+    const visible = sessionStore.createSession(chatId, chatId, 'visible', 'group');
+    visible.larkAppId = APP;
+    visible.scope = 'chat';
+    sessionStore.updateSession(visible);
+    const host = currentSessionRuntimeHost({
+      ownerLarkAppId: APP,
+      activeSessions: new Map(),
+      ownerBootId: 'boot-isolated-chat-slots',
+      keyedTriggerAdmissionBlocked: () => false,
+    });
+
+    await expect(host.projection.read({
+      kind: 'byRoute',
+      route: { kind: 'chat', chatId },
+    })).resolves.toMatchObject({
+      kind: 'one',
+      session: { sessionId: visible.sessionId },
+    });
+
+    sessionStore.closeSession(visible.sessionId);
+    await expect(host.projection.read({
+      kind: 'byRoute',
+      route: { kind: 'chat', chatId },
+    })).resolves.toEqual({ kind: 'notFound' });
+  });
+
   it('fails closed when a stable route has multiple active owner bindings', async () => {
     for (const title of ['first', 'second']) {
       const session = sessionStore.createSession('oc_collision', 'om_collision', title, 'group');
@@ -1179,6 +1253,33 @@ describe('Current SessionRuntime projection adapter', () => {
     });
 
     expect(replacement).not.toBe(first);
+  });
+
+  it('fails closed when one stable Bot epoch is rebound to another Lark owner', () => {
+    const registry = new Map<string, DaemonSession>();
+    const ownerBotId = parseBotId('bot_cache_owner_binding');
+    currentSessionRuntimeHost({
+      ownerBotId,
+      ownerLarkAppId: APP,
+      activeSessions: registry,
+      ownerBootId: 'boot-cache-owner-binding',
+      keyedTriggerAdmissionBlocked: () => false,
+    });
+
+    expect(() => currentSessionRuntimeHost({
+      ownerBotId,
+      ownerLarkAppId: 'cli_foreign',
+      activeSessions: registry,
+      ownerBootId: 'boot-cache-owner-binding',
+      keyedTriggerAdmissionBlocked: () => false,
+    })).toThrow(/different Lark owner/i);
+    expect(() => currentSessionRuntimeHost({
+      ownerBotId,
+      ownerLarkAppId: 'cli_foreign',
+      activeSessions: registry,
+      ownerBootId: 'boot-cache-owner-binding-next',
+      keyedTriggerAdmissionBlocked: () => false,
+    })).toThrow(/different Lark owner/i);
   });
 
   it('does not borrow liveness or chat identity from a foreign owner with the same sessionId', async () => {

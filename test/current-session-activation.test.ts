@@ -74,6 +74,30 @@ describe('Current Session activation Adapter', () => {
     })).not.toBe(first);
   });
 
+  it('fails closed when one Bot epoch is rebound to a different Lark owner', () => {
+    const registry = new Map<string, DaemonSession>();
+    const ownerBotId = parseBotId('bot_activation_owner_binding');
+    currentSessionActivationCoordinator({
+      ownerBotId,
+      ownerLarkAppId: 'cli_owner',
+      runtimeEpoch: 'daemon-owner-binding',
+      activeSessions: registry,
+    });
+
+    expect(() => currentSessionActivationCoordinator({
+      ownerBotId,
+      ownerLarkAppId: 'cli_foreign',
+      runtimeEpoch: 'daemon-owner-binding',
+      activeSessions: registry,
+    })).toThrow(/different Lark owner/i);
+    expect(() => currentSessionActivationCoordinator({
+      ownerBotId,
+      ownerLarkAppId: 'cli_foreign',
+      runtimeEpoch: 'daemon-owner-binding-next',
+      activeSessions: registry,
+    })).toThrow(/different Lark owner/i);
+  });
+
   it('preserves exists, missing and unknown backend observations', async () => {
     const ds = session();
     const registry = new Map([[activeSessionKey(ds), ds]]);
@@ -107,6 +131,45 @@ describe('Current Session activation Adapter', () => {
       });
     }
     expect(fork).toHaveBeenCalledTimes(2);
+  });
+
+  it('fails closed on malformed owner evidence before resolving an activation target', () => {
+    const target = session();
+    const foreignNested = session({
+      session: {
+        ...target.session,
+        larkAppId: 'cli_foreign',
+      },
+    });
+    const portWithForeignNestedOwner = createCurrentSessionActivationPort({
+      ownerLarkAppId: 'cli_owner',
+      activeSessions: new Map([[activeSessionKey(foreignNested), foreignNested]]),
+    });
+    expect(portWithForeignNestedOwner.begin(request('missing'))).toEqual({
+      kind: 'quarantined',
+      message: 'Current activation registry has malformed owner evidence',
+    });
+
+    const unrelated = session({
+      rootMessageId: 'om_unrelated',
+      session: {
+        ...target.session,
+        sessionId: 'session-unrelated',
+        rootMessageId: 'om_unrelated',
+      },
+    });
+    const registry = new Map([
+      [activeSessionKey(target), target],
+      ['non-canonical-owner-alias', unrelated],
+    ]);
+    const portWithAlias = createCurrentSessionActivationPort({
+      ownerLarkAppId: 'cli_owner',
+      activeSessions: registry,
+    });
+    expect(portWithAlias.begin(request('missing'))).toEqual({
+      kind: 'quarantined',
+      message: 'Current activation registry has malformed owner evidence',
+    });
   });
 
   it('keeps an unknown backend binding quarantined until an explicit re-probe', async () => {
@@ -149,6 +212,161 @@ describe('Current Session activation Adapter', () => {
       action: 'reattached',
     });
     expect(fork).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not erase an unknown backend quarantine when retirement sees ambiguous owner bindings', () => {
+    const ds = session();
+    const registry = new Map([[activeSessionKey(ds), ds]]);
+    const port = createCurrentSessionActivationPort({
+      ownerLarkAppId: 'cli_owner',
+      activeSessions: registry,
+    });
+
+    expect(port.begin(request('unknown'))).toEqual({
+      kind: 'quarantined',
+      message: 'persistent backend observation is unknown',
+    });
+
+    const duplicate = session({
+      rootMessageId: 'om_other_root',
+      session: {
+        ...ds.session,
+        rootMessageId: 'om_other_root',
+      },
+    });
+    registry.set(activeSessionKey(duplicate), duplicate);
+    expect(port.retire({
+      sessionId: ds.session.sessionId,
+      requestIdentity: 'ambiguous-retirement',
+      reason: 'explicitClose',
+    })).toEqual({
+      kind: 'quarantined',
+      message: 'Current retirement has multiple exact owner bindings',
+    });
+
+    registry.delete(activeSessionKey(duplicate));
+    expect(port.begin({
+      sessionId: ds.session.sessionId,
+      requestIdentity: 'ordinary-after-ambiguous-retirement',
+      goal: {
+        kind: 'ensure',
+        cause: 'ordinary',
+        input: { promptInput: 'must remain fenced', resumeOrTurnId: true },
+      },
+    })).toEqual({
+      kind: 'quarantined',
+      message: 'persistent backend binding is quarantined pending an explicit re-probe',
+    });
+  });
+
+  it('preserves an unknown backend quarantine when retirement is proven not applied', () => {
+    const ds = session();
+    const registry = new Map([[activeSessionKey(ds), ds]]);
+    const port = createCurrentSessionActivationPort({
+      ownerLarkAppId: 'cli_owner',
+      activeSessions: registry,
+    });
+    const retirement = {
+      sessionId: ds.session.sessionId,
+      requestIdentity: 'close-not-applied',
+      reason: 'explicitClose' as const,
+    };
+
+    expect(port.begin(request('unknown'))).toMatchObject({ kind: 'quarantined' });
+    expect(port.retire(retirement)).toEqual({ kind: 'retired', action: 'retired' });
+    expect(port.begin({
+      sessionId: ds.session.sessionId,
+      requestIdentity: 'ordinary-while-close-pending',
+      goal: {
+        kind: 'ensure',
+        cause: 'ordinary',
+        input: { promptInput: 'must remain fenced', resumeOrTurnId: true },
+      },
+    })).toEqual({
+      kind: 'quarantined',
+      message: 'activation retirement is pending provider settlement',
+    });
+    expect(port.settleRetirement({
+      ...retirement,
+      disposition: 'notApplied',
+    })).toEqual({ kind: 'settled', disposition: 'notApplied' });
+    expect(port.begin({
+      sessionId: ds.session.sessionId,
+      requestIdentity: 'ordinary-after-close-refusal',
+      goal: {
+        kind: 'ensure',
+        cause: 'ordinary',
+        input: { promptInput: 'must remain fenced', resumeOrTurnId: true },
+      },
+    })).toEqual({
+      kind: 'quarantined',
+      message: 'persistent backend binding is quarantined pending an explicit re-probe',
+    });
+  });
+
+  it('quarantines the exact binding when the retirement provider throws', () => {
+    const ds = session();
+    const registry = new Map([[activeSessionKey(ds), ds]]);
+    const port = createCurrentSessionActivationPort({
+      ownerLarkAppId: 'cli_owner',
+      activeSessions: registry,
+    });
+    const retirement = {
+      sessionId: ds.session.sessionId,
+      requestIdentity: 'close-provider-threw',
+      reason: 'explicitClose' as const,
+    };
+
+    expect(port.retire(retirement)).toEqual({ kind: 'retired', action: 'retired' });
+    expect(port.settleRetirement({
+      ...retirement,
+      disposition: 'unknown',
+    })).toEqual({
+      kind: 'quarantined',
+      message: 'Current retirement provider outcome is unknown',
+    });
+    expect(port.begin({
+      sessionId: ds.session.sessionId,
+      requestIdentity: 'ordinary-after-close-throw',
+      goal: {
+        kind: 'ensure',
+        cause: 'ordinary',
+        input: { promptInput: 'must remain fenced', resumeOrTurnId: true },
+      },
+    })).toEqual({
+      kind: 'quarantined',
+      message: 'persistent backend binding is quarantined pending an explicit re-probe',
+    });
+  });
+
+  it('clears an old binding quarantine only after retirement is applied', () => {
+    const ds = session();
+    const registry = new Map([[activeSessionKey(ds), ds]]);
+    const port = createCurrentSessionActivationPort({
+      ownerLarkAppId: 'cli_owner',
+      activeSessions: registry,
+    });
+    const retirement = {
+      sessionId: ds.session.sessionId,
+      requestIdentity: 'close-applied',
+      reason: 'explicitClose' as const,
+    };
+
+    expect(port.begin(request('unknown'))).toMatchObject({ kind: 'quarantined' });
+    expect(port.retire(retirement)).toEqual({ kind: 'retired', action: 'retired' });
+    expect(port.settleRetirement({
+      ...retirement,
+      disposition: 'applied',
+    })).toEqual({ kind: 'settled', disposition: 'applied' });
+    expect(port.begin({
+      sessionId: ds.session.sessionId,
+      requestIdentity: 'ordinary-after-close-applied',
+      goal: {
+        kind: 'ensure',
+        cause: 'ordinary',
+        input: { promptInput: 'new lifecycle', resumeOrTurnId: true },
+      },
+    }).kind).toBe('effect');
   });
 
   it('quarantines a lost executor acceptance response across request identities', async () => {
@@ -252,8 +470,8 @@ describe('Current Session activation Adapter', () => {
     const replacement = session();
     registry.set(activeSessionKey(ds), replacement);
     expect(port.resume(begun.continuation, { kind: 'returned', value })).toEqual({
-      kind: 'stale',
-      message: 'Current Session binding changed during activation',
+      kind: 'unknownAfterEffect',
+      message: 'Current Session binding changed after activation effect invocation',
     });
   });
 

@@ -9,6 +9,7 @@ const lifecycle = vi.hoisted(() => ({
   latestPerBotEnvForRestart: vi.fn(),
   resumeSession: vi.fn(),
   retireCurrentSessionActivation: vi.fn(),
+  settleCurrentSessionRetirement: vi.fn(),
   sendWorkerSessionInput: vi.fn(),
   suspendWorker: vi.fn(),
 }));
@@ -44,14 +45,27 @@ vi.mock('../src/core/worker-pool.js', () => ({
 vi.mock('../src/core/current-session-activation.js', () => ({
   ensureCurrentSessionActivation: lifecycle.ensureCurrentSessionActivation,
   retireCurrentSessionActivation: lifecycle.retireCurrentSessionActivation,
+  settleCurrentSessionRetirement: lifecycle.settleCurrentSessionRetirement,
 }));
 
-import { createCurrentSessionControlPort } from '../src/core/current-session-control.js';
+import {
+  createCurrentSessionControlPort as createCurrentSessionControlPortImpl,
+  currentSessionControlPort,
+} from '../src/core/current-session-control.js';
+import {
+  currentRouteAdmissionKey,
+  reserveCurrentRouteAdmission,
+} from '../src/core/current-route-admission.js';
+import type { CurrentSessionActivationCoordinator } from '../src/core/current-session-activation.js';
 import type {
   ControlMutationInput,
   ControlMutationPort,
   ControlMutationTransitionResult,
+  KeyedTriggerAuthority,
+  KeyedTriggerTurnPort,
+  SessionDirectory,
 } from '../src/core/session-runtime.js';
+import { createSessionRuntimeHost } from '../src/core/session-runtime.js';
 import type {
   SessionStore,
   SessionStoreVersion,
@@ -63,6 +77,31 @@ import type { Session } from '../src/types.js';
 const OWNER = 'cli_owner';
 const FOREIGN_OWNER = 'cli_foreign';
 const SESSION_ID = 'session-current-control';
+const OWNER_BOT_ID = 'bot_controlowner' as never;
+const RUNTIME_EPOCH = 'daemon-epoch-1';
+const defaultActivation = {
+  ensure: lifecycle.ensureCurrentSessionActivation,
+  reconcile: vi.fn(),
+  retire: lifecycle.retireCurrentSessionActivation,
+  settleRetirement: lifecycle.settleCurrentSessionRetirement,
+} as unknown as CurrentSessionActivationCoordinator;
+const defaultRouteScratchRetirement = {
+  retire: vi.fn(async () => ({ kind: 'cleared' as const })),
+};
+
+type ControlPortOptions = Parameters<typeof createCurrentSessionControlPortImpl>[0];
+function createCurrentSessionControlPort(
+  options: Omit<ControlPortOptions, 'ownerBotId' | 'runtimeEpoch' | 'activation'>
+  & Partial<Pick<ControlPortOptions, 'ownerBotId' | 'runtimeEpoch' | 'activation'>>,
+): ReturnType<typeof createCurrentSessionControlPortImpl> {
+  return createCurrentSessionControlPortImpl({
+    ownerBotId: OWNER_BOT_ID,
+    runtimeEpoch: RUNTIME_EPOCH,
+    activation: defaultActivation,
+    routeScratchRetirement: defaultRouteScratchRetirement,
+    ...options,
+  });
+}
 
 function session(overrides: Partial<Session> = {}): Session {
   return {
@@ -125,6 +164,63 @@ function unusedStore(): SessionStore {
   };
 }
 
+const unusedRuntimeKeyedTriggers: KeyedTriggerAuthority = {
+  inspect: () => ({ kind: 'unreadable', message: 'unused' }),
+  reserve: () => ({ kind: 'unreadable', message: 'unused' }),
+  begin: () => ({ kind: 'unreadable', message: 'unused' }),
+  settleDispatchUnknown: () => ({ kind: 'unreadable', message: 'unused' }),
+};
+
+const unusedRuntimeKeyedTurns: KeyedTriggerTurnPort = {
+  prepare: () => ({ kind: 'unreadable', message: 'unused' }),
+  acceptAtMostOnce: async () => ({ kind: 'refused', message: 'unused' }),
+  failClose: async () => ({ kind: 'unreadable', message: 'unused' }),
+};
+
+function runtimeDirectory(): SessionDirectory {
+  const row = {
+    key: 'current-control-runtime-row',
+    sessionId: SESSION_ID,
+    route: { kind: 'thread' as const, anchorId: 'om_current_control' },
+    ordinaryIngressBinding: {
+      scope: 'thread' as const,
+      canonicalAnchor: 'om_current_control',
+      chatId: 'oc_current_control',
+      chatType: 'group' as const,
+    },
+    recordStatus: 'active' as const,
+    executorStatus: 'working' as const,
+  };
+  return {
+    async read(query) {
+      if (query.kind === 'list') return { kind: 'list', rows: [row] };
+      if (query.kind === 'dashboardSnapshot') {
+        return { kind: 'notReady', message: 'unused dashboard snapshot' };
+      }
+      const matches = query.kind === 'byExternalSession'
+        ? query.sessionId === SESSION_ID
+        : query.route.kind === 'thread'
+          && query.route.anchorId === row.route.anchorId;
+      return matches ? { kind: 'one', row } : { kind: 'notFound' };
+    },
+  };
+}
+
+async function runtimeAddressFor(controlMutation: ControlMutationPort) {
+  const host = createSessionRuntimeHost({
+    directory: runtimeDirectory(),
+    keyedTriggers: unusedRuntimeKeyedTriggers,
+    keyedTriggerTurns: unusedRuntimeKeyedTurns,
+    controlMutation,
+  });
+  const projected = await host.projection.read({
+    kind: 'byExternalSession',
+    sessionId: SESSION_ID,
+  });
+  if (projected.kind !== 'one') throw new Error('expected exact Runtime test Session');
+  return { host, address: projected.session.address };
+}
+
 function begin(
   port: ControlMutationPort,
   command: ControlMutationInput,
@@ -162,7 +258,15 @@ describe('Current Session control adapter', () => {
           closeDisposition: 'notApplied',
         }
       : { ok: true, alreadyClosed: false, known: true });
-    lifecycle.retireCurrentSessionActivation.mockResolvedValue(undefined);
+    lifecycle.retireCurrentSessionActivation.mockResolvedValue({
+      kind: 'retired',
+      action: 'retired',
+    });
+    lifecycle.settleCurrentSessionRetirement.mockImplementation(async request => (
+      request.disposition === 'unknown'
+        ? { kind: 'quarantined', message: 'provider outcome is unknown' }
+        : { kind: 'settled', disposition: request.disposition }
+    ));
     lifecycle.ensureCurrentSessionActivation.mockResolvedValue({
       kind: 'active',
       action: 'started',
@@ -171,6 +275,8 @@ describe('Current Session control adapter', () => {
     lifecycle.resumeSession.mockResolvedValue({ ok: true });
     lifecycle.sendWorkerSessionInput.mockReturnValue(true);
     lifecycle.suspendWorker.mockReturnValue(true);
+    defaultRouteScratchRetirement.retire.mockReset();
+    defaultRouteScratchRetirement.retire.mockResolvedValue({ kind: 'cleared' });
     legacyStore.getOwnedSession.mockReset();
     legacyStore.getSessionForOwnerStrict.mockReset();
     asyncTriggerStore.lookup.mockReset();
@@ -204,7 +310,108 @@ describe('Current Session control adapter', () => {
     });
   });
 
-  it('accepts an equal persisted binding and preserves a replaced-row close refusal', async () => {
+  it('fails closed when one Bot epoch is rebound to another owner or activation coordinator', () => {
+    const registry = new Map<string, DaemonSession>();
+    const firstActivation = {
+      ensure: vi.fn(),
+      reconcile: vi.fn(),
+      retire: vi.fn(),
+    } as unknown as CurrentSessionActivationCoordinator;
+    const secondActivation = {
+      ensure: vi.fn(),
+      reconcile: vi.fn(),
+      retire: vi.fn(),
+    } as unknown as CurrentSessionActivationCoordinator;
+    const input = {
+      ownerBotId: OWNER_BOT_ID,
+      ownerLarkAppId: OWNER,
+      runtimeEpoch: RUNTIME_EPOCH,
+      activation: firstActivation,
+      activeSessions: registry,
+    };
+
+    const first = currentSessionControlPort(input);
+    expect(currentSessionControlPort(input)).toBe(first);
+    expect(() => currentSessionControlPort({
+      ...input,
+      activation: secondActivation,
+    })).toThrow(/different activation coordinator/i);
+    expect(() => currentSessionControlPort({
+      ...input,
+      ownerLarkAppId: FOREIGN_OWNER,
+    })).toThrow(/different Lark App/i);
+    expect(() => currentSessionControlPort({
+      ...input,
+      ownerLarkAppId: FOREIGN_OWNER,
+      runtimeEpoch: `${RUNTIME_EPOCH}-next`,
+      activation: secondActivation,
+    })).toThrow(/different Lark App/i);
+  });
+
+  it('replaces one Bot cache binding on a new daemon epoch without retaining the old port', () => {
+    const registry = new Map<string, DaemonSession>();
+    const firstActivation = {
+      ensure: vi.fn(),
+      reconcile: vi.fn(),
+      retire: vi.fn(),
+    } as unknown as CurrentSessionActivationCoordinator;
+    const nextActivation = {
+      ensure: vi.fn(),
+      reconcile: vi.fn(),
+      retire: vi.fn(),
+    } as unknown as CurrentSessionActivationCoordinator;
+    const firstInput = {
+      ownerBotId: OWNER_BOT_ID,
+      ownerLarkAppId: OWNER,
+      runtimeEpoch: 'daemon-epoch-cache-first',
+      activation: firstActivation,
+      activeSessions: registry,
+    };
+    const nextInput = {
+      ...firstInput,
+      runtimeEpoch: 'daemon-epoch-cache-next',
+      activation: nextActivation,
+    };
+
+    const first = currentSessionControlPort(firstInput);
+    const next = currentSessionControlPort(nextInput);
+
+    expect(next).not.toBe(first);
+    expect(currentSessionControlPort(nextInput)).toBe(next);
+    expect(currentSessionControlPort(firstInput)).not.toBe(first);
+  });
+
+  it('isolates cache bindings for different stable Bots that share one Lark App', () => {
+    const registry = new Map<string, DaemonSession>();
+    const firstActivation = {
+      ensure: vi.fn(),
+      reconcile: vi.fn(),
+      retire: vi.fn(),
+    } as unknown as CurrentSessionActivationCoordinator;
+    const otherActivation = {
+      ensure: vi.fn(),
+      reconcile: vi.fn(),
+      retire: vi.fn(),
+    } as unknown as CurrentSessionActivationCoordinator;
+    const first = currentSessionControlPort({
+      ownerBotId: OWNER_BOT_ID,
+      ownerLarkAppId: OWNER,
+      runtimeEpoch: 'daemon-epoch-shared-app',
+      activation: firstActivation,
+      activeSessions: registry,
+    });
+    const other = currentSessionControlPort({
+      ownerBotId: 'bot_other_control_owner' as never,
+      ownerLarkAppId: OWNER,
+      runtimeEpoch: 'daemon-epoch-shared-app',
+      activation: otherActivation,
+      activeSessions: registry,
+    });
+
+    expect(other).not.toBe(first);
+  });
+
+  it('accepts an equal persisted binding and makes post-retirement replacement sticky-unknown', async () => {
     let current = session();
     const port = createCurrentSessionControlPort({
       ownerLarkAppId: OWNER,
@@ -232,13 +439,52 @@ describe('Current Session control adapter', () => {
     current = session({ title: 'Replacement row' });
 
     const staleResult = await settleEffect(port, staleEffect);
-    expect(staleResult).toEqual({
-      kind: 'retryable',
-      message: 'executor_generation_stale',
+    expect(staleResult).toMatchObject({
+      kind: 'unknown',
+      message: expect.stringContaining('after activation retirement committed'),
     });
-    expect(begin(port, { kind: 'close', reason: 'dashboard' }, 'stale-binding'))
-      .toMatchObject({ kind: 'effect' });
-    expect(lifecycle.closeSession).toHaveBeenCalledTimes(2);
+    expect(lifecycle.closeSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses the injected owner coordinator to fence close before the provider', async () => {
+    const events: string[] = [];
+    const activation = {
+      ensure: vi.fn(),
+      reconcile: vi.fn(),
+      retire: vi.fn(async () => {
+        events.push('retire');
+        return { kind: 'retryable' as const, message: 'activation fence unavailable' };
+      }),
+    };
+    lifecycle.closeSession.mockImplementation(async () => {
+      events.push('close');
+      return { ok: true, alreadyClosed: false, known: true };
+    });
+    const current = session();
+    const port = createCurrentSessionControlPort({
+      ownerBotId: OWNER_BOT_ID,
+      ownerLarkAppId: OWNER,
+      runtimeEpoch: RUNTIME_EPOCH,
+      activation,
+      activeSessions: new Map(),
+      sessionStore: unusedStore(),
+      resolveStoredSession: () => current,
+    });
+
+    await expect(settleEffect(
+      port,
+      begin(port, { kind: 'close', reason: 'dashboard' }, 'close-fenced'),
+    )).resolves.toEqual({
+      kind: 'retryable',
+      message: 'activation fence unavailable',
+    });
+    expect(activation.retire).toHaveBeenCalledWith({
+      sessionId: SESSION_ID,
+      requestIdentity: 'control-close:close-fenced',
+      reason: 'explicitClose',
+    });
+    expect(events).toEqual(['retire']);
+    expect(lifecycle.retireCurrentSessionActivation).not.toHaveBeenCalled();
   });
 
   it('preserves and replays a typed backend close failure without running the effect twice', async () => {
@@ -271,7 +517,7 @@ describe('Current Session control adapter', () => {
     expect(lifecycle.closeSession).toHaveBeenCalledTimes(1);
   });
 
-  it('keeps a proven-open close refusal hash-only and re-drives the same operation', async () => {
+  it('re-drives a proven-open close refusal through a fresh retirement receipt', async () => {
     lifecycle.closeSession.mockReset();
     lifecycle.closeSession
       .mockResolvedValueOnce({
@@ -306,6 +552,17 @@ describe('Current Session control adapter', () => {
         kind: 'committed',
         result: { kind: 'closed', alreadyClosed: false, known: true },
       });
+    expect(lifecycle.retireCurrentSessionActivation).toHaveBeenCalledTimes(2);
+    const [firstRetirement, secondRetirement] = lifecycle.retireCurrentSessionActivation.mock.calls;
+    expect(secondRetirement![0].requestIdentity).not.toBe(firstRetirement![0].requestIdentity);
+    expect(lifecycle.settleCurrentSessionRetirement).toHaveBeenNthCalledWith(1, {
+      ...firstRetirement![0],
+      disposition: 'notApplied',
+    });
+    expect(lifecycle.settleCurrentSessionRetirement).toHaveBeenNthCalledWith(2, {
+      ...secondRetirement![0],
+      disposition: 'applied',
+    });
     expect(lifecycle.closeSession).toHaveBeenCalledTimes(2);
   });
 
@@ -333,7 +590,34 @@ describe('Current Session control adapter', () => {
       message: 'riff_cancel_failed',
     });
     expect(begin(port, command, 'unknown-close')).toEqual(first);
+    expect(lifecycle.settleCurrentSessionRetirement).toHaveBeenCalledWith({
+      sessionId: SESSION_ID,
+      requestIdentity: 'control-close:unknown-close',
+      reason: 'explicitClose',
+      disposition: 'unknown',
+    });
     expect(lifecycle.closeSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('settles the activation fence as unknown when the close provider throws', async () => {
+    lifecycle.closeSession.mockRejectedValue(new Error('provider transport lost'));
+    const current = session();
+    const port = createCurrentSessionControlPort({
+      ownerLarkAppId: OWNER,
+      activeSessions: new Map(),
+      sessionStore: unusedStore(),
+      resolveStoredSession: () => current,
+    });
+    const effect = begin(port, { kind: 'close', reason: 'dashboard' }, 'throwing-close');
+    if (effect.kind !== 'effect') throw new Error(`expected effect, got ${effect.kind}`);
+
+    await expect(port.execute(effect.intent)).rejects.toThrow('provider transport lost');
+    expect(lifecycle.settleCurrentSessionRetirement).toHaveBeenCalledWith({
+      sessionId: SESSION_ID,
+      requestIdentity: 'control-close:throwing-close',
+      reason: 'explicitClose',
+      disposition: 'unknown',
+    });
   });
 
   it('fails closed when a failed close identity is reused with another target payload', async () => {
@@ -496,19 +780,97 @@ describe('Current Session control adapter', () => {
     });
   });
 
+  it('publishes passivation before suspending the provider executor', async () => {
+    const events: string[] = [];
+    const activation = {
+      ensure: vi.fn(),
+      reconcile: vi.fn(),
+      retire: vi.fn(async () => {
+        events.push('retire');
+        return { kind: 'retired' as const, action: 'retired' as const };
+      }),
+      settleRetirement: vi.fn(async ({ disposition }) => {
+        events.push(`settle:${disposition}`);
+        return { kind: 'settled' as const, disposition: 'applied' as const };
+      }),
+    };
+    lifecycle.suspendWorker.mockImplementation(() => {
+      events.push('suspend');
+      return true;
+    });
+    const ds = activeSession({}, {
+      worker: { killed: false } as DaemonSession['worker'],
+    });
+    const port = createCurrentSessionControlPort({
+      ownerLarkAppId: OWNER,
+      activation,
+      activeSessions: new Map([[activeSessionKey(ds), ds]]),
+      sessionStore: unusedStore(),
+      resolveStoredSession: () => ds.session,
+    });
+
+    await expect(settleEffect(
+      port,
+      begin(port, { kind: 'suspend', source: 'dashboard' }, 'suspend-fenced'),
+    )).resolves.toMatchObject({
+      kind: 'committed',
+      result: { kind: 'suspended', suspended: true },
+    });
+    expect(activation.retire).toHaveBeenCalledWith({
+      sessionId: SESSION_ID,
+      requestIdentity: 'control-suspend:suspend-fenced',
+      reason: 'passivation',
+    });
+    expect(events).toEqual(['retire', 'suspend', 'settle:applied']);
+  });
+
+  it('still publishes passivation when suspend finds no live worker', async () => {
+    const ds = activeSession({}, { worker: null });
+    const port = createCurrentSessionControlPort({
+      ownerLarkAppId: OWNER,
+      activeSessions: new Map([[activeSessionKey(ds), ds]]),
+      sessionStore: unusedStore(),
+      resolveStoredSession: () => ds.session,
+    });
+
+    const transition = begin(
+      port,
+      { kind: 'suspend', source: 'dashboard' },
+      'suspend-dormant',
+    );
+    expect(transition.kind).toBe('effect');
+    await expect(settleEffect(port, transition)).resolves.toEqual({
+      kind: 'committed',
+      result: { kind: 'suspended', suspended: false },
+    });
+    expect(lifecycle.retireCurrentSessionActivation).toHaveBeenCalledWith({
+      sessionId: SESSION_ID,
+      requestIdentity: 'control-suspend:suspend-dormant',
+      reason: 'passivation',
+    });
+    expect(lifecycle.suspendWorker).not.toHaveBeenCalled();
+  });
+
   it('codes a reopen effect whose durable row disappeared as not_found', async () => {
     const closed = session({ status: 'closed' });
+    const routeReservation = Object.freeze({});
     lifecycle.resumeSession.mockResolvedValueOnce({ ok: false, error: 'not_found' });
     const port = createCurrentSessionControlPort({
       ownerLarkAppId: OWNER,
       activeSessions: new Map(),
       sessionStore: unusedStore(),
       resolveStoredSession: () => ({ ...closed }),
+      isRouteAdmissionToken: ({ token }) => token === routeReservation,
     });
 
     await expect(settleEffect(
       port,
-      begin(port, { kind: 'reopen', source: 'dashboard', wake: false }, 'missing-on-reopen'),
+      port.begin({
+        sessionId: SESSION_ID,
+        operationIdentity: 'missing-on-reopen',
+        command: { kind: 'reopen', source: 'dashboard', wake: false },
+        routeReservation,
+      }),
     )).resolves.toEqual({
       kind: 'rejected',
       reason: 'sessionNotFound',
@@ -579,16 +941,28 @@ describe('Current Session control adapter', () => {
   it('passes the exact owner registry to persisted-session reopen', async () => {
     const registry = new Map<string, DaemonSession>();
     const closed = session({ status: 'closed' });
+    const reopened = activeSession();
+    const routeReservation = Object.freeze({});
+    lifecycle.resumeSession.mockImplementationOnce(async () => {
+      registry.set(activeSessionKey(reopened), reopened);
+      return { ok: true, ds: reopened };
+    });
     const port = createCurrentSessionControlPort({
       ownerLarkAppId: OWNER,
       activeSessions: registry,
       sessionStore: unusedStore(),
-      resolveStoredSession: () => ({ ...closed }),
+      resolveStoredSession: () => registry.get(activeSessionKey(reopened))?.session ?? ({ ...closed }),
+      isRouteAdmissionToken: ({ token }) => token === routeReservation,
     });
 
     await expect(settleEffect(
       port,
-      begin(port, { kind: 'reopen', source: 'dashboard', wake: false }, 'owner-reopen'),
+      port.begin({
+        sessionId: SESSION_ID,
+        operationIdentity: 'owner-reopen',
+        command: { kind: 'reopen', source: 'dashboard', wake: false },
+        routeReservation,
+      }),
     )).resolves.toEqual({
       kind: 'committed',
       result: {
@@ -606,8 +980,130 @@ describe('Current Session control adapter', () => {
       owner: {
         larkAppId: OWNER,
         activeSessions: registry,
+        routeConflictPolicy: 'failClosed',
       },
     });
+    expect(defaultRouteScratchRetirement.retire).toHaveBeenCalledWith({
+      expectedRoute: {
+        scope: 'thread',
+        canonicalAnchor: 'om_current_control',
+        chatId: 'oc_current_control',
+        chatType: 'group',
+      },
+      source: 'resume',
+      parentSessionId: SESSION_ID,
+      parentOperationIdentity: 'owner-reopen',
+      heldRouteAdmissionToken: routeReservation,
+    });
+    expect(lifecycle.ensureCurrentSessionActivation).not.toHaveBeenCalled();
+  });
+
+  it('wakes a reopened Session only after its new exact binding is published', async () => {
+    const events: string[] = [];
+    const registry = new Map<string, DaemonSession>();
+    const closed = session({ status: 'closed' });
+    const reopened = activeSession();
+    const routeReservation = Object.freeze({});
+    lifecycle.resumeSession.mockImplementationOnce(async () => {
+      events.push('resume');
+      registry.set(activeSessionKey(reopened), reopened);
+      return { ok: true, ds: reopened };
+    });
+    const activation = {
+      reconcile: vi.fn(),
+      retire: vi.fn(),
+      ensure: vi.fn(async () => {
+        expect(registry.get(activeSessionKey(reopened))).toBe(reopened);
+        events.push('ensure');
+        return { kind: 'active' as const, action: 'started' as const };
+      }),
+    };
+    const port = createCurrentSessionControlPort({
+      ownerLarkAppId: OWNER,
+      activation,
+      activeSessions: registry,
+      sessionStore: unusedStore(),
+      resolveStoredSession: () => registry.get(activeSessionKey(reopened))?.session ?? closed,
+      isRouteAdmissionToken: ({ token }) => token === routeReservation,
+    });
+
+    await expect(settleEffect(
+      port,
+      port.begin({
+        sessionId: SESSION_ID,
+        operationIdentity: 'owner-reopen-wake',
+        command: { kind: 'reopen', source: 'dashboard', wake: true },
+        routeReservation,
+      }),
+    )).resolves.toMatchObject({
+      kind: 'committed',
+      result: { kind: 'reopened', wake: true, executor: 'active' },
+    });
+    expect(activation.ensure).toHaveBeenCalledWith({
+      sessionId: SESSION_ID,
+      requestIdentity: 'control-reopen:owner-reopen-wake',
+      cause: 'dashboard',
+      promptInput: '',
+      resumeOrTurnId: true,
+    });
+    expect(events).toEqual(['resume', 'ensure']);
+  });
+
+  it('requires a held exact route admission before a Dashboard reopen can enter its effect', () => {
+    const closed = session({ status: 'closed' });
+    const port = createCurrentSessionControlPort({
+      ownerLarkAppId: OWNER,
+      activeSessions: new Map(),
+      sessionStore: unusedStore(),
+      resolveStoredSession: () => closed,
+      isRouteAdmissionToken: () => false,
+    });
+
+    expect(begin(
+      port,
+      { kind: 'reopen', source: 'dashboard', wake: false },
+      'owner-reopen-unreserved',
+    )).toEqual({
+      kind: 'rejected',
+      reason: 'invalidCommand',
+      code: 'target_route_not_reserved',
+      message: 'target_route_not_reserved',
+    });
+    expect(defaultRouteScratchRetirement.retire).not.toHaveBeenCalled();
+    expect(lifecycle.resumeSession).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when a classified route scratch accepts input before reopen cleanup', async () => {
+    const closed = session({ status: 'closed' });
+    const routeReservation = Object.freeze({});
+    const retirement = {
+      retire: vi.fn(async () => ({
+        kind: 'occupied' as const,
+        activeSessionId: 'scratch-accepted-input',
+      })),
+    };
+    const port = createCurrentSessionControlPort({
+      ownerLarkAppId: OWNER,
+      activeSessions: new Map(),
+      sessionStore: unusedStore(),
+      resolveStoredSession: () => closed,
+      isRouteAdmissionToken: ({ token }) => token === routeReservation,
+      routeScratchRetirement: retirement,
+    });
+    const effect = port.begin({
+      sessionId: SESSION_ID,
+      operationIdentity: 'owner-reopen-accepted-input',
+      command: { kind: 'reopen', source: 'dashboard', wake: false },
+      routeReservation,
+    });
+
+    await expect(settleEffect(port, effect)).resolves.toEqual({
+      kind: 'rejected',
+      reason: 'transitionRejected',
+      message: 'anchor_occupied',
+      details: { activeSessionId: 'scratch-accepted-input' },
+    });
+    expect(lifecycle.resumeSession).not.toHaveBeenCalled();
   });
 
   it('returns exact protected-session evidence for prune admission', () => {
@@ -679,13 +1175,13 @@ describe('Current Session control adapter', () => {
       lastCliInput: undefined,
     });
     const routeReservation = Object.freeze({});
-    const isRelocationRouteReservation = vi.fn(() => true);
+    const isRouteAdmissionToken = vi.fn(() => true);
     const port = createCurrentSessionControlPort({
       ownerLarkAppId: OWNER,
       activeSessions: new Map([[activeSessionKey(ds), ds]]),
       sessionStore: unusedStore(),
       resolveStoredSession: () => ds.session,
-      isRelocationRouteReservation,
+      isRouteAdmissionToken,
     });
 
     // The route registry classified this row as disposable before the trigger
@@ -697,7 +1193,8 @@ describe('Current Session control adapter', () => {
       routeReservation,
       command: {
         kind: 'close',
-        reason: 'relocateScratch',
+        reason: 'routeScratch',
+        source: 'relocate',
         expectedRoute: {
           scope: 'chat',
           canonicalAnchor: 'oc_relocate_target',
@@ -713,11 +1210,9 @@ describe('Current Session control adapter', () => {
       code: 'target_chat_has_session',
       message: 'target_chat_has_session',
     });
-    expect(isRelocationRouteReservation).toHaveBeenCalledWith({
+    expect(isRouteAdmissionToken).toHaveBeenCalledWith({
       token: routeReservation,
-      ownerLarkAppId: OWNER,
-      activeSessions: expect.any(Map),
-      route: { kind: 'chat', chatId: 'oc_relocate_target' },
+      key: `${OWNER}\0chat\0oc_relocate_target\0oc_relocate_target\0group`,
     });
     expect(lifecycle.closeSession).not.toHaveBeenCalled();
   });
@@ -725,7 +1220,8 @@ describe('Current Session control adapter', () => {
   it('retires exact live and persisted-only scratches only under the held target route', async () => {
     const command: ControlMutationInput = {
       kind: 'close',
-      reason: 'relocateScratch',
+      reason: 'routeScratch',
+      source: 'relocate',
       expectedRoute: {
         scope: 'chat',
         canonicalAnchor: 'oc_relocate_target',
@@ -746,7 +1242,7 @@ describe('Current Session control adapter', () => {
       activeSessions: new Map([[activeSessionKey(live), live]]),
       sessionStore: unusedStore(),
       resolveStoredSession: () => live.session,
-      isRelocationRouteReservation: ({ token }) => token === liveReservation,
+      isRouteAdmissionToken: ({ token }) => token === liveReservation,
     });
 
     const liveEffect = livePort.begin({
@@ -773,7 +1269,7 @@ describe('Current Session control adapter', () => {
       activeSessions: new Map(),
       sessionStore: unusedStore(),
       resolveStoredSession: () => durable,
-      isRelocationRouteReservation: ({ token }) => token === durableReservation,
+      isRouteAdmissionToken: ({ token }) => token === durableReservation,
     });
     const durableEffect = durablePort.begin({
       sessionId: SESSION_ID,
@@ -786,6 +1282,153 @@ describe('Current Session control adapter', () => {
       result: { kind: 'closed', known: true },
     });
     expect(lifecycle.closeSession).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects persisted-only scratch close unless the canonical anchor exactly matches its scope', () => {
+    const persistedThread = session({
+      chatId: 'oc_route_target',
+      rootMessageId: 'om_actual_thread',
+      scope: 'thread',
+      cliId: undefined,
+      lastCliInput: undefined,
+    });
+    const reservation = Object.freeze({});
+    const threadPort = createCurrentSessionControlPort({
+      ownerLarkAppId: OWNER,
+      activeSessions: new Map(),
+      sessionStore: unusedStore(),
+      resolveStoredSession: () => persistedThread,
+      isRouteAdmissionToken: () => true,
+    });
+
+    expect(threadPort.begin({
+      sessionId: SESSION_ID,
+      operationIdentity: 'persisted-thread-wrong-anchor',
+      routeReservation: reservation,
+      command: {
+        kind: 'close',
+        reason: 'routeScratch',
+        source: 'resume',
+        expectedRoute: {
+          scope: 'thread',
+          canonicalAnchor: 'om_other_thread',
+          chatId: 'oc_route_target',
+          chatType: 'group',
+        },
+      },
+    })).toMatchObject({
+      kind: 'rejected',
+      code: 'target_chat_has_session',
+    });
+
+    const persistedChat = session({
+      chatId: 'oc_route_target',
+      rootMessageId: 'om_irrelevant_for_chat',
+      scope: 'chat',
+      cliId: undefined,
+      lastCliInput: undefined,
+    });
+    const chatPort = createCurrentSessionControlPort({
+      ownerLarkAppId: OWNER,
+      activeSessions: new Map(),
+      sessionStore: unusedStore(),
+      resolveStoredSession: () => persistedChat,
+      isRouteAdmissionToken: () => true,
+    });
+
+    expect(chatPort.begin({
+      sessionId: SESSION_ID,
+      operationIdentity: 'persisted-chat-wrong-anchor',
+      routeReservation: reservation,
+      command: {
+        kind: 'close',
+        reason: 'routeScratch',
+        source: 'resume',
+        expectedRoute: {
+          scope: 'chat',
+          canonicalAnchor: 'oc_route_alias',
+          chatId: 'oc_route_target',
+          chatType: 'group',
+        },
+      },
+    })).toMatchObject({
+      kind: 'rejected',
+      code: 'target_route_not_reserved',
+    });
+    expect(lifecycle.closeSession).not.toHaveBeenCalled();
+  });
+
+  it('does not enter the scratch close provider when held route admission is released during retirement', async () => {
+    let retirementStarted!: () => void;
+    let finishRetirement!: () => void;
+    const started = new Promise<void>(resolve => { retirementStarted = resolve; });
+    const finish = new Promise<void>(resolve => { finishRetirement = resolve; });
+    const activation = {
+      ensure: vi.fn(),
+      reconcile: vi.fn(),
+      retire: vi.fn(async () => {
+        retirementStarted();
+        await finish;
+        return { kind: 'retired' as const, action: 'retired' as const };
+      }),
+      settleRetirement: vi.fn(async () => ({
+        kind: 'quarantined' as const,
+        message: 'route authority changed after retirement',
+      })),
+    };
+    const scratch = activeSession({
+      chatId: 'oc_route_release',
+      rootMessageId: 'oc_route_release',
+      scope: 'chat',
+      cliId: undefined,
+      lastCliInput: undefined,
+    });
+    const route = {
+      scope: 'chat' as const,
+      canonicalAnchor: 'oc_route_release',
+      chatId: 'oc_route_release',
+      chatType: 'group' as const,
+    };
+    const admission = reserveCurrentRouteAdmission(currentRouteAdmissionKey({
+      ownerLarkAppId: OWNER,
+      ...route,
+    }));
+    await admission.ready;
+    const port = createCurrentSessionControlPort({
+      ownerLarkAppId: OWNER,
+      activation,
+      activeSessions: new Map([[activeSessionKey(scratch), scratch]]),
+      sessionStore: unusedStore(),
+      resolveStoredSession: () => scratch.session,
+    });
+    const effect = port.begin({
+      sessionId: SESSION_ID,
+      operationIdentity: 'scratch-route-released',
+      routeReservation: admission.token,
+      command: {
+        kind: 'close',
+        reason: 'routeScratch',
+        source: 'resume',
+        expectedRoute: route,
+      },
+    });
+
+    const settling = settleEffect(port, effect);
+    await started;
+    admission.release();
+    finishRetirement();
+
+    await expect(settling).resolves.toMatchObject({
+      kind: 'unknown',
+      message: expect.stringContaining('route authority changed'),
+    });
+    expect(activation.settleRetirement).toHaveBeenCalledWith({
+      sessionId: SESSION_ID,
+      requestIdentity: 'control-close:scratch-route-released',
+      reason: 'explicitClose',
+      disposition: 'unknown',
+    });
+    expect(lifecycle.closeSession).not.toHaveBeenCalled();
   });
 
   it('revalidates Agent CLI close exemptions, protected work, and transfer at admission', () => {
@@ -987,6 +1630,174 @@ describe('Current Session control adapter', () => {
     expect(lifecycle.ensureCurrentSessionActivation).toHaveBeenNthCalledWith(2, expect.objectContaining({
       requestIdentity: 'control-restart:restart-two',
     }));
+  });
+
+  it.each([
+    ['staleBeforeEffect', { kind: 'staleAddress' }],
+    ['unknownAfterEffect', { kind: 'unknown', message: 'activation lifecycle changed' }],
+  ] as const)('maps revived restart activation %s without retrying an invoked effect', async (kind, expected) => {
+    const ds = activeSession({}, { worker: null });
+    const activation = {
+      ensure: vi.fn(async () => ({ kind, message: 'activation lifecycle changed' })),
+      reconcile: vi.fn(),
+      retire: vi.fn(),
+      settleRetirement: vi.fn(),
+    };
+    const port = createCurrentSessionControlPort({
+      ownerLarkAppId: OWNER,
+      activation,
+      activeSessions: new Map([[activeSessionKey(ds), ds]]),
+      sessionStore: unusedStore(),
+      resolveStoredSession: () => ds.session,
+    });
+
+    await expect(settleEffect(
+      port,
+      begin(port, { kind: 'restart', source: 'dashboard' }, `restart-${kind}`),
+    )).resolves.toEqual(expected);
+  });
+
+  it('retires the live lifecycle before sending provider restart IPC', async () => {
+    const events: string[] = [];
+    const activation = {
+      ensure: vi.fn(),
+      reconcile: vi.fn(),
+      retire: vi.fn(async () => {
+        events.push('retire');
+        return { kind: 'retired' as const, action: 'retired' as const };
+      }),
+      settleRetirement: vi.fn(async ({ disposition }) => {
+        events.push(`settle:${disposition}`);
+        return { kind: 'settled' as const, disposition: 'applied' as const };
+      }),
+    };
+    const send = vi.fn(() => { events.push('restart-ipc'); });
+    const ds = activeSession({}, {
+      worker: { killed: false, send } as DaemonSession['worker'],
+    });
+    const port = createCurrentSessionControlPort({
+      ownerLarkAppId: OWNER,
+      activation,
+      activeSessions: new Map([[activeSessionKey(ds), ds]]),
+      sessionStore: unusedStore(),
+      resolveStoredSession: () => ds.session,
+    });
+
+    await expect(settleEffect(
+      port,
+      begin(port, { kind: 'restart', source: 'dashboard' }, 'restart-live'),
+    )).resolves.toMatchObject({
+      kind: 'committed',
+      result: { kind: 'restarted', revived: false },
+    });
+    expect(activation.retire).toHaveBeenCalledWith({
+      sessionId: SESSION_ID,
+      requestIdentity: 'control-restart:restart-live',
+      reason: 'replacement',
+    });
+    expect(activation.ensure).not.toHaveBeenCalled();
+    expect(events).toEqual(['retire', 'restart-ipc', 'settle:applied']);
+  });
+
+  it.each([
+    ['close', { kind: 'close', reason: 'dashboard' }],
+    ['restart', { kind: 'restart', source: 'dashboard' }],
+    ['suspend', { kind: 'suspend', source: 'dashboard' }],
+  ] as const)('revalidates the exact binding after the %s retirement await', async (
+    _label,
+    command,
+  ) => {
+    const originalSend = vi.fn();
+    const original = activeSession({}, {
+      worker: { killed: false, send: originalSend } as DaemonSession['worker'],
+    });
+    const replacement = activeSession({}, {
+      worker: { killed: false, send: vi.fn() } as DaemonSession['worker'],
+    });
+    const registry = new Map([[activeSessionKey(original), original]]);
+    const activation = {
+      ensure: vi.fn(),
+      reconcile: vi.fn(),
+      retire: vi.fn(async () => {
+        registry.set(activeSessionKey(replacement), replacement);
+        return { kind: 'retired' as const, action: 'retired' as const };
+      }),
+      settleRetirement: vi.fn(async () => ({
+        kind: 'quarantined' as const,
+        message: 'binding changed after retirement',
+      })),
+    };
+    const port = createCurrentSessionControlPort({
+      ownerLarkAppId: OWNER,
+      activation,
+      activeSessions: registry,
+      sessionStore: unusedStore(),
+      resolveStoredSession: () => registry.get(activeSessionKey(replacement))!.session,
+    });
+
+    await expect(settleEffect(
+      port,
+      begin(port, command, `post-retire-${_label}`),
+    )).resolves.toMatchObject({
+      kind: 'unknown',
+      message: expect.stringContaining('after activation retirement committed'),
+    });
+    expect(lifecycle.closeSession).not.toHaveBeenCalled();
+    expect(lifecycle.suspendWorker).not.toHaveBeenCalled();
+    expect(originalSend).not.toHaveBeenCalled();
+    expect(replacement.worker?.send).not.toHaveBeenCalled();
+    expect(activation.settleRetirement).toHaveBeenCalledWith(expect.objectContaining({
+      disposition: 'unknown',
+    }));
+  });
+
+  it('keeps a retire-then-replace control sticky in SessionRuntime and never enters the provider', async () => {
+    const original = activeSession({}, {
+      worker: { killed: false, send: vi.fn() } as DaemonSession['worker'],
+    });
+    const replacement = activeSession({}, {
+      worker: { killed: false, send: vi.fn() } as DaemonSession['worker'],
+    });
+    const registry = new Map([[activeSessionKey(original), original]]);
+    let current = original;
+    const activation = {
+      ensure: vi.fn(),
+      reconcile: vi.fn(),
+      retire: vi.fn(async () => {
+        current = replacement;
+        registry.set(activeSessionKey(replacement), replacement);
+        return { kind: 'retired' as const, action: 'retired' as const };
+      }),
+      settleRetirement: vi.fn(async () => ({
+        kind: 'quarantined' as const,
+        message: 'binding changed after retirement',
+      })),
+    };
+    const port = createCurrentSessionControlPort({
+      ownerLarkAppId: OWNER,
+      activation,
+      activeSessions: registry,
+      sessionStore: unusedStore(),
+      resolveStoredSession: () => current.session,
+    });
+    const { host, address } = await runtimeAddressFor(port);
+    const request = {
+      target: { kind: 'session' as const, address },
+      idempotencyKey: 'retire-replace-sticky',
+      command: {
+        kind: 'control.mutate' as const,
+        input: { kind: 'close' as const, reason: 'dashboard' as const },
+      },
+    };
+
+    await expect(host.runtime.submit(request)).resolves.toMatchObject({ kind: 'ambiguous' });
+    await expect(host.runtime.submit(request)).resolves.toMatchObject({ kind: 'ambiguous' });
+
+    expect(activation.retire).toHaveBeenCalledTimes(1);
+    expect(activation.settleRetirement).toHaveBeenCalledTimes(1);
+    expect(lifecycle.closeSession).not.toHaveBeenCalled();
+    expect(original.worker?.send).not.toHaveBeenCalled();
+    expect(replacement.worker?.send).not.toHaveBeenCalled();
   });
 
   it('injects a validated command only through the exact live owner binding', async () => {
@@ -1241,7 +2052,20 @@ describe('Current Session control adapter', () => {
   });
 
   it('publishes a cwd transition before restarting the exact live executor', async () => {
-    const send = vi.fn();
+    const events: string[] = [];
+    const activation = {
+      ensure: vi.fn(),
+      reconcile: vi.fn(),
+      retire: vi.fn(async () => {
+        events.push('retire');
+        return { kind: 'retired' as const, action: 'retired' as const };
+      }),
+      settleRetirement: vi.fn(async ({ disposition }) => {
+        events.push(`settle:${disposition}`);
+        return { kind: 'settled' as const, disposition: 'applied' as const };
+      }),
+    };
+    const send = vi.fn(() => { events.push('restart-ipc'); });
     const ds = activeSession({
       workingDir: '/roles/old',
       riffRepoDirs: ['/roles/old'],
@@ -1260,11 +2084,15 @@ describe('Current Session control adapter', () => {
     const after = storedState({ workingDir: '/roles/new' } as Partial<StoredSessionState>);
     const store: SessionStore = {
       load: vi.fn(() => ({ kind: 'loaded', state: before, version: storeVersion() })),
-      apply: vi.fn(() => ({ kind: 'applied', state: after, nextVersion: storeVersion() })),
+      apply: vi.fn(() => {
+        events.push('metadata');
+        return { kind: 'applied' as const, state: after, nextVersion: storeVersion() };
+      }),
     };
     const registry = new Map([[activeSessionKey(ds), ds]]);
     const port = createCurrentSessionControlPort({
       ownerLarkAppId: OWNER,
+      activation,
       activeSessions: registry,
       sessionStore: store,
       resolveStoredSession: () => ds.session,
@@ -1295,6 +2123,150 @@ describe('Current Session control adapter', () => {
       type: 'restart',
       updateWorkingDir: '/roles/new',
     }));
+    expect(activation.retire).toHaveBeenCalledWith({
+      sessionId: SESSION_ID,
+      requestIdentity: 'control-cd:cwd-one',
+      reason: 'replacement',
+    });
+    expect(events).toEqual(['metadata', 'retire', 'restart-ipc', 'settle:applied']);
+  });
+
+  it('keeps committed cwd metadata sticky when activation retirement is retryable', async () => {
+    const send = vi.fn();
+    const ds = activeSession({ workingDir: '/roles/old' }, {
+      workingDir: '/roles/old',
+      worker: { killed: false, send } as DaemonSession['worker'],
+      initConfig: {
+        backendType: 'tmux',
+        workingDir: '/roles/old',
+      } as DaemonSession['initConfig'],
+    });
+    const store: SessionStore = {
+      load: vi.fn(() => ({
+        kind: 'loaded',
+        state: storedState({ workingDir: '/roles/old' }),
+        version: storeVersion(),
+      })),
+      apply: vi.fn(() => ({
+        kind: 'applied',
+        state: storedState({ workingDir: '/roles/new' }),
+        nextVersion: storeVersion(),
+      })),
+    };
+    const activation = {
+      ensure: vi.fn(),
+      reconcile: vi.fn(),
+      retire: vi.fn(async () => ({
+        kind: 'retryable' as const,
+        message: 'activation retirement not yet proven',
+      })),
+    };
+    const port = createCurrentSessionControlPort({
+      ownerLarkAppId: OWNER,
+      activation,
+      activeSessions: new Map([[activeSessionKey(ds), ds]]),
+      sessionStore: store,
+      resolveStoredSession: () => ds.session,
+    });
+    const { host, address } = await runtimeAddressFor(port);
+    const request = {
+      target: { kind: 'session' as const, address },
+      idempotencyKey: 'cwd-metadata-sticky',
+      command: {
+        kind: 'control.mutate' as const,
+        input: {
+          kind: 'changeWorkingDirectory' as const,
+          resolvedPath: '/roles/new',
+        },
+      },
+    };
+
+    await expect(host.runtime.submit(request)).resolves.toMatchObject({ kind: 'ambiguous' });
+    await expect(host.runtime.submit(request)).resolves.toMatchObject({ kind: 'ambiguous' });
+    await expect(host.runtime.submit({
+      ...request,
+      command: {
+        kind: 'control.mutate',
+        input: { kind: 'changeWorkingDirectory', resolvedPath: '/roles/other' },
+      },
+    })).resolves.toMatchObject({
+      kind: 'rejected',
+      reason: 'idempotencyConflict',
+    });
+
+    expect(store.apply).toHaveBeenCalledTimes(1);
+    expect(activation.retire).toHaveBeenCalledTimes(1);
+    expect(send).not.toHaveBeenCalled();
+    expect(ds.session.workingDir).toBe('/roles/new');
+  });
+
+  it('keeps cwd metadata sticky when the binding is replaced before execute starts', async () => {
+    const originalSend = vi.fn();
+    const replacementSend = vi.fn();
+    const original = activeSession({ workingDir: '/roles/old' }, {
+      workingDir: '/roles/old',
+      worker: { killed: false, send: originalSend } as DaemonSession['worker'],
+      initConfig: { backendType: 'tmux', workingDir: '/roles/old' } as DaemonSession['initConfig'],
+    });
+    const replacement = activeSession({ workingDir: '/roles/new' }, {
+      workingDir: '/roles/new',
+      worker: { killed: false, send: replacementSend } as DaemonSession['worker'],
+      initConfig: { backendType: 'tmux', workingDir: '/roles/new' } as DaemonSession['initConfig'],
+    });
+    const registry = new Map([[activeSessionKey(original), original]]);
+    let current = original;
+    const store: SessionStore = {
+      load: vi.fn(() => ({
+        kind: 'loaded',
+        state: storedState({ workingDir: '/roles/old' }),
+        version: storeVersion(),
+      })),
+      apply: vi.fn(() => {
+        current = replacement;
+        registry.set(activeSessionKey(replacement), replacement);
+        return {
+          kind: 'applied' as const,
+          state: storedState({ workingDir: '/roles/new' }),
+          nextVersion: storeVersion(),
+        };
+      }),
+    };
+    const activation = {
+      ensure: vi.fn(),
+      reconcile: vi.fn(),
+      retire: vi.fn(),
+    };
+    const port = createCurrentSessionControlPort({
+      ownerLarkAppId: OWNER,
+      activation,
+      activeSessions: registry,
+      sessionStore: store,
+      resolveStoredSession: () => current.session,
+    });
+    const { host, address } = await runtimeAddressFor(port);
+    const request = {
+      target: { kind: 'session' as const, address },
+      idempotencyKey: 'cwd-replaced-before-execute',
+      command: {
+        kind: 'control.mutate' as const,
+        input: { kind: 'changeWorkingDirectory' as const, resolvedPath: '/roles/new' },
+      },
+    };
+
+    await expect(host.runtime.submit(request)).resolves.toMatchObject({ kind: 'ambiguous' });
+    await expect(host.runtime.submit(request)).resolves.toMatchObject({ kind: 'ambiguous' });
+    await expect(host.runtime.submit({
+      ...request,
+      command: {
+        kind: 'control.mutate',
+        input: { kind: 'changeWorkingDirectory', resolvedPath: '/roles/other' },
+      },
+    })).resolves.toMatchObject({ kind: 'rejected', reason: 'idempotencyConflict' });
+
+    expect(store.apply).toHaveBeenCalledTimes(1);
+    expect(activation.retire).not.toHaveBeenCalled();
+    expect(originalSend).not.toHaveBeenCalled();
+    expect(replacementSend).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -1350,13 +2322,20 @@ describe('Current Session control adapter', () => {
   });
 
   it.each([
-    ['unreachable live worker', true],
-    ['no live worker', false],
-  ] as const)('uses cold restart and destroys stale backing state for %s', async (_label, hasWorker) => {
+    ['unreachable live worker', 'unreachable', 'replacement'],
+    ['no live worker', 'missing', 'passivation'],
+    ['already-dead worker', 'killed', 'passivation'],
+  ] as const)('uses cold restart and destroys stale backing state for %s', async (
+    _label,
+    workerState,
+    retirementReason,
+  ) => {
     const send = vi.fn(() => { throw new Error('worker channel closed'); });
     const ds = activeSession({ workingDir: '/roles/old' }, {
       workingDir: '/roles/old',
-      worker: hasWorker ? { killed: false, send } as DaemonSession['worker'] : null,
+      worker: workerState === 'missing'
+        ? null
+        : { killed: workerState === 'killed', send } as DaemonSession['worker'],
       initConfig: { backendType: 'tmux', workingDir: '/roles/old' } as DaemonSession['initConfig'],
     });
     const store: SessionStore = {
@@ -1389,7 +2368,13 @@ describe('Current Session control adapter', () => {
         workingDir: '/roles/new',
       },
     });
-    expect(send).toHaveBeenCalledTimes(hasWorker ? 1 : 0);
+    expect(lifecycle.retireCurrentSessionActivation).toHaveBeenCalledWith({
+      sessionId: SESSION_ID,
+      requestIdentity: 'control-cd:operation-1',
+      reason: retirementReason,
+    });
+    expect(lifecycle.ensureCurrentSessionActivation).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledTimes(workerState === 'unreachable' ? 1 : 0);
     expect(lifecycle.killWorker).toHaveBeenCalledWith(ds);
   });
 
@@ -1412,23 +2397,49 @@ describe('Current Session control adapter', () => {
         nextVersion: storeVersion(),
       })),
     };
-    const port = createCurrentSessionControlPort({
+    const replacement = activeSession({ workingDir: '/roles/new' }, {
+      worker: { killed: false, send: vi.fn() } as DaemonSession['worker'],
+    });
+    const activation = {
+      ensure: vi.fn(),
+      reconcile: vi.fn(),
+      retire: vi.fn(async () => {
+        current = replacement;
+        registry.set(activeSessionKey(replacement), replacement);
+        return { kind: 'retired' as const, action: 'retired' as const };
+      }),
+      settleRetirement: vi.fn(async () => ({
+        kind: 'quarantined' as const,
+        message: 'binding changed after retirement',
+      })),
+    };
+    const fencedPort = createCurrentSessionControlPort({
       ownerLarkAppId: OWNER,
+      activation,
       activeSessions: registry,
       sessionStore: store,
       resolveStoredSession: () => current.session,
     });
-    const effect = begin(port, {
+    const fencedEffect = begin(fencedPort, {
       kind: 'changeWorkingDirectory',
       resolvedPath: '/roles/new',
-    });
-    const replacement = activeSession({ workingDir: '/roles/new' }, {
-      worker: { killed: false, send: vi.fn() } as DaemonSession['worker'],
-    });
-    current = replacement;
-    registry.set(activeSessionKey(replacement), replacement);
+    }, 'cwd-replaced-during-retire');
 
-    await expect(settleEffect(port, effect)).resolves.toEqual({ kind: 'staleAddress' });
+    await expect(settleEffect(fencedPort, fencedEffect)).resolves.toMatchObject({
+      kind: 'unknown',
+      message: expect.stringContaining('after metadata and activation retirement committed'),
+    });
+    expect(activation.retire).toHaveBeenCalledWith({
+      sessionId: SESSION_ID,
+      requestIdentity: 'control-cd:cwd-replaced-during-retire',
+      reason: 'replacement',
+    });
+    expect(activation.settleRetirement).toHaveBeenCalledWith({
+      sessionId: SESSION_ID,
+      requestIdentity: 'control-cd:cwd-replaced-during-retire',
+      reason: 'replacement',
+      disposition: 'unknown',
+    });
     expect(send).not.toHaveBeenCalled();
     expect(replacement.worker?.send).not.toHaveBeenCalled();
     expect(lifecycle.killWorker).not.toHaveBeenCalled();

@@ -2301,7 +2301,8 @@ export async function restoreActiveSessions(
           || outcome.kind === 'ambiguous'
           || outcome.kind === 'retryable'
           || outcome.kind === 'rejected'
-          || outcome.kind === 'stale') {
+          || outcome.kind === 'staleBeforeEffect'
+          || outcome.kind === 'unknownAfterEffect') {
         logger.warn(
           `[${ds.session.sessionId.substring(0, 8)}] Current restore activation settled ${outcome.kind}: `
           + `${'message' in outcome ? outcome.message : 'activation was not accepted'}`,
@@ -2421,13 +2422,20 @@ export async function resumeSession(
   sessionId: string,
   activeSessions: Map<string, DaemonSession>,
   options: {
-    owner?: { larkAppId: string; activeSessions: Map<string, DaemonSession> };
+    owner?: {
+      larkAppId: string;
+      activeSessions: Map<string, DaemonSession>;
+      /** Current callers retire route scratches through SessionRuntime first.
+       * This provider may only verify that the route is empty. */
+      routeConflictPolicy: 'failClosed';
+    };
   } = {},
 ): Promise<{ ok: true; ds: DaemonSession }
 | { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'vc_receiver_managed' | 'deferred_unmaterialized' | 'resume_cancelled' | 'owner_mismatch'; activeSessionId?: string }> {
   const ownerCurrent = (): boolean => (
     !options.owner
-    || (options.owner.activeSessions === activeSessions
+    || (options.owner.routeConflictPolicy === 'failClosed'
+      && options.owner.activeSessions === activeSessions
       && sessionStore.currentSessionStoreOwner() === options.owner.larkAppId)
   );
   const readSession = (): Session | undefined => (
@@ -2515,6 +2523,9 @@ export async function resumeSession(
   // throwaway command container, so clobbering it would lose real intent.
   const existing = activeSessions.get(key);
   if (existing) {
+    if (options.owner) {
+      return { ok: false, error: 'anchor_occupied', activeSessionId: existing.session.sessionId };
+    }
     // Master's isDisposableCommandScratch subsumes isRelayableRealSession /
     // pendingRepo / queued / adopt / pending-prompt. PR #597 additionally
     // refuses to clobber a durable activation owner or an opening that has not
@@ -2558,28 +2569,37 @@ export async function resumeSession(
   // bot is therefore a genuine scratch or a crash leftover — closing it is
   // correct either way. The two branches are intentionally NOT identical;
   // don't "unify" them by reading pendingRepo here (it isn't there to read).
-  const conflicts = sessionStore.listSessions().filter(s =>
+  const conflictRows = options.owner
+    ? sessionStore.listSessionsForOwnerStrict(options.owner.larkAppId)
+    : sessionStore.listSessions();
+  const conflicts = conflictRows.filter(s =>
     s.sessionId !== sessionId
     && s.status === 'active'
     // Legacy active rows predate per-bot stamping. Conservatively attribute an
     // unscoped row to this daemon, matching transfer/restore collision rules;
     // otherwise a disk-only legacy anchor can be ghosted by the resumed row.
-    && (!s.larkAppId || s.larkAppId === larkAppId)
+    && (options.owner
+      ? s.larkAppId === options.owner.larkAppId
+      : !s.larkAppId || s.larkAppId === larkAppId)
     && (s.scope === 'chat' ? 'chat' : 'thread') === scope
     && storedSessionAnchorId(s) === anchor,
   );
-  const realConflict = conflicts.find(s =>
-    hasProtectedSessionMutationOwnership(s)
-    || !!s.cliId
-    || !!s.lastCliInput
-    || !!s.adoptedFrom
-    || s.queued === true,
-  );
+  const realConflict = options.owner
+    ? conflicts[0]
+    : conflicts.find(s =>
+      hasProtectedSessionMutationOwnership(s)
+      || !!s.cliId
+      || !!s.lastCliInput
+      || !!s.adoptedFrom
+      || s.queued === true,
+    );
   if (realConflict) {
     return { ok: false, error: 'anchor_occupied', activeSessionId: realConflict.sessionId };
   }
-  for (const scratch of conflicts) {
-    await closeWithinOwner(scratch.sessionId);
+  if (!options.owner) {
+    for (const scratch of conflicts) {
+      await closeWithinOwner(scratch.sessionId);
+    }
   }
   const replacementAfterDiskCleanup = activeSessions.get(key);
   if (replacementAfterDiskCleanup) {

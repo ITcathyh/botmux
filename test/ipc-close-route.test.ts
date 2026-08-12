@@ -9,6 +9,7 @@ import {
 } from '../src/core/dashboard-ipc-server.js';
 import { daemonIpcAuthHeaders } from '../src/core/daemon-ipc-auth.js';
 import * as workerPool from '../src/core/worker-pool.js';
+import * as currentActivation from '../src/core/current-session-activation.js';
 import {
   currentDashboardSessionRegistry,
   installCurrentDashboardSessionRuntimeForTest,
@@ -216,7 +217,7 @@ describe('POST /api/sessions/:sessionId/close', () => {
     expect(closeSpy).toHaveBeenCalledTimes(1);
   });
 
-  it('re-drives the same close operation after a proven-open refusal', async () => {
+  it('re-drives the same close operation after a proven-open refusal and re-fences a replacement binding', async () => {
     const active = {
       session: {
         sessionId: 's-close-proven-open',
@@ -232,19 +233,38 @@ describe('POST /api/sessions/:sessionId/close', () => {
       scope: 'thread',
     } as any;
     vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(active);
+    const events: string[] = [];
     const closeSpy = vi.spyOn(workerPool, 'closeSession')
-      .mockResolvedValueOnce({
-        ok: false,
-        alreadyClosed: false,
-        error: 'riff_shutdown_fence_in_progress',
-        closeDisposition: 'notApplied',
-        taskId: 'task-close-proven-open',
-      } as any)
-      .mockResolvedValueOnce({ ok: true, alreadyClosed: false, known: true });
-    installCurrentDashboardSessionRuntimeForTest(
-      'app-1',
-      currentDashboardSessionRegistry(active),
-    );
+      .mockImplementationOnce(async () => {
+        events.push('close:first');
+        return {
+          ok: false,
+          alreadyClosed: false,
+          error: 'riff_shutdown_fence_in_progress',
+          closeDisposition: 'notApplied',
+          taskId: 'task-close-proven-open',
+        } as any;
+      })
+      .mockImplementationOnce(async () => {
+        events.push('close:replacement');
+        return { ok: true, alreadyClosed: false, known: true };
+      });
+    const retirementRequests: Array<{ requestIdentity: string }> = [];
+    const realCoordinator = currentActivation.currentSessionActivationCoordinator;
+    vi.spyOn(currentActivation, 'currentSessionActivationCoordinator')
+      .mockImplementation((options) => {
+        const coordinator = realCoordinator(options);
+        return {
+          ...coordinator,
+          retire: async (request) => {
+            events.push(retirementRequests.length === 0 ? 'retire:first' : 'retire:replacement');
+            retirementRequests.push(request);
+            return coordinator.retire(request);
+          },
+        };
+      });
+    const registry = currentDashboardSessionRegistry(active);
+    installCurrentDashboardSessionRuntimeForTest('app-1', registry);
     const request = {
       auth: 'signed' as const,
       authRequired: true,
@@ -252,6 +272,14 @@ describe('POST /api/sessions/:sessionId/close', () => {
     };
 
     const first = await postClose(active.session.sessionId, request);
+    const replacement = {
+      ...active,
+      session: { ...active.session },
+    } as any;
+    registry.clear();
+    for (const [key, value] of currentDashboardSessionRegistry(replacement)) {
+      registry.set(key, value);
+    }
     const replay = await postClose(active.session.sessionId, request);
 
     expect(first.status).toBe(503);
@@ -259,6 +287,15 @@ describe('POST /api/sessions/:sessionId/close', () => {
     expect(replay.status).toBe(200);
     expect(await replay.json()).toEqual({ ok: true, alreadyClosed: false, known: true });
     expect(closeSpy).toHaveBeenCalledTimes(2);
+    expect(retirementRequests).toHaveLength(2);
+    expect(retirementRequests[1]!.requestIdentity)
+      .not.toBe(retirementRequests[0]!.requestIdentity);
+    expect(events).toEqual([
+      'retire:first',
+      'close:first',
+      'retire:replacement',
+      'close:replacement',
+    ]);
   });
 
   it('reports an unknown close outcome without a contradictory retryable field and keeps it sticky', async () => {

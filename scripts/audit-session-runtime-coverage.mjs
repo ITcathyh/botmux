@@ -21,7 +21,8 @@ const expectedCoverage = new Map([
   ['keyed-trigger-start', { targetMilestone: 'A1', disposition: 'migrated' }],
   ['current-session-store-adapter', { targetMilestone: 'A1', disposition: 'migrated' }],
   ['ordinary-im', { targetMilestone: 'C1', disposition: 'migrated' }],
-  ['control', { targetMilestone: 'C2', disposition: 'remaining' }],
+  ['dashboard-control', { targetMilestone: 'C2', disposition: 'migrated' }],
+  ['remaining-control-bypass', { targetMilestone: 'C2', disposition: 'remaining' }],
   ['executor-generation', { targetMilestone: 'A2', disposition: 'migrated' }],
   ['per-session-command-lane', { targetMilestone: 'A3', disposition: 'migrated' }],
   ['scheduler', { targetMilestone: 'C4', disposition: 'migrated' }],
@@ -252,6 +253,194 @@ const mandatoryActivationLegacyPartition = Object.freeze({
   generationPrecommitCreation: 28,
 });
 
+// C2 is a caller cut, not a claim over every historical "control" writer.
+// These bindings name the deep Dashboard command seam; the exact authority
+// selectors are validated separately once the source census has identified
+// the Current adapters that implement it. Command/card/shared providers that
+// still mutate directly get their own `remaining-control-bypass` partition;
+// unrelated Target-A gaps remain in the final `remaining-bypass` partition.
+const mandatoryControlProductionBinding = Object.freeze({
+  ipcSource: 'src/core/dashboard-ipc-server.ts',
+  operationIdReader: 'sessionOperationId',
+  commandClientSource: 'src/core/current-dashboard-session-command-client.ts',
+  commandClientFactory: 'createCurrentDashboardSessionCommandClient',
+  currentRuntimeSource: 'src/core/current-session-runtime.ts',
+  currentRuntimeFactory: 'currentSessionRuntimeHost',
+  runtimeSource: 'src/core/session-runtime.ts',
+  runtimeFactory: 'createSessionRuntimeHost',
+  runtimeSubmitFunction: 'submit',
+  mutationEffectRunner: 'runControlMutationEffects',
+  mutationResumeFunction: 'resumeControlMutationAttempt',
+  renameEffectRunner: 'runControlRenameEffect',
+  controlSource: 'src/core/current-session-control.ts',
+  controlFactory: 'createCurrentSessionControlPort',
+  cwdSource: 'src/core/session-cwd.ts',
+  cwdCurrentPublisher: 'syncCurrentSessionWorkingDir',
+  cwdRemainingPublisher: 'repinSessionWorkingDir',
+  openingSource: 'src/core/current-dashboard-route-opening.ts',
+  openingFactory: 'createCurrentDashboardRouteOpeningPort',
+  dashboardOpeningBarrierSource: 'src/core/session-manager.ts',
+  dashboardOpeningBarrierFunction: 'spawnDashboardSession',
+  routeRegistrySource: 'src/core/current-ordinary-route-registry.ts',
+  routeRegistryFactory: 'createCurrentOrdinaryRouteRegistryRuntime',
+  routeAdmissionSource: 'src/core/current-route-admission.ts',
+  routeAdmissionFactory: 'reserveCurrentRouteAdmission',
+  triggerSource: 'src/core/trigger-session.ts',
+  triggerFunction: 'triggerSessionTurnAdmitted',
+  maintenanceSource: 'src/core/current-dashboard-host-maintenance.ts',
+  maintenanceFactory: 'createCurrentDashboardHostMaintenance',
+  chatRenameSource: 'src/core/current-dashboard-chat-rename.ts',
+  chatRenameFactory: 'createCurrentDashboardChatRename',
+  aggregatorSource: 'src/dashboard.ts',
+  createOperationHostFactory: 'createDashboardSessionCreateOperationHost',
+  idleOperationHostFactory: 'createDashboardIdleCleanupOperationHost',
+  aggregatorOperationIdReader: 'requiredDashboardSessionCreateOperationId',
+  idleChildExecutor: 'executeDashboardIdleCleanupChild',
+  webOperationSource: 'src/dashboard/web/operation-id.ts',
+  webOperationCoordinator: 'SemanticOperationCoordinator',
+  sessionsCardSource: 'src/im/lark/sessions-card.ts',
+  sessionsCardBuilder: 'buildSessionsDetailCard',
+  sessionsCardHandler: 'handleSessionsCardAction',
+  daemonSource: 'src/daemon.ts',
+  daemonHostFactory: 'currentDaemonSessionRuntimeHost',
+  daemonActivationFactory: 'currentDaemonSessionActivation',
+  activationCoordinatorFactory: 'currentSessionActivationCoordinator',
+  operationReceiptDurability: 'daemonEpoch',
+});
+
+const mandatoryControlRoutes = new Map([
+  ['GET /api/sessions/:sessionId/trigger-result', {
+    sink: 'buildAsyncTriggerLookupResponse',
+    delegatedFunction: 'buildAsyncTriggerLookupResponse',
+    delegatedSink: 'dashboardSessionRuntimeSubmitter',
+    commandKind: 'control.mutate',
+    identitySource: 'derived-trigger-id',
+  }],
+  ['POST /api/sessions/:sessionId/close', {
+    sink: 'dashboardSessionRuntimeSubmitter',
+    commandKind: 'control.mutate',
+  }],
+  ['POST /api/sessions/:sessionId/prune', {
+    sink: 'dashboardSessionRuntimeSubmitter',
+    commandKind: 'control.mutate',
+  }],
+  ['POST /api/sessions/:sessionId/restart', {
+    sink: 'submitControl',
+    commandKind: 'control.mutate',
+  }],
+  ['POST /api/sessions/:sessionId/suspend', {
+    sink: 'submitControl',
+    commandKind: 'control.mutate',
+  }],
+  ['POST /api/host-overload/sweep', {
+    sink: 'maintenance.sweep',
+  }],
+  ['POST /api/sessions/:sessionId/slash', {
+    sink: 'submit',
+    commandKind: 'control.mutate',
+  }],
+  ['POST /api/sessions/:sessionId/chat-rename', {
+    sink: 'port.submit',
+  }],
+  ['POST /api/sessions/:sessionId/cd', {
+    sink: 'submitControl',
+    commandKind: 'control.mutate',
+  }],
+  ['POST /api/sessions/:sessionId/board', {
+    sink: 'dashboardSessionRuntimeSubmitter',
+    commandKind: 'control.mutate',
+  }],
+  ['POST /api/sessions/:sessionId/whiteboard', {
+    sink: 'dashboardSessionRuntimeSubmitter',
+    commandKind: 'control.mutate',
+  }],
+  ['POST /api/sessions/:sessionId/start', {
+    sink: 'submit',
+    commandKind: 'control.mutate',
+  }],
+  ['POST /api/sessions/spawn', {
+    sink: 'submit',
+    commandKind: 'dashboard.spawn',
+  }],
+  ['POST /api/sessions/:sessionId/rename', {
+    sink: 'dashboardSessionRuntimeSubmitter',
+    commandKind: 'control.rename',
+  }],
+  ['POST /api/sessions/:sessionId/lock', {
+    sink: 'dashboardSessionRuntimeSubmitter',
+    commandKind: 'control.mutate',
+  }],
+  ['POST /api/sessions/:sessionId/resume', {
+    sink: 'dashboardSessionRuntimeSubmitter',
+    commandKind: 'control.mutate',
+  }],
+  ['POST /api/sessions/migrate-to-chat', {
+    sink: 'submitControl',
+    commandKind: 'control.mutate',
+  }],
+  ['PUT /api/bot-agent', {
+    sink: 'maintenance.changeAgent',
+  }],
+].map(([route, proof]) => [
+  route,
+  { identitySource: 'caller-supplied', ...proof },
+]));
+
+const mandatoryControlForbiddenCallerCalls = [
+  'sessionStore.createSession',
+  'sessionStore.createSessionExact',
+  'sessionStore.updateSession',
+  'sessionStore.closeSession',
+  'sessionStore.reactivateClosedSession',
+  'getActiveSessionsRegistry',
+  'activeSessions.set',
+  'activeSessions.delete',
+  'spawnDashboardSession',
+  'forkWorker',
+  'closeSession',
+  'resumeSession',
+  'transferSession',
+  'suspendWorker',
+  'killWorker',
+  'activateQueuedSession',
+  'repinSessionWorkingDir',
+  'syncCurrentSessionWorkingDir',
+  'sendWorkerSessionInput',
+  'requestAgentSessionRename',
+  'updateSessionTitle',
+];
+
+// Every IPC route is forbidden from directly acquiring a Session write
+// capability. The reviewed C2 caller cut additionally forbids the read-only
+// registry lookup above so those routes cannot sidestep their Runtime target.
+const mandatoryIpcRouteForbiddenDirectWriteCalls =
+  mandatoryControlForbiddenCallerCalls.filter(call => call !== 'getActiveSessionsRegistry');
+
+const mandatorySharedRouteAdmissionConsumers = new Map([
+  ['src/core/current-ordinary-route-registry.ts#createCurrentOrdinaryRouteRegistryRuntime', 3],
+  ['src/core/current-reopen-route-admission.ts#createCurrentReopenRouteAdmissionPort', 1],
+  ['src/core/current-scheduled-fire.ts#createCurrentScheduledFireAdapter', 2],
+  ['src/core/trigger-session.ts#triggerSessionTurnAdmitted', 1],
+]);
+
+const mandatoryDashboardControlAuthoritySelectors = new Map([
+  ['src/core/current-dashboard-route-opening.ts', ['inspectCurrentDashboardRoute']],
+  ['src/core/current-ordinary-route-registry.ts', ['inspectRelocationTarget']],
+  ['src/core/current-session-control.ts', ['convergeAsyncTriggerFault', 'execute']],
+  ['src/core/session-manager.ts', ['spawnDashboardSession']],
+]);
+
+const mandatoryRemainingControlBypassSelectors = new Map([
+  ['src/core/command-handler.ts', [
+    'commitRepoSelection',
+    'handleCardCommand',
+    'handleCommand',
+  ]],
+  ['src/im/lark/card-handler.ts', ['commitRepoSelection', 'handleCardAction']],
+  ['src/core/session-cwd.ts', ['assignWorkingDirectory', 'repinSessionWorkingDir']],
+  ['src/core/session-title.ts', ['updateSessionTitle']],
+]);
+
 const mandatoryOrdinaryCallers = new Map([
   ['src/daemon.ts#handleNewTopicAdmitted', { sessionSubmitCount: 0, routeSubmitCount: 1 }],
   ['src/daemon.ts#handleThreadReplyAdmitted', { sessionSubmitCount: 1, routeSubmitCount: 1 }],
@@ -317,6 +506,8 @@ const mandatorySessionLaneDeferredPaths = new Map([
 
 let cachedFacts;
 const parsedSources = new Map();
+let activeSourceOverrides;
+let activeOverrideParsedSources;
 
 function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
@@ -501,6 +692,13 @@ function validateLedgerSchema(ledger) {
   validateKeyedProductionBindingSchema(keyedTrigger.productionBinding);
   const ordinary = ledger.coverage.find(entry => entry.id === 'ordinary-im');
   validateOrdinaryProductionBindingSchema(ordinary.productionBinding);
+  const dashboardControl = ledger.coverage.find(entry => entry.id === 'dashboard-control');
+  validateDashboardControlAuthoritySelectors(dashboardControl.selectors);
+  validateControlProductionBindingSchema(dashboardControl.productionBinding);
+  const remainingControl = ledger.coverage.find(
+    entry => entry.id === 'remaining-control-bypass',
+  );
+  validateRemainingControlBypassSelectors(remainingControl.selectors);
   const executor = ledger.coverage.find(entry => entry.id === 'executor-generation');
   validateExecutorSelectors(executor.selectors);
   validateExecutorProductionBindingSchema(executor.productionBinding);
@@ -516,6 +714,7 @@ function validateLedgerSchema(ledger) {
   for (const entry of ledger.coverage) {
     if (entry.id !== 'keyed-trigger-start'
       && entry.id !== 'ordinary-im'
+      && entry.id !== 'dashboard-control'
       && entry.id !== 'executor-generation'
       && entry.id !== 'per-session-command-lane'
       && entry.id !== 'projection'
@@ -523,6 +722,106 @@ function validateLedgerSchema(ledger) {
       && entry.id !== 'activation-restore') {
       assert(entry.productionBinding === undefined, `${entry.id} must not claim a migrated production binding`);
     }
+  }
+}
+
+function validateControlProductionBindingSchema(binding) {
+  assert(isPlainObject(binding), 'dashboard-control.productionBinding must be an object');
+  const allowedKeys = new Set([
+    ...Object.keys(mandatoryControlProductionBinding),
+    'routes',
+    'forbiddenCallerCalls',
+    'sharedRouteAdmissionConsumers',
+  ]);
+  for (const key of Object.keys(binding)) {
+    assert(allowedKeys.has(key), `dashboard-control.productionBinding has unsupported field: ${key}`);
+  }
+  for (const [field, expected] of Object.entries(mandatoryControlProductionBinding)) {
+    assert(
+      binding[field] === expected,
+      `dashboard-control.productionBinding.${field} must be ${expected}`,
+    );
+  }
+
+  assert(
+    Array.isArray(binding.routes) && binding.routes.length === mandatoryControlRoutes.size,
+    'dashboard-control.productionBinding.routes must cover every reviewed Dashboard mutation route',
+  );
+  const seenRoutes = new Set();
+  for (const route of binding.routes) {
+    assert(isPlainObject(route), 'dashboard-control.productionBinding route must be an object');
+    assert(
+      typeof route.method === 'string' && typeof route.path === 'string',
+      'dashboard-control.productionBinding route method/path are required',
+    );
+    const routeKey = `${route.method} ${route.path}`;
+    assert(!seenRoutes.has(routeKey), `dashboard-control.productionBinding duplicates route ${routeKey}`);
+    seenRoutes.add(routeKey);
+    const expected = mandatoryControlRoutes.get(routeKey);
+    assert(expected, `dashboard-control.productionBinding has unknown Dashboard route ${routeKey}`);
+    assert(
+      sameStringSet(Object.keys(route), ['method', 'path', ...Object.keys(expected)]),
+      `dashboard-control.productionBinding route ${routeKey} must keep the exact reviewed fields`,
+    );
+    for (const [field, value] of Object.entries(expected)) {
+      assert(
+        route[field] === value,
+        `dashboard-control.productionBinding route ${routeKey}.${field} must be ${value}`,
+      );
+    }
+  }
+  for (const routeKey of mandatoryControlRoutes.keys()) {
+    assert(
+      seenRoutes.has(routeKey),
+      `dashboard-control.productionBinding.routes must include ${routeKey}`,
+    );
+  }
+
+  validateStringArray(
+    binding.forbiddenCallerCalls,
+    'dashboard-control.productionBinding.forbiddenCallerCalls',
+  );
+  assert(
+    sameStringSet(binding.forbiddenCallerCalls, mandatoryControlForbiddenCallerCalls),
+    'dashboard-control.productionBinding.forbiddenCallerCalls must keep the exact direct Current capability fence',
+  );
+
+  assert(
+    Array.isArray(binding.sharedRouteAdmissionConsumers)
+      && binding.sharedRouteAdmissionConsumers.length === mandatorySharedRouteAdmissionConsumers.size,
+    'dashboard-control.productionBinding.sharedRouteAdmissionConsumers must cover every reviewed route producer',
+  );
+  const seenConsumers = new Set();
+  for (const consumer of binding.sharedRouteAdmissionConsumers) {
+    assert(
+      isPlainObject(consumer)
+        && sameStringSet(
+          Object.keys(consumer),
+          ['sourceFile', 'enclosingFunction', 'reservationCount'],
+        ),
+      'dashboard-control.productionBinding shared route-admission consumer has unsupported fields',
+    );
+    const key = `${consumer.sourceFile}#${consumer.enclosingFunction}`;
+    assert(
+      !seenConsumers.has(key),
+      `dashboard-control.productionBinding duplicates route-admission consumer ${key}`,
+    );
+    seenConsumers.add(key);
+    const expected = mandatorySharedRouteAdmissionConsumers.get(key);
+    assert(
+      expected !== undefined,
+      `dashboard-control.productionBinding has unknown route-admission consumer ${key}`,
+    );
+    assert(
+      consumer.reservationCount === expected,
+      `dashboard-control.productionBinding ${key}.reservationCount must be ${expected}`,
+    );
+  }
+  for (const key of mandatorySharedRouteAdmissionConsumers.keys()) {
+    assert(
+      seenConsumers.has(key),
+      `dashboard-control.productionBinding.sharedRouteAdmissionConsumers must include ${key}`,
+    );
   }
 }
 
@@ -771,6 +1070,70 @@ function sameStringSet(actual, expected) {
     && actual.every(value => expected.includes(value));
 }
 
+function validateExactFunctionSelectors(
+  entryId,
+  selectors,
+  expectedSelectors,
+  { accessLane } = {},
+) {
+  assert(
+    selectors.length === expectedSelectors.size,
+    `${entryId} selectors must remain the exact reviewed authority partition`,
+  );
+  const seen = new Set();
+  for (const selector of selectors) {
+    const expectedFunctions = expectedSelectors.get(selector.sourceFile);
+    assert(
+      expectedFunctions,
+      `${entryId} selectors must remain the exact reviewed authority partition: ${selector.sourceFile}`,
+    );
+    assert(
+      !seen.has(selector.sourceFile),
+      `${entryId} selectors duplicate exact reviewed source: ${selector.sourceFile}`,
+    );
+    seen.add(selector.sourceFile);
+    assert(
+      sameStringSet(selector.enclosingFunctions ?? [], expectedFunctions),
+      `${entryId} selectors must name only exact reviewed functions: ${selector.sourceFile}`,
+    );
+    assert(
+      accessLane === undefined
+        ? selector.accessLanes === undefined
+        : sameStringSet(selector.accessLanes ?? [], [accessLane]),
+      accessLane === undefined
+        ? `${entryId} selectors must not widen through an access lane: ${selector.sourceFile}`
+        : `${entryId} selectors must use only the exact ${accessLane} access lane: ${selector.sourceFile}`,
+    );
+    assert(
+      selector.authorityIds === undefined,
+      `${entryId} selectors must not widen through authority IDs: ${selector.sourceFile}`,
+    );
+  }
+  for (const source of expectedSelectors.keys()) {
+    assert(
+      seen.has(source),
+      `${entryId} selectors must remain the exact reviewed authority partition: ${source}`,
+    );
+  }
+}
+
+function validateDashboardControlAuthoritySelectors(selectors) {
+  validateExactFunctionSelectors(
+    'dashboard-control',
+    selectors,
+    mandatoryDashboardControlAuthoritySelectors,
+    { accessLane: 'session-runtime-current-adapter' },
+  );
+}
+
+function validateRemainingControlBypassSelectors(selectors) {
+  validateExactFunctionSelectors(
+    'remaining-control-bypass',
+    selectors,
+    mandatoryRemainingControlBypassSelectors,
+  );
+}
+
 function validateOrdinaryAuthoritySelectors(selectors) {
   assert(
     selectors.length === mandatoryOrdinaryAuthoritySelectors.size,
@@ -857,19 +1220,106 @@ function validateActivationProductionBinding(binding) {
 
   const adapterSource = sourceFile(binding.currentAdapterSource);
   const adapterFactory = findNamedFunction(adapterSource, binding.currentAdapterFactory);
+  const quarantineFor = findNamedFunction(adapterFactory, 'quarantineFor');
   const adapterBegin = findNamedFunction(adapterFactory, 'begin');
   const adapterExecute = findNamedFunction(adapterFactory, 'execute');
+  const adapterRetire = findNamedFunction(adapterFactory, 'retire');
+  const adapterSettleRetirement = findNamedFunction(adapterFactory, 'settleRetirement');
   assert(
     containsIdentifier(adapterExecute, binding.managedProvider)
       && containsIdentifier(adapterExecute, binding.adoptProvider),
     'A4 Current Adapter must preserve managed and adopt provider protocols behind one seam',
   );
   assert(
-    containsStringLiteral(adapterBegin, 'unknown')
-      && containsIdentifier(adapterBegin, 'observation')
-      && callExpressionsWithin(adapterBegin, 'quarantines.set').length > 0
+    callExpressionsWithin(quarantineFor, 'quarantines.set').length === 1
+      && containsIdentifier(quarantineFor, 'backendUnknown')
+      && containsIdentifier(quarantineFor, 'pendingRetirements'),
+    'A4 backend quarantine must bind unknown evidence and pending retirements to one exact Current binding',
+  );
+  assert(
+    containsStringLiteral(adapterBegin, 'reconcile')
+      && containsStringLiteral(adapterBegin, 'unknown')
+      && propertyAccessExpressionsWithin(adapterBegin, 'request', 'goal').length > 0
+      && propertyAccessExpressionsWithin(adapterBegin, 'quarantined', 'backendUnknown').length > 0
+      && propertyAccessExpressionsWithin(adapterBegin, 'quarantined', 'pendingRetirements').length > 0
+      && propertyAssignmentsWithin(
+        adapterBegin,
+        'quarantined',
+        'backendUnknown',
+        ts.SyntaxKind.FalseKeyword,
+      ).length === 1
       && callExpressionsWithin(adapterBegin, 'quarantines.delete').length === 1,
     'A4 unknown backend evidence must stay quarantined until one typed exists/missing re-probe',
+  );
+  assert(
+    callExpressionsWithin(adapterRetire, 'quarantineFor').length === 1
+      && callExpressionsWithin(adapterRetire, 'pendingRetirements.add').length === 1
+      && callExpressionsWithin(adapterRetire, 'quarantines.delete').length === 0
+      && propertyAssignmentsWithin(
+        adapterRetire,
+        'quarantine',
+        'backendUnknown',
+        ts.SyntaxKind.FalseKeyword,
+      ).length === 0,
+    'A4 retirement prepare must publish its provider fence without clearing backend quarantine',
+  );
+
+  const appliedBranches = propertyLiteralIf(
+    adapterSettleRetirement,
+    'request',
+    'disposition',
+    'applied',
+  );
+  const notAppliedBranches = propertyLiteralIf(
+    adapterSettleRetirement,
+    'request',
+    'disposition',
+    'notApplied',
+  );
+  assert(
+    appliedBranches.length === 1 && notAppliedBranches.length === 1,
+    'A4 retirement settlement must distinguish applied from notApplied provider evidence',
+  );
+  const [appliedBranch] = appliedBranches;
+  const [notAppliedBranch] = notAppliedBranches;
+  const notAppliedCleanup = callExpressionsWithin(
+    notAppliedBranch.thenStatement,
+    'quarantines.delete',
+  );
+  const notAppliedCleanupGuard = notAppliedCleanup[0]
+    ? ancestorWithin(notAppliedCleanup[0], notAppliedBranch.thenStatement, ts.isIfStatement)
+    : undefined;
+  const notAppliedGuardText = notAppliedCleanupGuard?.expression.getText(adapterSource) ?? '';
+  assert(
+    callExpressionsWithin(appliedBranch.thenStatement, 'quarantines.delete').length === 1
+      && callExpressionsWithin(notAppliedBranch.thenStatement, 'pendingRetirements.delete').length === 1
+      && notAppliedCleanup.length === 1
+      && notAppliedGuardText.includes('!quarantine.backendUnknown')
+      && notAppliedGuardText.includes('quarantine.pendingRetirements.size === 0'),
+    'A4 notApplied settlement may clear only its pending fence and must preserve prior backend-unknown evidence',
+  );
+  const unknownSettlement = notAppliedBranch.elseStatement;
+  assert(
+    !!unknownSettlement
+      && callExpressionsWithin(unknownSettlement, 'pendingRetirements.delete').length === 1
+      && callExpressionsWithin(unknownSettlement, 'quarantines.delete').length === 0
+      && propertyAssignmentsWithin(
+        unknownSettlement,
+        'quarantine',
+        'backendUnknown',
+        ts.SyntaxKind.TrueKeyword,
+      ).length === 1
+      && propertyAssignmentsWithin(
+        adapterSettleRetirement,
+        'retirement',
+        'settlement',
+      ).length === 1
+      && propertyAccessExpressionsWithin(
+        adapterSettleRetirement,
+        'request',
+        'disposition',
+      ).length >= 4,
+    'A4 unknown retirement settlement must remain sticky and bind one exact evidence receipt',
   );
 
   const coordinatorFactory = findNamedFunction(adapterSource, binding.coordinatorFactory);
@@ -1318,6 +1768,22 @@ function validateRawPublisherDisposition(entry, selected, authorityClassificatio
 }
 
 function sourceFile(path) {
+  if (activeSourceOverrides
+      && Object.prototype.hasOwnProperty.call(activeSourceOverrides, path)) {
+    const cachedOverride = activeOverrideParsedSources.get(path);
+    if (cachedOverride) return cachedOverride;
+    const source = activeSourceOverrides[path];
+    assert(typeof source === 'string', `production source override must be text: ${path}`);
+    const parsed = ts.createSourceFile(
+      path,
+      source,
+      ts.ScriptTarget.Latest,
+      true,
+      ts.ScriptKind.TS,
+    );
+    activeOverrideParsedSources.set(path, parsed);
+    return parsed;
+  }
   const cached = parsedSources.get(path);
   if (cached) return cached;
   const absolute = resolve(repoRoot, path);
@@ -1354,6 +1820,69 @@ function findNamedFunction(parsed, name) {
   return matches[0];
 }
 
+function findNamedClass(parsed, name) {
+  const matches = [];
+  const visit = node => {
+    if (ts.isClassDeclaration(node) && node.name?.text === name) matches.push(node);
+    ts.forEachChild(node, visit);
+  };
+  visit(parsed);
+  assert(matches.length === 1, `missing or ambiguous production class ${parsed.fileName}#${name}`);
+  return matches[0];
+}
+
+function findIpcRouteHandler(parsed, method, path) {
+  const matches = [];
+  const visit = node => {
+    if (ts.isCallExpression(node)
+        && calledName(node) === 'ipcRoute'
+        && node.arguments.length >= 3
+        && ts.isStringLiteralLike(node.arguments[0])
+        && node.arguments[0].text === method
+        && ts.isStringLiteralLike(node.arguments[1])
+        && node.arguments[1].text === path) {
+      matches.push(node.arguments[2]);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(parsed);
+  assert(
+    matches.length === 1,
+    `missing or ambiguous Dashboard route ${parsed.fileName}#${method} ${path}`,
+  );
+  const [handler] = matches;
+  assert(
+    ts.isArrowFunction(handler) || ts.isFunctionExpression(handler),
+    `Dashboard route ${method} ${path} must keep an inline handler for caller-cut inspection`,
+  );
+  return handler;
+}
+
+function ipcRouteCallbacks(parsed) {
+  const routes = [];
+  const visit = node => {
+    if (ts.isCallExpression(node)
+        && calledName(node) === 'ipcRoute'
+        && node.arguments.length >= 3) {
+      const [methodArgument, pathArgument, handler] = node.arguments;
+      const method = ts.isStringLiteralLike(methodArgument)
+        ? methodArgument.text
+        : methodArgument.getText(parsed);
+      const path = ts.isStringLiteralLike(pathArgument)
+        ? pathArgument.text
+        : pathArgument.getText(parsed);
+      assert(
+        ts.isArrowFunction(handler) || ts.isFunctionExpression(handler),
+        `Dashboard route ${method} ${path} must keep an inline callback for direct capability inspection`,
+      );
+      routes.push({ method, path, handler });
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(parsed);
+  return routes;
+}
+
 function containsStringLiteral(node, expected) {
   let found = false;
   const visit = current => {
@@ -1372,6 +1901,56 @@ function containsIdentifier(node, expected) {
   };
   visit(node);
   return found;
+}
+
+function propertyAccessExpressionsWithin(node, owner, property) {
+  const accesses = [];
+  const visit = current => {
+    if (ts.isPropertyAccessExpression(current)
+        && ts.isIdentifier(current.expression)
+        && current.expression.text === owner
+        && current.name.text === property) {
+      accesses.push(current);
+    }
+    ts.forEachChild(current, visit);
+  };
+  visit(node);
+  return accesses;
+}
+
+function propertyAssignmentsWithin(node, owner, property, valueKind) {
+  const assignments = [];
+  const visit = current => {
+    if (ts.isBinaryExpression(current)
+        && current.operatorToken.kind === ts.SyntaxKind.EqualsToken
+        && ts.isPropertyAccessExpression(current.left)
+        && ts.isIdentifier(current.left.expression)
+        && current.left.expression.text === owner
+        && current.left.name.text === property
+        && (valueKind === undefined || current.right.kind === valueKind)) {
+      assignments.push(current);
+    }
+    ts.forEachChild(current, visit);
+  };
+  visit(node);
+  return assignments;
+}
+
+function ifStatementsWithin(node) {
+  const statements = [];
+  const visit = current => {
+    if (ts.isIfStatement(current)) statements.push(current);
+    ts.forEachChild(current, visit);
+  };
+  visit(node);
+  return statements;
+}
+
+function propertyLiteralIf(node, owner, property, literal) {
+  return ifStatementsWithin(node).filter(statement => (
+    propertyAccessExpressionsWithin(statement.expression, owner, property).length > 0
+      && containsStringLiteral(statement.expression, literal)
+  ));
 }
 
 function awaitExpressionsWithin(node) {
@@ -1464,6 +2043,39 @@ function guardedPortCallback(parsed, scope, guardName, portCall, label) {
   return guards[0];
 }
 
+function validateLaneExternalEffect(parsed, effectRunner, label) {
+  const executeCalls = callExpressionsWithin(effectRunner, 'port.execute');
+  assert(
+    executeCalls.length === 1
+      && !!ancestorWithin(executeCalls[0], effectRunner, ts.isAwaitExpression),
+    `${label} must await exactly one port.execute effect`,
+  );
+  const laneCalls = callExpressionsWithin(effectRunner, 'commandLane.submit');
+  assert(laneCalls.length > 0, `${label} must return through the Session lane`);
+  for (const [index, laneCall] of laneCalls.entries()) {
+    const callback = resolvedTransitionCallback(
+      parsed,
+      laneCall.arguments[1],
+      `${label} Session lane callback ${index + 1}`,
+    );
+    assert(
+      callExpressionsWithin(callback, 'port.execute').length === 0,
+      `${label} Session lane callback must not invoke port.execute`,
+    );
+    assertSynchronousCallback(callback, `${label} Session lane callback ${index + 1}`);
+  }
+  assert(
+    laneCalls.every(laneCall => !nodeContains(laneCall, executeCalls[0])),
+    `${label} port.execute must remain outside every Session lane submission`,
+  );
+  const resumeLaneCalls = laneCalls.filter(laneCall => laneCall.pos > executeCalls[0].end);
+  assert(
+    resumeLaneCalls.length === 1
+      && !!ancestorWithin(resumeLaneCalls[0], effectRunner, ts.isAwaitExpression),
+    `${label} must await exactly one Session lane resume after port.execute`,
+  );
+}
+
 function objectLiteralOwnPropertyNames(node) {
   assert(ts.isObjectLiteralExpression(node), 'production composition options must be an object literal');
   assert(
@@ -1545,6 +2157,575 @@ function validateMigratedProductionBinding(binding, authoritySites) {
   }
 }
 
+function validateControlProductionBinding(binding, authoritySites, assigned) {
+  const ipc = sourceFile(binding.ipcSource);
+  const operationIdReader = findNamedFunction(ipc, binding.operationIdReader);
+  assert(
+    containsIdentifier(operationIdReader, 'operationId')
+      && containsStringLiteral(operationIdReader, 'x-botmux-operation-id')
+      && containsStringLiteral(operationIdReader, 'bad_operation_id')
+      && callExpressionsWithin(operationIdReader, 'randomUUID').length === 0,
+    'C2 Dashboard operation identity must be caller-supplied, exact across body/header, and never regenerated',
+  );
+  const ipcRoutes = ipcRouteCallbacks(ipc);
+  for (const route of ipcRoutes) {
+    verifyNoForbiddenCalls(
+      route.handler,
+      mandatoryIpcRouteForbiddenDirectWriteCalls,
+      `Dashboard route ${route.method} ${route.path}`,
+    );
+  }
+  const reviewedCallerRoutes = new Set(binding.routes
+    .filter(route => route.identitySource === 'caller-supplied')
+    .map(route => `${route.method} ${route.path}`));
+  const discoveredCallerRoutes = new Set();
+  for (const route of ipcRoutes) {
+    const operationReads = callExpressionsWithin(route.handler, binding.operationIdReader);
+    if (operationReads.length === 0) continue;
+    const routeKey = `${route.method} ${route.path}`;
+    assert(
+      reviewedCallerRoutes.has(routeKey),
+      `C2 Dashboard caller-operation route census found unreviewed route ${routeKey}`,
+    );
+    assert(
+      operationReads.length === 1,
+      `C2 Dashboard caller-operation route census requires exactly one identity read in ${routeKey}`,
+    );
+    discoveredCallerRoutes.add(routeKey);
+  }
+  for (const routeKey of reviewedCallerRoutes) {
+    assert(
+      discoveredCallerRoutes.has(routeKey),
+      `C2 Dashboard caller-operation route census is missing reviewed route ${routeKey}`,
+    );
+  }
+  for (const route of binding.routes) {
+    const handler = findIpcRouteHandler(ipc, route.method, route.path);
+    const callerOperationIds = callExpressionsWithin(handler, binding.operationIdReader);
+    assert(
+      route.identitySource === 'derived-trigger-id'
+        ? callerOperationIds.length === 0
+        : callerOperationIds.length === 1,
+      route.identitySource === 'derived-trigger-id'
+        ? `C2 Dashboard route ${route.method} ${route.path} must not invent a caller operation identity`
+        : `C2 Dashboard route ${route.method} ${route.path} must read one stable operation identity`,
+    );
+    const sinkCalls = callExpressionsWithin(handler, route.sink);
+    assert(
+      sinkCalls.length === 1,
+      `C2 Dashboard route ${route.method} ${route.path} must cross ${route.sink} exactly once`,
+    );
+    if (route.identitySource === 'caller-supplied') {
+      const operationDeclaration = ancestorWithin(
+        callerOperationIds[0],
+        handler,
+        ts.isVariableDeclaration,
+      );
+      assert(
+        operationDeclaration
+          && ts.isIdentifier(operationDeclaration.name)
+          && operationDeclaration.initializer
+          && nodeContains(operationDeclaration.initializer, callerOperationIds[0])
+          && propertyAccessExpressionsWithin(
+            sinkCalls[0],
+            operationDeclaration.name.text,
+            'value',
+          ).length === 1,
+        `C2 Dashboard route ${route.method} ${route.path} must flow operationId.value into its ${route.sink} sink`,
+      );
+    }
+    if (route.delegatedFunction !== undefined) {
+      const delegated = findNamedFunction(ipc, route.delegatedFunction);
+      assert(
+        callExpressionsWithin(delegated, route.delegatedSink).length === 1
+          && containsStringLiteral(delegated, route.commandKind)
+          && delegated.getText().includes('trigger-result-fault:')
+          && containsIdentifier(delegated, 'memTriggerId'),
+        `C2 Dashboard route ${route.method} ${route.path} must derive one stable convergence identity and submit ${route.commandKind}`,
+      );
+      verifyNoForbiddenCalls(
+        delegated,
+        binding.forbiddenCallerCalls,
+        `C2 Dashboard delegated caller ${route.delegatedFunction}`,
+      );
+    } else if (route.commandKind !== undefined) {
+      assert(
+        containsStringLiteral(sinkCalls[0], route.commandKind),
+        `C2 Dashboard route ${route.method} ${route.path} must submit ${route.commandKind}`,
+      );
+    }
+    verifyNoForbiddenCalls(
+      handler,
+      binding.forbiddenCallerCalls,
+      `C2 Dashboard caller ${route.method} ${route.path}`,
+    );
+  }
+
+  const client = sourceFile(binding.commandClientSource);
+  const operationKey = findNamedFunction(client, 'operationKey');
+  assert(
+    containsIdentifier(operationKey, 'sessionId')
+      && containsIdentifier(operationKey, 'idempotencyKey')
+      && /\\(?:0|u0000)/.test(operationKey.getText()),
+    'C2 Dashboard external receipt key must bind Session identity and caller operation identity',
+  );
+  const executeExternal = findNamedFunction(client, 'executeExternal');
+  assert(
+    callExpressionsWithin(executeExternal, 'initialHost.projection.read').length === 1
+      && callExpressionsWithin(executeExternal, 'host.projection.read').length === 2
+      && callExpressionsWithin(executeExternal, 'host.runtime.submit').length === 2
+      && containsIdentifier(executeExternal, 'controlRouteReservation')
+      && containsStringLiteral(executeExternal, 'staleAddress'),
+    'C2 Dashboard external-session client must boundedly re-project opaque addresses and submit only through Runtime',
+  );
+  const clientFactory = findNamedFunction(client, binding.commandClientFactory);
+  assert(
+    variableDeclarationsWithin(clientFactory, 'externalAttempts').length === 1
+      && callExpressionsWithin(clientFactory, 'computeInputHash').length === 1
+      && callExpressionsWithin(clientFactory, 'externalAttempts.set').length >= 2
+      && callExpressionsWithin(clientFactory, 'externalAttempts.delete').length === 0
+      && callExpressionsWithin(clientFactory, 'externalAttempts.clear').length === 0,
+    'C2 Dashboard client must retain semantic operation receipts for the daemon epoch',
+  );
+  assert(
+    callExpressionsWithin(clientFactory, 'withBotTurnAdmission').length === 1
+      && callExpressionsWithin(clientFactory, 'host.runtime.submit').length === 1,
+    'C2 Dashboard client must share fleet admission and delegate route commands to Runtime',
+  );
+  const clientSubmit = findNamedFunction(client, 'submit');
+  assert(
+    nodeContains(clientFactory, clientSubmit),
+    'C2 Dashboard external receipt submit must remain inside the daemon-epoch client',
+  );
+  const externalExecuteCalls = callExpressionsWithin(clientSubmit, 'executeExternal');
+  const runningReceiptCalls = callExpressionsWithin(clientSubmit, 'externalAttempts.set')
+    .filter(call => containsStringLiteral(call, 'running'));
+  const terminalAwaits = awaitExpressionsWithin(clientSubmit).filter(awaitExpression => (
+    ts.isIdentifier(awaitExpression.expression)
+      && awaitExpression.expression.text === 'terminal'
+  ));
+  const deferredCallback = externalExecuteCalls.length === 1
+    ? ancestorWithin(
+        externalExecuteCalls[0],
+        clientSubmit,
+        node => ts.isArrowFunction(node) || ts.isFunctionExpression(node),
+      )
+    : undefined;
+  const deferredCall = deferredCallback && ts.isCallExpression(deferredCallback.parent)
+    ? deferredCallback.parent
+    : undefined;
+  const thenExpression = deferredCall && ts.isPropertyAccessExpression(deferredCall.expression)
+    ? deferredCall.expression
+    : undefined;
+  const promiseResolveCall = thenExpression && ts.isCallExpression(thenExpression.expression)
+    ? thenExpression.expression
+    : undefined;
+  assert(
+    externalExecuteCalls.length === 1
+      && runningReceiptCalls.length === 1
+      && terminalAwaits.length === 1
+      && deferredCallback
+      && deferredCall
+      && deferredCall.arguments[0] === deferredCallback
+      && thenExpression?.name.text === 'then'
+      && promiseResolveCall
+      && calledName(promiseResolveCall) === 'Promise.resolve'
+      && promiseResolveCall.arguments.length === 0
+      && deferredCall.end < runningReceiptCalls[0].pos
+      && runningReceiptCalls[0].end < terminalAwaits[0].pos
+      && containsIdentifier(runningReceiptCalls[0], 'terminal'),
+    'C2 Dashboard running receipt must be published before executeExternal starts in a deferred microtask',
+  );
+  const terminalDeclaration = ancestorWithin(
+    deferredCall,
+    clientSubmit,
+    ts.isVariableDeclaration,
+  );
+  const terminalStatement = ancestorWithin(deferredCall, clientSubmit, ts.isVariableStatement);
+  const runningReceiptStatement = ancestorWithin(
+    runningReceiptCalls[0],
+    clientSubmit,
+    ts.isExpressionStatement,
+  );
+  const receiptBlock = terminalStatement?.parent;
+  const terminalStatementIndex = ts.isBlock(receiptBlock)
+    ? receiptBlock.statements.indexOf(terminalStatement)
+    : -1;
+  assert(
+    terminalDeclaration
+      && ts.isIdentifier(terminalDeclaration.name)
+      && terminalDeclaration.name.text === 'terminal'
+      && terminalDeclaration.initializer === deferredCall
+      && ts.isBlock(receiptBlock)
+      && runningReceiptStatement?.parent === receiptBlock
+      && receiptBlock.statements[terminalStatementIndex + 1] === runningReceiptStatement,
+    'C2 Dashboard running receipt must be published immediately after queuing the execution microtask and before yielding to that microtask',
+  );
+  const directProjectionCalls = callExpressionsWithin(clientSubmit, 'projection.read');
+  const directEffectCalls = callExpressionsWithin(clientSubmit, 'execute');
+  assert(
+    [...directProjectionCalls, ...directEffectCalls]
+      .every(call => nodeContains(deferredCallback, call)),
+    'C2 Dashboard running receipt must be published before projection or effect execution; every projection/execute call must remain in the deferred microtask',
+  );
+
+  const runtime = sourceFile(binding.runtimeSource);
+  const runtimeFactory = findNamedFunction(runtime, binding.runtimeFactory);
+  assert(
+    containsStringLiteral(runtimeFactory, 'control.mutate')
+      && containsStringLiteral(runtimeFactory, 'control.rename')
+      && containsIdentifier(runtimeFactory, 'controlMutationPort')
+      && containsIdentifier(runtimeFactory, 'controlRenameEffectPort'),
+    'C2 Runtime must own typed control mutation and rename policy kernels',
+  );
+  const runtimeTransition = findNamedFunction(runtime, 'run');
+  const mutationBeginGuards = callExpressionsWithin(
+    runtimeTransition,
+    'invokeSynchronousPort',
+  ).filter(call => containsStringLiteral(call, 'ControlMutationPort.begin'));
+  const mutationBeginCalls = mutationBeginGuards.flatMap(
+    guard => callExpressionsWithin(guard, 'port.begin'),
+  );
+  assert(
+    mutationBeginCalls.length === 1,
+    'C2 control mutation must have exactly one staged begin transition',
+  );
+  guardedPortCallback(
+    runtime,
+    runtimeTransition,
+    'invokeSynchronousPort',
+    mutationBeginCalls[0],
+    'C2 control mutation begin transition',
+  );
+  const renameBegin = findNamedFunction(runtime, 'beginControlRenameEffect');
+  const renameBeginCalls = callExpressionsWithin(renameBegin, 'port.begin');
+  assert(
+    renameBeginCalls.length === 1,
+    'C2 control rename must have exactly one staged begin transition',
+  );
+  guardedPortCallback(
+    runtime,
+    renameBegin,
+    'invokeSynchronousPort',
+    renameBeginCalls[0],
+    'C2 control rename begin transition',
+  );
+  const mutationResume = findNamedFunction(runtime, binding.mutationResumeFunction);
+  const mutationResumeCalls = callExpressionsWithin(mutationResume, 'port.resume');
+  assert(
+    mutationResumeCalls.length === 1,
+    'C2 control mutation must have exactly one staged resume transition',
+  );
+  guardedPortCallback(
+    runtime,
+    mutationResume,
+    'invokeSynchronousPort',
+    mutationResumeCalls[0],
+    'C2 control mutation resume transition',
+  );
+  const mutationEffects = findNamedFunction(runtime, binding.mutationEffectRunner);
+  validateLaneExternalEffect(runtime, mutationEffects, 'C2 control mutation effect');
+  const renameEffects = findNamedFunction(runtime, binding.renameEffectRunner);
+  validateLaneExternalEffect(runtime, renameEffects, 'C2 native rename effect');
+  const runtimeSubmit = findNamedFunction(runtime, binding.runtimeSubmitFunction);
+  const mutationEffectDispatches = callExpressionsWithin(
+    runtimeSubmit,
+    binding.mutationEffectRunner,
+  );
+  const renameEffectDispatches = callExpressionsWithin(
+    runtimeSubmit,
+    binding.renameEffectRunner,
+  );
+  const submitLaneCalls = callExpressionsWithin(runtimeSubmit, 'commandLane.submit');
+  assert(
+    mutationEffectDispatches.length === 1
+      && renameEffectDispatches.length === 1,
+    'C2 Runtime submit must dispatch each staged control effect through one deep effect runner',
+  );
+  assert(
+    submitLaneCalls.every(laneCall => (
+      !nodeContains(laneCall, mutationEffectDispatches[0])
+        && !nodeContains(laneCall, renameEffectDispatches[0])
+    )),
+    'C2 control mutation effect runner and rename effect runner must execute outside the Session lane',
+  );
+  const terminalEviction = findNamedFunction(runtime, 'retainTerminalIdempotency');
+  assert(
+    !containsIdentifier(terminalEviction, 'controlMutations')
+      && !containsIdentifier(terminalEviction, 'controlCommands'),
+    'C2 applied/unknown control receipts must not enter bounded transport eviction',
+  );
+  const settleControlMutation = findNamedFunction(runtime, 'settleControlMutationTransition');
+  const quarantineControlMutation = findNamedFunction(runtime, 'quarantineControlMutationAttempt');
+  assert(
+    callExpressionsWithin(settleControlMutation, 'controlMutations.set').length === 3
+      && containsStringLiteral(settleControlMutation, 'applied')
+      && containsStringLiteral(settleControlMutation, 'unknown')
+      && callExpressionsWithin(quarantineControlMutation, 'controlMutations.set').length === 1
+      && containsStringLiteral(quarantineControlMutation, 'unknown'),
+    'C2 control mutation must retain applied and response-loss unknown receipts for the Runtime epoch',
+  );
+  const settleControlRename = findNamedFunction(runtime, 'settleControlRename');
+  const settleControlRenameUnknown = findNamedFunction(runtime, 'settleControlRenameUnknown');
+  assert(
+    callExpressionsWithin(settleControlRename, 'controlCommands.set').length === 1
+      && containsStringLiteral(settleControlRename, 'applied')
+      && callExpressionsWithin(settleControlRenameUnknown, 'controlCommands.set').length === 1
+      && containsStringLiteral(settleControlRenameUnknown, 'unknown'),
+    'C2 control rename must retain applied and response-loss unknown receipts for the Runtime epoch',
+  );
+
+  const control = sourceFile(binding.controlSource);
+  const controlFactory = findNamedFunction(control, binding.controlFactory);
+  const controlBegin = findNamedFunction(control, 'begin');
+  const controlExecute = findNamedFunction(control, 'execute');
+  const controlResume = findNamedFunction(control, 'resume');
+  assert(
+    nodeContains(controlFactory, controlBegin)
+      && nodeContains(controlFactory, controlExecute)
+      && nodeContains(controlFactory, controlResume)
+      && awaitExpressionsWithin(controlBegin).length === 0
+      && awaitExpressionsWithin(controlResume).length === 0
+      && awaitExpressionsWithin(controlExecute).length > 0,
+    'C2 Current control Adapter must keep synchronous begin/resume around one lane-external effect',
+  );
+  assert(
+    callExpressionsWithin(controlFactory, 'options.activation.retire').length >= 1
+      && callExpressionsWithin(controlFactory, 'options.activation.ensure').length >= 1
+      && callExpressionsWithin(controlFactory, binding.activationCoordinatorFactory).length === 0,
+    'C2 Current control Adapter must receive the owner/epoch A4 coordinator instead of minting one',
+  );
+
+  // The syntactic writes live in a shared provider and therefore remain in
+  // `remaining-control-bypass`: the census cannot truthfully split one write
+  // site by its callers. The production proof instead fixes the seam: Current
+  // control reaches only the store-owned projection publisher, while the
+  // legacy command path remains visibly attached to the durable direct writer.
+  const cwd = sourceFile(binding.cwdSource);
+  const cwdCurrentPublisher = findNamedFunction(cwd, binding.cwdCurrentPublisher);
+  const cwdRemainingPublisher = findNamedFunction(cwd, binding.cwdRemainingPublisher);
+  assert(
+    callExpressionsWithin(controlFactory, binding.cwdCurrentPublisher).length === 1
+      && callExpressionsWithin(controlFactory, binding.cwdRemainingPublisher).length === 0
+      && callExpressionsWithin(cwdCurrentPublisher, 'assignWorkingDirectory').length === 1
+      && callExpressionsWithin(cwdCurrentPublisher, 'publishWorkingDirectory').length === 1
+      && callExpressionsWithin(cwdCurrentPublisher, 'sessionStore.updateSession').length === 0,
+    'C2 Current cwd projection must cross the non-durable shared publisher exactly once',
+  );
+  assert(
+    callExpressionsWithin(cwdRemainingPublisher, 'assignWorkingDirectory').length === 1
+      && callExpressionsWithin(cwdRemainingPublisher, 'sessionStore.updateSession').length === 1
+      && callExpressionsWithin(cwdRemainingPublisher, 'publishWorkingDirectory').length === 1,
+    'C2 cwd census boundary must keep the legacy durable writer explicit as remaining-control-bypass',
+  );
+
+  const routeRegistry = sourceFile(binding.routeRegistrySource);
+  const routeRegistryFactory = findNamedFunction(routeRegistry, binding.routeRegistryFactory);
+  const dashboardSpawn = findNamedFunction(routeRegistry, 'submitDashboardSpawnRoute');
+  assert(
+    nodeContains(routeRegistryFactory, dashboardSpawn)
+      && callExpressionsWithin(dashboardSpawn, 'opening.inspect').length === 1
+      && callExpressionsWithin(dashboardSpawn, 'opening.begin').length === 1
+      && callExpressionsWithin(dashboardSpawn, 'opening.execute').length === 1
+      && callExpressionsWithin(dashboardSpawn, 'opening.resume').length === 1
+      && !!ancestorWithin(
+        callExpressionsWithin(dashboardSpawn, 'opening.execute')[0],
+        dashboardSpawn,
+        ts.isAwaitExpression,
+      )
+      && containsIdentifier(routeRegistryFactory, 'dashboardSpawnRecords')
+      && containsIdentifier(routeRegistryFactory, 'relocationRecords')
+      && containsIdentifier(routeRegistryFactory, 'routeUnknowns'),
+    'C2 route Adapter must stage Dashboard opening and retain route/relocation uncertainty receipts',
+  );
+  const opening = sourceFile(binding.openingSource);
+  const openingFactory = findNamedFunction(opening, binding.openingFactory);
+  for (const method of ['begin', 'execute', 'resume']) {
+    assert(
+      nodeContains(openingFactory, findNamedFunction(opening, method)),
+      `C2 Dashboard opening Adapter must own ${method}`,
+    );
+  }
+  const openingBarrier = findNamedFunction(
+    sourceFile(binding.dashboardOpeningBarrierSource),
+    binding.dashboardOpeningBarrierFunction,
+  );
+  const openingBarrierText = openingBarrier.getText();
+  assert(
+    callExpressionsWithin(openingBarrier, 'withActiveSessionKeyLock').length === 1
+      && openingBarrierText.includes('dashboardSpawnOpeningPending: true')
+      && openingBarrierText.includes('ds.dashboardSpawnOpeningPending = false')
+      && callExpressionsWithin(openingBarrier, 'forkOrShowRepoCard').length === 1,
+    'C2 Dashboard opening must hold one visible route barrier through worker/repo installation',
+  );
+
+  const maintenance = sourceFile(binding.maintenanceSource);
+  const maintenanceFactory = findNamedFunction(maintenance, binding.maintenanceFactory);
+  assert(
+    containsIdentifier(maintenanceFactory, 'batches')
+      && containsIdentifier(maintenanceFactory, 'agentChangeOperations')
+      && callExpressionsWithin(maintenanceFactory, 'batches.delete').length === 0
+      && callExpressionsWithin(maintenanceFactory, 'batches.clear').length === 0,
+    'C2 host maintenance must retain one fixed candidate batch per stable operation identity',
+  );
+  const chatRename = sourceFile(binding.chatRenameSource);
+  const chatRenameFactory = findNamedFunction(chatRename, binding.chatRenameFactory);
+  assert(
+    containsIdentifier(chatRenameFactory, 'attempts')
+      && callExpressionsWithin(chatRenameFactory, 'computeInputHash').length === 1
+      && callExpressionsWithin(chatRenameFactory, 'attempts.delete').length === 0
+      && callExpressionsWithin(chatRenameFactory, 'attempts.clear').length === 0,
+    'C2 chat rename must retain success/unknown receipts for the daemon epoch',
+  );
+
+  // These are transport receipts rather than Session authority selectors.
+  // They still form part of the C2 caller cut: a retry must reach the same
+  // daemon operation instead of expanding a new aggregate/fleet mutation.
+  const aggregator = sourceFile(binding.aggregatorSource);
+  const createOperationHost = findNamedFunction(
+    aggregator,
+    binding.createOperationHostFactory,
+  );
+  const idleOperationHost = findNamedFunction(
+    aggregator,
+    binding.idleOperationHostFactory,
+  );
+  for (const [label, host] of [
+    ['create-session', createOperationHost],
+    ['idle-cleanup', idleOperationHost],
+  ]) {
+    assert(
+      containsIdentifier(host, 'receipts')
+        && containsStringLiteral(host, 'processLocal')
+        && callExpressionsWithin(host, 'receipts.set').length >= 2
+        && callExpressionsWithin(host, 'receipts.delete').length === 0
+        && callExpressionsWithin(host, 'receipts.clear').length === 0,
+      `C2 Dashboard ${label} parent operation must retain one process-epoch receipt`,
+    );
+  }
+  assert(
+    containsIdentifier(idleOperationHost, 'priorBatch')
+      && callExpressionsWithin(idleOperationHost, 'driveDashboardIdleCleanupAttempt').length === 1,
+    'C2 idle cleanup retries must continue one frozen candidate batch',
+  );
+  const aggregatorOperationId = findNamedFunction(
+    aggregator,
+    binding.aggregatorOperationIdReader,
+  );
+  assert(
+    containsStringLiteral(aggregatorOperationId, 'x-botmux-operation-id')
+      && containsIdentifier(aggregatorOperationId, 'bodyValue')
+      && callExpressionsWithin(aggregatorOperationId, 'randomUUID').length === 0,
+    'C2 Dashboard aggregator must require one matching body/header operation identity',
+  );
+  const idleChildExecutor = findNamedFunction(aggregator, binding.idleChildExecutor);
+  assert(
+    containsStringLiteral(idleChildExecutor, 'x-botmux-operation-id')
+      && containsIdentifier(idleChildExecutor, 'operationId'),
+    'C2 idle cleanup must forward the fixed child operation identity in header and body',
+  );
+  assert(
+    callExpressionsWithin(aggregator, 'dashboardSessionCreateOperations.run').length === 1
+      && callExpressionsWithin(aggregator, 'dashboardIdleCleanupOperations.run').length === 1,
+    'C2 Dashboard aggregator mutation routes must cross their parent receipt hosts exactly once',
+  );
+
+  const webOperations = sourceFile(binding.webOperationSource);
+  const webCoordinator = findNamedClass(webOperations, binding.webOperationCoordinator);
+  const webBegin = findNamedFunction(webOperations, 'begin');
+  const webFinish = findNamedFunction(webOperations, 'finish');
+  const webReconcile = findNamedFunction(webOperations, 'reconcile');
+  assert(
+    nodeContains(webCoordinator, webBegin)
+      && nodeContains(webCoordinator, webFinish)
+      && nodeContains(webCoordinator, webReconcile)
+      && containsStringLiteral(webCoordinator, 'unknown')
+      && containsIdentifier(webFinish, 'disposition')
+      && containsStringLiteral(webCoordinator, 'outcome_unknown'),
+    'C2 browser operation coordinator must reuse retryable identities and quarantine unknown outcomes',
+  );
+
+  const sessionsCard = sourceFile(binding.sessionsCardSource);
+  const sessionsCardBuilder = findNamedFunction(sessionsCard, binding.sessionsCardBuilder);
+  const sessionsCardHandler = findNamedFunction(sessionsCard, binding.sessionsCardHandler);
+  assert(
+    callExpressionsWithin(sessionsCardBuilder, 'randomUUID').length === 1
+      && containsIdentifier(sessionsCardBuilder, 'writeOperationId')
+      && containsIdentifier(sessionsCardBuilder, 'operation_id'),
+    'C2 Sessions card must embed one stable lifecycle operation identity per rendered card',
+  );
+  assert(
+    callExpressionsWithin(sessionsCardHandler, 'validCardOperationId').length === 2
+      && callExpressionsWithin(sessionsCardHandler, 'client.request').length >= 2
+      && containsIdentifier(sessionsCardHandler, 'operationId'),
+    'C2 Sessions card callbacks must validate and forward the rendered operation identity',
+  );
+
+  const routeAdmission = sourceFile(binding.routeAdmissionSource);
+  findNamedFunction(routeAdmission, binding.routeAdmissionFactory);
+  for (const consumer of binding.sharedRouteAdmissionConsumers) {
+    const parsed = sourceFile(consumer.sourceFile);
+    const fn = findNamedFunction(parsed, consumer.enclosingFunction);
+    assert(
+      importedModules(parsed).includes('./current-route-admission.js')
+        && callExpressionsWithin(fn, binding.routeAdmissionFactory).length
+          === consumer.reservationCount,
+      `C2 ${consumer.sourceFile}#${consumer.enclosingFunction} must share the one Current route admission module`,
+    );
+  }
+
+  const currentRuntime = sourceFile(binding.currentRuntimeSource);
+  const currentRuntimeFactory = findNamedFunction(
+    currentRuntime,
+    binding.currentRuntimeFactory,
+  );
+  assert(
+    callExpressionsWithin(currentRuntimeFactory, binding.runtimeFactory).length === 1
+      && containsIdentifier(currentRuntimeFactory, 'controlMutation')
+      && containsIdentifier(currentRuntimeFactory, 'controlRenameEffect'),
+    'C2 Current Host must inject both control ports into the one owner/epoch Runtime',
+  );
+  const daemon = sourceFile(binding.daemonSource);
+  const daemonActivation = findNamedFunction(daemon, binding.daemonActivationFactory);
+  const daemonHost = findNamedFunction(daemon, binding.daemonHostFactory);
+  assert(
+    callExpressionsWithin(daemonActivation, binding.activationCoordinatorFactory).length === 1
+      && containsIdentifier(daemonActivation, 'requireBotId')
+      && containsIdentifier(daemonActivation, 'getDaemonBootId'),
+    'C2 daemon must resolve the A4 coordinator from immutable BotId + boot epoch',
+  );
+  assert(
+    callExpressionsWithin(daemonHost, binding.daemonActivationFactory).length === 1
+      && callExpressionsWithin(daemonHost, binding.currentRuntimeFactory).length === 1
+      && containsIdentifier(daemonHost, 'activation')
+      && containsIdentifier(daemonHost, 'controlMutation'),
+    'C2 daemon Host must inject the same A4 coordinator into control and Runtime composition',
+  );
+  assert(
+    callExpressionsWithin(daemon, binding.commandClientFactory).length === 1
+      && callExpressionsWithin(daemon, 'setDashboardSessionRuntimeSubmitter').length === 1
+      && callExpressionsWithin(daemon, binding.maintenanceFactory).length === 1
+      && callExpressionsWithin(daemon, binding.chatRenameFactory).length === 1,
+    'C2 daemon must install one epoch-stable Dashboard client and its host-level control adapters',
+  );
+
+  for (const site of authoritySites.filter(site => (
+    site.accessLane === 'session-runtime-current-adapter'
+      && [
+        binding.controlSource,
+        binding.openingSource,
+        binding.routeRegistrySource,
+        binding.dashboardOpeningBarrierSource,
+      ].includes(site.sourceFile)
+  ))) {
+    assert(
+      assigned.get(siteIdentity(site)) === 'dashboard-control'
+        || assigned.get(siteIdentity(site)) === 'ordinary-im',
+      `C2 Current authority site escaped an exact migrated caller cut: ${siteIdentity(site)}`,
+    );
+  }
+}
+
 function validateSchedulerProductionBinding(binding, authoritySites) {
   const producer = sourceFile(binding.producerSource);
   const setter = findNamedFunction(producer, binding.submitSetter);
@@ -1607,7 +2788,7 @@ function validateSchedulerProductionBinding(binding, authoritySites) {
   assert(
     effectCalls.length === 1
       && !!ancestorWithin(effectCalls[0], effectRunner, ts.isAwaitExpression)
-      && callExpressionsWithin(effectRunner, 'commandLane.submit').length === 1,
+      && callExpressionsWithin(effectRunner, 'commandLane.submit').length === 2,
     'C4 scheduled external effect must execute outside the lane and resume through one lane submit',
   );
   assert(
@@ -1628,7 +2809,7 @@ function validateSchedulerProductionBinding(binding, authoritySites) {
   const adapter = sourceFile(binding.adapterSource);
   const adapterFactory = findNamedFunction(adapter, binding.adapterFactory);
   assert(
-    callExpressionsWithin(adapterFactory, 'reserveCurrentRouteAdmission').length === 1
+    callExpressionsWithin(adapterFactory, 'reserveCurrentRouteAdmission').length === 2
       && callExpressionsWithin(adapterFactory, 'downstream.runtime.submit').length >= 1,
     'C4 Current adapter must share route admission and submit through the downstream Runtime',
   );
@@ -2027,17 +3208,10 @@ function validateOrdinaryProductionBinding(binding, authoritySites, assigned) {
     );
   }
 
-  const ordinarySources = new Set([
-    binding.ingressCoreSource,
-    'src/core/current-ordinary-ingress-metadata.ts',
-    binding.routeOpeningSource,
-    binding.routeRegistrySource,
-    binding.pendingRepoProductionSource,
-    'src/core/current-pending-repo-completion.ts',
-  ]);
   for (const site of authoritySites.filter(site => (
     site.accessLane === 'session-runtime-current-adapter'
-      && ordinarySources.has(site.sourceFile)
+      && mandatoryOrdinaryAuthoritySelectors
+        .get(site.sourceFile)?.includes(site.enclosingFunction)
   ))) {
     assert(
       assigned.get(siteIdentity(site)) === 'ordinary-im',
@@ -2114,12 +3288,14 @@ function validateSessionLaneProductionBinding(binding) {
   );
   assert(
     targetConditional
-      && containsIdentifier(targetConditional.condition, 'addressSlot')
+      && containsIdentifier(targetConditional.condition, 'laneSessionId')
       && nodeContains(targetConditional.whenTrue, firstTransitionLaneCall)
       && callExpressionsWithin(
         targetConditional.whenFalse,
-        binding.sessionTransitionFunction,
+        'enterLane',
       ).length === 1
+      && callExpressionsWithin(sessionReducer, binding.sessionTransitionFunction).length === 1
+      && containsIdentifier(sessionReducer, 'ownedWaitingControl')
       && containsIdentifier(firstTransitionLaneCall, 'sessionLaneAddress')
       && containsStringLiteral(sessionSubmit, 'session')
       && callExpressionsWithin(sessionSubmit, 'addressSlots.get').length === 1,
@@ -2470,7 +3646,7 @@ function validateProjectionProductionBinding(binding) {
   );
 }
 
-export function auditSessionRuntimeCoverage({ ledger } = {}) {
+function auditSessionRuntimeCoverageActive(ledger) {
   const coverageLedger = ledger ?? JSON.parse(readFileSync(ledgerPath, 'utf8'));
   validateLedgerSchema(coverageLedger);
   const facts = loadFacts();
@@ -2494,6 +3670,12 @@ export function auditSessionRuntimeCoverage({ ledger } = {}) {
       }
     }
     if (entry.id === 'ordinary-im') validateOrdinaryAuthoritySelectors(entry.selectors);
+    if (entry.id === 'dashboard-control') {
+      validateDashboardControlAuthoritySelectors(entry.selectors);
+    }
+    if (entry.id === 'remaining-control-bypass') {
+      validateRemainingControlBypassSelectors(entry.selectors);
+    }
     validateAuthorityDisposition(entry, selected);
     const actual = selectedSiteFacts(selected);
     assert(
@@ -2575,6 +3757,14 @@ export function auditSessionRuntimeCoverage({ ledger } = {}) {
   validateMigratedProductionBinding(keyedTrigger.productionBinding, facts.sites);
   const ordinary = coverageLedger.coverage.find(entry => entry.id === 'ordinary-im');
   validateOrdinaryProductionBinding(ordinary.productionBinding, facts.sites, assigned);
+  const dashboardControl = coverageLedger.coverage.find(
+    entry => entry.id === 'dashboard-control',
+  );
+  validateControlProductionBinding(
+    dashboardControl.productionBinding,
+    facts.sites,
+    assigned,
+  );
   const executor = coverageLedger.coverage.find(entry => entry.id === 'executor-generation');
   validateExecutorProductionBinding(executor.productionBinding, facts.sites, assigned);
   const sessionLane = coverageLedger.coverage.find(entry => entry.id === 'per-session-command-lane');
@@ -2586,6 +3776,25 @@ export function auditSessionRuntimeCoverage({ ledger } = {}) {
   const activation = coverageLedger.coverage.find(entry => entry.id === 'activation-restore');
   validateActivationProductionBinding(activation.productionBinding);
   return { summary: entryCounts.join(', ') };
+}
+
+export function auditSessionRuntimeCoverage({ ledger, sourceOverrides } = {}) {
+  // Mutation-oracle tests replace reviewed source in memory; the CLI never
+  // supplies this seam and always audits files from the checkout.
+  assert(
+    sourceOverrides === undefined || isPlainObject(sourceOverrides),
+    'sourceOverrides must be an object keyed by production source path',
+  );
+  const previousSourceOverrides = activeSourceOverrides;
+  const previousOverrideParsedSources = activeOverrideParsedSources;
+  activeSourceOverrides = sourceOverrides;
+  activeOverrideParsedSources = new Map();
+  try {
+    return auditSessionRuntimeCoverageActive(ledger);
+  } finally {
+    activeSourceOverrides = previousSourceOverrides;
+    activeOverrideParsedSources = previousOverrideParsedSources;
+  }
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === scriptPath) {

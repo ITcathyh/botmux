@@ -72,6 +72,7 @@ vi.mock('../src/core/worker-pool.js', async importOriginal => {
     killStalePids: vi.fn(),
     sweepDeadPidMarkers: vi.fn(),
     getCurrentCliVersion: vi.fn(() => 'test-cli-v1'),
+    getDaemonBootId: vi.fn(() => 'dashboard-create-session-test-boot'),
     restoreUsageLimitRuntimeState: vi.fn(),
     setActiveSessionIfActive: vi.fn((map: Map<string, any>, k: string, ds: any) => {
       if (map.has(k) && map.get(k) !== ds) return false;
@@ -162,6 +163,7 @@ beforeEach(() => {
   store.clear();
   sessionSeq = 0;
   forkWorkerMock.mockClear();
+  forkWorkerMock.mockReturnValue(true);
   sendMessageMock.mockClear();
   uploadImageMock.mockClear();
   replyMessageMock.mockClear();
@@ -1294,15 +1296,16 @@ describe('executeScheduledTask — workerless owner semantics', () => {
     expect(closeWorkerSessionMock).not.toHaveBeenCalled();
   });
 
-  it('retires a scratch owner and creates a fresh scheduled session', async () => {
+  it('fails closed instead of bare-closing a scratch without Current control wiring', async () => {
     const scratch = owner();
     const active = new Map([[sessionKey(ROOT, APP), scratch]]);
 
-    await executeScheduledTask(task(), active, vi.fn());
+    await expect(executeScheduledTask(task(), active, vi.fn()))
+      .rejects.toThrow(/exact closed proof|control/i);
 
-    expect(closeWorkerSessionMock).toHaveBeenCalledWith('existing-owner');
-    expect(active.get(sessionKey(ROOT, APP))).not.toBe(scratch);
-    expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+    expect(closeWorkerSessionMock).not.toHaveBeenCalled();
+    expect(active.get(sessionKey(ROOT, APP))).toBe(scratch);
+    expect(forkWorkerMock).not.toHaveBeenCalled();
   });
 
   it('retains a fresh-session reservation and opening prompt when fork pre-accept throws', async () => {

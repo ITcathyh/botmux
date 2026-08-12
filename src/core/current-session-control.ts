@@ -1,6 +1,5 @@
 /** Current JSON/worker-pool Adapter for staged Session control commands. */
 
-import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import type { Session } from '../types.js';
 import * as legacySessionStore from '../services/session-store.js';
@@ -18,10 +17,13 @@ import {
   type CloseSessionResult,
 } from './worker-pool.js';
 import type { DaemonToWorker } from '../types.js';
-import {
-  ensureCurrentSessionActivation,
-  retireCurrentSessionActivation,
-} from './current-session-activation.js';
+import type { BotId } from './bot-identity.js';
+import type { CurrentSessionActivationCoordinator } from './current-session-activation.js';
+import type {
+  SessionRetirementDisposition,
+  SessionRetirementOutcome,
+  SessionRetirementReason,
+} from './session-activation-runtime.js';
 import type {
   ControlMutationAppliedResult,
   ControlMutationInput,
@@ -42,8 +44,14 @@ import { protectedSessionMutationReasons } from './session-mutation-guard.js';
 import { syncCurrentSessionWorkingDir } from './session-cwd.js';
 import { resolveUnionIdFromOpenId } from '../im/lark/client.js';
 import {
-  isCurrentRelocationRouteReservation,
-} from './current-ordinary-route-registry.js';
+  currentRouteAdmissionKey,
+  isCurrentRouteAdmissionToken,
+  type CurrentRouteAdmissionRoute,
+} from './current-route-admission.js';
+import type {
+  CurrentRouteScratchRetirementPort,
+  CurrentRouteScratchRetirementResult,
+} from './current-route-scratch-retirement.js';
 import {
   isDisposableCurrentRouteScratch,
   isDisposableStoredRouteScratch,
@@ -61,6 +69,8 @@ interface CurrentControlPlan {
   readonly session: Session;
   readonly active?: DaemonSession;
   readonly routeReservation?: unknown;
+  readonly retirementBindingIdentity: string;
+  readonly retirementAttempt: number;
 }
 
 type CurrentMetadataCommand = Extract<ControlMutationInput, {
@@ -73,11 +83,22 @@ type CurrentMetadataCommand = Extract<ControlMutationInput, {
 }>;
 
 type CurrentControlExecution =
+  | {
+      readonly kind: 'activationFence';
+      readonly result: Exclude<SessionRetirementOutcome, { kind: 'retired' }>;
+    }
   | { readonly kind: 'close'; readonly result: CloseSessionResult }
   | { readonly kind: 'activate'; readonly result: Awaited<ReturnType<typeof activateQueuedSession>> }
   | { readonly kind: 'reopen'; readonly result: Awaited<ReturnType<typeof resumeSession>>; readonly wake: boolean; readonly activation?: unknown }
+  | {
+      readonly kind: 'reopenPreparation';
+      readonly result: Extract<
+        CurrentRouteScratchRetirementResult,
+        { kind: 'retryable' | 'unknown' }
+      >;
+    }
   | { readonly kind: 'restart'; readonly revived: boolean; readonly activation?: unknown }
-  | { readonly kind: 'suspend'; readonly suspended: boolean }
+  | { readonly kind: 'suspend'; readonly suspended: boolean; readonly alreadyDormant?: boolean }
   | {
       readonly kind: 'relocate';
       readonly result: Awaited<ReturnType<typeof transferSession>>;
@@ -88,6 +109,7 @@ type CurrentControlExecution =
       readonly mode: 'respawn-resume' | 'cold-restart';
     }
   | { readonly kind: 'injectCommand'; readonly accepted: boolean }
+  | { readonly kind: 'postRetirementUnknown'; readonly message: string }
   | { readonly kind: 'stale' };
 
 type CloseSessionFailure = Exclude<CloseSessionResult, { ok: true }>;
@@ -111,6 +133,21 @@ function controlSessionSnapshot(session: Session): ControlSessionSnapshot {
     rootMessageId: session.rootMessageId,
     ...(session.workingDir ? { workingDir: session.workingDir } : {}),
     ...(session.cliId ? { cliId: session.cliId } : {}),
+  };
+}
+
+function exactRouteForSession(session: Session): CurrentRouteAdmissionRoute | undefined {
+  const scope = session.scope === 'chat' ? 'chat' : 'thread';
+  const canonicalAnchor = scope === 'chat' ? session.chatId : session.rootMessageId;
+  const chatType = session.chatType ?? 'group';
+  if (!session.chatId || !canonicalAnchor || (chatType !== 'group' && chatType !== 'p2p')) {
+    return undefined;
+  }
+  return {
+    scope,
+    canonicalAnchor,
+    chatId: session.chatId,
+    chatType,
   };
 }
 
@@ -411,20 +448,24 @@ function protectedMutationRejection(
 }
 
 export function createCurrentSessionControlPort(options: {
+  readonly ownerBotId: BotId;
   readonly ownerLarkAppId: string;
+  readonly runtimeEpoch: string;
+  readonly activation: CurrentSessionActivationCoordinator;
+  readonly routeScratchRetirement: CurrentRouteScratchRetirementPort;
   readonly activeSessions: Map<string, DaemonSession>;
   readonly sessionStore?: SessionStore;
   /** Owner-bound row resolver for lifecycle planning and exact revalidation. */
   readonly resolveStoredSession?: (sessionId: string) => StoredSessionResolution;
   /** Internal seam for cross-app owner identity resolution. */
   readonly resolveOwnerUnionId?: typeof resolveUnionIdFromOpenId;
-  /** Internal fault-test seam; production verifies capabilities in the shared
-   * Current ordinary-route registry. */
-  readonly isRelocationRouteReservation?: typeof isCurrentRelocationRouteReservation;
+  /** Internal fault-test seam; production verifies capabilities minted by the
+   * shared Current route-admission authority. */
+  readonly isRouteAdmissionToken?: typeof isCurrentRouteAdmissionToken;
 }): ControlMutationPort {
   const store = options.sessionStore ?? legacySessionStore.createCurrentSessionStore({
     ownerLarkAppId: options.ownerLarkAppId,
-    runtimeEpoch: `current-control:${randomUUID()}`,
+    runtimeEpoch: options.runtimeEpoch,
   });
   const resolveStored = options.resolveStoredSession ?? ((sessionId: string): StoredSessionResolution => {
     try {
@@ -442,8 +483,12 @@ export function createCurrentSessionControlPort(options: {
       return 'ambiguous';
     }
   });
-  const relocationReservationIsCurrent = options.isRelocationRouteReservation
-    ?? isCurrentRelocationRouteReservation;
+  const routeAdmissionTokenIsCurrent = options.isRouteAdmissionToken
+    ?? isCurrentRouteAdmissionToken;
+  const routeAdmissionKey = (route: CurrentRouteAdmissionRoute): string => currentRouteAdmissionKey({
+    ownerLarkAppId: options.ownerLarkAppId,
+    ...route,
+  });
   type CurrentControlEffect = {
     readonly plan: CurrentControlPlan;
     readonly phase: 'control' | 'relocateOwnerLookup' | 'relocateTransfer';
@@ -452,12 +497,101 @@ export function createCurrentSessionControlPort(options: {
   const continuations = new WeakMap<object, CurrentControlPlan>();
   const closeFailureReceipts = new Map<string, {
     readonly requestHash: string;
+    readonly nextRetirementAttempt: number;
     readonly result?: CloseSessionFailure;
   }>();
+  const activeBindingIdentities = new WeakMap<
+    DaemonSession,
+    WeakMap<Session, string>
+  >();
+  const storedBindingIdentities = new WeakMap<Session, string>();
+  let nextBindingIdentity = 0;
   const closeReceiptKey = (sessionId: string, operationIdentity: string): string => (
     `${sessionId}\0${operationIdentity}`
   );
+  type PreparedRetirement = {
+    readonly sessionId: string;
+    readonly requestIdentity: string;
+    readonly reason: SessionRetirementReason;
+  };
+  const retirementBindingIdentity = (
+    active: DaemonSession | undefined,
+    session: Session,
+  ): string => {
+    if (!active) {
+      const prior = storedBindingIdentities.get(session);
+      if (prior) return prior;
+      const identity = `stored-${++nextBindingIdentity}`;
+      storedBindingIdentities.set(session, identity);
+      return identity;
+    }
+    let bySession = activeBindingIdentities.get(active);
+    if (!bySession) {
+      bySession = new WeakMap();
+      activeBindingIdentities.set(active, bySession);
+    }
+    const prior = bySession.get(session);
+    if (prior) return prior;
+    const identity = `active-${++nextBindingIdentity}`;
+    bySession.set(session, identity);
+    return identity;
+  };
   const token = (): object => Object.freeze(Object.create(null)) as object;
+  const retireBeforeProvider = async (
+    plan: CurrentControlPlan,
+    operation: string,
+    reason: SessionRetirementReason,
+  ): Promise<
+    | { readonly kind: 'prepared'; readonly retirement: PreparedRetirement }
+    | Extract<CurrentControlExecution, { kind: 'activationFence' }>
+  > => {
+    const requestIdentity = plan.command.kind === 'close' && plan.retirementAttempt > 0
+      ? `control-${operation}-retry:${plan.operationIdentity.length}:${plan.operationIdentity}`
+        + `:${plan.retirementBindingIdentity}:${plan.retirementAttempt}`
+      : `control-${operation}:${plan.operationIdentity}`;
+    const retirement = await options.activation.retire({
+      sessionId: plan.sessionId,
+      requestIdentity,
+      reason,
+    });
+    return retirement.kind === 'retired'
+      ? {
+          kind: 'prepared',
+          retirement: {
+            sessionId: plan.sessionId,
+            requestIdentity,
+            reason,
+          },
+        }
+      : { kind: 'activationFence', result: retirement };
+  };
+  const settleRetirement = async (
+    retirement: PreparedRetirement,
+    disposition: SessionRetirementDisposition,
+  ): Promise<Extract<CurrentControlExecution, { kind: 'postRetirementUnknown' }> | undefined> => {
+    try {
+      const settlement = await options.activation.settleRetirement({
+        ...retirement,
+        disposition,
+      });
+      if (disposition === 'unknown') return undefined;
+      if (settlement.kind === 'settled' && settlement.disposition === disposition) return undefined;
+      return {
+        kind: 'postRetirementUnknown',
+        message: `Current activation retirement could not settle ${disposition}: ${settlement.kind === 'quarantined'
+          ? settlement.message
+          : `Adapter reported ${settlement.disposition}`}`,
+      };
+    } catch (error) {
+      if (disposition === 'unknown') return undefined;
+      return {
+        kind: 'postRetirementUnknown',
+        message: `Current activation retirement ${disposition} settlement failed: ${error instanceof Error
+          ? error.message
+          : String(error)}`,
+      };
+    }
+  };
   const effect = (
     plan: CurrentControlPlan,
     phase: CurrentControlEffect['phase'],
@@ -493,22 +627,20 @@ export function createCurrentSessionControlPort(options: {
             message: 'operation identity already belongs to a different close command',
           };
         }
-        // notApplied retains only the semantic hash: the same operation may
-        // re-drive, but another payload may never capture its identity.
+        // A proven-not-applied provider refusal retains only the semantic
+        // hash. The same command may re-drive, but it must acquire a fresh
+        // activation retirement receipt before invoking the provider again.
         if (priorCloseFailure.result) {
           return closeFailureTransition(priorCloseFailure.result);
         }
       }
-      if (command.kind === 'close' && command.reason === 'relocateScratch') {
+      if (command.kind === 'close' && command.reason === 'routeScratch') {
         const expected = command.expectedRoute;
-        if (expected.scope !== 'chat'
-            || !expected.chatId
-            || expected.canonicalAnchor !== expected.chatId
-            || !relocationReservationIsCurrent({
+        if (!expected.chatId
+            || (expected.scope === 'chat' && expected.canonicalAnchor !== expected.chatId)
+            || !routeAdmissionTokenIsCurrent({
               token: routeReservation,
-              ownerLarkAppId: options.ownerLarkAppId,
-              activeSessions: options.activeSessions,
-              route: { kind: 'chat', chatId: expected.chatId },
+              key: routeAdmissionKey(expected),
             })) {
           return {
             kind: 'rejected',
@@ -587,11 +719,14 @@ export function createCurrentSessionControlPort(options: {
       }
       if (command.kind === 'relocate') {
         const active = exact.active!;
-        if (!relocationReservationIsCurrent({
+        if (!routeAdmissionTokenIsCurrent({
           token: routeReservation,
-          ownerLarkAppId: options.ownerLarkAppId,
-          activeSessions: options.activeSessions,
-          route: { kind: 'chat', chatId: command.targetChatId },
+          key: routeAdmissionKey({
+            scope: 'chat',
+            canonicalAnchor: command.targetChatId,
+            chatId: command.targetChatId,
+            chatType: 'group',
+          }),
         })) {
           return {
             kind: 'rejected',
@@ -652,7 +787,7 @@ export function createCurrentSessionControlPort(options: {
           };
         }
       }
-      if (command.kind === 'close' && command.reason === 'relocateScratch') {
+      if (command.kind === 'close' && command.reason === 'routeScratch') {
         const expected = command.expectedRoute;
         const ownerBindings = [...options.activeSessions.entries()].filter(([, candidate]) => (
           candidate.larkAppId === options.ownerLarkAppId
@@ -664,7 +799,7 @@ export function createCurrentSessionControlPort(options: {
               : ownerBindings.length !== 0)) {
           return {
             kind: 'unknown',
-            message: 'Current relocate scratch has an ambiguous owner/canonical binding',
+            message: 'Current route scratch has an ambiguous owner/canonical binding',
           };
         }
         const routeMatches = exact.active
@@ -674,7 +809,10 @@ export function createCurrentSessionControlPort(options: {
             && sessionAnchorId(exact.active) === expected.canonicalAnchor
           : (exact.session.scope ?? 'thread') === expected.scope
             && exact.session.chatId === expected.chatId
-            && (exact.session.chatType ?? 'group') === expected.chatType;
+            && (exact.session.chatType ?? 'group') === expected.chatType
+            && (expected.scope === 'chat'
+              ? expected.canonicalAnchor === exact.session.chatId
+              : expected.canonicalAnchor === exact.session.rootMessageId);
         const stillDisposable = exact.active
           ? isDisposableCurrentRouteScratch(exact.active)
             && !isSessionTransferring(exact.active)
@@ -782,13 +920,6 @@ export function createCurrentSessionControlPort(options: {
           };
         }
       }
-      if (command.kind === 'suspend'
-        && (!exact.active!.worker || exact.active!.worker!.killed)) {
-        return {
-          kind: 'committed',
-          result: { kind: 'suspended', suspended: false },
-        };
-      }
       if (command.kind === 'reopen' && exact.session.status !== 'closed') {
         return {
           kind: 'rejected',
@@ -796,6 +927,21 @@ export function createCurrentSessionControlPort(options: {
           code: 'not_closed',
           message: 'Current Session is not closed',
         };
+      }
+      if (command.kind === 'reopen') {
+        const targetRoute = exactRouteForSession(exact.session);
+        if (!targetRoute
+            || !routeAdmissionTokenIsCurrent({
+              token: routeReservation,
+              key: targetRoute ? routeAdmissionKey(targetRoute) : '',
+            })) {
+          return {
+            kind: 'rejected',
+            reason: 'invalidCommand',
+            code: 'target_route_not_reserved',
+            message: 'target_route_not_reserved',
+          };
+        }
       }
       if (command.kind === 'changeWorkingDirectory') {
         const metadata = applyWorkingDirectoryMetadata(
@@ -814,6 +960,8 @@ export function createCurrentSessionControlPort(options: {
         session: exact.session,
         ...(exact.active ? { active: exact.active } : {}),
         ...(routeReservation === undefined ? {} : { routeReservation }),
+        retirementBindingIdentity: retirementBindingIdentity(exact.active, exact.session),
+        retirementAttempt: priorCloseFailure?.nextRetirementAttempt ?? 0,
       });
       return effect(
         plan,
@@ -860,48 +1008,157 @@ export function createCurrentSessionControlPort(options: {
         };
       }
       if (plan.command.kind === 'close') {
-        const result = await closeSession(plan.sessionId, {
-          owner: {
-            larkAppId: options.ownerLarkAppId,
-            activeSessions: options.activeSessions,
-          },
-          isCurrent: () => sameBinding(
+        const priorWorker = plan.active?.worker;
+        const priorGeneration = plan.active?.workerGeneration;
+        const routeScratchAuthorityIsCurrent = (): boolean => {
+          if (plan.command.kind !== 'close' || plan.command.reason !== 'routeScratch') {
+            return true;
+          }
+          const expected = plan.command.expectedRoute;
+          if (!routeAdmissionTokenIsCurrent({
+            token: plan.routeReservation,
+            key: routeAdmissionKey(expected),
+          })) return false;
+          const exact = exactOwnedSession(
             options.ownerLarkAppId,
             options.activeSessions,
             resolveStored,
-            plan,
-          ),
-        });
-        if (result.ok) {
-          await retireCurrentSessionActivation({
-            ownerLarkAppId: options.ownerLarkAppId,
-            sessionId: plan.sessionId,
-            requestIdentity: `control-close:${plan.operationIdentity}`,
-            reason: 'explicitClose',
-          });
+            plan.sessionId,
+          );
+          if (!exact || exact === 'ambiguous') return false;
+          const routeMatches = exact.active
+            ? exact.active.scope === expected.scope
+              && exact.active.chatId === expected.chatId
+              && exact.active.chatType === expected.chatType
+              && sessionAnchorId(exact.active) === expected.canonicalAnchor
+            : (exact.session.scope ?? 'thread') === expected.scope
+              && exact.session.chatId === expected.chatId
+              && (exact.session.chatType ?? 'group') === expected.chatType
+              && (expected.scope === 'chat'
+                ? expected.canonicalAnchor === exact.session.chatId
+                : expected.canonicalAnchor === exact.session.rootMessageId);
+          const stillDisposable = exact.active
+            ? isDisposableCurrentRouteScratch(exact.active)
+              && !isSessionTransferring(exact.active)
+            : isDisposableStoredRouteScratch(exact.session);
+          return routeMatches && stillDisposable;
+        };
+        const prepared = await retireBeforeProvider(plan, 'close', 'explicitClose');
+        if (prepared.kind === 'activationFence') return prepared;
+        if (!sameBinding(options.ownerLarkAppId, options.activeSessions, resolveStored, plan)
+            || plan.active?.worker !== priorWorker
+            || plan.active?.workerGeneration !== priorGeneration
+            || !routeScratchAuthorityIsCurrent()) {
+          await settleRetirement(prepared.retirement, 'unknown');
+          return {
+            kind: 'postRetirementUnknown',
+            message: 'Current close binding or route authority changed after activation retirement committed',
+          };
         }
+        let result: CloseSessionResult;
+        try {
+          result = await closeSession(plan.sessionId, {
+            owner: {
+              larkAppId: options.ownerLarkAppId,
+              activeSessions: options.activeSessions,
+            },
+            isCurrent: () => sameBinding(
+              options.ownerLarkAppId,
+              options.activeSessions,
+              resolveStored,
+              plan,
+            ) && routeScratchAuthorityIsCurrent(),
+          });
+        } catch (error) {
+          await settleRetirement(prepared.retirement, 'unknown');
+          throw error;
+        }
+        const settlementFailure = await settleRetirement(
+          prepared.retirement,
+          result.ok ? 'applied' : result.closeDisposition,
+        );
+        if (settlementFailure) return settlementFailure;
         return { kind: 'close', result };
       }
       if (plan.command.kind === 'reopen') {
-        if (!sameBinding(options.ownerLarkAppId, options.activeSessions, resolveStored, plan)) {
+        const expectedRoute = exactRouteForSession(plan.session);
+        const reservationIsCurrent = (): boolean => !!expectedRoute
+          && routeAdmissionTokenIsCurrent({
+            token: plan.routeReservation,
+            key: routeAdmissionKey(expectedRoute),
+          });
+        if (!expectedRoute
+            || !reservationIsCurrent()
+            || !sameBinding(options.ownerLarkAppId, options.activeSessions, resolveStored, plan)) {
           return { kind: 'stale' };
+        }
+        const retirement = await options.routeScratchRetirement.retire({
+          expectedRoute,
+          source: 'resume',
+          parentSessionId: plan.sessionId,
+          parentOperationIdentity: plan.operationIdentity,
+          heldRouteAdmissionToken: plan.routeReservation,
+        });
+        if (retirement.kind !== 'cleared') {
+          if (retirement.kind === 'occupied') {
+            return {
+              kind: 'reopen',
+              result: {
+                ok: false,
+                error: 'anchor_occupied',
+                activeSessionId: retirement.activeSessionId,
+              },
+              wake: plan.command.wake,
+            };
+          }
+          return { kind: 'reopenPreparation', result: retirement };
+        }
+        if (!reservationIsCurrent()
+            || !sameBinding(options.ownerLarkAppId, options.activeSessions, resolveStored, plan)) {
+          return {
+            kind: 'reopenPreparation',
+            result: {
+              kind: 'unknown',
+              message: 'Current reopen target changed after route scratch retirement',
+            },
+          };
         }
         const result = await resumeSession(plan.sessionId, options.activeSessions, {
           owner: {
             larkAppId: options.ownerLarkAppId,
             activeSessions: options.activeSessions,
+            routeConflictPolicy: 'failClosed',
           },
         });
         let activation: unknown;
+        if (result.ok) {
+          const rebound = exactOwnedSession(
+            options.ownerLarkAppId,
+            options.activeSessions,
+            resolveStored,
+            plan.sessionId,
+          );
+          if (!reservationIsCurrent()
+              || rebound === undefined
+              || rebound === 'ambiguous'
+              || rebound.active !== result.ds
+              || rebound.session !== result.ds.session) {
+            return {
+              kind: 'reopenPreparation',
+              result: {
+                kind: 'unknown',
+                message: 'Current reopen committed without an exact published binding',
+              },
+            };
+          }
+        }
         if (result.ok && plan.command.wake) {
-          activation = await ensureCurrentSessionActivation({
-            ownerLarkAppId: options.ownerLarkAppId,
+          activation = await options.activation.ensure({
             sessionId: plan.sessionId,
             requestIdentity: `control-reopen:${plan.operationIdentity}`,
             cause: 'dashboard',
             promptInput: '',
             resumeOrTurnId: true,
-            activeSessions: options.activeSessions,
           });
         }
         return { kind: 'reopen', result, wake: plan.command.wake, activation };
@@ -911,23 +1168,40 @@ export function createCurrentSessionControlPort(options: {
           return { kind: 'stale' };
         }
         const active = plan.active!;
-        if (active.worker && !active.worker.killed) {
+        const worker = active.worker;
+        if (worker && !worker.killed) {
+          const prepared = await retireBeforeProvider(plan, 'restart', 'replacement');
+          if (prepared.kind === 'activationFence') return prepared;
+          if (!sameBinding(options.ownerLarkAppId, options.activeSessions, resolveStored, plan)
+              || active.worker !== worker
+              || worker.killed) {
+            await settleRetirement(prepared.retirement, 'unknown');
+            return {
+              kind: 'postRetirementUnknown',
+              message: 'Current restart binding changed after activation retirement committed',
+            };
+          }
           active.workerReady = false;
-          active.worker.send({
-            type: 'restart',
-            reason: 'operator',
-            env: latestPerBotEnvForRestart(active),
-          } as DaemonToWorker);
+          try {
+            worker.send({
+              type: 'restart',
+              reason: 'operator',
+              env: latestPerBotEnvForRestart(active),
+            } as DaemonToWorker);
+          } catch (error) {
+            await settleRetirement(prepared.retirement, 'unknown');
+            throw error;
+          }
+          const settlementFailure = await settleRetirement(prepared.retirement, 'applied');
+          if (settlementFailure) return settlementFailure;
           return { kind: 'restart', revived: false };
         }
-        const activation = await ensureCurrentSessionActivation({
-          ownerLarkAppId: options.ownerLarkAppId,
+        const activation = await options.activation.ensure({
           sessionId: plan.sessionId,
           requestIdentity: `control-restart:${plan.operationIdentity}`,
           cause: 'dashboard',
           promptInput: '',
           resumeOrTurnId: active.hasHistory,
-          activeSessions: options.activeSessions,
         });
         return { kind: 'restart', revived: true, activation };
       }
@@ -935,35 +1209,79 @@ export function createCurrentSessionControlPort(options: {
         if (!sameBinding(options.ownerLarkAppId, options.activeSessions, resolveStored, plan)) {
           return { kind: 'stale' };
         }
-        return {
-          kind: 'suspend',
-          suspended: suspendWorker(
+        const worker = plan.active!.worker;
+        const prepared = await retireBeforeProvider(plan, 'suspend', 'passivation');
+        if (prepared.kind === 'activationFence') return prepared;
+        if (!sameBinding(options.ownerLarkAppId, options.activeSessions, resolveStored, plan)
+            || plan.active!.worker !== worker) {
+          await settleRetirement(prepared.retirement, 'unknown');
+          return {
+            kind: 'postRetirementUnknown',
+            message: 'Current suspend binding changed after activation retirement committed',
+          };
+        }
+        if (!worker || worker.killed) {
+          const settlementFailure = await settleRetirement(prepared.retirement, 'applied');
+          if (settlementFailure) return settlementFailure;
+          return { kind: 'suspend', suspended: false, alreadyDormant: true };
+        }
+        let suspended: boolean;
+        try {
+          suspended = suspendWorker(
             plan.active!,
             plan.command.kind === 'suspend' && plan.command.source === 'hostOverload'
               ? 'host_overload_suspend'
               : 'manual_suspend',
-          ),
+          );
+        } catch (error) {
+          await settleRetirement(prepared.retirement, 'unknown');
+          throw error;
+        }
+        const settlementFailure = await settleRetirement(
+          prepared.retirement,
+          suspended ? 'applied' : 'notApplied',
+        );
+        if (settlementFailure) return settlementFailure;
+        return {
+          kind: 'suspend',
+          suspended,
         };
       }
       if (current.phase === 'relocateTransfer' && plan.command.kind === 'relocate') {
+        const relocate = plan.command;
         if (!sameBinding(options.ownerLarkAppId, options.activeSessions, resolveStored, plan)) {
           return { kind: 'stale' };
         }
-        const reservationIsCurrent = () => relocationReservationIsCurrent({
+        const reservationIsCurrent = () => routeAdmissionTokenIsCurrent({
           token: plan.routeReservation,
-          ownerLarkAppId: options.ownerLarkAppId,
-          activeSessions: options.activeSessions,
-          route: { kind: 'chat', chatId: plan.command.kind === 'relocate'
-            ? plan.command.targetChatId
-            : '' },
+          key: routeAdmissionKey({
+            scope: 'chat',
+            canonicalAnchor: relocate.targetChatId,
+            chatId: relocate.targetChatId,
+            chatType: 'group',
+          }),
         });
         if (!reservationIsCurrent()) return { kind: 'stale' };
-        return {
-          kind: 'relocate',
-          result: await transferSession(
+        const priorWorker = plan.active!.worker;
+        const priorGeneration = plan.active!.workerGeneration;
+        const prepared = await retireBeforeProvider(plan, 'relocate', 'transfer');
+        if (prepared.kind === 'activationFence') return prepared;
+        if (!sameBinding(options.ownerLarkAppId, options.activeSessions, resolveStored, plan)
+            || !reservationIsCurrent()
+            || plan.active!.worker !== priorWorker
+            || plan.active!.workerGeneration !== priorGeneration) {
+          await settleRetirement(prepared.retirement, 'unknown');
+          return {
+            kind: 'postRetirementUnknown',
+            message: 'Current relocate binding changed after activation retirement committed',
+          };
+        }
+        let result: Awaited<ReturnType<typeof transferSession>>;
+        try {
+          result = await transferSession(
             plan.sessionId,
-            plan.command.targetChatId,
-            plan.command.targetRootMessageId,
+            relocate.targetChatId,
+            relocate.targetRootMessageId,
             'group',
             'chat',
             {
@@ -979,12 +1297,47 @@ export function createCurrentSessionControlPort(options: {
               ),
               isTargetRouteReservationCurrent: reservationIsCurrent,
             },
-          ),
+          );
+        } catch (error) {
+          await settleRetirement(prepared.retirement, 'unknown');
+          throw error;
+        }
+        const settlementFailure = await settleRetirement(
+          prepared.retirement,
+          result.ok ? 'applied' : 'unknown',
+        );
+        if (settlementFailure) return settlementFailure;
+        return {
+          kind: 'relocate',
+          result,
         };
       }
       if (plan.command.kind === 'changeWorkingDirectory') {
         if (!sameBinding(options.ownerLarkAppId, options.activeSessions, resolveStored, plan)) {
-          return { kind: 'stale' };
+          return {
+            kind: 'postRetirementUnknown',
+            message: 'Current cwd binding changed after metadata committed',
+          };
+        }
+        const priorWorker = plan.active!.worker;
+        const prepared = await retireBeforeProvider(
+          plan,
+          'cd',
+          priorWorker && !priorWorker.killed ? 'replacement' : 'passivation',
+        );
+        if (prepared.kind === 'activationFence') {
+          return {
+            kind: 'postRetirementUnknown',
+            message: `Current cwd metadata committed before activation retirement settled: ${prepared.result.message}`,
+          };
+        }
+        if (!sameBinding(options.ownerLarkAppId, options.activeSessions, resolveStored, plan)
+            || plan.active!.worker !== priorWorker) {
+          await settleRetirement(prepared.retirement, 'unknown');
+          return {
+            kind: 'postRetirementUnknown',
+            message: 'Current cwd binding changed after metadata and activation retirement committed',
+          };
         }
         const active = plan.active!;
         if (active.worker && !active.worker.killed) {
@@ -995,13 +1348,19 @@ export function createCurrentSessionControlPort(options: {
               updateWorkingDir: plan.command.resolvedPath,
               env: latestPerBotEnvForRestart(active),
             } as DaemonToWorker);
+            const settlementFailure = await settleRetirement(prepared.retirement, 'applied');
+            if (settlementFailure) return settlementFailure;
             return { kind: 'changeWorkingDirectory', mode: 'respawn-resume' };
           } catch {
             killWorker(active);
+            const settlementFailure = await settleRetirement(prepared.retirement, 'applied');
+            if (settlementFailure) return settlementFailure;
             return { kind: 'changeWorkingDirectory', mode: 'cold-restart' };
           }
         }
         killWorker(active);
+        const settlementFailure = await settleRetirement(prepared.retirement, 'applied');
+        if (settlementFailure) return settlementFailure;
         return { kind: 'changeWorkingDirectory', mode: 'cold-restart' };
       }
       const active = plan.active;
@@ -1030,6 +1389,19 @@ export function createCurrentSessionControlPort(options: {
         return { kind: 'unknown', message: 'Current control Adapter returned no settlement proof' };
       }
       if (execution.kind === 'stale') return { kind: 'staleAddress' };
+      if (execution.kind === 'postRetirementUnknown') {
+        return { kind: 'unknown', message: execution.message };
+      }
+      if (execution.kind === 'activationFence') {
+        return execution.result.kind === 'retryable'
+          ? { kind: 'retryable', message: execution.result.message }
+          : { kind: 'quarantined', message: execution.result.message };
+      }
+      if (execution.kind === 'reopenPreparation') {
+        return execution.result.kind === 'retryable'
+          ? { kind: 'retryable', message: execution.result.message }
+          : { kind: 'unknown', message: execution.result.message };
+      }
       if (execution.kind === 'relocateOwnerResolved') {
         if (plan.command.kind !== 'relocate') {
           return { kind: 'unknown', message: 'relocate owner lookup lost its command' };
@@ -1068,6 +1440,7 @@ export function createCurrentSessionControlPort(options: {
         const receipt = Object.freeze({ ...result });
         closeFailureReceipts.set(closeReceiptKey(plan.sessionId, plan.operationIdentity), {
           requestHash: plan.requestHash,
+          nextRetirementAttempt: plan.retirementAttempt + 1,
           ...(result.closeDisposition === 'unknown' ? { result: receipt } : {}),
         });
         return closeFailureTransition(receipt);
@@ -1115,8 +1488,10 @@ export function createCurrentSessionControlPort(options: {
           if (activation.kind === 'retryable') {
             return { kind: 'retryable', message: String(activation.message) };
           }
-          if (activation.kind === 'stale') return { kind: 'staleAddress' };
-          if (activation.kind === 'ambiguous' || activation.kind === 'quarantined') {
+          if (activation.kind === 'staleBeforeEffect') return { kind: 'staleAddress' };
+          if (activation.kind === 'ambiguous'
+              || activation.kind === 'quarantined'
+              || activation.kind === 'unknownAfterEffect') {
             return { kind: 'unknown', message: String(activation.message) };
           }
           if (activation.kind === 'rejected') {
@@ -1133,6 +1508,9 @@ export function createCurrentSessionControlPort(options: {
         };
       }
       if (execution.kind === 'suspend') {
+        if (execution.alreadyDormant) {
+          return { kind: 'committed', result: { kind: 'suspended', suspended: false } };
+        }
         return execution.suspended
           ? { kind: 'committed', result: { kind: 'suspended', suspended: true } }
           : {
@@ -1145,7 +1523,10 @@ export function createCurrentSessionControlPort(options: {
       if (execution.kind === 'relocate') {
         if (!execution.result.ok) {
           return execution.result.error === 'session_not_active'
-            ? { kind: 'staleAddress' }
+            ? {
+                kind: 'unknown',
+                message: 'Session activation retired before relocation binding became stale',
+              }
             : {
                 kind: 'rejected',
                 reason: 'transitionRejected',
@@ -1217,7 +1598,8 @@ export function createCurrentSessionControlPort(options: {
           executor = activation.action === 'deferred' ? 'deferred' : 'active';
         } else if (activation.kind === 'ambiguous'
             || activation.kind === 'quarantined'
-            || activation.kind === 'stale') {
+            || activation.kind === 'staleBeforeEffect'
+            || activation.kind === 'unknownAfterEffect') {
           executor = 'unknown';
         }
       }
@@ -1236,22 +1618,55 @@ export function createCurrentSessionControlPort(options: {
 
 const portsByRegistry = new WeakMap<
   Map<string, DaemonSession>,
-  Map<string, ControlMutationPort>
+  Map<BotId, {
+    readonly ownerBotId: BotId;
+    readonly ownerLarkAppId: string;
+    readonly runtimeEpoch: string;
+    readonly activation: CurrentSessionActivationCoordinator;
+    readonly routeScratchRetirement: CurrentRouteScratchRetirementPort;
+    readonly port: ControlMutationPort;
+  }>
 >();
 
 export function currentSessionControlPort(options: {
+  readonly ownerBotId: BotId;
   readonly ownerLarkAppId: string;
+  readonly runtimeEpoch: string;
+  readonly activation: CurrentSessionActivationCoordinator;
+  readonly routeScratchRetirement: CurrentRouteScratchRetirementPort;
   readonly activeSessions: Map<string, DaemonSession>;
 }): ControlMutationPort {
+  if (!options.runtimeEpoch
+      || options.runtimeEpoch.trim() !== options.runtimeEpoch
+      || options.runtimeEpoch.includes('\0')) {
+    throw new Error('Current control runtime epoch must be an exact non-empty identity');
+  }
   let byOwner = portsByRegistry.get(options.activeSessions);
   if (!byOwner) {
     byOwner = new Map();
     portsByRegistry.set(options.activeSessions, byOwner);
   }
-  let port = byOwner.get(options.ownerLarkAppId);
-  if (!port) {
-    port = createCurrentSessionControlPort(options);
-    byOwner.set(options.ownerLarkAppId, port);
+  const cached = byOwner.get(options.ownerBotId);
+  if (cached && cached.ownerLarkAppId !== options.ownerLarkAppId) {
+    throw new Error('Current control Bot is already bound to a different Lark App');
   }
+  if (cached?.runtimeEpoch === options.runtimeEpoch) {
+    if (cached.activation !== options.activation) {
+      throw new Error('Current control owner epoch already has a different activation coordinator');
+    }
+    if (cached.routeScratchRetirement !== options.routeScratchRetirement) {
+      throw new Error('Current control owner epoch already has a different route scratch retirement port');
+    }
+    return cached.port;
+  }
+  const port = createCurrentSessionControlPort(options);
+  byOwner.set(options.ownerBotId, {
+    ownerBotId: options.ownerBotId,
+    ownerLarkAppId: options.ownerLarkAppId,
+    runtimeEpoch: options.runtimeEpoch,
+    activation: options.activation,
+    routeScratchRetirement: options.routeScratchRetirement,
+    port,
+  });
   return port;
 }

@@ -19,6 +19,30 @@ function cloneLedger(): Record<string, any> {
   return structuredClone(checkedInLedger());
 }
 
+function productionSource(path: string): string {
+  return readFileSync(resolve(repoRoot, path), 'utf8');
+}
+
+function replaceAfter(
+  source: string,
+  anchor: string,
+  before: string,
+  after: string,
+): string {
+  const anchorIndex = source.indexOf(anchor);
+  expect(anchorIndex, `missing mutation anchor ${anchor}`).toBeGreaterThanOrEqual(0);
+  const beforeIndex = source.indexOf(before, anchorIndex);
+  expect(beforeIndex, `missing mutation target after ${anchor}`).toBeGreaterThanOrEqual(0);
+  return source.slice(0, beforeIndex) + after + source.slice(beforeIndex + before.length);
+}
+
+function auditWithSourceOverride(path: string, source: string): void {
+  auditSessionRuntimeCoverage({
+    ledger: cloneLedger(),
+    sourceOverrides: { [path]: source },
+  });
+}
+
 describe('SessionRuntime coverage ledger', () => {
   it('proves the checked-in migration and remaining-bypass coverage from source', () => {
     const result = spawnSync(process.execPath, [auditScript], {
@@ -134,12 +158,270 @@ describe('SessionRuntime coverage ledger', () => {
       .toThrow(/projection\.productionBinding\.aggregatorSource/);
   });
 
-  it('rejects a selector whose named production symbol disappeared', () => {
+  it('rejects a Dashboard selector whose exact Current symbol disappeared', () => {
     const ledger = cloneLedger();
-    const control = ledger.coverage.find((entry: any) => entry.id === 'control');
+    const control = ledger.coverage.find((entry: any) => entry.id === 'dashboard-control');
     control.selectors[0].enclosingFunctions = ['removedControlEntrypoint'];
     expect(() => auditSessionRuntimeCoverage({ ledger }))
-      .toThrow(/selector.*matched no authority sites|missing.*removedControlEntrypoint/i);
+      .toThrow(/dashboard-control selectors.*exact reviewed/i);
+  });
+
+  it('locks C2 to a migrated Dashboard caller cut plus a non-zero direct remainder', () => {
+    const ledger = cloneLedger();
+    const dashboard = ledger.coverage.find((entry: any) => entry.id === 'dashboard-control');
+    const remaining = ledger.coverage.find(
+      (entry: any) => entry.id === 'remaining-control-bypass',
+    );
+    const projection = ledger.coverage.find((entry: any) => entry.id === 'projection');
+
+    expect(ledger.coverage.some((entry: any) => entry.id === 'control')).toBe(false);
+    expect(dashboard).toMatchObject({
+      targetMilestone: 'C2',
+      disposition: 'migrated',
+      authoritySites: { recordCount: 8, mutationCount: 8 },
+      productionBinding: { operationReceiptDurability: 'daemonEpoch' },
+    });
+    expect(remaining).toMatchObject({
+      targetMilestone: 'C2',
+      disposition: 'remaining',
+      authoritySites: { recordCount: 86, mutationCount: 86 },
+    });
+    expect(remaining.authoritySites.mutationCount).toBeGreaterThan(0);
+    expect(remaining.productionBinding).toBeUndefined();
+    expect(projection).toMatchObject({
+      targetMilestone: 'C3',
+      disposition: 'migrated',
+      authoritySites: { recordCount: 23, mutationCount: 23 },
+    });
+  });
+
+  it.each([
+    ['src/core/current-dashboard-route-opening.ts', 'inspectCurrentDashboardRoute'],
+    ['src/core/current-ordinary-route-registry.ts', 'inspectRelocationTarget'],
+    ['src/core/current-session-control.ts', 'convergeAsyncTriggerFault'],
+    ['src/core/current-session-control.ts', 'execute'],
+    ['src/core/session-manager.ts', 'spawnDashboardSession'],
+  ])('rejects deleting exact C2 authority %s#%s', (sourceFile, enclosingFunction) => {
+    const ledger = cloneLedger();
+    const dashboard = ledger.coverage.find((entry: any) => entry.id === 'dashboard-control');
+    const selector = dashboard.selectors.find((candidate: any) => (
+      candidate.sourceFile === sourceFile
+      && candidate.enclosingFunctions?.includes(enclosingFunction)
+    ));
+    if (selector.enclosingFunctions.length === 1) {
+      dashboard.selectors = dashboard.selectors.filter((candidate: any) => candidate !== selector);
+    } else {
+      selector.enclosingFunctions = selector.enclosingFunctions
+        .filter((name: string) => name !== enclosingFunction);
+    }
+
+    expect(() => auditSessionRuntimeCoverage({ ledger }))
+      .toThrow(/dashboard-control selectors.*exact reviewed/i);
+  });
+
+  it('rejects a whole-file Dashboard authority selector', () => {
+    const ledger = cloneLedger();
+    const dashboard = ledger.coverage.find((entry: any) => entry.id === 'dashboard-control');
+    delete dashboard.selectors[0].enclosingFunctions;
+
+    expect(() => auditSessionRuntimeCoverage({ ledger }))
+      .toThrow(/dashboard-control selectors must name only exact reviewed functions/i);
+  });
+
+  it('requires the trigger-result convergence route and its trigger-derived identity', () => {
+    const withoutRoute = cloneLedger();
+    const dashboard = withoutRoute.coverage.find(
+      (entry: any) => entry.id === 'dashboard-control',
+    );
+    dashboard.productionBinding.routes = dashboard.productionBinding.routes
+      .filter((route: any) => route.path !== '/api/sessions/:sessionId/trigger-result');
+    expect(() => auditSessionRuntimeCoverage({ ledger: withoutRoute }))
+      .toThrow(/routes must cover every reviewed Dashboard mutation route/i);
+
+    const wrongIdentity = cloneLedger();
+    const triggerRoute = wrongIdentity.coverage
+      .find((entry: any) => entry.id === 'dashboard-control')
+      .productionBinding.routes
+      .find((route: any) => route.path === '/api/sessions/:sessionId/trigger-result');
+    triggerRoute.identitySource = 'caller-supplied';
+    expect(() => auditSessionRuntimeCoverage({ ledger: wrongIdentity }))
+      .toThrow(/trigger-result\.identitySource must be derived-trigger-id/i);
+  });
+
+  it('rejects weakening the C2 direct Current capability fence', () => {
+    const ledger = cloneLedger();
+    const dashboard = ledger.coverage.find((entry: any) => entry.id === 'dashboard-control');
+    dashboard.productionBinding.forbiddenCallerCalls =
+      dashboard.productionBinding.forbiddenCallerCalls
+        .filter((call: string) => call !== 'getActiveSessionsRegistry');
+
+    expect(() => auditSessionRuntimeCoverage({ ledger }))
+      .toThrow(/forbiddenCallerCalls.*exact direct Current capability fence/i);
+  });
+
+  it('reverse-censuses every caller-operation-bearing Dashboard route', () => {
+    const path = 'src/core/dashboard-ipc-server.ts';
+    const source = productionSource(path);
+    const mutated = `${source}\n` + [
+      "ipcRoute('POST', '/api/sessions/:sessionId/unreviewed-control', async (req, res, params) => {",
+      '  const operationId = sessionOperationId(req, {});',
+      '  await dashboardSessionRuntimeSubmitter?.({',
+      "    target: { kind: 'externalSession', sessionId: params.sessionId },",
+      '    idempotencyKey: operationId.value,',
+      "    command: { kind: 'control.mutate', input: { kind: 'close' } },",
+      '  });',
+      '  jsonRes(res, 200, { ok: true });',
+      '});',
+    ].join('\n');
+
+    expect(() => auditWithSourceOverride(path, mutated))
+      .toThrow(/caller-operation route census.*unreviewed-control/i);
+  });
+
+  it('scans every Dashboard route callback for direct-write capabilities', () => {
+    const path = 'src/core/dashboard-ipc-server.ts';
+    const source = productionSource(path);
+    const mutated = replaceAfter(
+      source,
+      "ipcRoute('GET', '/__health'",
+      "(_req, res) => {",
+      "(_req, res) => {\n  sessionStore.updateSession('unreviewed' as never, {} as never);",
+    );
+
+    expect(() => auditWithSourceOverride(path, mutated))
+      .toThrow(/Dashboard route GET \/__health.*forbidden direct-write capability.*sessionStore\.updateSession/i);
+  });
+
+  it('proves each caller operation identity reaches its reviewed command sink', () => {
+    const path = 'src/core/dashboard-ipc-server.ts';
+    const source = productionSource(path);
+    const mutated = replaceAfter(
+      source,
+      "ipcRoute('POST', '/api/sessions/:sessionId/close'",
+      'idempotencyKey: operationId.value,',
+      "idempotencyKey: 'constant-operation-id',",
+    );
+
+    expect(() => auditWithSourceOverride(path, mutated))
+      .toThrow(/POST \/api\/sessions\/:sessionId\/close.*operationId\.value.*sink/i);
+  });
+
+  it('proves the external running receipt is visible before execution can start', () => {
+    const path = 'src/core/current-dashboard-session-command-client.ts';
+    const source = productionSource(path);
+    let mutated = replaceAfter(
+      source,
+      'const submit = async',
+      'const terminal = Promise.resolve().then(() => executeExternal(',
+      'const terminal = executeExternal(',
+    );
+    mutated = replaceAfter(
+      mutated,
+      'const terminal = executeExternal(',
+      '      externalInput,\n    ));',
+      '      externalInput,\n    );',
+    );
+
+    expect(() => auditWithSourceOverride(path, mutated))
+      .toThrow(/running receipt.*before.*executeExternal|executeExternal.*deferred microtask/i);
+  });
+
+  it('rejects an external projection started before the running receipt', () => {
+    const path = 'src/core/current-dashboard-session-command-client.ts';
+    const source = productionSource(path);
+    const mutated = replaceAfter(
+      source,
+      'const submit = async',
+      'const terminal = Promise.resolve().then(() => executeExternal(',
+      "await host.projection.read({ kind: 'session', sessionId: input.target.sessionId });\n    const terminal = Promise.resolve().then(() => executeExternal(",
+    );
+
+    expect(() => auditWithSourceOverride(path, mutated))
+      .toThrow(/running receipt.*before.*projection|projection.*deferred microtask/i);
+  });
+
+  it('rejects yielding to the execution microtask before publishing the running receipt', () => {
+    const path = 'src/core/current-dashboard-session-command-client.ts';
+    const source = productionSource(path);
+    const mutated = replaceAfter(
+      source,
+      'const submit = async',
+      '    externalAttempts.set(key, { requestHash, state:',
+      "    await Promise.resolve();\n    externalAttempts.set(key, { requestHash, state:",
+    );
+
+    expect(() => auditWithSourceOverride(path, mutated))
+      .toThrow(/running receipt.*immediately after.*microtask|before yielding.*microtask/i);
+  });
+
+  it('rejects a control effect executed from inside a Session lane callback', () => {
+    const path = 'src/core/session-runtime.ts';
+    const source = productionSource(path);
+    const mutated = replaceAfter(
+      source,
+      'const runControlMutationEffects = async',
+      'await port.execute(step.intent)',
+      'await commandLane.submit(sessionLaneAddress(step.sessionId), async () => await port.execute(step.intent))',
+    );
+
+    expect(() => auditWithSourceOverride(path, mutated))
+      .toThrow(/control mutation.*lane callback.*port\.execute|lane callback.*must not.*await/i);
+  });
+
+  it('rejects dispatching the control effect runner from inside the Session lane', () => {
+    const path = 'src/core/session-runtime.ts';
+    const source = productionSource(path);
+    const mutated = replaceAfter(
+      source,
+      "if (result.kind === 'controlMutationEffect')",
+      'return await runControlMutationEffects(result)',
+      'return await commandLane.submit(sessionLaneAddress(result.sessionId), () => runControlMutationEffects(result))',
+    );
+
+    expect(() => auditWithSourceOverride(path, mutated))
+      .toThrow(/control mutation effect runner.*outside.*Session lane/i);
+  });
+
+  it('requires reopen cleanup to share the reviewed Current route admission', () => {
+    const ledger = cloneLedger();
+    const dashboard = ledger.coverage.find((entry: any) => entry.id === 'dashboard-control');
+    dashboard.productionBinding.sharedRouteAdmissionConsumers =
+      dashboard.productionBinding.sharedRouteAdmissionConsumers
+        .filter((consumer: any) => (
+          consumer.sourceFile !== 'src/core/current-reopen-route-admission.ts'
+        ));
+
+    expect(() => auditSessionRuntimeCoverage({ ledger }))
+      .toThrow(/sharedRouteAdmissionConsumers must cover every reviewed route producer/i);
+  });
+
+  it('rejects a drifted shared route-admission reservation count', () => {
+    const ledger = cloneLedger();
+    const dashboard = ledger.coverage.find((entry: any) => entry.id === 'dashboard-control');
+    const scheduled = dashboard.productionBinding.sharedRouteAdmissionConsumers
+      .find((consumer: any) => consumer.sourceFile === 'src/core/current-scheduled-fire.ts');
+    scheduled.reservationCount += 1;
+
+    expect(() => auditSessionRuntimeCoverage({ ledger }))
+      .toThrow(/current-scheduled-fire.*reservationCount must be 2/i);
+  });
+
+  it.each([
+    ['Runtime effect runner', 'mutationEffectRunner'],
+    ['Runtime resume transition', 'mutationResumeFunction'],
+    ['A4 daemon coordinator', 'daemonActivationFactory'],
+    ['Dashboard create receipt host', 'createOperationHostFactory'],
+    ['Dashboard operation identity reader', 'aggregatorOperationIdReader'],
+    ['browser operation coordinator', 'webOperationCoordinator'],
+    ['Sessions card operation identity', 'sessionsCardBuilder'],
+    ['shared cwd Current publisher', 'cwdCurrentPublisher'],
+  ])('rejects deleting the C2 production proof for %s', (_label, field) => {
+    const ledger = cloneLedger();
+    const dashboard = ledger.coverage.find((entry: any) => entry.id === 'dashboard-control');
+    dashboard.productionBinding[field] = `removed-${field}`;
+
+    expect(() => auditSessionRuntimeCoverage({ ledger }))
+      .toThrow(new RegExp(`dashboard-control\\.productionBinding\\.${field}`, 'i'));
   });
 
   it('binds coverage claims to the reviewed authority inventory digest', () => {
@@ -440,6 +722,48 @@ describe('SessionRuntime coverage ledger', () => {
       .toThrow(/activation-restore\.productionBinding\.daemonFactory/i);
   });
 
+  it('rejects clearing backend quarantine while retirement is only prepared', () => {
+    const path = 'src/core/current-session-activation.ts';
+    const source = productionSource(path);
+    const mutated = replaceAfter(
+      source,
+      'retire(request): SessionRetirementOutcome',
+      'quarantine.pendingRetirements.add(key);',
+      'quarantines.delete(request.sessionId);',
+    );
+
+    expect(() => auditWithSourceOverride(path, mutated))
+      .toThrow(/retirement prepare.*without clearing backend quarantine/i);
+  });
+
+  it('rejects dropping prior backend-unknown evidence after a notApplied provider result', () => {
+    const path = 'src/core/current-session-activation.ts';
+    const source = productionSource(path);
+    const mutated = replaceAfter(
+      source,
+      'settleRetirement(request): SessionRetirementSettlementOutcome',
+      '!quarantine.backendUnknown && quarantine.pendingRetirements.size === 0',
+      'quarantine.pendingRetirements.size === 0',
+    );
+
+    expect(() => auditWithSourceOverride(path, mutated))
+      .toThrow(/notApplied settlement.*preserve prior backend-unknown evidence/i);
+  });
+
+  it('rejects making an unknown retirement settlement reactivatable', () => {
+    const path = 'src/core/current-session-activation.ts';
+    const source = productionSource(path);
+    const mutated = replaceAfter(
+      source,
+      'settleRetirement(request): SessionRetirementSettlementOutcome',
+      'quarantine.backendUnknown = true;',
+      'quarantine.backendUnknown = false;',
+    );
+
+    expect(() => auditWithSourceOverride(path, mutated))
+      .toThrow(/unknown retirement settlement.*remain sticky/i);
+  });
+
   it('rejects deleting an existing/route one-submit caller proof', () => {
     const ledger = cloneLedger();
     const ordinary = ledger.coverage.find((entry: any) => entry.id === 'ordinary-im');
@@ -469,10 +793,13 @@ describe('SessionRuntime coverage ledger', () => {
       .toThrow(/forbiddenLegacyIdentifiers.*(exact legacy|must not be empty)|legacy ordinary/i);
   });
 
-  it('keeps ordinary migrated selectors exact and mid-session repo in C2', () => {
+  it('keeps ordinary and Dashboard selectors exact while shared providers stay remaining', () => {
     const ledger = cloneLedger();
     const ordinary = ledger.coverage.find((entry: any) => entry.id === 'ordinary-im');
-    const control = ledger.coverage.find((entry: any) => entry.id === 'control');
+    const dashboard = ledger.coverage.find((entry: any) => entry.id === 'dashboard-control');
+    const remaining = ledger.coverage.find(
+      (entry: any) => entry.id === 'remaining-control-bypass',
+    );
 
     expect(ordinary.selectors.every((selector: any) => (
       selector.accessLanes?.length === 1
@@ -485,9 +812,26 @@ describe('SessionRuntime coverage ledger', () => {
         || name === 'runCurrentOrdinaryOpeningPostCommit'
       ))
     ))).toBe(false);
-    expect(control.selectors.some((selector: any) => (
+    expect(dashboard.selectors.every((selector: any) => (
+      selector.enclosingFunctions?.length > 0
+      && selector.accessLanes?.length === 1
+      && selector.accessLanes[0] === 'session-runtime-current-adapter'
+    ))).toBe(true);
+    expect(dashboard.selectors.some((selector: any) => (
+      selector.sourceFile === 'src/core/session-cwd.ts'
+    ))).toBe(false);
+    expect(remaining.selectors.every((selector: any) => (
+      selector.enclosingFunctions?.length > 0
+      && selector.accessLanes === undefined
+    ))).toBe(true);
+    expect(remaining.selectors.some((selector: any) => (
       selector.sourceFile === 'src/im/lark/card-handler.ts'
       && selector.enclosingFunctions?.includes('commitRepoSelection')
+    ))).toBe(true);
+    expect(remaining.selectors.some((selector: any) => (
+      selector.sourceFile === 'src/core/session-cwd.ts'
+      && selector.enclosingFunctions?.includes('assignWorkingDirectory')
+      && selector.enclosingFunctions?.includes('repinSessionWorkingDir')
     ))).toBe(true);
   });
 

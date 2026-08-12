@@ -11,9 +11,12 @@ import {
 import { currentSessionRuntimeHost } from '../src/core/current-session-runtime.js';
 import {
   createCurrentOrdinaryRouteRegistryRuntime,
-  isCurrentRelocationRouteReservation,
   type CurrentOrdinaryRouteOpeningRollbackToken,
 } from '../src/core/current-ordinary-route-registry.js';
+import {
+  currentRouteAdmissionKey,
+  isCurrentRouteAdmissionToken,
+} from '../src/core/current-route-admission.js';
 import {
   createCurrentDashboardRouteOpeningPort,
   type CurrentDashboardRouteInspection,
@@ -389,7 +392,8 @@ describe('Current ordinary route registry', () => {
         });
         if (kind === 'close') {
           expect(request.command.input).toMatchObject({
-            reason: 'relocateScratch',
+            reason: 'routeScratch',
+            source: 'relocate',
             expectedRoute: {
               scope: 'chat',
               canonicalAnchor: targetTurn.route.chatId,
@@ -487,7 +491,7 @@ describe('Current ordinary route registry', () => {
     expect(submissions).toEqual([
       {
         address: scratchAddress,
-        operationIdentity: expect.stringMatching(/^relocate-target-scratch:/),
+        operationIdentity: expect.stringMatching(/^route-scratch:/),
         command: 'close',
       },
       {
@@ -498,6 +502,102 @@ describe('Current ordinary route registry', () => {
     ]);
     expect(sessionStore.getSessionForOwnerStrict(OWNER, scratch.sessionId)?.status)
       .toBe('closed');
+  });
+
+  it('reserves a relocation operation hash across a retryable preflight', async () => {
+    const sourceTurn = turn({
+      messageKey: 'om_relocate_retry_source',
+      anchor: 'om_relocate_retry_source_root',
+      chatId: 'oc_relocate_retry_source',
+    });
+    const source = liveDaemonSession(OWNER, 'session-relocate-retry-source', sourceTurn);
+    const activeSessions = new Map([[activeSessionKey(source), source]]);
+    sessionStore.updateSession(source.session);
+    const address = Object.freeze({}) as SessionAddress;
+    let projectionReads = 0;
+    const runtimeSubmit = vi.fn<SessionRuntime['submit']>(async (request) => ({
+      kind: 'applied',
+      action: 'control.mutated',
+      policy: 'control-staged-transition',
+      sessionId: source.session.sessionId,
+      result: {
+        kind: 'relocated',
+        targetChatId: request.command.kind === 'control.mutate'
+          && request.command.input.kind === 'relocate'
+          ? request.command.input.targetChatId
+          : 'unexpected',
+        targetRootMessageId: request.command.kind === 'control.mutate'
+          && request.command.input.kind === 'relocate'
+          ? request.command.input.targetRootMessageId
+          : 'unexpected',
+      },
+    }) as never);
+    const routeRuntime = createCurrentOrdinaryRouteRegistryRuntime({
+      ownerLarkAppId: OWNER,
+      activeSessions,
+      openingCreator: {
+        begin: () => ({ kind: 'unknown', message: 'unused' }),
+        async execute() { throw new Error('unused'); },
+        resume: () => ({ kind: 'unknown', message: 'unused' }),
+        rollback: () => ({ kind: 'rolledBack' }),
+      },
+      downstream: {
+        projection: {
+          async read(query) {
+            if (query.kind !== 'byRoute') return { kind: 'notFound' };
+            projectionReads += 1;
+            if (projectionReads === 1) {
+              return { kind: 'notReady', message: 'owner Store temporarily unavailable' };
+            }
+            return {
+              kind: 'one',
+              session: {
+                address,
+                sessionId: source.session.sessionId,
+                route: { kind: 'thread', anchorId: source.session.rootMessageId },
+                recordStatus: 'active',
+                executorStatus: 'idle',
+              },
+            };
+          },
+        },
+        runtime: { submit: runtimeSubmit },
+      },
+    });
+    const request = (targetRootMessageId: string) => ({
+      target: {
+        kind: 'route' as const,
+        route: { kind: 'thread' as const, anchorId: source.session.rootMessageId },
+      },
+      idempotencyKey: 'relocate-retryable-operation',
+      command: {
+        kind: 'control.mutate' as const,
+        input: {
+          kind: 'relocate' as const,
+          sourceAnchor: source.session.rootMessageId,
+          targetChatId: 'oc_relocate_retry_target',
+          targetRootMessageId,
+          requester: { larkAppId: 'app-leader', openId: 'ou_route_sender' },
+        },
+      },
+    });
+
+    await expect(routeRuntime.submit(request('om_target_a'))).resolves.toMatchObject({
+      kind: 'retryable',
+    });
+    await expect(routeRuntime.submit(request('om_target_b'))).resolves.toMatchObject({
+      kind: 'rejected',
+      reason: 'idempotencyConflict',
+    });
+    expect(projectionReads).toBe(1);
+    expect(runtimeSubmit).not.toHaveBeenCalled();
+
+    await expect(routeRuntime.submit(request('om_target_a'))).resolves.toMatchObject({
+      kind: 'applied',
+      sessionId: source.session.sessionId,
+    });
+    expect(projectionReads).toBe(2);
+    expect(runtimeSubmit).toHaveBeenCalledOnce();
   });
 
   it('holds the target route through relocate detach so an ordinary opener joins the moved Session', async () => {
@@ -554,11 +654,15 @@ describe('Current ordinary route registry', () => {
           expect(request.command.input.kind).toBe('relocate');
           if (request.command.input.kind !== 'relocate'
               || request.target.kind !== 'session') throw new Error('invalid relocate test request');
-          expect(isCurrentRelocationRouteReservation({
+          expect(isCurrentRouteAdmissionToken({
             token: request.target.controlRouteReservation,
-            ownerLarkAppId: OWNER,
-            activeSessions,
-            route: { kind: 'chat', chatId: request.command.input.targetChatId },
+            key: currentRouteAdmissionKey({
+              ownerLarkAppId: OWNER,
+              scope: 'chat',
+              canonicalAnchor: request.command.input.targetChatId,
+              chatId: request.command.input.targetChatId,
+              chatType: 'group',
+            }),
           })).toBe(true);
           detachStarted.resolve();
           await releaseDetach.promise;

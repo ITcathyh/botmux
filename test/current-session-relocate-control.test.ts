@@ -9,6 +9,7 @@ const lifecycle = vi.hoisted(() => ({
   resolveOwnerUnionId: vi.fn(),
   resumeSession: vi.fn(),
   retireCurrentSessionActivation: vi.fn(),
+  settleCurrentSessionRetirement: vi.fn(),
   suspendWorker: vi.fn(),
   transferSession: vi.fn(),
 }));
@@ -29,13 +30,15 @@ vi.mock('../src/core/worker-pool.js', () => ({
 vi.mock('../src/core/current-session-activation.js', () => ({
   ensureCurrentSessionActivation: lifecycle.ensureCurrentSessionActivation,
   retireCurrentSessionActivation: lifecycle.retireCurrentSessionActivation,
+  settleCurrentSessionRetirement: lifecycle.settleCurrentSessionRetirement,
 }));
 
 vi.mock('../src/im/lark/client.js', () => ({
   resolveUnionIdFromOpenId: lifecycle.resolveOwnerUnionId,
 }));
 
-import { createCurrentSessionControlPort } from '../src/core/current-session-control.js';
+import { createCurrentSessionControlPort as createCurrentSessionControlPortImpl } from '../src/core/current-session-control.js';
+import type { CurrentSessionActivationCoordinator } from '../src/core/current-session-activation.js';
 import type {
   ControlMutationInput,
   ControlMutationPort,
@@ -47,8 +50,29 @@ import type { Session } from '../src/types.js';
 
 const OWNER = 'cli_peer';
 const SESSION_ID = 'session-relocate';
+const OWNER_BOT_ID = 'bot_relocateowner' as never;
+const RUNTIME_EPOCH = 'daemon-epoch-1';
 const ROUTE_RESERVATION = Object.freeze({ test: 'target-route-reservation' });
-const acceptsRouteReservation = vi.fn(() => true);
+const acceptsRouteAdmissionToken = vi.fn(() => true);
+const defaultActivation = {
+  ensure: lifecycle.ensureCurrentSessionActivation,
+  reconcile: vi.fn(),
+  retire: lifecycle.retireCurrentSessionActivation,
+  settleRetirement: lifecycle.settleCurrentSessionRetirement,
+} as unknown as CurrentSessionActivationCoordinator;
+
+type ControlPortOptions = Parameters<typeof createCurrentSessionControlPortImpl>[0];
+function createCurrentSessionControlPort(
+  options: Omit<ControlPortOptions, 'ownerBotId' | 'runtimeEpoch' | 'activation'>
+  & Partial<Pick<ControlPortOptions, 'ownerBotId' | 'runtimeEpoch' | 'activation'>>,
+): ReturnType<typeof createCurrentSessionControlPortImpl> {
+  return createCurrentSessionControlPortImpl({
+    ownerBotId: OWNER_BOT_ID,
+    runtimeEpoch: RUNTIME_EPOCH,
+    activation: defaultActivation,
+    ...options,
+  });
+}
 
 function session(overrides: Partial<Session> = {}): Session {
   return {
@@ -136,6 +160,15 @@ describe('Current Session relocate control', () => {
     lifecycle.isSessionTransferring.mockReturnValue(false);
     lifecycle.transferSession.mockResolvedValue({ ok: true });
     lifecycle.resolveOwnerUnionId.mockResolvedValue(null);
+    lifecycle.retireCurrentSessionActivation.mockResolvedValue({
+      kind: 'retired',
+      action: 'retired',
+    });
+    lifecycle.settleCurrentSessionRetirement.mockImplementation(async request => (
+      request.disposition === 'unknown'
+        ? { kind: 'quarantined', message: 'provider outcome is unknown' }
+        : { kind: 'settled', disposition: request.disposition }
+    ));
   });
 
   it('rejects relocate without an opaque reservation from the Current route registry', () => {
@@ -164,7 +197,7 @@ describe('Current Session relocate control', () => {
       activeSessions: registry,
       sessionStore: unusedStore,
       resolveStoredSession: () => ds.session,
-      isRelocationRouteReservation: acceptsRouteReservation,
+      isRouteAdmissionToken: acceptsRouteAdmissionToken,
     });
 
     await expect(settle(port, begin(port, relocate()))).resolves.toEqual({
@@ -189,6 +222,47 @@ describe('Current Session relocate control', () => {
     );
   });
 
+  it('publishes the transfer fence before invoking the relocation provider', async () => {
+    const events: string[] = [];
+    const activation = {
+      ensure: vi.fn(),
+      reconcile: vi.fn(),
+      retire: vi.fn(async () => {
+        events.push('retire');
+        return { kind: 'retired' as const, action: 'retired' as const };
+      }),
+      settleRetirement: vi.fn(async ({ disposition }) => {
+        events.push(`settle:${disposition}`);
+        return { kind: 'settled' as const, disposition: 'applied' as const };
+      }),
+    };
+    lifecycle.transferSession.mockImplementation(async () => {
+      events.push('transfer');
+      return { ok: true };
+    });
+    const ds = active();
+    const registry = new Map([[activeSessionKey(ds), ds]]);
+    const port = createCurrentSessionControlPort({
+      ownerLarkAppId: OWNER,
+      activation,
+      activeSessions: registry,
+      sessionStore: unusedStore,
+      resolveStoredSession: () => ds.session,
+      isRouteAdmissionToken: acceptsRouteAdmissionToken,
+    });
+
+    await expect(settle(port, begin(port, relocate()))).resolves.toMatchObject({
+      kind: 'committed',
+      result: { kind: 'relocated' },
+    });
+    expect(activation.retire).toHaveBeenCalledWith({
+      sessionId: SESSION_ID,
+      requestIdentity: 'control-relocate:relay-op-1',
+      reason: 'transfer',
+    });
+    expect(events).toEqual(['retire', 'transfer', 'settle:applied']);
+  });
+
   it('rejects a foreign owner and a non-canonical registry alias', () => {
     const foreign = active({ larkAppId: 'cli_foreign' });
     foreign.session.larkAppId = 'cli_foreign';
@@ -197,7 +271,7 @@ describe('Current Session relocate control', () => {
       activeSessions: new Map([[activeSessionKey(foreign), foreign]]),
       sessionStore: unusedStore,
       resolveStoredSession: () => undefined,
-      isRelocationRouteReservation: acceptsRouteReservation,
+      isRouteAdmissionToken: acceptsRouteAdmissionToken,
     });
     const aliased = active();
     const aliasPort = createCurrentSessionControlPort({
@@ -205,7 +279,7 @@ describe('Current Session relocate control', () => {
       activeSessions: new Map([['non-canonical-alias', aliased]]),
       sessionStore: unusedStore,
       resolveStoredSession: () => undefined,
-      isRelocationRouteReservation: acceptsRouteReservation,
+      isRouteAdmissionToken: acceptsRouteAdmissionToken,
     });
 
     expect(begin(foreignPort, relocate())).toMatchObject({
@@ -225,7 +299,7 @@ describe('Current Session relocate control', () => {
       activeSessions: new Map([[activeSessionKey(ds), ds]]),
       sessionStore: unusedStore,
       resolveStoredSession: () => ds.session,
-      isRelocationRouteReservation: acceptsRouteReservation,
+      isRouteAdmissionToken: acceptsRouteAdmissionToken,
     });
 
     expect(begin(port, relocate({
@@ -248,7 +322,7 @@ describe('Current Session relocate control', () => {
       activeSessions: registry,
       sessionStore: unusedStore,
       resolveStoredSession: () => ds.session,
-      isRelocationRouteReservation: acceptsRouteReservation,
+      isRouteAdmissionToken: acceptsRouteAdmissionToken,
     });
 
     await expect(settle(port, begin(port, relocate({
@@ -265,21 +339,43 @@ describe('Current Session relocate control', () => {
     expect(lifecycle.transferSession).toHaveBeenCalledOnce();
   });
 
-  it('fails stale when the source binding is replaced before the effect', async () => {
+  it('keeps the operation sticky-unknown when the source binding is replaced after retirement', async () => {
     const ds = active();
     const registry = new Map([[activeSessionKey(ds), ds]]);
+    const replacement = active();
+    const activation = {
+      ensure: vi.fn(),
+      reconcile: vi.fn(),
+      retire: vi.fn(async () => {
+        registry.set(activeSessionKey(replacement), replacement);
+        return { kind: 'retired' as const, action: 'retired' as const };
+      }),
+      settleRetirement: vi.fn(async () => ({
+        kind: 'quarantined' as const,
+        message: 'binding changed after retirement',
+      })),
+    };
     const port = createCurrentSessionControlPort({
       ownerLarkAppId: OWNER,
+      activation,
       activeSessions: registry,
       sessionStore: unusedStore,
       resolveStoredSession: () => ds.session,
-      isRelocationRouteReservation: acceptsRouteReservation,
+      isRouteAdmissionToken: acceptsRouteAdmissionToken,
     });
     const effect = begin(port, relocate());
-    const replacement = active();
-    registry.set(activeSessionKey(replacement), replacement);
 
-    await expect(settle(port, effect)).resolves.toEqual({ kind: 'staleAddress' });
+    await expect(settle(port, effect)).resolves.toMatchObject({
+      kind: 'unknown',
+      message: expect.stringContaining('after activation retirement committed'),
+    });
+    expect(activation.retire).toHaveBeenCalledOnce();
+    expect(activation.settleRetirement).toHaveBeenCalledWith({
+      sessionId: SESSION_ID,
+      requestIdentity: 'control-relocate:relay-op-1',
+      reason: 'transfer',
+      disposition: 'unknown',
+    });
     expect(lifecycle.transferSession).not.toHaveBeenCalled();
   });
 });

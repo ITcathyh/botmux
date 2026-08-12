@@ -29,7 +29,6 @@ import type {
   SessionCommandRoute,
   SessionProjection,
   SessionRuntime,
-  SessionRoute,
 } from './session-runtime.js';
 import type {
   CurrentDashboardRouteOpeningPort,
@@ -143,38 +142,6 @@ interface RouteBinding {
   readonly route: NormalizedOrdinaryImTurn['route'];
 }
 
-interface CurrentRelocationRouteReservation {
-  readonly ownerLarkAppId: string;
-  readonly activeSessions: Map<string, DaemonSession>;
-  readonly route: SessionRoute;
-}
-
-const currentRelocationRouteReservations = new WeakMap<
-  object,
-  CurrentRelocationRouteReservation
->();
-
-/** Validate one exact, still-held reservation minted by this Current route
- * registry. The token has no enumerable authority and becomes invalid before
- * the waiting ordinary route admission is released. */
-export function isCurrentRelocationRouteReservation(input: {
-  readonly token: unknown;
-  readonly ownerLarkAppId: string;
-  readonly activeSessions: Map<string, DaemonSession>;
-  readonly route: SessionRoute;
-}): boolean {
-  if (!isObject(input.token)) return false;
-  const held = currentRelocationRouteReservations.get(input.token);
-  if (!held
-      || held.ownerLarkAppId !== input.ownerLarkAppId
-      || held.activeSessions !== input.activeSessions
-      || held.route.kind !== input.route.kind) return false;
-  return held.route.kind === 'thread' && input.route.kind === 'thread'
-    ? held.route.anchorId === input.route.anchorId
-    : held.route.kind === 'chat' && input.route.kind === 'chat'
-      && held.route.chatId === input.route.chatId;
-}
-
 interface ProviderAttempt {
   readonly terminal: Promise<OrdinaryIngressCommandOutcome>;
   settle(outcome: OrdinaryIngressCommandOutcome): void;
@@ -215,6 +182,10 @@ type RelocationRecord =
       readonly requestHash: string;
       readonly state: 'terminal';
       readonly outcome: ControlMutationCommandOutcome;
+    }
+  | {
+      readonly requestHash: string;
+      readonly state: 'retryable';
     };
 
 interface DashboardSpawnAttempt {
@@ -1531,7 +1502,8 @@ export function createCurrentOrdinaryRouteRegistryRuntime(
         };
       }
 
-      const closeOperation = `relocate-target-scratch:${computeInputHash({
+      const closeOperation = `route-scratch:${computeInputHash({
+        source: 'relocate',
         relocationOperationIdentity: input.relocationOperationIdentity,
         relocationRequestHash: input.relocationRequestHash,
         sessionId,
@@ -1549,7 +1521,8 @@ export function createCurrentOrdinaryRouteRegistryRuntime(
             kind: 'control.mutate',
             input: {
               kind: 'close',
-              reason: 'relocateScratch',
+              reason: 'routeScratch',
+              source: 'relocate',
               expectedRoute: {
                 scope: 'chat',
                 canonicalAnchor: input.targetChatId,
@@ -1658,10 +1631,10 @@ export function createCurrentOrdinaryRouteRegistryRuntime(
           message: 'route relocation idempotency key belongs to a different command',
         };
       }
-      const terminal = prior.state === 'terminal'
-        ? prior.outcome
-        : await prior.attempt.terminal;
-      return duplicateRelocation(terminal);
+      if (prior.state === 'terminal') return duplicateRelocation(prior.outcome);
+      if (prior.state === 'received') {
+        return duplicateRelocation(await prior.attempt.terminal);
+      }
     }
 
     const attempt = createRelocationAttempt();
@@ -1671,27 +1644,25 @@ export function createCurrentOrdinaryRouteRegistryRuntime(
     ): ControlMutationCommandOutcome => {
       const current = relocationRecords.get(relocationKey);
       if (current?.state === 'received' && current.attempt === attempt) {
-        if (outcome.kind === 'applied'
-            || outcome.kind === 'duplicate'
-            || outcome.kind === 'ambiguous'
-            || outcome.kind === 'quarantined') {
+        if (outcome.kind === 'retryable'
+            || outcome.kind === 'notWired'
+            || outcome.kind === 'staleAddress') {
+          relocationRecords.set(relocationKey, {
+            requestHash,
+            state: 'retryable',
+          });
+        } else {
           relocationRecords.set(relocationKey, {
             requestHash,
             state: 'terminal',
             outcome,
           });
-        } else {
-          relocationRecords.delete(relocationKey);
         }
       }
       attempt.settle(outcome);
       return outcome;
     };
 
-    const targetRoute = {
-      kind: 'chat' as const,
-      chatId: command.targetChatId,
-    };
     const targetAdmission = reserveCurrentRouteAdmission(currentRouteAdmissionKey({
       ownerLarkAppId: options.ownerLarkAppId,
       scope: 'chat',
@@ -1700,12 +1671,7 @@ export function createCurrentOrdinaryRouteRegistryRuntime(
       chatType: 'group',
     }));
     await targetAdmission.ready;
-    const reservation = Object.freeze(Object.create(null)) as object;
-    currentRelocationRouteReservations.set(reservation, {
-      ownerLarkAppId: options.ownerLarkAppId,
-      activeSessions: options.activeSessions,
-      route: targetRoute,
-    });
+    const reservation = targetAdmission.token;
     try {
       let projected: Awaited<ReturnType<SessionProjection['read']>>;
       try {
@@ -1762,7 +1728,6 @@ export function createCurrentOrdinaryRouteRegistryRuntime(
       }
       return finishRelocation(forwarded);
     } finally {
-      currentRelocationRouteReservations.delete(reservation);
       targetAdmission.release();
     }
   };

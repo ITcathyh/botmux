@@ -48,7 +48,8 @@ const wp = vi.hoisted(() => ({ registry: null as Map<string, any> | null }));
 
 vi.mock('../src/core/worker-pool.js', () => ({
   forkWorker: vi.fn(),
-  forkAdoptWorker: vi.fn(),
+  forkAdoptWorker: vi.fn(() => true),
+  getDaemonBootId: vi.fn(() => 'session-resume-test-boot'),
   adoptSandboxBlocked: vi.fn((botCfg: any, session?: any) =>
     botCfg?.sandbox === true || botCfg?.readIsolation === true || session?.sandbox === true || process.env.BOTMUX_SANDBOX === '1'),
   killStalePids: vi.fn(),
@@ -121,6 +122,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
 
 vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({
+    botId: 'bot_sessionresumetest',
     config: {
       larkAppId: 'app_test',
       cliId: 'claude-code',
@@ -133,6 +135,7 @@ vi.mock('../src/bot-registry.js', () => ({
     resolvedAllowedUsers: [],
   })),
   getAllBots: vi.fn(() => [{
+    botId: 'bot_sessionresumetest',
     config: { larkAppId: 'app_test', cliId: 'claude-code' },
     botName: 'TestBot',
     botOpenId: 'ou_test',
@@ -391,6 +394,119 @@ describe('resumeSession', () => {
       expect([...map.values()].some(v => v.session.sessionId === 'scratch-2716f0f8')).toBe(false);
       // …and the resumed session now owns the anchor.
       if (r.ok) expect(map.get(key)!.session.sessionId).toBe(closed.sessionId);
+    });
+
+    it('keeps an owner-mode live scratch intact so Current can retire it through its Session lane', async () => {
+      sessionStore.init('app_test');
+      const closed = makeClosedSession({ chatId: 'oc_owner_live_scratch', scope: 'chat' });
+      const map = new Map<string, DaemonSession>();
+      const key = sessionKey('oc_owner_live_scratch', 'app_test');
+      const scratch = {
+        session: {
+          sessionId: 'scratch-owner-live',
+          larkAppId: 'app_test',
+          chatId: 'oc_owner_live_scratch',
+          rootMessageId: 'oc_owner_live_scratch',
+          scope: 'chat',
+          chatType: 'group',
+          status: 'active',
+        },
+        worker: null,
+        pendingRepo: false,
+        chatId: 'oc_owner_live_scratch',
+        chatType: 'group',
+        scope: 'chat',
+        larkAppId: 'app_test',
+      } as unknown as DaemonSession;
+      map.set(key, scratch);
+      wp.registry = map;
+
+      const result = await resumeSession(closed.sessionId, map, {
+        owner: {
+          larkAppId: 'app_test',
+          activeSessions: map,
+          routeConflictPolicy: 'failClosed',
+        },
+      } as never);
+
+      expect(result).toEqual({
+        ok: false,
+        error: 'anchor_occupied',
+        activeSessionId: 'scratch-owner-live',
+      });
+      expect(map.get(key)).toBe(scratch);
+      expect(closeSession).not.toHaveBeenCalled();
+      expect(sessionStore.getOwnedSession(closed.sessionId)?.status).toBe('closed');
+    });
+
+    it('keeps an owner-mode persisted-only scratch intact instead of bare-closing it', async () => {
+      sessionStore.init('app_test');
+      const closed = makeClosedSession({ rootMessageId: 'om_owner_disk_scratch' });
+      const scratch = sessionStore.createSession(
+        closed.chatId,
+        'om_owner_disk_scratch',
+        '/help',
+        'group',
+      );
+      scratch.larkAppId = 'app_test';
+      scratch.scope = 'thread';
+      scratch.cliId = undefined;
+      scratch.lastCliInput = undefined;
+      sessionStore.updateSession(scratch);
+      const map = new Map<string, DaemonSession>();
+
+      const result = await resumeSession(closed.sessionId, map, {
+        owner: {
+          larkAppId: 'app_test',
+          activeSessions: map,
+          routeConflictPolicy: 'failClosed',
+        },
+      } as never);
+
+      expect(result).toEqual({
+        ok: false,
+        error: 'anchor_occupied',
+        activeSessionId: scratch.sessionId,
+      });
+      expect(closeSession).not.toHaveBeenCalled();
+      expect(sessionStore.getOwnedSession(scratch.sessionId)?.status).toBe('active');
+      expect(sessionStore.getOwnedSession(closed.sessionId)?.status).toBe('closed');
+    });
+
+    it('does not authorize foreign or ownerless legacy rows as owner-mode route conflicts', async () => {
+      sessionStore.init('app_test');
+      const closed = makeClosedSession({ rootMessageId: 'om_owner_strict_conflicts' });
+      const ownerless = {
+        ...structuredClone(closed),
+        sessionId: 'ownerless-legacy-conflict',
+        status: 'active' as const,
+        larkAppId: undefined,
+      };
+      const foreign = {
+        ...structuredClone(closed),
+        sessionId: 'foreign-owner-conflict',
+        status: 'active' as const,
+        larkAppId: 'app_foreign',
+      };
+      const strictRows = vi.spyOn(sessionStore, 'listSessionsForOwnerStrict')
+        .mockReturnValue([ownerless, foreign]);
+      const map = new Map<string, DaemonSession>();
+
+      try {
+        const result = await resumeSession(closed.sessionId, map, {
+          owner: {
+            larkAppId: 'app_test',
+            activeSessions: map,
+            routeConflictPolicy: 'failClosed',
+          },
+        });
+
+        expect(result.ok).toBe(true);
+        expect(strictRows).toHaveBeenCalledWith('app_test');
+        expect(closeSession).not.toHaveBeenCalled();
+      } finally {
+        strictRows.mockRestore();
+      }
     });
 
     it('STILL blocks on a pendingRepo occupant (deliberate setup, not a throwaway)', async () => {

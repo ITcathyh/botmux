@@ -666,11 +666,12 @@ class CurrentSessionDirectory implements SessionDirectory {
     const matches = query.kind === 'byExternalSession'
       ? rows.filter((candidate) => candidate.sessionId === query.sessionId)
       : rows.filter((candidate) => {
-          if (candidate.route.kind === 'thread' && query.route.kind === 'thread') {
-            return candidate.route.anchorId === query.route.anchorId;
+          const binding = candidate.ordinaryIngressBinding;
+          if (binding.scope === 'thread' && query.route.kind === 'thread') {
+            return binding.canonicalAnchor === query.route.anchorId;
           }
-          if (candidate.route.kind === 'chat' && query.route.kind === 'chat') {
-            return candidate.route.chatId === query.route.chatId;
+          if (binding.scope === 'chat' && query.route.kind === 'chat') {
+            return binding.canonicalAnchor === query.route.chatId;
           }
           return false;
         });
@@ -680,6 +681,7 @@ class CurrentSessionDirectory implements SessionDirectory {
       if (active.length > 1) {
         return { kind: 'notReady', message: 'current Session projection has multiple active owner bindings' };
       }
+      return { kind: 'notFound' };
     }
     if (matches.length > 1) {
       return { kind: 'notReady', message: 'current Session projection has multiple matching owner bindings' };
@@ -694,6 +696,7 @@ export interface CurrentSessionRuntimeHost {
 }
 
 interface CachedCurrentSessionRuntimeHost {
+  ownerLarkAppId: string;
   runtimeEpoch: string;
   ordinaryIngress?: OrdinaryIngressPort;
   ordinaryRouteOpeningCreator?: CurrentOrdinaryRouteOpeningCreator;
@@ -800,7 +803,7 @@ function leaseCurrentSessionRuntimeHost(
         }
         return host.runtime.submit({
           ...request,
-          target: { kind: 'session', address: innerAddress },
+          target: { ...request.target, address: innerAddress },
         } as SessionCommandRequest<C>);
       },
     },
@@ -960,6 +963,9 @@ export function currentSessionRuntimeHost(options: {
     hostsByRegistry.set(options.activeSessions, byOwner);
   }
   const cached = byOwner.get(stableOwnerKey);
+  if (cached && cached.ownerLarkAppId !== options.ownerLarkAppId) {
+    throw new Error('Current SessionRuntime Bot is already bound to a different Lark owner');
+  }
   if (cached?.runtimeEpoch === runtimeEpoch) {
     const ordinaryCompatible = options.ordinaryIngress === undefined
       || cached.ordinaryIngress === options.ordinaryIngress;
@@ -1038,6 +1044,7 @@ export function currentSessionRuntimeHost(options: {
     const host = leaseCurrentSessionRuntimeHost(composedHost, lease);
     cached.lease.active = false;
     byOwner.set(stableOwnerKey, {
+      ownerLarkAppId: options.ownerLarkAppId,
       runtimeEpoch,
       ordinaryIngress,
       ordinaryRouteOpeningCreator,
@@ -1073,6 +1080,7 @@ export function currentSessionRuntimeHost(options: {
   const host = leaseCurrentSessionRuntimeHost(routeHost ?? innerHost, lease);
   if (cached) cached.lease.active = false;
   byOwner.set(stableOwnerKey, {
+    ownerLarkAppId: options.ownerLarkAppId,
     runtimeEpoch,
     ordinaryIngress: options.ordinaryIngress,
     ordinaryRouteOpeningCreator: options.ordinaryRouteOpeningCreator,

@@ -45,6 +45,7 @@ import {
 } from './scheduled-fire.js';
 import type {
   CommandOutcomeFor,
+  ControlMutationCommandOutcome,
   ScheduledFireCommand,
   ScheduledFireCommandOutcome,
   ScheduledFireEffectSettlement,
@@ -58,8 +59,11 @@ import type {
 import { createSessionRuntimeHost } from './session-runtime.js';
 import {
   ensureCurrentSessionActivation,
+  currentSessionActivationCoordinator,
   type CurrentSessionActivationCoordinator,
 } from './current-session-activation.js';
+import { createCurrentSessionControlPort } from './current-session-control.js';
+import { createCurrentRouteScratchRetirementPort } from './current-route-scratch-retirement.js';
 import type { SessionActivationOutcome } from './session-activation-runtime.js';
 import {
   activeSessionAnchorId,
@@ -68,13 +72,13 @@ import {
   type DaemonSession,
 } from './types.js';
 import {
-  closeSession,
+  getDaemonBootId,
   getCurrentCliVersion,
-  isDisposableCommandScratch,
   isRelayableRealSession,
   sendWorkerInput,
   setActiveSessionIfActive,
 } from './worker-pool.js';
+import { isDisposableCurrentRouteScratch } from './current-route-scratch.js';
 import {
   armSilentScheduledTurn,
   disarmSilentScheduledTurn,
@@ -93,6 +97,33 @@ interface PreparedInput {
   readonly plan: CurrentScheduledRoutePlan;
   readonly input: ReturnType<typeof buildFollowUpCliInput>;
   readonly whiteboardId?: string;
+}
+
+interface CurrentScheduledDownstream {
+  readonly runtime: SessionRuntime;
+  readonly projection: SessionProjection;
+}
+
+type CurrentScheduledRouteEffectPhase =
+  | { readonly kind: 'preEffect'; readonly effectsStarted: false }
+  | { readonly kind: 'effectsStarted'; readonly effectsStarted: true };
+
+interface CurrentScheduledRouteEffectTracker {
+  readonly effectsStarted: boolean;
+  markStarted(): void;
+}
+
+function createScheduledRouteEffectTracker(): CurrentScheduledRouteEffectTracker {
+  let phase: CurrentScheduledRouteEffectPhase = {
+    kind: 'preEffect',
+    effectsStarted: false,
+  };
+  return {
+    get effectsStarted() { return phase.effectsStarted; },
+    markStarted() {
+      phase = { kind: 'effectsStarted', effectsStarted: true };
+    },
+  };
 }
 
 type ScheduledEffect =
@@ -270,7 +301,43 @@ export function createCurrentScheduledFireAdapter(options: {
       const plan = next.kind === 'prepared' ? next.plan : next.prepared.plan;
       if (!currentPlanStillOwns(options.activeSessions, plan)) {
         finishPlan(plan);
-        return { kind: 'retryable', message: 'scheduled Session owner changed during dispatch' };
+        if (next.kind === 'prepared') {
+          return { kind: 'retryable', message: 'scheduled Session owner changed during preparation' };
+        }
+        if (next.kind === 'sent') {
+          if (settlement.kind === 'returned' && settlement.value === true) {
+            return {
+              kind: 'unknown',
+              message: 'scheduled input was accepted before the Session owner changed',
+            };
+          }
+          if (plan.fire.task.silent === true) {
+            disarmSilentScheduledTurn(plan.current, plan.fire.runId);
+          }
+          return {
+            kind: 'retryable',
+            message: 'scheduled Session owner changed after the live send was refused',
+          };
+        }
+        if (settlement.kind === 'returned') {
+          const activation = settlement.value as SessionActivationOutcome | undefined;
+          const terminal = activation?.kind === 'duplicate' ? activation.outcome : activation;
+          if (terminal?.kind === 'retryable'
+              || terminal?.kind === 'staleBeforeEffect'
+              || terminal?.kind === 'rejected') {
+            if (plan.fire.task.silent === true) {
+              disarmSilentScheduledTurn(plan.current, plan.fire.runId);
+            }
+            return {
+              kind: 'retryable',
+              message: terminal.message,
+            };
+          }
+        }
+        return {
+          kind: 'unknown',
+          message: 'scheduled activation may have started before the Session owner changed',
+        };
       }
       if (next.kind === 'prepared') {
         if (settlement.kind === 'threw') {
@@ -351,7 +418,7 @@ export function createCurrentScheduledFireAdapter(options: {
         }
         finishPlan(plan);
         if (terminal?.kind === 'retryable'
-            || terminal?.kind === 'stale'
+            || terminal?.kind === 'staleBeforeEffect'
             || terminal?.kind === 'rejected') {
           return {
             kind: 'retryable',
@@ -438,21 +505,156 @@ export function createCurrentScheduledFireAdapter(options: {
     });
   };
 
-  const prepareRoute = async (
-    fire: ScheduledFireEnvelope,
-  ): Promise<CurrentScheduledRoutePlan | ScheduledFireCommandOutcome> => {
-    const allBots = getAllBots();
-    if (allBots.length === 0) {
-      return { kind: 'retryable', message: 'no Bot is configured for scheduled execution' };
-    }
-    const bot = allBots.find(candidate => candidate.config.larkAppId === options.ownerLarkAppId);
-    if (!bot || (fire.task.larkAppId && fire.task.larkAppId !== options.ownerLarkAppId)) {
+  const retireDisposableRouteScratch = async (input: {
+    readonly fire: ScheduledFireEnvelope;
+    readonly current: DaemonSession;
+    readonly downstream: CurrentScheduledDownstream;
+    readonly routeReservation: object;
+    readonly effects: CurrentScheduledRouteEffectTracker;
+  }): Promise<ScheduledFireCommandOutcome | undefined> => {
+    const { current } = input;
+    const routeKey = activeSessionKey(current);
+    const expectedRoute = {
+      scope: current.scope,
+      canonicalAnchor: activeSessionAnchorId(current),
+      chatId: current.chatId,
+      chatType: current.chatType,
+    } as const;
+    const routeBusy = (message: string): ScheduledFireCommandOutcome => ({
+      kind: 'rejected',
+      reason: 'routeBusy',
+      message,
+    });
+    const classifyDeparture = (unresolvedMessage: string): ScheduledFireCommandOutcome | undefined => {
+      const winner = options.activeSessions.get(routeKey);
+      if (!winner) return undefined;
+      if (winner !== current) {
+        return routeBusy(`scheduled route was claimed by ${winner.session.sessionId}`);
+      }
+      return { kind: 'quarantined', message: unresolvedMessage };
+    };
+
+    let projected: Awaited<ReturnType<SessionProjection['read']>>;
+    try {
+      projected = await input.downstream.projection.read({
+        kind: 'byExternalSession',
+        sessionId: current.session.sessionId,
+      });
+    } catch (error) {
       return {
-        kind: 'rejected',
-        reason: 'invalidCommand',
-        message: `scheduled task ${fire.task.id} is bound to an unavailable Bot`,
+        kind: 'retryable',
+        message: `scheduled route scratch projection failed: ${errorMessage(error)}`,
       };
     }
+    if (projected.kind === 'notReady') {
+      return { kind: 'retryable', message: projected.message };
+    }
+    if (projected.kind === 'notFound') {
+      return classifyDeparture(
+        'scheduled route scratch remains Current without an exact Session projection',
+      );
+    }
+    if (projected.kind !== 'one'
+        || projected.session.sessionId !== current.session.sessionId) {
+      return {
+        kind: 'quarantined',
+        message: 'scheduled route scratch projection did not preserve its exact Session identity',
+      };
+    }
+    const routeMatches = projected.session.recordStatus === 'active'
+      && (expectedRoute.scope === 'thread'
+        ? projected.session.route.kind === 'thread'
+          && projected.session.route.anchorId === expectedRoute.canonicalAnchor
+        : projected.session.route.kind === 'chat'
+          && projected.session.route.chatId === expectedRoute.chatId);
+    if (!routeMatches) {
+      return classifyDeparture(
+        'scheduled route scratch remained Current after leaving its exact route binding',
+      );
+    }
+    const currentWinner = options.activeSessions.get(routeKey);
+    if (!currentWinner) return undefined;
+    if (currentWinner !== current) {
+      return routeBusy(`scheduled route was claimed by ${currentWinner.session.sessionId}`);
+    }
+    if (!isDisposableCurrentRouteScratch(current)) {
+      return routeBusy('scheduled route owner is no longer a disposable route scratch');
+    }
+
+    const closeOperation = `route-scratch:${computeInputHash({
+      source: 'scheduler',
+      runId: input.fire.runId,
+      sessionId: current.session.sessionId,
+      expectedRoute,
+    })}`;
+    let closed: ControlMutationCommandOutcome;
+    try {
+      closed = await input.downstream.runtime.submit({
+        target: {
+          kind: 'session',
+          address: projected.session.address,
+          controlRouteReservation: input.routeReservation,
+        },
+        idempotencyKey: closeOperation,
+        command: {
+          kind: 'control.mutate',
+          input: {
+            kind: 'close',
+            reason: 'routeScratch',
+            source: 'scheduler',
+            expectedRoute,
+          },
+        },
+      });
+    } catch (error) {
+      return {
+        kind: 'quarantined',
+        message: `scheduled route scratch close outcome is unknown: ${errorMessage(error)}`,
+      };
+    }
+    if ((closed.kind === 'applied' || closed.kind === 'duplicate')
+        && closed.sessionId === current.session.sessionId
+        && closed.result?.kind === 'closed') {
+      if (closed.result.known && !closed.result.alreadyClosed) {
+        input.effects.markStarted();
+      }
+      return classifyDeparture(
+        'scheduled route scratch close returned without retiring its exact Current owner',
+      );
+    }
+    if (closed.kind === 'retryable') return closed;
+    if (closed.kind === 'notWired') {
+      return { kind: 'retryable', message: closed.message };
+    }
+    if (closed.kind === 'staleAddress') {
+      return {
+        kind: 'retryable',
+        message: 'scheduled route scratch address became stale before the close effect',
+      };
+    }
+    if (closed.kind === 'rejected' && closed.reason === 'sessionNotFound') {
+      return classifyDeparture(
+        'scheduled route scratch address became stale while its Current owner remained',
+      );
+    }
+    if (closed.kind === 'rejected' && closed.reason === 'transitionRejected') {
+      return routeBusy(closed.message);
+    }
+    return {
+      kind: 'quarantined',
+      message: closed.kind === 'ambiguous' || closed.kind === 'quarantined'
+        ? `scheduled route scratch close is unresolved: ${closed.message}`
+        : 'scheduled route scratch close returned no exact closed proof',
+    };
+  };
+
+  const prepareRoute = async (
+    fire: ScheduledFireEnvelope,
+    bot: ReturnType<typeof getAllBots>[number],
+    downstream: CurrentScheduledDownstream,
+    routeAdmission: { readonly key: string; readonly token: object },
+    effects: CurrentScheduledRouteEffectTracker,
+  ): Promise<CurrentScheduledRoutePlan | ScheduledFireCommandOutcome> => {
     const task = fire.task;
     const larkAppId = bot.config.larkAppId;
     const { getChatMode, sendMessage, replyMessage } = await import('../im/lark/client.js');
@@ -469,6 +671,7 @@ export function createCurrentScheduledFireAdapter(options: {
       } else {
         if (task.creatorRootMessageId && task.creatorChatId !== task.chatId) {
           const creatorAppId = task.creatorLarkAppId ?? larkAppId;
+          effects.markStarted();
           void targetNotice({
             kind: 'chat', taskName: task.name, targetAppId: larkAppId,
             targetChatId: task.chatId, targetBrand: bot.config.brand,
@@ -479,6 +682,7 @@ export function createCurrentScheduledFireAdapter(options: {
             `[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${errorMessage(error)})`,
           ));
         }
+        effects.markStarted();
         anchor = await sendMessage(
           larkAppId,
           task.chatId,
@@ -492,6 +696,7 @@ export function createCurrentScheduledFireAdapter(options: {
       if (!silent) {
         if (task.creatorRootMessageId && task.creatorChatId !== task.chatId) {
           const creatorAppId = task.creatorLarkAppId ?? larkAppId;
+          effects.markStarted();
           void targetNotice({
             kind: 'chat', taskName: task.name, targetAppId: larkAppId,
             targetChatId: task.chatId, targetBrand: bot.config.brand,
@@ -503,6 +708,7 @@ export function createCurrentScheduledFireAdapter(options: {
           ));
         }
         try {
+          effects.markStarted();
           topLevelTriggerId = await sendMessage(
             larkAppId,
             task.chatId,
@@ -535,6 +741,7 @@ export function createCurrentScheduledFireAdapter(options: {
       if (isCrossThread) {
         if (!silent) {
           const creatorAppId = task.creatorLarkAppId ?? larkAppId;
+          effects.markStarted();
           void targetNotice({
             kind: 'thread', taskName: task.name, targetAppId: larkAppId,
             targetChatId: task.chatId, targetRootMessageId: task.rootMessageId,
@@ -553,6 +760,7 @@ export function createCurrentScheduledFireAdapter(options: {
           isContinuation = true;
         } else {
           try {
+            effects.markStarted();
             await replyMessage(
               larkAppId,
               task.rootMessageId,
@@ -567,6 +775,7 @@ export function createCurrentScheduledFireAdapter(options: {
               `[scheduler] Failed to reply in original thread ${task.rootMessageId} `
               + `(${errorMessage(error)}); falling back to new thread`,
             );
+            effects.markStarted();
             anchor = await sendMessage(
               larkAppId,
               task.chatId,
@@ -575,6 +784,7 @@ export function createCurrentScheduledFireAdapter(options: {
           }
         }
       } else {
+        effects.markStarted();
         anchor = await sendMessage(
           larkAppId,
           task.chatId,
@@ -583,120 +793,362 @@ export function createCurrentScheduledFireAdapter(options: {
       }
     }
 
-    options.refreshCliVersion(bot.config);
-    const key = sessionKey(anchor, larkAppId);
-    let existing = options.activeSessions.get(key);
-    if (existing) {
-      const reservedState = existing.pendingRepo
-        ? 'pending_repo'
-        : existing.pendingRepoCommitInFlight
-          ? 'pending_repo_commit'
-          : existing.initialStartPending
-            ? 'initial_start_pending'
-            : existing.worktreeCreating
-              ? 'worktree_creating'
-              : existing.session.queued
-                ? 'queued_backlog'
-                : undefined;
-      if (reservedState) {
-        return {
-          kind: 'rejected',
-          reason: 'routeBusy',
-          message: `scheduled route owner is in ${reservedState}`,
-        };
-      }
-      if (hasProtectedSessionMutationOwnership(existing)) {
-        return {
-          kind: 'rejected',
-          reason: 'routeBusy',
-          message: 'scheduled route has a protected activation owner',
-        };
-      }
-      const resumableOwner = isRelayableRealSession(existing)
-        || !!existing.session.suspendedColdResume;
-      if (isContinuation && resumableOwner) {
-        return {
-          fire, current: existing, bot, isContinuation: true,
-          newlyCreated: false, sharedTopicRootId,
-        };
-      }
-      if (isContinuation && isDisposableCommandScratch(existing)) {
-        await closeSession(existing.session.sessionId);
-        if (options.activeSessions.get(key) === existing) options.activeSessions.delete(key);
-        existing = undefined;
-      }
-    }
-
     const deferredFreshTopic = executionPosition === 'new-topic' && silent;
     const runtimeScope: 'thread' | 'chat' = deferredFreshTopic
       ? 'chat'
       : scope === 'chat' && anchor !== task.chatId ? 'thread' : scope;
-    const session = sessionStore.createSession(
-      task.chatId,
-      anchor,
-      `${t('schedule.title_prefix', undefined, localeForBot(larkAppId))} ${task.name}`,
-      task.chatType === 'p2p' ? 'p2p' : 'group',
-    );
-    const now = Date.now();
-    session.larkAppId = larkAppId;
-    session.scope = runtimeScope;
-    if (deferredFreshTopic) {
-      session.deferredScheduleRun = {
-        taskId: task.id,
-        turnId: fire.runId,
-        routingAnchor: anchor,
-        ...(task.topicTitle?.trim() ? { topicTitle: task.topicTitle.trim() } : {}),
-        createdAt: new Date(now).toISOString(),
-      };
-    }
-    session.lastMessageAt = new Date(now).toISOString();
-    sessionStore.updateSession(session);
-    messageQueue.ensureQueue(anchor);
-    const current: DaemonSession = {
-      session,
-      worker: null,
-      workerPort: null,
-      workerToken: null,
-      larkAppId,
+    const expectedRoute = {
+      scope: runtimeScope,
+      canonicalAnchor: runtimeScope === 'thread' ? anchor : task.chatId,
       chatId: task.chatId,
       chatType: task.chatType === 'p2p' ? 'p2p' : 'group',
-      scope: runtimeScope,
-      spawnedAt: sessionCreatedAtMs(session),
-      cliVersion: getCurrentCliVersion(),
-      lastMessageAt: now,
-      hasHistory: isContinuation,
-      workingDir: task.workingDir,
-      initialStartPending: true,
-      pendingPrompt: task.silent === true
-        ? `${buildSilentScheduleHint(task.name, localeForBot(larkAppId))}\n\n${task.prompt}`
-        : task.prompt,
+    } as const;
+    const exactAdmissionKey = deferredFreshTopic
+      ? routeAdmission.key
+      : currentRouteAdmissionKey({ ownerLarkAppId: options.ownerLarkAppId, ...expectedRoute });
+    const projectionQuery = {
+      kind: 'byRoute' as const,
+      route: runtimeScope === 'thread'
+        ? { kind: 'thread' as const, anchorId: anchor }
+        : { kind: 'chat' as const, chatId: task.chatId },
     };
-    if (!setActiveSessionIfActive(options.activeSessions, key, current)) {
-      const winner = options.activeSessions.get(key);
-      await closeSession(session.sessionId);
-      return {
-        kind: 'rejected',
-        reason: 'routeBusy',
-        message: `scheduled route registration lost${winner ? ` to ${winner.session.sessionId}` : ''}`,
+
+    const prepareUnderExactAdmission = async (
+      routeReservation: object,
+    ): Promise<CurrentScheduledRoutePlan | ScheduledFireCommandOutcome> => {
+      options.refreshCliVersion(bot.config);
+      const key = sessionKey(anchor, larkAppId);
+      let existing = options.activeSessions.get(key);
+      if (existing) {
+        const reservedState = existing.pendingRepo
+          ? 'pending_repo'
+          : existing.pendingRepoCommitInFlight
+            ? 'pending_repo_commit'
+            : existing.initialStartPending
+              ? 'initial_start_pending'
+              : existing.worktreeCreating
+                ? 'worktree_creating'
+                : existing.session.queued
+                  ? 'queued_backlog'
+                  : undefined;
+        if (reservedState) {
+          return {
+            kind: 'rejected',
+            reason: 'routeBusy',
+            message: `scheduled route owner is in ${reservedState}`,
+          };
+        }
+        if (hasProtectedSessionMutationOwnership(existing)) {
+          return {
+            kind: 'rejected',
+            reason: 'routeBusy',
+            message: 'scheduled route has a protected activation owner',
+          };
+        }
+        if (!isContinuation) {
+          return {
+            kind: 'rejected',
+            reason: 'routeBusy',
+            message: `scheduled fresh route was claimed by ${existing.session.sessionId}`,
+          };
+        }
+        const resumableOwner = isRelayableRealSession(existing)
+          || !!existing.session.suspendedColdResume;
+        if (resumableOwner) {
+          return {
+            fire, current: existing, bot, isContinuation: true,
+            newlyCreated: false, sharedTopicRootId,
+          };
+        }
+        if (isDisposableCurrentRouteScratch(existing)) {
+          const retirement = await retireDisposableRouteScratch({
+            fire,
+            current: existing,
+            downstream,
+            routeReservation,
+            effects,
+          });
+          if (retirement) return retirement;
+          existing = options.activeSessions.get(key);
+          if (existing) {
+            return {
+              kind: 'rejected',
+              reason: 'routeBusy',
+              message: `scheduled route was claimed by ${existing.session.sessionId}`,
+            };
+          }
+        }
+        if (existing) {
+          return {
+            kind: 'rejected',
+            reason: 'routeBusy',
+            message: 'scheduled route owner is neither resumable nor disposable',
+          };
+        }
+      }
+
+      if (!deferredFreshTopic && !options.activeSessions.has(key)) {
+        let projected: Awaited<ReturnType<SessionProjection['read']>>;
+        try {
+          projected = await downstream.projection.read(projectionQuery);
+        } catch (error) {
+          return {
+            kind: 'retryable',
+            message: `scheduled durable route projection failed: ${errorMessage(error)}`,
+          };
+        }
+        if (projected.kind === 'notReady') {
+          return { kind: 'retryable', message: projected.message };
+        }
+        if (projected.kind === 'one' && projected.session.recordStatus === 'active') {
+          if (!isContinuation && runtimeScope === 'thread') {
+            return {
+              kind: 'rejected',
+              reason: 'routeBusy',
+              message: `scheduled fresh route was claimed by ${projected.session.sessionId}`,
+            };
+          }
+          let closed: ControlMutationCommandOutcome;
+          try {
+            closed = await downstream.runtime.submit({
+              target: {
+                kind: 'session',
+                address: projected.session.address,
+                controlRouteReservation: routeReservation,
+              },
+              idempotencyKey: `route-scratch:${computeInputHash({
+                source: 'scheduler',
+                runId: fire.runId,
+                sessionId: projected.session.sessionId,
+                expectedRoute,
+              })}`,
+              command: {
+                kind: 'control.mutate',
+                input: {
+                  kind: 'close',
+                  reason: 'routeScratch',
+                  source: 'scheduler',
+                  expectedRoute,
+                },
+              },
+            });
+          } catch (error) {
+            return {
+              kind: 'quarantined',
+              message: `scheduled durable route scratch close outcome is unknown: ${errorMessage(error)}`,
+            };
+          }
+          if (closed.kind === 'rejected' && closed.reason === 'transitionRejected') {
+            return { kind: 'rejected', reason: 'routeBusy', message: closed.message };
+          }
+          if (closed.kind === 'retryable') return closed;
+          if (closed.kind === 'notWired') {
+            return { kind: 'retryable', message: closed.message };
+          }
+          if (closed.kind === 'staleAddress') {
+            return {
+              kind: 'retryable',
+              message: 'scheduled durable route scratch address became stale before the close effect',
+            };
+          }
+          if (closed.kind === 'rejected' && closed.reason === 'sessionNotFound') {
+            return {
+              kind: 'retryable',
+              message: 'scheduled durable route scratch departed before the close effect',
+            };
+          }
+          if ((closed.kind === 'applied' || closed.kind === 'duplicate')
+              && closed.sessionId === projected.session.sessionId
+              && closed.result?.kind === 'closed') {
+            if (closed.result.known && !closed.result.alreadyClosed) {
+              effects.markStarted();
+            }
+            const liveWinner = options.activeSessions.get(key);
+            if (liveWinner) {
+              return {
+                kind: 'rejected',
+                reason: 'routeBusy',
+                message: `scheduled route was claimed by ${liveWinner.session.sessionId}`,
+              };
+            }
+            let afterClose: Awaited<ReturnType<SessionProjection['read']>>;
+            try {
+              afterClose = await downstream.projection.read(projectionQuery);
+            } catch (error) {
+              return {
+                kind: 'retryable',
+                message: `scheduled durable route recheck failed: ${errorMessage(error)}`,
+              };
+            }
+            if (afterClose.kind === 'notReady') {
+              return { kind: 'retryable', message: afterClose.message };
+            }
+            if (afterClose.kind === 'one' && afterClose.session.recordStatus === 'active') {
+              return afterClose.session.sessionId === projected.session.sessionId
+                ? {
+                    kind: 'quarantined',
+                    message: 'scheduled durable route scratch remained active after exact close proof',
+                  }
+                : {
+                    kind: 'rejected',
+                    reason: 'routeBusy',
+                    message: `scheduled route was claimed by ${afterClose.session.sessionId}`,
+                  };
+            }
+            if (afterClose.kind === 'notFound'
+                || (afterClose.kind === 'one' && afterClose.session.recordStatus === 'closed')) {
+              isContinuation = true;
+            } else {
+              return {
+                kind: 'quarantined',
+                message: 'scheduled durable route recheck returned no exact Session proof',
+              };
+            }
+          } else {
+            return {
+              kind: 'quarantined',
+              message: 'scheduled durable route owner has no exact retirement proof',
+            };
+          }
+        } else if (projected.kind !== 'notFound') {
+          return {
+            kind: 'quarantined',
+            message: 'scheduled durable route projection returned an invalid result',
+          };
+        }
+      }
+
+      effects.markStarted();
+      const session = sessionStore.createSession(
+        task.chatId,
+        anchor,
+        `${t('schedule.title_prefix', undefined, localeForBot(larkAppId))} ${task.name}`,
+        task.chatType === 'p2p' ? 'p2p' : 'group',
+      );
+      const now = Date.now();
+      session.larkAppId = larkAppId;
+      session.scope = runtimeScope;
+      if (deferredFreshTopic) {
+        session.deferredScheduleRun = {
+          taskId: task.id,
+          turnId: fire.runId,
+          routingAnchor: anchor,
+          ...(task.topicTitle?.trim() ? { topicTitle: task.topicTitle.trim() } : {}),
+          createdAt: new Date(now).toISOString(),
+        };
+      }
+      session.lastMessageAt = new Date(now).toISOString();
+      sessionStore.updateSession(session);
+      messageQueue.ensureQueue(anchor);
+      const current: DaemonSession = {
+        session,
+        worker: null,
+        workerPort: null,
+        workerToken: null,
+        larkAppId,
+        chatId: task.chatId,
+        chatType: task.chatType === 'p2p' ? 'p2p' : 'group',
+        scope: runtimeScope,
+        spawnedAt: sessionCreatedAtMs(session),
+        cliVersion: getCurrentCliVersion(),
+        lastMessageAt: now,
+        hasHistory: isContinuation,
+        workingDir: task.workingDir,
+        initialStartPending: true,
+        pendingPrompt: task.silent === true
+          ? `${buildSilentScheduleHint(task.name, localeForBot(larkAppId))}\n\n${task.prompt}`
+          : task.prompt,
       };
-    }
-    return {
-      fire, current, bot, isContinuation, newlyCreated: true, sharedTopicRootId,
+      if (!setActiveSessionIfActive(options.activeSessions, key, current)) {
+        const winner = options.activeSessions.get(key);
+        sessionStore.closeSession(session.sessionId);
+        return {
+          kind: 'rejected',
+          reason: 'routeBusy',
+          message: `scheduled route registration lost${winner ? ` to ${winner.session.sessionId}` : ''}`,
+        };
+      }
+      return {
+        fire, current, bot, isContinuation, newlyCreated: true, sharedTopicRootId,
+      };
     };
+
+    if (exactAdmissionKey === routeAdmission.key) {
+      return prepareUnderExactAdmission(routeAdmission.token);
+    }
+    const exactAdmission = reserveCurrentRouteAdmission(exactAdmissionKey);
+    await exactAdmission.ready;
+    try {
+      return await prepareUnderExactAdmission(exactAdmission.token);
+    } finally {
+      exactAdmission.release();
+    }
   };
 
-  const wrapRuntime = (downstream: {
-    readonly runtime: SessionRuntime;
-    readonly projection: SessionProjection;
-  }): SessionRuntime => {
+  const wrapRuntime = (downstream: CurrentScheduledDownstream): SessionRuntime => {
     interface RouteAttempt {
-      readonly requestHash: string;
       readonly terminal: Promise<ScheduledFireCommandOutcome>;
       settle(outcome: ScheduledFireCommandOutcome): void;
     }
-    const attempts = new Map<string, RouteAttempt>();
-    const completed = new Map<string, { requestHash: string; sessionId: string }>();
-    const completedOrder: string[] = [];
+    type RouteRecord =
+      | {
+          readonly requestHash: string;
+          readonly state: 'received';
+          readonly attempt: RouteAttempt;
+        }
+      | { readonly requestHash: string; readonly state: 'retryable' }
+      | {
+          readonly requestHash: string;
+          readonly state: 'terminal';
+          readonly outcome: ScheduledFireCommandOutcome;
+        };
+    const records = new Map<string, RouteRecord>();
+    const settledOrder: Array<{ readonly runId: string; readonly record: RouteRecord }> = [];
+
+    const retainSettled = (runId: string, record: RouteRecord): void => {
+      records.set(runId, record);
+      settledOrder.push({ runId, record });
+      while (settledOrder.length > 1024) {
+        const evicted = settledOrder.shift();
+        if (evicted && records.get(evicted.runId) === evicted.record) {
+          records.delete(evicted.runId);
+        }
+      }
+    };
+
+    const replay = (
+      outcome: ScheduledFireCommandOutcome,
+      state: 'inFlight' | 'inputAccepted',
+    ): ScheduledFireCommandOutcome => {
+      if (outcome.kind === 'applied') {
+        return {
+          kind: 'duplicate',
+          state,
+          policy: 'scheduled-process-local',
+          durability: 'processLocal',
+          sessionId: outcome.sessionId,
+          message: 'scheduled route joined the winning Current attempt',
+        };
+      }
+      if (outcome.kind === 'ambiguous') return { ...outcome, idempotent: true };
+      return outcome;
+    };
+
+    const createAttempt = (): RouteAttempt => {
+      let resolveTerminal!: (outcome: ScheduledFireCommandOutcome) => void;
+      let settled = false;
+      const terminal = new Promise<ScheduledFireCommandOutcome>((resolve) => {
+        resolveTerminal = resolve;
+      });
+      return {
+        terminal,
+        settle(outcome) {
+          if (settled) return;
+          settled = true;
+          resolveTerminal(outcome);
+        },
+      };
+    };
 
     const submitScheduled = async (
       request: SessionCommandRequest<ScheduledFireCommand>,
@@ -720,22 +1172,7 @@ export function createCurrentScheduledFireAdapter(options: {
           message: `scheduled route input is not canonicalizable: ${errorMessage(error)}`,
         };
       }
-      const priorCompleted = completed.get(fire.runId);
-      if (priorCompleted) {
-        if (priorCompleted.requestHash !== requestHash) {
-          return {
-            kind: 'rejected', reason: 'idempotencyConflict',
-            message: 'logical run id already belongs to a different scheduled fire',
-          };
-        }
-        return {
-          kind: 'duplicate', state: 'inputAccepted',
-          policy: 'scheduled-process-local', durability: 'processLocal',
-          sessionId: priorCompleted.sessionId,
-          message: 'scheduled route was already accepted in this runtime epoch',
-        };
-      }
-      const prior = attempts.get(fire.runId);
+      const prior = records.get(fire.runId);
       if (prior) {
         if (prior.requestHash !== requestHash) {
           return {
@@ -743,37 +1180,34 @@ export function createCurrentScheduledFireAdapter(options: {
             message: 'logical run id already belongs to a different scheduled fire',
           };
         }
-        const terminal = await prior.terminal;
-        if (terminal.kind === 'applied') {
-          return {
-            kind: 'duplicate', state: 'inputAccepted',
-            policy: 'scheduled-process-local', durability: 'processLocal',
-            sessionId: terminal.sessionId,
-            message: 'scheduled route joined the winning Current attempt',
-          };
+        if (prior.state === 'received') {
+          return replay(await prior.attempt.terminal, 'inFlight');
         }
-        return terminal;
+        if (prior.state === 'terminal') return replay(prior.outcome, 'inputAccepted');
       }
-      let settle!: (outcome: ScheduledFireCommandOutcome) => void;
-      const terminal = new Promise<ScheduledFireCommandOutcome>((resolve) => { settle = resolve; });
-      const attempt: RouteAttempt = { requestHash, terminal, settle };
-      attempts.set(fire.runId, attempt);
-      const admission = reserveCurrentRouteAdmission(routeAdmissionKey(fire));
+      const attempt = createAttempt();
+      records.set(fire.runId, { requestHash, state: 'received', attempt });
+      const initialAdmissionKey = routeAdmissionKey(fire);
+      const admission = reserveCurrentRouteAdmission(initialAdmissionKey);
       await admission.ready;
-      let final: ScheduledFireCommandOutcome;
+      let final!: ScheduledFireCommandOutcome;
+      let preparedPlan: CurrentScheduledRoutePlan | undefined;
+      const routeEffects = createScheduledRouteEffectTracker();
       try {
         let currentDefinitionRevision: number | undefined;
+        let definitionReadFailed = false;
         let definitionReadError: unknown;
         try {
           currentDefinitionRevision = options.readDefinitionRevision?.(
             fire.identity.scheduleId,
           );
         } catch (error) {
+          definitionReadFailed = true;
           definitionReadError = error;
         }
-        if (definitionReadError !== undefined) {
+        if (definitionReadFailed) {
           final = {
-            kind: 'quarantined',
+            kind: 'retryable',
             message: `scheduled definition revision is unreadable: ${errorMessage(definitionReadError)}`,
           };
         } else if (options.readDefinitionRevision
@@ -784,49 +1218,99 @@ export function createCurrentScheduledFireAdapter(options: {
             message: `scheduled definition revision ${fire.identity.definitionRevision} was superseded`,
           };
         } else {
-          const prepared = await prepareRoute(fire);
-          if (!('fire' in prepared)) {
-            final = prepared;
+          const allBots = getAllBots();
+          if (allBots.length === 0) {
+            final = {
+              kind: 'retryable',
+              message: 'no Bot is configured for scheduled execution',
+            };
           } else {
-            routePlans.set(fire.runId, prepared);
-            const projected = await downstream.projection.read({
-              kind: 'byExternalSession',
-              sessionId: prepared.current.session.sessionId,
-            });
-            if (projected.kind !== 'one') {
-              finishPlan(prepared);
+            const bot = allBots.find(
+              candidate => candidate.config.larkAppId === options.ownerLarkAppId,
+            );
+            if (!bot
+                || (fire.task.larkAppId
+                  && fire.task.larkAppId !== options.ownerLarkAppId)) {
               final = {
-                kind: 'quarantined',
-                message: projected.kind === 'notReady'
-                  ? projected.message
-                  : 'scheduled route winner has no exact Session projection',
+                kind: 'rejected',
+                reason: 'invalidCommand',
+                message: `scheduled task ${fire.task.id} is bound to an unavailable Bot`,
               };
             } else {
-              final = await downstream.runtime.submit({
-                target: { kind: 'session', address: projected.session.address },
-                idempotencyKey: fire.runId,
-                command: request.command,
-              });
-              finishPlan(prepared);
+              const prepared = await prepareRoute(
+                fire,
+                bot,
+                downstream,
+                { key: initialAdmissionKey, token: admission.token },
+                routeEffects,
+              );
+              if (!('fire' in prepared)) {
+                final = prepared;
+              } else {
+                preparedPlan = prepared;
+                routePlans.set(fire.runId, prepared);
+                const projected = await downstream.projection.read({
+                  kind: 'byExternalSession',
+                  sessionId: prepared.current.session.sessionId,
+                });
+                if (projected.kind !== 'one') {
+                  final = {
+                    kind: 'retryable',
+                    message: projected.kind === 'notReady'
+                      ? projected.message
+                      : 'scheduled route winner has no exact Session projection',
+                  };
+                } else {
+                  try {
+                    final = await downstream.runtime.submit({
+                      target: { kind: 'session', address: projected.session.address },
+                      idempotencyKey: fire.runId,
+                      command: request.command,
+                    });
+                  } catch (error) {
+                    final = {
+                      kind: 'quarantined',
+                      message: `scheduled child effect outcome is unknown: ${errorMessage(error)}`,
+                    };
+                  }
+                }
+              }
             }
           }
         }
       } catch (error) {
-        final = {
-          kind: 'quarantined',
-          message: `scheduled route execution failed: ${errorMessage(error)}`,
-        };
+        final = routeEffects.effectsStarted
+          ? {
+              kind: 'quarantined',
+              message: `scheduled route execution failed after route effects: ${errorMessage(error)}`,
+            }
+          : {
+              kind: 'retryable',
+              message: `scheduled route execution failed before route effects: ${errorMessage(error)}`,
+            };
       } finally {
+        if (preparedPlan) finishPlan(preparedPlan);
         admission.release();
       }
-      attempts.delete(fire.runId);
-      if (final.kind === 'applied') {
-        completed.set(fire.runId, { requestHash, sessionId: final.sessionId });
-        completedOrder.push(fire.runId);
-        while (completedOrder.length > 1024) {
-          const evicted = completedOrder.shift();
-          if (evicted) completed.delete(evicted);
-        }
+      if (final.kind === 'staleAddress') {
+        final = {
+          kind: 'retryable',
+          message: 'scheduled Session address became stale before the child effect',
+        };
+      } else if (final.kind === 'notWired') {
+        final = { kind: 'retryable', message: final.message };
+      }
+      if (routeEffects.effectsStarted && final.kind === 'retryable') {
+        final = {
+          kind: 'quarantined',
+          message: `scheduled route outcome is unknown after route effects: ${final.message}`,
+        };
+      }
+      const current = records.get(fire.runId);
+      if (current?.state === 'received' && current.attempt === attempt) {
+        retainSettled(fire.runId, final.kind === 'retryable'
+          ? { requestHash, state: 'retryable' }
+          : { requestHash, state: 'terminal', outcome: final });
       }
       attempt.settle(final);
       return final;
@@ -869,13 +1353,48 @@ export async function executeScheduledTaskThroughRuntime(
     refreshCliVersion,
     ...(activation === undefined ? {} : { activation }),
   });
+  const ownerBot = getAllBots().find(bot => bot.config.larkAppId === ownerLarkAppId);
+  const ownerBotId = ownerBot?.botId;
+  const runtimeEpoch = getDaemonBootId();
+  let base!: ReturnType<typeof createSessionRuntimeHost>;
+  const canonicalActivation = ownerBotId
+    ? currentSessionActivationCoordinator({
+        ownerBotId,
+        ownerLarkAppId,
+        runtimeEpoch,
+        activeSessions,
+      })
+    : undefined;
+  const routeScratchRetirement = canonicalActivation
+    ? createCurrentRouteScratchRetirementPort({
+        ownerLarkAppId,
+        downstream: () => base,
+      })
+    : undefined;
+  const controlMutation = canonicalActivation && routeScratchRetirement && ownerBotId
+    ? createCurrentSessionControlPort({
+        ownerBotId,
+        ownerLarkAppId,
+        runtimeEpoch,
+        activation: canonicalActivation,
+        routeScratchRetirement,
+        activeSessions,
+      })
+    : undefined;
   const directory = {
     async read(query: Parameters<SessionProjection['read']>[0]) {
       const matches = [...activeSessions.values()].filter(current => (
         current.larkAppId === ownerLarkAppId
         && current.session.status === 'active'
-        && (query.kind !== 'byExternalSession'
-          || current.session.sessionId === query.sessionId)
+        && (query.kind === 'byExternalSession'
+          ? current.session.sessionId === query.sessionId
+          : query.kind === 'byRoute'
+            ? query.route.kind === 'thread'
+              ? current.scope === 'thread'
+                && activeSessionAnchorId(current) === query.route.anchorId
+              : current.scope === 'chat'
+                && activeSessionAnchorId(current) === query.route.chatId
+            : true)
       ));
       if (query.kind === 'list') {
         return {
@@ -897,6 +1416,12 @@ export async function executeScheduledTaskThroughRuntime(
               ? 'working' as const
               : 'dormant' as const,
           })),
+        };
+      }
+      if (matches.length > 1) {
+        return {
+          kind: 'notReady' as const,
+          message: 'scheduled bridge projection has multiple active owner bindings',
         };
       }
       const current = matches[0];
@@ -923,7 +1448,7 @@ export async function executeScheduledTaskThroughRuntime(
       };
     },
   };
-  const base = createSessionRuntimeHost({
+  base = createSessionRuntimeHost({
     directory,
     keyedTriggers: {
       inspect: () => ({ kind: 'blocked', message: 'not available in schedule bridge' }),
@@ -937,6 +1462,7 @@ export async function executeScheduledTaskThroughRuntime(
       failClose: async () => ({ kind: 'unreadable', message: 'not available in schedule bridge' }),
     },
     scheduledFire: adapter.port,
+    ...(controlMutation ? { controlMutation } : {}),
   });
   const host = { projection: base.projection, runtime: adapter.wrapRuntime(base) };
   const identity = createManualScheduledFireIdentity({

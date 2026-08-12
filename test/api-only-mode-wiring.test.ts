@@ -311,7 +311,11 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     expect(resumeRoute).toContain('dashboardControlEffects?.resumeNotice(');
     expect(resumeRoute).not.toContain('replyMessage(');
     expect(resumeRoute).not.toContain('sendMessage(');
-    const productionBinding = region(daemonSource, 'registerBot(cfg);', 'ensureVcMeetingDaemonAuthToken(');
+    const productionBinding = region(
+      daemonSource,
+      'registerBot(cfg, botIdentity.botId);',
+      'ensureVcMeetingDaemonAuthToken(',
+    );
     expect(productionBinding).toContain('setDashboardControlEffects(createCurrentDashboardControlEffects({');
   });
 

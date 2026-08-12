@@ -134,6 +134,7 @@ import {
   toSchedulerSubmitOutcome,
 } from './core/current-scheduled-fire.js';
 import { currentSessionControlPort } from './core/current-session-control.js';
+import { createCurrentRouteScratchRetirementPort } from './core/current-route-scratch-retirement.js';
 import {
   createCurrentOrdinaryRouteOpeningProduction,
   type CurrentOrdinaryRouteOpeningPolicyFacts,
@@ -650,6 +651,13 @@ const currentDashboardOpeningPorts = new Map<
   string,
   ReturnType<typeof createCurrentDashboardRouteOpeningPort>
 >();
+const currentRouteScratchRetirementPorts = new Map<
+  string,
+  {
+    ownerBootId: string;
+    port: ReturnType<typeof createCurrentRouteScratchRetirementPort>;
+  }
+>();
 
 // #796: a bare `/t` whose setup falls through to the repo-picker opening still
 // runs the talk-permission recheck in materialization, but topic setup must
@@ -1073,6 +1081,18 @@ function currentDaemonSessionActivation(ownerLarkAppId: string) {
   });
 }
 
+function currentDaemonRouteScratchRetirement(ownerLarkAppId: string) {
+  const ownerBootId = getDaemonBootId();
+  const cached = currentRouteScratchRetirementPorts.get(ownerLarkAppId);
+  if (cached?.ownerBootId === ownerBootId) return cached.port;
+  const port = createCurrentRouteScratchRetirementPort({
+    ownerLarkAppId,
+    downstream: () => currentDaemonSessionRuntimeHost(ownerLarkAppId),
+  });
+  currentRouteScratchRetirementPorts.set(ownerLarkAppId, { ownerBootId, port });
+  return port;
+}
+
 function currentDashboardOpeningPort(
   ownerLarkAppId: string,
 ): ReturnType<typeof createCurrentDashboardRouteOpeningPort> {
@@ -1129,7 +1149,11 @@ function currentDaemonSessionRuntimeHost(ownerLarkAppId: string) {
     }),
     scheduledFire: scheduled.adapter.port,
     controlMutation: currentSessionControlPort({
+      ownerBotId,
       ownerLarkAppId,
+      runtimeEpoch: ownerBootId,
+      activation,
+      routeScratchRetirement: currentDaemonRouteScratchRetirement(ownerLarkAppId),
       activeSessions,
     }),
   });

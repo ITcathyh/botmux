@@ -85,7 +85,7 @@ function activationResult(
       : { kind: 'accepted' };
   }
   if (terminal.kind === 'retryable') return refused(terminal.message);
-  if (terminal.kind === 'stale') return { kind: 'stateChanged' };
+  if (terminal.kind === 'staleBeforeEffect') return { kind: 'stateChanged' };
   if (terminal.kind === 'rejected') {
     return terminal.reason === 'conflict'
       ? unknown(terminal.message)

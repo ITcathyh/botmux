@@ -24,6 +24,7 @@ import { clearMessageListenerRunPreviewStore, markMessageListenerRunPreviewRepli
 import * as persistentBackend from '../src/core/persistent-backend.js';
 import { __testOnly_resetBotRegistry, getBot, loadBotConfigs, registerBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
+import { parseBotId } from '../src/core/bot-identity.js';
 import { sessionKey } from '../src/core/types.js';
 import { writeRoleFile, writeTeamRoleFile } from '../src/core/role-resolver.js';
 import {
@@ -1233,6 +1234,12 @@ describe('GET /api/sessions', () => {
     try {
       config.session.dataDir = dataDir;
       sessionStore.init('cli_quarantined');
+      registerBot({
+        larkAppId: 'cli_quarantined',
+        larkAppSecret: '',
+        apiOnly: true,
+        cliId: 'codex',
+      }, parseBotId('bot_dashboard_quarantined'));
       setLarkAppId('cli_quarantined');
       workerPool.setActiveSessionsRegistry(registry);
 
@@ -2328,6 +2335,93 @@ describe('PUT /api/bot-read-isolation', () => {
 });
 
 describe('POST /api/sessions/:sessionId/resume', () => {
+  it.each(['live', 'persisted-only'] as const)(
+    'retires a %s disposable route scratch through its child SessionRuntime before owner resume',
+    async (scratchKind) => {
+      const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-resume-scratch-'));
+      const previousDataDir = config.session.dataDir;
+      const ownerLarkAppId = `cli_resume_scratch_${scratchKind.replace('-', '_')}`;
+      const registry = new Map<string, any>();
+      try {
+        config.session.dataDir = dataDir;
+        sessionStore.init(ownerLarkAppId);
+
+        const target = sessionStore.createSession(
+          'oc_resume_scratch',
+          'om_resume_scratch',
+          'closed target',
+          'group',
+          'thread',
+        );
+        Object.assign(target, {
+          larkAppId: ownerLarkAppId,
+          workingDir: process.cwd(),
+        });
+        sessionStore.updateSession(target);
+        sessionStore.closeSession(target.sessionId);
+
+        const scratch = sessionStore.createSession(
+          'oc_resume_scratch',
+          'om_resume_scratch',
+          'disposable command scratch',
+          'group',
+          'thread',
+        );
+        Object.assign(scratch, {
+          larkAppId: ownerLarkAppId,
+          workingDir: process.cwd(),
+          cliId: undefined,
+          lastCliInput: undefined,
+        });
+        sessionStore.updateSession(scratch);
+        if (scratchKind === 'live') {
+          registry.set(sessionKey(scratch.rootMessageId, ownerLarkAppId), {
+            session: scratch,
+            worker: null,
+            workerPort: null,
+            workerToken: null,
+            larkAppId: ownerLarkAppId,
+            chatId: scratch.chatId,
+            chatType: 'group',
+            scope: 'thread',
+            spawnedAt: Date.now(),
+            cliVersion: 'test',
+            lastMessageAt: Date.now(),
+            hasHistory: false,
+            workingDir: scratch.workingDir,
+          });
+        }
+        workerPool.setActiveSessionsRegistry(registry);
+        installCurrentDashboardSessionRuntimeForTest(ownerLarkAppId, registry);
+
+        handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+        const response = await fetch(
+          `http://127.0.0.1:${handle.port}/api/sessions/${target.sessionId}/resume`,
+          {
+            method: 'POST',
+            headers: {
+              'x-botmux-operation-id': `dashboard-resume-scratch-${scratchKind}`,
+            },
+          },
+        );
+
+        expect(response.status).toBe(200);
+        expect(await response.json()).toMatchObject({
+          ok: true,
+          sessionId: target.sessionId,
+        });
+        expect(sessionStore.getSession(scratch.sessionId)?.status).toBe('closed');
+        expect(sessionStore.getSession(target.sessionId)?.status).toBe('active');
+        expect([...registry.values()].map(ds => ds.session.sessionId)).toEqual([target.sessionId]);
+      } finally {
+        workerPool.setActiveSessionsRegistry(new Map());
+        sessionStore.init();
+        config.session.dataDir = previousDataDir;
+        rmSync(dataDir, { recursive: true, force: true });
+      }
+    },
+  );
+
   it('rejects a managed VC receiver without reactivating or waking it', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-resume-'));
     const prevConfigDataDir = config.session.dataDir;
@@ -2498,6 +2592,12 @@ describe('GET /api/events', () => {
     try {
       config.session.dataDir = dataDir;
       sessionStore.init('cli_zombie');
+      registerBot({
+        larkAppId: 'cli_zombie',
+        larkAppSecret: '',
+        apiOnly: true,
+        cliId: 'codex',
+      }, parseBotId('bot_dashboard_zombie'));
       setLarkAppId('cli_zombie');
       workerPool.setActiveSessionsRegistry(registry); // empty — zombie already evicted
 

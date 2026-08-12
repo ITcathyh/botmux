@@ -32,6 +32,9 @@ const mocks = vi.hoisted(() => {
     sendWorkerInput: vi.fn(() => true),
     forkWorker: vi.fn(),
     forkAdoptWorker: vi.fn(),
+    sessionActivationEnsure: vi.fn(),
+    sessionActivationReconcile: vi.fn(),
+    sessionActivationRetire: vi.fn(),
     admitQueuedActivationTail: vi.fn(),
     promoteQueuedActivationTail: vi.fn(),
     stagePendingRepoSetup: vi.fn(),
@@ -108,6 +111,19 @@ vi.mock('../src/core/worker-pool.js', async () => {
     forkAdoptWorker: mocks.forkAdoptWorker,
     admitQueuedActivationTail: mocks.admitQueuedActivationTail,
     promoteQueuedActivationTail: mocks.promoteQueuedActivationTail,
+  };
+});
+
+vi.mock('../src/core/current-session-activation.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/current-session-activation.js');
+  const coordinator = Object.freeze({
+    ensure: (...args: any[]) => mocks.sessionActivationEnsure(...args),
+    reconcile: (...args: any[]) => mocks.sessionActivationReconcile(...args),
+    retire: (...args: any[]) => mocks.sessionActivationRetire(...args),
+  });
+  return {
+    ...actual,
+    currentSessionActivationCoordinator: vi.fn(() => coordinator),
   };
 });
 
@@ -464,6 +480,7 @@ function clearRouteSpies(): void {
     mocks.sendWorkerInput,
     mocks.forkWorker,
     mocks.forkAdoptWorker,
+    mocks.sessionActivationEnsure,
     mocks.admitQueuedActivationTail,
     mocks.promoteQueuedActivationTail,
     mocks.stagePendingRepoSetup,
@@ -501,6 +518,33 @@ beforeEach(() => {
   bot.resolvedAllowedUsers = [OWNER];
   mocks.downloadResources.mockResolvedValue({ attachments: [], needLogin: false });
   mocks.getAvailableBots.mockResolvedValue([]);
+  mocks.sessionActivationEnsure.mockImplementation(async (input: any) => {
+    const current = [...activeSessions.values()].find(candidate => (
+      candidate.larkAppId === APP
+      && candidate.session.sessionId === input.sessionId
+      && activeSessions.get(activeSessionKey(candidate)) === candidate
+    ));
+    if (!current) {
+      return { kind: 'retryable', message: 'test Current activation target is unavailable' };
+    }
+    try {
+      const accepted = mocks.forkWorker(
+        current,
+        input.promptInput,
+        input.resumeOrTurnId ?? false,
+      );
+      return accepted === true
+        ? { kind: 'active', action: 'deferred' }
+        : { kind: 'retryable', message: 'test Current activation was not accepted' };
+    } catch (error) {
+      return {
+        kind: 'ambiguous',
+        message: error instanceof Error ? error.message : String(error),
+      };
+    }
+  });
+  mocks.sessionActivationReconcile.mockResolvedValue({ kind: 'active', action: 'deferred' });
+  mocks.sessionActivationRetire.mockResolvedValue({ kind: 'retired', action: 'retired' });
 });
 
 afterAll(() => {
@@ -871,17 +915,26 @@ describe('daemon no-owner ordinary route one-cut', () => {
     const first = mocks.currentSessionRuntimeHost.mock.calls[0]![0] as any;
     const second = mocks.currentSessionRuntimeHost.mock.calls[1]![0] as any;
     expect(first).toMatchObject({
+      ownerBotId: parseBotId('bot_current_one_cut'),
       ownerLarkAppId: APP,
       activeSessions,
       ownerBootId: expect.any(String),
+      runtimeEpoch: expect.any(String),
       ordinaryIngress: expect.any(Object),
       ordinaryRouteOpeningCreator: expect.any(Object),
+      dashboardRouteOpening: expect.any(Object),
       pendingRepoCompletion: expect.any(Object),
+      scheduledFire: expect.any(Object),
+      controlMutation: expect.any(Object),
     });
     expect(second.ownerBootId).toBe(first.ownerBootId);
+    expect(second.runtimeEpoch).toBe(first.runtimeEpoch);
     expect(second.ordinaryIngress).toBe(first.ordinaryIngress);
     expect(second.ordinaryRouteOpeningCreator).toBe(first.ordinaryRouteOpeningCreator);
+    expect(second.dashboardRouteOpening).toBe(first.dashboardRouteOpening);
     expect(second.pendingRepoCompletion).toBe(first.pendingRepoCompletion);
+    expect(second.scheduledFire).toBe(first.scheduledFire);
+    expect(second.controlMutation).toBe(first.controlMutation);
   });
 
   it('releases the route delivery lock after enqueue while completion is pending', async () => {
@@ -1086,6 +1139,11 @@ describe('daemon Current ordinary opening adapter', () => {
     });
     expect(current.pendingRepo).toBeUndefined();
     expect(current.session.pendingRepoSetup).toBeUndefined();
+    expect(mocks.sessionActivationEnsure).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: current.session.sessionId,
+      cause: 'ordinary',
+      promptInput: expect.objectContaining({ content: expect.any(String) }),
+    }));
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
     expect(mocks.downloadResources).toHaveBeenCalledTimes(1);
     expect(mocks.resolveSender).toHaveBeenCalledTimes(1);
@@ -1118,6 +1176,7 @@ describe('daemon Current ordinary opening adapter', () => {
         autoWorktreeBase,
         { slug: 'open-an-isolated-worktree' },
       );
+      expect(mocks.sessionActivationEnsure).toHaveBeenCalledTimes(1);
       expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
     }, { timeout: 1_000 });
     const current = activeSessions.get(sessionKey(anchor, APP));

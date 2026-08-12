@@ -231,6 +231,28 @@ describe('Current ordinary ingress worker-process Adapter', () => {
     });
   });
 
+  it.each([
+    ['staleBeforeEffect', { kind: 'stateChanged' }],
+    ['unknownAfterEffect', {
+      kind: 'unknown',
+      message: 'activation lifecycle changed',
+    }],
+  ] as const)('maps activation %s without retrying an invoked effect', async (kind, expected) => {
+    const current = daemonSession();
+    current.worker = null;
+    const activeSessions = new Map<string, DaemonSession>([[activeSessionKey(current), current]]);
+    const workerProcesses = createCurrentOrdinaryIngressWorkerProcesses({
+      ownerLarkAppId: OWNER,
+      activeSessions,
+      sendWorkerInput: vi.fn(() => true),
+      activation: {
+        ensure: vi.fn(async () => ({ kind, message: 'activation lifecycle changed' })),
+      },
+    });
+
+    await expect(workerProcesses.dispatch(forkCommand())).resolves.toEqual(expected);
+  });
+
   it('forks only the current adopted binding and proves a void helper by its new worker lifetime', async () => {
     const current = daemonSession();
     current.worker = null;

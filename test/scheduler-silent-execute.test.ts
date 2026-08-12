@@ -27,6 +27,28 @@ import type { DaemonSession } from '../src/core/types.js';
 const store = new Map<string, Session>();
 let sessionSeq = 0;
 vi.mock('../src/services/session-store.js', () => ({
+  createCurrentSessionStore: vi.fn(() => ({
+    load: vi.fn((sessionId: string) => {
+      const session = store.get(sessionId);
+      if (!session) return { kind: 'notFound' as const };
+      return {
+        kind: 'loaded' as const,
+        state: {
+          sessionId,
+          route: (session.scope ?? 'thread') === 'chat'
+            ? { kind: 'chat' as const, chatId: session.chatId }
+            : { kind: 'thread' as const, anchorId: session.rootMessageId },
+          recordStatus: session.status === 'active' ? 'active' as const : 'closed' as const,
+          title: session.title,
+          executorGeneration: 1,
+          queued: session.queued === true,
+          locked: session.locked === true,
+        },
+        version: Object.freeze({}),
+      };
+    }),
+    apply: vi.fn(() => ({ kind: 'notApplied' as const, message: 'unused test transition' })),
+  })),
   registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
   cleanupSessionBridgeSendMarkers: vi.fn(),
   cleanupSessionBridgeSendMarkersNow: vi.fn(),
@@ -41,8 +63,34 @@ vi.mock('../src/services/session-store.js', () => ({
   }),
   updateSession: vi.fn((s: Session) => { store.set(s.sessionId, s); }),
   getSession: vi.fn((id: string) => store.get(id)),
+  getOwnedSession: vi.fn((id: string) => store.get(id)),
+  getSessionForOwnerStrict: vi.fn((_owner: string, id: string) => store.get(id)),
+  listSessionsForOwnerStrict: vi.fn(() => [...store.values()]),
   listSessions: vi.fn(() => [...store.values()]),
-  closeSession: vi.fn(),
+  closeSession: vi.fn(async (
+    sessionId: string,
+    options?: { owner?: { activeSessions?: Map<string, DaemonSession> }; isCurrent?: () => boolean },
+  ) => {
+    if (options?.isCurrent && !options.isCurrent()) {
+      return {
+        ok: false,
+        alreadyClosed: false,
+        known: true,
+        closeDisposition: 'notApplied' as const,
+      };
+    }
+    const session = store.get(sessionId);
+    if (!session || session.status !== 'active') {
+      return { ok: true, alreadyClosed: true, known: !!session };
+    }
+    session.status = 'closed';
+    for (const [key, current] of options?.owner?.activeSessions ?? []) {
+      if (current.session.sessionId === sessionId) {
+        options?.owner?.activeSessions?.delete(key);
+      }
+    }
+    return { ok: true, alreadyClosed: false, known: true };
+  }),
   updateSessionPid: vi.fn(),
 }));
 
@@ -101,6 +149,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   ) => action()),
   isRelayableRealSession: vi.fn((ds: DaemonSession) =>
     (!!ds.worker && !ds.worker.killed) || !!ds.session.cliId || !!ds.session.lastCliInput),
+  isSessionTransferring: vi.fn(() => false),
   isDisposableCommandScratch: vi.fn((ds: DaemonSession) =>
     !ds.worker
     && !ds.pendingRepo
@@ -111,11 +160,35 @@ vi.mock('../src/core/worker-pool.js', () => ({
     && !ds.session.queued
     && !ds.session.cliId
     && !ds.session.lastCliInput),
-  closeSession: vi.fn(),
+  closeSession: vi.fn(async (
+    sessionId: string,
+    options?: { owner?: { activeSessions?: Map<string, DaemonSession> }; isCurrent?: () => boolean },
+  ) => {
+    if (options?.isCurrent && !options.isCurrent()) {
+      return {
+        ok: false,
+        alreadyClosed: false,
+        known: true,
+        closeDisposition: 'notApplied' as const,
+      };
+    }
+    const session = store.get(sessionId);
+    if (!session || session.status !== 'active') {
+      return { ok: true, alreadyClosed: true, known: !!session };
+    }
+    session.status = 'closed';
+    for (const [key, current] of options?.owner?.activeSessions ?? []) {
+      if (current.session.sessionId === sessionId) {
+        options?.owner?.activeSessions?.delete(key);
+      }
+    }
+    return { ok: true, alreadyClosed: false, known: true };
+  }),
   suspendWorker: vi.fn(),
 }));
 
 const BOT = {
+  botId: 'bot_scheduler_silent_test',
   config: { larkAppId: 'cli_app_test', cliId: 'claude-code', cliPathOverride: undefined, defaultWorkingDir: '/tmp' },
   botName: 'TestBot',
   botOpenId: 'ou_bot',
@@ -324,6 +397,50 @@ describe('executeScheduledTask — fresh-topic execution', () => {
 });
 
 describe('executeScheduledTask — silent chat-scope fire', () => {
+  it('ignores an unrelated active Session when projecting the target route', async () => {
+    const unrelatedSession: Session = {
+      sessionId: 'sess-unrelated-route',
+      chatId: 'oc_unrelated',
+      rootMessageId: 'om_unrelated',
+      title: 'unrelated',
+      chatType: 'group',
+      scope: 'thread',
+      status: 'active',
+      larkAppId: APP,
+      cliId: 'codex',
+      createdAt: new Date('2026-01-01T00:00:00Z').toISOString(),
+    };
+    const unrelated: DaemonSession = {
+      session: unrelatedSession,
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId: APP,
+      chatId: unrelatedSession.chatId,
+      chatType: 'group',
+      scope: 'thread',
+      spawnedAt: 0,
+      cliVersion: 'test-cli-v1',
+      lastMessageAt: 0,
+      hasHistory: true,
+      workingDir: '/tmp',
+    };
+    store.set(unrelatedSession.sessionId, unrelatedSession);
+    const active = new Map<string, DaemonSession>([
+      [sessionKey(unrelatedSession.rootMessageId, APP), unrelated],
+    ]);
+
+    await executeScheduledTask(
+      baseTask({ scope: 'chat', silent: true }),
+      active,
+      refreshCliVersion,
+    );
+
+    expect(active.get(sessionKey(unrelatedSession.rootMessageId, APP))).toBe(unrelated);
+    expect(active.get(sessionKey(CHAT, APP))?.session.sessionId).toMatch(/^sess-/);
+    expect(active).toHaveLength(2);
+  });
+
   it('posts no banner and anchors at chatId', async () => {
     const active = new Map<string, DaemonSession>();
     await executeScheduledTask(baseTask({ scope: 'chat', silent: true }), active, refreshCliVersion);
@@ -515,6 +632,49 @@ describe('executeScheduledTask — live-session injection', () => {
     };
   }
 
+  it('retires a same-route disposable scratch through the bridge control port', async () => {
+    const scratchSession: Session = {
+      sessionId: 'sess-bridge-scratch',
+      chatId: CHAT,
+      rootMessageId: ROOT,
+      title: 'bridge scratch',
+      chatType: 'group',
+      scope: 'thread',
+      status: 'active',
+      larkAppId: APP,
+      createdAt: new Date('2026-01-01T00:00:00Z').toISOString(),
+    };
+    store.set(scratchSession.sessionId, scratchSession);
+    const scratch: DaemonSession = {
+      session: scratchSession,
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId: APP,
+      chatId: CHAT,
+      chatType: 'group',
+      scope: 'thread',
+      spawnedAt: 0,
+      cliVersion: 'test-cli-v1',
+      lastMessageAt: 0,
+      hasHistory: false,
+      workingDir: '/tmp',
+    };
+    const active = new Map<string, DaemonSession>([
+      [sessionKey(ROOT, APP), scratch],
+    ]);
+
+    await executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+      active,
+      refreshCliVersion,
+    );
+
+    expect(scratchSession.status).toBe('closed');
+    expect(active.get(sessionKey(ROOT, APP))?.session.sessionId).not.toBe(scratchSession.sessionId);
+    expect(forkWorkerMock).toHaveBeenCalledOnce();
+  });
+
   it('idle session: injects with the exact scheduled turn armed, no banner', async () => {
     const active = new Map<string, DaemonSession>();
     const existing = liveSession('idle');
@@ -544,6 +704,39 @@ describe('executeScheduledTask — live-session injection', () => {
     const turnId = sendWorkerInputMock.mock.calls[0][2];
     expect(existing.silentScheduledTurns?.has(turnId)).toBe(true);
     expect(existing.silentScheduledTurns?.has('normal-user-turn')).toBe(false);
+  });
+
+  it('keeps an accepted live send sticky when the Session owner changes before resume', async () => {
+    const active = new Map<string, DaemonSession>();
+    const existing = liveSession('idle');
+    active.set(sessionKey(ROOT, APP), existing);
+    const replacementSession: Session = {
+      ...existing.session,
+      sessionId: 'sess-live-replacement',
+      title: 'replacement',
+    };
+    const replacement: DaemonSession = {
+      ...existing,
+      session: replacementSession,
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+    };
+    store.set(replacementSession.sessionId, replacementSession);
+    sendWorkerInputMock.mockImplementationOnce(() => {
+      active.set(sessionKey(ROOT, APP), replacement);
+      return true;
+    });
+
+    await expect(executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+      active,
+      refreshCliVersion,
+    )).rejects.toThrow(/accepted.*owner changed/i);
+
+    expect(sendWorkerInputMock).toHaveBeenCalledOnce();
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(active.get(sessionKey(ROOT, APP))).toBe(replacement);
   });
 
   it('cold-resumes the registered worker-less session instead of losing the scheduled turn to CAS', async () => {

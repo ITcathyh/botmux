@@ -19,8 +19,14 @@ import {
   createCurrentDashboardHostMaintenance,
 } from '../../src/core/current-dashboard-host-maintenance.js';
 import { createCurrentDashboardSessionCommandClient } from '../../src/core/current-dashboard-session-command-client.js';
+import { parseBotId } from '../../src/core/bot-identity.js';
+import { createCurrentRouteScratchRetirementPort } from '../../src/core/current-route-scratch-retirement.js';
+import { currentSessionActivationCoordinator } from '../../src/core/current-session-activation.js';
 import { createCurrentSessionControlPort } from '../../src/core/current-session-control.js';
-import { currentSessionRuntimeHost } from '../../src/core/current-session-runtime.js';
+import {
+  currentSessionRuntimeHost,
+  type CurrentSessionRuntimeHost,
+} from '../../src/core/current-session-runtime.js';
 import * as sessionStore from '../../src/services/session-store.js';
 import { activeSessionKey, type DaemonSession } from '../../src/core/types.js';
 
@@ -144,14 +150,31 @@ export function installCurrentDashboardSessionRuntimeForTest(
     !ownerLarkAppId,
   );
   const runtimeEpoch = `dashboard-test:${randomUUID()}`;
-  const host = currentSessionRuntimeHost({
+  const ownerBotId = parseBotId(`bot_${randomUUID().replaceAll('-', '')}`);
+  const activation = currentSessionActivationCoordinator({
+    ownerBotId,
+    ownerLarkAppId: resolvedOwnerLarkAppId,
+    runtimeEpoch,
+    activeSessions,
+  });
+  let host: CurrentSessionRuntimeHost;
+  const routeScratchRetirement = createCurrentRouteScratchRetirementPort({
+    ownerLarkAppId: resolvedOwnerLarkAppId,
+    downstream: () => host,
+  });
+  host = currentSessionRuntimeHost({
+    ownerBotId,
     ownerLarkAppId: resolvedOwnerLarkAppId,
     activeSessions,
     ownerBootId: runtimeEpoch,
     runtimeEpoch,
     keyedTriggerAdmissionBlocked: () => false,
     controlMutation: createCurrentSessionControlPort({
+      ownerBotId,
       ownerLarkAppId: resolvedOwnerLarkAppId,
+      runtimeEpoch,
+      activation,
+      routeScratchRetirement,
       activeSessions,
     }),
   });

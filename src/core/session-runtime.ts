@@ -446,12 +446,13 @@ export type ControlMutationInput =
       readonly target: SessionCliSelectionTarget;
     }
   | {
-      /** Relocation may retire only the exact still-disposable target scratch
-       * classified under its held owner/route reservation. */
+      /** A route producer may retire only the exact still-disposable scratch
+       * classified under its held owner/route admission capability. */
       readonly kind: 'close';
-      readonly reason: 'relocateScratch';
+      readonly reason: 'routeScratch';
+      readonly source: 'relocate' | 'scheduler' | 'resume';
       readonly expectedRoute: {
-        readonly scope: 'chat';
+        readonly scope: 'thread' | 'chat';
         readonly canonicalAnchor: string;
         readonly chatId: string;
         readonly chatType: 'group' | 'p2p';

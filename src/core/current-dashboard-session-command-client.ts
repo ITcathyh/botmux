@@ -10,6 +10,10 @@
 
 import { computeInputHash } from '../utils/canonical-input-hash.js';
 import { withBotTurnAdmission } from './bot-turn-mutation-gate.js';
+import {
+  createCurrentReopenRouteAdmissionPort,
+  type CurrentReopenRouteAdmissionPort,
+} from './current-reopen-route-admission.js';
 import type { CurrentSessionRuntimeHost } from './current-session-runtime.js';
 import type {
   CommandOutcomeFor,
@@ -124,12 +128,130 @@ function invalidOutcome(error: unknown): ExternalOutcome {
 
 async function executeExternal(
   hostForAttempt: () => CurrentSessionRuntimeHost,
+  reopenRouteAdmission: CurrentReopenRouteAdmissionPort,
   input: {
     readonly target: Extract<CurrentDashboardSessionRuntimeTarget, { kind: 'externalSession' }>;
     readonly idempotencyKey: string;
     readonly command: ExternalCommand;
   },
 ): Promise<ExternalOutcome> {
+  if (input.command.kind === 'control.mutate'
+      && input.command.input.kind === 'reopen') {
+    let initialHost: CurrentSessionRuntimeHost;
+    try {
+      initialHost = hostForAttempt();
+    } catch (error) {
+      return {
+        kind: 'retryable',
+        message: `Dashboard SessionRuntime host is not ready: ${message(error)}`,
+      };
+    }
+    let initial: Awaited<ReturnType<CurrentSessionRuntimeHost['projection']['read']>>;
+    try {
+      initial = await initialHost.projection.read({
+        kind: 'byExternalSession',
+        sessionId: input.target.sessionId,
+      });
+    } catch (error) {
+      return {
+        kind: 'retryable',
+        message: `Dashboard Session projection failed before reopen admission: ${message(error)}`,
+      };
+    }
+    if (initial.kind === 'notFound') {
+      return {
+        kind: 'rejected',
+        reason: 'sessionNotFound',
+        message: 'Session is not owned by this Runtime Host',
+      };
+    }
+    if (initial.kind === 'notReady') return { kind: 'retryable', message: initial.message };
+    if (initial.kind !== 'one') {
+      return {
+        kind: 'quarantined',
+        message: 'Session projection did not resolve exactly one owner',
+      };
+    }
+    const admission = reopenRouteAdmission.reserve({ session: initial.session });
+    if (admission.kind !== 'reserved') return admission;
+    try {
+      try {
+        await admission.ready;
+      } catch (error) {
+        return {
+          kind: 'retryable',
+          message: `Dashboard reopen route admission failed: ${message(error)}`,
+        };
+      }
+      const revalidated = admission.revalidate();
+      if (revalidated.kind !== 'current') return revalidated;
+
+      // A Host lease may be superseded while this operation waits for route
+      // admission. Re-project under the held admission before each bounded
+      // stale-address retry; never submit the pre-admission address.
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        let host: CurrentSessionRuntimeHost;
+        try {
+          host = hostForAttempt();
+        } catch (error) {
+          return {
+            kind: 'retryable',
+            message: `Dashboard SessionRuntime host is not ready: ${message(error)}`,
+          };
+        }
+        let projected: Awaited<ReturnType<CurrentSessionRuntimeHost['projection']['read']>>;
+        try {
+          projected = await host.projection.read({
+            kind: 'byExternalSession',
+            sessionId: input.target.sessionId,
+          });
+        } catch (error) {
+          return {
+            kind: 'retryable',
+            message: `Dashboard Session projection failed before dispatch: ${message(error)}`,
+          };
+        }
+        if (projected.kind === 'notFound') {
+          return {
+            kind: 'rejected',
+            reason: 'sessionNotFound',
+            message: 'Session is not owned by this Runtime Host',
+          };
+        }
+        if (projected.kind === 'notReady') {
+          return { kind: 'retryable', message: projected.message };
+        }
+        if (projected.kind !== 'one') {
+          return {
+            kind: 'quarantined',
+            message: 'Session projection did not resolve exactly one owner',
+          };
+        }
+        let outcome: ExternalOutcome;
+        try {
+          outcome = await host.runtime.submit({
+            target: {
+              kind: 'session',
+              address: projected.session.address,
+              controlRouteReservation: admission.token,
+            },
+            idempotencyKey: input.idempotencyKey,
+            command: input.command,
+          }) as ExternalOutcome;
+        } catch (error) {
+          return {
+            kind: 'quarantined',
+            message: `Dashboard Runtime dispatch outcome is unknown: ${message(error)}`,
+          };
+        }
+        if (outcome.kind !== 'staleAddress' || attempt === 1) return outcome;
+      }
+      return { kind: 'staleAddress' };
+    } finally {
+      admission.release();
+    }
+  }
+
   for (let attempt = 0; attempt < 2; attempt += 1) {
     let host: CurrentSessionRuntimeHost;
     try {
@@ -203,10 +325,14 @@ export function createCurrentDashboardSessionCommandClient(options: {
   readonly ownerLarkAppId: () => string;
   /** Resolve the current leased Host. Operation receipts remain on this client. */
   readonly host: () => CurrentSessionRuntimeHost;
+  /** Internal FI seam; production resolves owner-strict Current rows. */
+  readonly reopenRouteAdmission?: CurrentReopenRouteAdmissionPort;
 }): CurrentDashboardSessionCommandSubmitter {
   // Intentionally retained for the entire daemon epoch. Current has no durable
   // operation evidence that could safely back an LRU eviction.
   const externalAttempts = new Map<string, ExternalAttempt>();
+  const reopenRouteAdmission = options.reopenRouteAdmission
+    ?? createCurrentReopenRouteAdmissionPort({ ownerLarkAppId: options.ownerLarkAppId });
 
   const submit = async <C extends CurrentDashboardSessionRuntimeCommand>(input: {
     readonly target: CurrentDashboardSessionRuntimeTarget;
@@ -282,7 +408,11 @@ export function createCurrentDashboardSessionCommandClient(options: {
     // Adapter is allowed to resolve synchronously and may re-enter the client
     // through instrumentation/hooks; starting executeExternal inline would let
     // that callback miss the receipt and drive the same operation twice.
-    const terminal = Promise.resolve().then(() => executeExternal(options.host, externalInput));
+    const terminal = Promise.resolve().then(() => executeExternal(
+      options.host,
+      reopenRouteAdmission,
+      externalInput,
+    ));
     externalAttempts.set(key, { requestHash, state: 'running', terminal });
     const outcome = await terminal;
     if (externalAttempts.get(key)?.requestHash === requestHash) {

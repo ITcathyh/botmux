@@ -3,7 +3,7 @@
   "purpose": "Target-A 可执行覆盖台账：由源码和 A0 authority inventory 证明已迁移边界与 remaining bypass，不声明 Target-B durability。",
   "authorityInventory": {
     "path": "docs/architecture/session-authority-inventory.json",
-    "sha256": "e456bd63dd19c5bbf5962e6c826065a45d0df06f26d696e73073e852ebcad55d"
+    "sha256": "955d9b478d2bc2f11902f31782a33fb2d6bd61e4b01887bdefc922373d7c9bec"
   },
   "coverage": [
     {
@@ -72,7 +72,7 @@
       "authorityRawPublishers": {
         "recordCount": 1,
         "publishSiteCount": 2,
-        "digest": "9bf07240bcb367d12910145054fe1b5753af50b57172378ec3fd3449c409b3d0"
+        "digest": "27a359200e7fd720768b2c1165d13277a519099124bf81ab83328408a320af4b"
       }
     },
     {
@@ -167,7 +167,7 @@
       "authorityRawPublishers": {
         "recordCount": 1,
         "publishSiteCount": 2,
-        "digest": "e0187c59704b92b08ef5de7ce087b8d46aa1fad5aa93ecca5f00d2bd55cf2f17"
+        "digest": "3fb0d2df45932987e25b1bdf52467c79502894d574a27a63b65ecfa1f2dd42c3"
       },
       "productionBinding": {
         "daemonSource": "src/daemon.ts",
@@ -261,14 +261,281 @@
       }
     },
     {
-      "id": "control",
+      "id": "dashboard-control",
       "targetMilestone": "C2",
-      "disposition": "remaining",
-      "description": "Dashboard/card/command close、cancel、activate、rename 与非 pending 的 mid-session repo replacement 仍直接使用 Current mutation surface，后置到 C2。",
+      "disposition": "migrated",
+      "description": "Dashboard mutation caller cut 以 caller-supplied 或 trigger-derived stable operation identity 穿过单一 command client、SessionRuntime 与 Current control/route Adapter；authority selector 只认 exact Current adapter lane。",
       "selectors": [
         {
-          "sourceFile": "src/core/dashboard-ipc-server.ts"
+          "sourceFile": "src/core/current-dashboard-route-opening.ts",
+          "enclosingFunctions": [
+            "inspectCurrentDashboardRoute"
+          ],
+          "accessLanes": [
+            "session-runtime-current-adapter"
+          ]
         },
+        {
+          "sourceFile": "src/core/current-ordinary-route-registry.ts",
+          "enclosingFunctions": [
+            "inspectRelocationTarget"
+          ],
+          "accessLanes": [
+            "session-runtime-current-adapter"
+          ]
+        },
+        {
+          "sourceFile": "src/core/current-session-control.ts",
+          "enclosingFunctions": [
+            "convergeAsyncTriggerFault",
+            "execute"
+          ],
+          "accessLanes": [
+            "session-runtime-current-adapter"
+          ]
+        },
+        {
+          "sourceFile": "src/core/session-manager.ts",
+          "enclosingFunctions": [
+            "spawnDashboardSession"
+          ],
+          "accessLanes": [
+            "session-runtime-current-adapter"
+          ]
+        }
+      ],
+      "authoritySites": {
+        "recordCount": 8,
+        "mutationCount": 8,
+        "digest": "3b1e7c7d089d6e2e0366f3e5bce331e65c12cfdad3b5a43ac738f394e49a6288"
+      },
+      "productionBinding": {
+        "ipcSource": "src/core/dashboard-ipc-server.ts",
+        "operationIdReader": "sessionOperationId",
+        "commandClientSource": "src/core/current-dashboard-session-command-client.ts",
+        "commandClientFactory": "createCurrentDashboardSessionCommandClient",
+        "currentRuntimeSource": "src/core/current-session-runtime.ts",
+        "currentRuntimeFactory": "currentSessionRuntimeHost",
+        "runtimeSource": "src/core/session-runtime.ts",
+        "runtimeFactory": "createSessionRuntimeHost",
+        "runtimeSubmitFunction": "submit",
+        "mutationEffectRunner": "runControlMutationEffects",
+        "mutationResumeFunction": "resumeControlMutationAttempt",
+        "renameEffectRunner": "runControlRenameEffect",
+        "controlSource": "src/core/current-session-control.ts",
+        "controlFactory": "createCurrentSessionControlPort",
+        "cwdSource": "src/core/session-cwd.ts",
+        "cwdCurrentPublisher": "syncCurrentSessionWorkingDir",
+        "cwdRemainingPublisher": "repinSessionWorkingDir",
+        "openingSource": "src/core/current-dashboard-route-opening.ts",
+        "openingFactory": "createCurrentDashboardRouteOpeningPort",
+        "dashboardOpeningBarrierSource": "src/core/session-manager.ts",
+        "dashboardOpeningBarrierFunction": "spawnDashboardSession",
+        "routeRegistrySource": "src/core/current-ordinary-route-registry.ts",
+        "routeRegistryFactory": "createCurrentOrdinaryRouteRegistryRuntime",
+        "routeAdmissionSource": "src/core/current-route-admission.ts",
+        "routeAdmissionFactory": "reserveCurrentRouteAdmission",
+        "triggerSource": "src/core/trigger-session.ts",
+        "triggerFunction": "triggerSessionTurnAdmitted",
+        "maintenanceSource": "src/core/current-dashboard-host-maintenance.ts",
+        "maintenanceFactory": "createCurrentDashboardHostMaintenance",
+        "chatRenameSource": "src/core/current-dashboard-chat-rename.ts",
+        "chatRenameFactory": "createCurrentDashboardChatRename",
+        "aggregatorSource": "src/dashboard.ts",
+        "createOperationHostFactory": "createDashboardSessionCreateOperationHost",
+        "idleOperationHostFactory": "createDashboardIdleCleanupOperationHost",
+        "aggregatorOperationIdReader": "requiredDashboardSessionCreateOperationId",
+        "idleChildExecutor": "executeDashboardIdleCleanupChild",
+        "webOperationSource": "src/dashboard/web/operation-id.ts",
+        "webOperationCoordinator": "SemanticOperationCoordinator",
+        "sessionsCardSource": "src/im/lark/sessions-card.ts",
+        "sessionsCardBuilder": "buildSessionsDetailCard",
+        "sessionsCardHandler": "handleSessionsCardAction",
+        "daemonSource": "src/daemon.ts",
+        "daemonHostFactory": "currentDaemonSessionRuntimeHost",
+        "daemonActivationFactory": "currentDaemonSessionActivation",
+        "activationCoordinatorFactory": "currentSessionActivationCoordinator",
+        "operationReceiptDurability": "daemonEpoch",
+        "routes": [
+          {
+            "method": "GET",
+            "path": "/api/sessions/:sessionId/trigger-result",
+            "sink": "buildAsyncTriggerLookupResponse",
+            "delegatedFunction": "buildAsyncTriggerLookupResponse",
+            "delegatedSink": "dashboardSessionRuntimeSubmitter",
+            "commandKind": "control.mutate",
+            "identitySource": "derived-trigger-id"
+          },
+          {
+            "method": "POST",
+            "path": "/api/sessions/:sessionId/close",
+            "sink": "dashboardSessionRuntimeSubmitter",
+            "commandKind": "control.mutate",
+            "identitySource": "caller-supplied"
+          },
+          {
+            "method": "POST",
+            "path": "/api/sessions/:sessionId/prune",
+            "sink": "dashboardSessionRuntimeSubmitter",
+            "commandKind": "control.mutate",
+            "identitySource": "caller-supplied"
+          },
+          {
+            "method": "POST",
+            "path": "/api/sessions/:sessionId/restart",
+            "sink": "submitControl",
+            "commandKind": "control.mutate",
+            "identitySource": "caller-supplied"
+          },
+          {
+            "method": "POST",
+            "path": "/api/sessions/:sessionId/suspend",
+            "sink": "submitControl",
+            "commandKind": "control.mutate",
+            "identitySource": "caller-supplied"
+          },
+          {
+            "method": "POST",
+            "path": "/api/host-overload/sweep",
+            "sink": "maintenance.sweep",
+            "identitySource": "caller-supplied"
+          },
+          {
+            "method": "POST",
+            "path": "/api/sessions/:sessionId/slash",
+            "sink": "submit",
+            "commandKind": "control.mutate",
+            "identitySource": "caller-supplied"
+          },
+          {
+            "method": "POST",
+            "path": "/api/sessions/:sessionId/chat-rename",
+            "sink": "port.submit",
+            "identitySource": "caller-supplied"
+          },
+          {
+            "method": "POST",
+            "path": "/api/sessions/:sessionId/cd",
+            "sink": "submitControl",
+            "commandKind": "control.mutate",
+            "identitySource": "caller-supplied"
+          },
+          {
+            "method": "POST",
+            "path": "/api/sessions/:sessionId/board",
+            "sink": "dashboardSessionRuntimeSubmitter",
+            "commandKind": "control.mutate",
+            "identitySource": "caller-supplied"
+          },
+          {
+            "method": "POST",
+            "path": "/api/sessions/:sessionId/whiteboard",
+            "sink": "dashboardSessionRuntimeSubmitter",
+            "commandKind": "control.mutate",
+            "identitySource": "caller-supplied"
+          },
+          {
+            "method": "POST",
+            "path": "/api/sessions/:sessionId/start",
+            "sink": "submit",
+            "commandKind": "control.mutate",
+            "identitySource": "caller-supplied"
+          },
+          {
+            "method": "POST",
+            "path": "/api/sessions/spawn",
+            "sink": "submit",
+            "commandKind": "dashboard.spawn",
+            "identitySource": "caller-supplied"
+          },
+          {
+            "method": "POST",
+            "path": "/api/sessions/:sessionId/rename",
+            "sink": "dashboardSessionRuntimeSubmitter",
+            "commandKind": "control.rename",
+            "identitySource": "caller-supplied"
+          },
+          {
+            "method": "POST",
+            "path": "/api/sessions/:sessionId/lock",
+            "sink": "dashboardSessionRuntimeSubmitter",
+            "commandKind": "control.mutate",
+            "identitySource": "caller-supplied"
+          },
+          {
+            "method": "POST",
+            "path": "/api/sessions/:sessionId/resume",
+            "sink": "dashboardSessionRuntimeSubmitter",
+            "commandKind": "control.mutate",
+            "identitySource": "caller-supplied"
+          },
+          {
+            "method": "POST",
+            "path": "/api/sessions/migrate-to-chat",
+            "sink": "submitControl",
+            "commandKind": "control.mutate",
+            "identitySource": "caller-supplied"
+          },
+          {
+            "method": "PUT",
+            "path": "/api/bot-agent",
+            "sink": "maintenance.changeAgent",
+            "identitySource": "caller-supplied"
+          }
+        ],
+        "forbiddenCallerCalls": [
+          "sessionStore.createSession",
+          "sessionStore.createSessionExact",
+          "sessionStore.updateSession",
+          "sessionStore.closeSession",
+          "sessionStore.reactivateClosedSession",
+          "getActiveSessionsRegistry",
+          "activeSessions.set",
+          "activeSessions.delete",
+          "spawnDashboardSession",
+          "forkWorker",
+          "closeSession",
+          "resumeSession",
+          "transferSession",
+          "suspendWorker",
+          "killWorker",
+          "activateQueuedSession",
+          "repinSessionWorkingDir",
+          "syncCurrentSessionWorkingDir",
+          "sendWorkerSessionInput",
+          "requestAgentSessionRename",
+          "updateSessionTitle"
+        ],
+        "sharedRouteAdmissionConsumers": [
+          {
+            "sourceFile": "src/core/current-ordinary-route-registry.ts",
+            "enclosingFunction": "createCurrentOrdinaryRouteRegistryRuntime",
+            "reservationCount": 3
+          },
+          {
+            "sourceFile": "src/core/current-reopen-route-admission.ts",
+            "enclosingFunction": "createCurrentReopenRouteAdmissionPort",
+            "reservationCount": 1
+          },
+          {
+            "sourceFile": "src/core/current-scheduled-fire.ts",
+            "enclosingFunction": "createCurrentScheduledFireAdapter",
+            "reservationCount": 2
+          },
+          {
+            "sourceFile": "src/core/trigger-session.ts",
+            "enclosingFunction": "triggerSessionTurnAdmitted",
+            "reservationCount": 1
+          }
+        ]
+      }
+    },
+    {
+      "id": "remaining-control-bypass",
+      "targetMilestone": "C2",
+      "disposition": "remaining",
+      "description": "Command/card mid-session repo 与 cwd/title shared provider 仍保留 direct Current 写面；它们是显式 C2 remainder，不被 Dashboard caller cut 或调用路径推断冒领。",
+      "selectors": [
         {
           "sourceFile": "src/core/command-handler.ts",
           "enclosingFunctions": [
@@ -285,23 +552,23 @@
           ]
         },
         {
-          "sourceFile": "src/daemon.ts",
+          "sourceFile": "src/core/session-cwd.ts",
           "enclosingFunctions": [
-            "handleNewTopicAdmitted",
-            "handleThreadReplyAdmitted"
+            "assignWorkingDirectory",
+            "repinSessionWorkingDir"
           ]
         },
         {
-          "sourceFile": "src/core/session-cwd.ts"
-        },
-        {
-          "sourceFile": "src/core/session-title.ts"
+          "sourceFile": "src/core/session-title.ts",
+          "enclosingFunctions": [
+            "updateSessionTitle"
+          ]
         }
       ],
       "authoritySites": {
-        "recordCount": 126,
-        "mutationCount": 128,
-        "digest": "da770479a68b23dfe281a39031801056c0922c197c74d159800a7644fbfd6873"
+        "recordCount": 86,
+        "mutationCount": 86,
+        "digest": "f937f6a395c6ae3405972cc5068cb323bbdbb1bdfe56c0595a3f73cfd3986a57"
       }
     },
     {
@@ -463,7 +730,7 @@
       "authoritySites": {
         "recordCount": 20,
         "mutationCount": 20,
-        "digest": "ae4dbc4a8a3f69de997b748cc21f2adbb28e11513a7d6e41705f9f7d0899f893"
+        "digest": "79d26f7140f3a8db6ed4460cbcd2bdf36dd9e2eba23cecbda4f984061d19c093"
       },
       "productionBinding": {
         "producerSource": "src/core/scheduler.ts",
@@ -711,9 +978,9 @@
         }
       ],
       "authoritySites": {
-        "recordCount": 16,
-        "mutationCount": 16,
-        "digest": "7f36bf6841f9417fcc28cf3b77d7fadd304655e869f569c634600b13bb6b6e0a"
+        "recordCount": 23,
+        "mutationCount": 23,
+        "digest": "ef1a5710f4f24e5d819286133b189a012cbd2030138a35c2dab471b21640cfa0"
       },
       "productionBinding": {
         "protocolSource": "src/core/dashboard-projection.ts",
@@ -738,9 +1005,9 @@
         }
       ],
       "authoritySites": {
-        "recordCount": 787,
-        "mutationCount": 790,
-        "digest": "aeee7a1fa18190cf293cff88eb38ed98ab69be266487f8ce2c7905c2c6af10f6"
+        "recordCount": 819,
+        "mutationCount": 824,
+        "digest": "207bc97a476a8ffda8b4c31c8169906116f2a115995746320d4dc881c231bc5d"
       },
       "rawPublisherSelectors": [
         {

@@ -180,7 +180,8 @@ describe('Current relocate target scratch Session lane', () => {
         }
         if (input.command.kind === 'close') {
           expect(input.command).toMatchObject({
-            reason: 'relocateScratch',
+            reason: 'routeScratch',
+            source: 'relocate',
             expectedRoute: {
               scope: 'chat',
               canonicalAnchor: 'oc_target',

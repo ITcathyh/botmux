@@ -14,6 +14,13 @@ import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 
 const SESSION_ID = 'session-dashboard-command-client';
 const ADDRESS = Object.freeze(Object.create(null)) as SessionAddress;
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>(resolvePromise => { resolve = resolvePromise; });
+  return { promise, resolve };
+}
+
 const FLEET_AFFECTING_COMMANDS: readonly {
   readonly label: string;
   readonly input: ControlMutationInput;
@@ -43,7 +50,118 @@ function oneProjection() {
   };
 }
 
+function closedProjection() {
+  return {
+    ...oneProjection(),
+    session: {
+      ...oneProjection().session,
+      recordStatus: 'closed' as const,
+    },
+  };
+}
+
+function immediateReopenRouteAdmission() {
+  return {
+    reserve: vi.fn(() => ({
+      kind: 'reserved' as const,
+      route: {
+        scope: 'thread' as const,
+        canonicalAnchor: 'om_dashboard_command_client',
+        chatId: 'oc_dashboard_command_client',
+        chatType: 'group' as const,
+      },
+      ready: Promise.resolve(),
+      token: Object.freeze({}),
+      revalidate: () => ({ kind: 'current' as const }),
+      release: vi.fn(),
+    })),
+  };
+}
+
 describe('Current Dashboard Session command client', () => {
+  it('acquires the closed target route before reprojecting and holds it through reopen terminal', async () => {
+    const admissionReady = deferred<void>();
+    const runtimeTerminal = deferred<{
+      kind: 'applied';
+      action: 'control.mutated';
+      policy: 'control-staged-transition';
+      sessionId: string;
+      result: { kind: 'reopened'; wake: false; executor: 'lazy'; session: {
+        chatId: string; rootMessageId: string;
+      } };
+    }>();
+    const token = Object.freeze({ admission: 'reopen-target' });
+    const release = vi.fn();
+    const projectionRead = vi.fn(async () => closedProjection());
+    const runtimeSubmit = vi.fn(async () => runtimeTerminal.promise);
+    const reserve = vi.fn(() => ({
+      kind: 'reserved' as const,
+      route: {
+        scope: 'thread' as const,
+        canonicalAnchor: 'om_dashboard_command_client',
+        chatId: 'oc_dashboard_command_client',
+        chatType: 'group' as const,
+      },
+      ready: admissionReady.promise,
+      token,
+      revalidate: vi.fn(() => ({ kind: 'current' as const })),
+      release,
+    }));
+    const submit = createCurrentDashboardSessionCommandClient({
+      ownerLarkAppId: () => 'owner-dashboard-reopen-admission',
+      host: () => ({
+        projection: { read: projectionRead },
+        runtime: { submit: runtimeSubmit },
+      }),
+      reopenRouteAdmission: { reserve },
+    } as never);
+
+    const reopening = submit({
+      target: { kind: 'externalSession', sessionId: SESSION_ID },
+      idempotencyKey: 'dashboard-reopen:route-admission',
+      command: {
+        kind: 'control.mutate',
+        input: { kind: 'reopen', source: 'dashboard', wake: false },
+      },
+    });
+
+    await vi.waitFor(() => expect(reserve).toHaveBeenCalledTimes(1));
+    expect(projectionRead).toHaveBeenCalledTimes(1);
+    expect(runtimeSubmit).not.toHaveBeenCalled();
+
+    admissionReady.resolve();
+    await vi.waitFor(() => expect(runtimeSubmit).toHaveBeenCalledTimes(1));
+    expect(projectionRead).toHaveBeenCalledTimes(2);
+    expect(runtimeSubmit).toHaveBeenCalledWith(expect.objectContaining({
+      target: {
+        kind: 'session',
+        address: ADDRESS,
+        controlRouteReservation: token,
+      },
+    }));
+    expect(release).not.toHaveBeenCalled();
+
+    runtimeTerminal.resolve({
+      kind: 'applied',
+      action: 'control.mutated',
+      policy: 'control-staged-transition',
+      sessionId: SESSION_ID,
+      result: {
+        kind: 'reopened',
+        wake: false,
+        executor: 'lazy',
+        session: {
+          chatId: 'oc_dashboard_command_client',
+          rootMessageId: 'om_dashboard_command_client',
+        },
+      },
+    });
+    await expect(reopening).resolves.toMatchObject({
+      kind: 'applied',
+      result: { kind: 'reopened' },
+    });
+    expect(release).toHaveBeenCalledTimes(1);
+  });
   it.each(FLEET_AFFECTING_COMMANDS)(
     'does not admit $label while an Agent configuration mutation is published',
     async ({ label, input }) => {
@@ -58,6 +176,7 @@ describe('Current Dashboard Session command client', () => {
       }));
       const submit = createCurrentDashboardSessionCommandClient({
         ownerLarkAppId: () => owner,
+        reopenRouteAdmission: immediateReopenRouteAdmission(),
         host: () => ({
           projection: { read: projectionRead },
           runtime: { submit: runtimeSubmit },
@@ -126,6 +245,7 @@ describe('Current Dashboard Session command client', () => {
       });
       const submit = createCurrentDashboardSessionCommandClient({
         ownerLarkAppId: () => owner,
+        reopenRouteAdmission: immediateReopenRouteAdmission(),
         host: () => ({
           projection: { read: async () => oneProjection() },
           runtime: { submit: runtimeSubmit },

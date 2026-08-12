@@ -45,7 +45,8 @@ export type SessionActivationTerminal =
   | { readonly kind: 'rejected'; readonly reason: 'notFound' | 'closed' | 'conflict'; readonly message: string }
   | { readonly kind: 'retryable'; readonly message: string }
   | { readonly kind: 'ambiguous'; readonly message: string }
-  | { readonly kind: 'stale'; readonly message: string }
+  | { readonly kind: 'staleBeforeEffect'; readonly message: string }
+  | { readonly kind: 'unknownAfterEffect'; readonly message: string }
   | { readonly kind: 'quarantined'; readonly message: string };
 
 export type SessionActivationOutcome = SessionActivationTerminal | {
@@ -66,18 +67,36 @@ export type SessionActivationEffectSettlement =
 
 export type SessionRetirementReason =
   | 'explicitClose'
+  | 'passivation'
   | 'replacement'
   | 'transfer'
   | 'shutdown';
+
+export interface SessionRetirementRequest {
+  readonly sessionId: string;
+  readonly requestIdentity: string;
+  readonly reason: SessionRetirementReason;
+}
+
+export type SessionRetirementDisposition = 'applied' | 'notApplied' | 'unknown';
+
+export interface SessionRetirementSettlementRequest extends SessionRetirementRequest {
+  readonly disposition: SessionRetirementDisposition;
+}
 
 export type SessionRetirementOutcome =
   | { readonly kind: 'retired'; readonly action: 'retired' | 'alreadyRetired' }
   | { readonly kind: 'retryable'; readonly message: string }
   | { readonly kind: 'quarantined'; readonly message: string };
 
+export type SessionRetirementSettlementOutcome =
+  | { readonly kind: 'settled'; readonly disposition: 'applied' | 'notApplied' }
+  | { readonly kind: 'quarantined'; readonly message: string };
+
 /**
- * Synchronous begin/resume/retire methods run inside the shared Session lane.
- * Only execute may await, and it always runs outside the lane.
+ * Synchronous begin/resume/retire/settleRetirement methods run inside the
+ * shared Session lane. Only execute may await, and it always runs outside the
+ * lane.
  */
 export interface SessionActivationPort {
   begin(request: SessionActivationRequest): SessionActivationTransition;
@@ -86,27 +105,41 @@ export interface SessionActivationPort {
     continuation: unknown,
     settlement: SessionActivationEffectSettlement,
   ): SessionActivationTransition;
-  retire(request: {
-    readonly sessionId: string;
-    readonly requestIdentity: string;
-    readonly reason: SessionRetirementReason;
-  }): SessionRetirementOutcome;
+  retire(request: SessionRetirementRequest): SessionRetirementOutcome;
+  settleRetirement(
+    request: SessionRetirementSettlementRequest,
+  ): SessionRetirementSettlementOutcome;
 }
 
 export interface SessionActivationRuntime {
   ensure(request: SessionActivationRequest): Promise<SessionActivationOutcome>;
-  retire(request: {
-    readonly sessionId: string;
-    readonly requestIdentity: string;
-    readonly reason: SessionRetirementReason;
-  }): Promise<SessionRetirementOutcome>;
+  retire(request: SessionRetirementRequest): Promise<SessionRetirementOutcome>;
+  settleRetirement(
+    request: SessionRetirementSettlementRequest,
+  ): Promise<SessionRetirementSettlementOutcome>;
 }
 
-interface ActivationAttempt {
-  readonly requestHash: string;
-  terminal: Promise<SessionActivationTerminal>;
-  state: 'running' | 'completed';
-}
+type ActivationAttempt =
+  | {
+      readonly requestHash: string;
+      terminal: Promise<SessionActivationTerminal>;
+      state: 'running' | 'completed';
+    }
+  | {
+      readonly requestHash: string;
+      readonly state: 'retryable';
+    };
+
+type RetirementReceipt =
+  | {
+      readonly reason: SessionRetirementReason;
+      readonly state: 'retryable';
+    }
+  | {
+      readonly reason: SessionRetirementReason;
+      readonly state: 'terminal';
+      readonly outcome: Exclude<SessionRetirementOutcome, { kind: 'retryable' }>;
+    };
 
 function exactNonempty(value: string, label: string): void {
   if (!value || value.trim() !== value || value.includes('\0')) {
@@ -122,7 +155,8 @@ function terminalTransition(
     case 'rejected':
     case 'retryable':
     case 'ambiguous':
-    case 'stale':
+    case 'staleBeforeEffect':
+    case 'unknownAfterEffect':
     case 'quarantined':
       return transition;
     case 'effect':
@@ -137,6 +171,13 @@ export function createSessionActivationRuntime(options: {
 }): SessionActivationRuntime {
   const lifecycleRevision = new Map<string, number>();
   const attempts = new Map<string, ActivationAttempt>();
+  const retirementReceipts = new Map<string, RetirementReceipt>();
+  const retirementSettlements = new Map<string, {
+    readonly reason: SessionRetirementReason;
+    readonly disposition: SessionRetirementDisposition;
+    readonly outcome: SessionRetirementSettlementOutcome;
+  }>();
+  const unknownEffectQuarantines = new Set<string>();
   const tails = new Map<string, Promise<void>>();
 
   const attemptKey = (
@@ -167,11 +208,26 @@ export function createSessionActivationRuntime(options: {
 
   const runAttempt = async (
     request: SessionActivationRequest,
+    admittedRevision: number,
   ): Promise<SessionActivationTerminal> => {
     const lane = options.laneAddress(request.sessionId);
-    let revision = 0;
+    const revision = admittedRevision;
     let transition = await options.commandLane.submit(lane, () => {
-      revision = revisionFor(request.sessionId);
+      if (revisionFor(request.sessionId) !== revision) {
+        return {
+          kind: 'staleBeforeEffect' as const,
+          message: 'activation attempt was superseded before admission',
+        };
+      }
+      if (unknownEffectQuarantines.has(request.sessionId)) {
+        if (request.goal.kind !== 'reconcile' || request.goal.observation === 'unknown') {
+          return {
+            kind: 'quarantined' as const,
+            message: 'activation effect outcome is quarantined pending an explicit re-probe',
+          };
+        }
+        unknownEffectQuarantines.delete(request.sessionId);
+      }
       try {
         return inspectTransition(options.port.begin(request));
       } catch (error) {
@@ -185,22 +241,52 @@ export function createSessionActivationRuntime(options: {
     for (;;) {
       if (transition.kind !== 'effect') return transition;
 
+      const intent = transition.intent;
+      const started = await options.commandLane.submit(lane, () => {
+        if (revisionFor(request.sessionId) !== revision) {
+          return {
+            kind: 'staleBeforeEffect' as const,
+            message: 'activation attempt was superseded before effect invocation',
+          };
+        }
+        try {
+          return {
+            kind: 'started' as const,
+            effect: options.port.execute(intent),
+          };
+        } catch (error) {
+          return {
+            kind: 'threw' as const,
+            error,
+          };
+        }
+      });
+      if (started.kind === 'staleBeforeEffect') return started;
       let settlement: SessionActivationEffectSettlement;
-      try {
-        settlement = { kind: 'returned', value: await options.port.execute(transition.intent) };
-      } catch (error) {
-        settlement = { kind: 'threw', error };
+      if (started.kind === 'threw') {
+        settlement = { kind: 'threw', error: started.error };
+      } else {
+        try {
+          settlement = { kind: 'returned', value: await started.effect };
+        } catch (error) {
+          settlement = { kind: 'threw', error };
+        }
       }
       const continuation = transition.continuation;
       transition = await options.commandLane.submit(lane, () => {
         if (revisionFor(request.sessionId) !== revision) {
+          unknownEffectQuarantines.add(request.sessionId);
           return {
-            kind: 'stale' as const,
-            message: 'activation continuation was superseded by a lifecycle transition',
+            kind: 'unknownAfterEffect' as const,
+            message: 'activation effect outcome was superseded by a lifecycle transition',
           };
         }
         try {
-          return inspectTransition(options.port.resume(continuation, settlement));
+          const resumed = inspectTransition(options.port.resume(continuation, settlement));
+          if (resumed.kind === 'unknownAfterEffect') {
+            unknownEffectQuarantines.add(request.sessionId);
+          }
+          return resumed;
         } catch (error) {
           return {
             kind: 'quarantined' as const,
@@ -235,16 +321,18 @@ export function createSessionActivationRuntime(options: {
           message: 'activation request identity already belongs to a different goal',
         };
       }
-      const duplicateState = prior.state === 'running' ? 'joined' : 'completed';
-      const outcome = await prior.terminal;
-      return { kind: 'duplicate', state: duplicateState, outcome };
+      if (prior.state !== 'retryable') {
+        const duplicateState = prior.state === 'running' ? 'joined' : 'completed';
+        const outcome = await prior.terminal;
+        return { kind: 'duplicate', state: duplicateState, outcome };
+      }
     }
 
     const previousTail = tails.get(request.sessionId);
     let releaseTail!: () => void;
     const nextTail = new Promise<void>((resolve) => { releaseTail = resolve; });
     tails.set(request.sessionId, nextTail);
-    const attempt: ActivationAttempt = {
+    const attempt: Extract<ActivationAttempt, { state: 'running' | 'completed' }> = {
       requestHash,
       state: 'running',
       terminal: Promise.resolve({
@@ -253,15 +341,15 @@ export function createSessionActivationRuntime(options: {
       }),
     };
     const terminal = (previousTail
-      ? previousTail.catch(() => undefined).then(() => runAttempt(request))
-      : runAttempt(request))
+      ? previousTail.catch(() => undefined).then(() => runAttempt(request, lifecycle))
+      : runAttempt(request, lifecycle))
       .then((result) => {
         attempt.state = 'completed';
         // `retryable` promises that no commit is known and the same identity
-        // may be retried. Keeping it in the process-local idempotency cache
-        // would poison that identity for the rest of the daemon lifetime.
+        // may be re-driven, but its semantic hash remains reserved for this
+        // runtime epoch so a different goal cannot reuse the business key.
         if (result.kind === 'retryable' && attempts.get(key) === attempt) {
-          attempts.delete(key);
+          attempts.set(key, { requestHash, state: 'retryable' });
         }
         return result;
       }, (error) => {
@@ -281,17 +369,110 @@ export function createSessionActivationRuntime(options: {
     exactNonempty(request.sessionId, 'sessionId');
     exactNonempty(request.requestIdentity, 'requestIdentity');
     return options.commandLane.submit(options.laneAddress(request.sessionId), () => {
-      lifecycleRevision.set(request.sessionId, revisionFor(request.sessionId) + 1);
+      const receiptKey = `${request.sessionId}\0${request.requestIdentity}`;
+      const prior = retirementReceipts.get(receiptKey);
+      if (prior) {
+        if (prior.reason !== request.reason) {
+          return {
+            kind: 'quarantined' as const,
+            message: 'retirement request identity already belongs to a different reason',
+          };
+        }
+        if (prior.state === 'terminal') return prior.outcome;
+      }
+      let outcome: SessionRetirementOutcome;
       try {
-        return options.port.retire(request);
+        outcome = options.port.retire(request);
       } catch (error) {
-        return {
+        outcome = {
           kind: 'quarantined',
           message: `activation retirement failed: ${error instanceof Error ? error.message : String(error)}`,
         };
       }
+      if (!outcome || typeof outcome !== 'object'
+          || (outcome.kind !== 'retired'
+            && outcome.kind !== 'retryable'
+            && outcome.kind !== 'quarantined')) {
+        outcome = {
+          kind: 'quarantined',
+          message: 'activation Adapter returned an invalid retirement outcome',
+        };
+      }
+      if (outcome.kind === 'retryable') {
+        retirementReceipts.set(receiptKey, { reason: request.reason, state: 'retryable' });
+        return outcome;
+      }
+      // Only a committed or ambiguous fence supersedes the current lifecycle.
+      // A retryable result explicitly proves that no fence was published.
+      lifecycleRevision.set(request.sessionId, revisionFor(request.sessionId) + 1);
+      retirementReceipts.set(receiptKey, {
+        reason: request.reason,
+        state: 'terminal',
+        outcome,
+      });
+      return outcome;
     });
   };
 
-  return { ensure, retire };
+  const settleRetirement: SessionActivationRuntime['settleRetirement'] = async (request) => {
+    exactNonempty(request.sessionId, 'sessionId');
+    exactNonempty(request.requestIdentity, 'requestIdentity');
+    return options.commandLane.submit(options.laneAddress(request.sessionId), () => {
+      const receiptKey = `${request.sessionId}\0${request.requestIdentity}`;
+      const retirement = retirementReceipts.get(receiptKey);
+      if (!retirement || retirement.state !== 'terminal' || retirement.outcome.kind !== 'retired') {
+        return {
+          kind: 'quarantined' as const,
+          message: 'retirement settlement has no committed activation fence',
+        };
+      }
+      if (retirement.reason !== request.reason) {
+        return {
+          kind: 'quarantined' as const,
+          message: 'retirement settlement reason does not match its activation fence',
+        };
+      }
+      const prior = retirementSettlements.get(receiptKey);
+      if (prior) {
+        if (prior.reason !== request.reason || prior.disposition !== request.disposition) {
+          return {
+            kind: 'quarantined' as const,
+            message: 'retirement settlement identity already belongs to different evidence',
+          };
+        }
+        return prior.outcome;
+      }
+      let outcome: SessionRetirementSettlementOutcome;
+      try {
+        outcome = options.port.settleRetirement(request);
+      } catch (error) {
+        outcome = {
+          kind: 'quarantined',
+          message: `activation retirement settlement failed: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+      if (!outcome || typeof outcome !== 'object'
+          || (outcome.kind !== 'settled' && outcome.kind !== 'quarantined')
+          || (outcome.kind === 'settled'
+            && (request.disposition === 'unknown' || outcome.disposition !== request.disposition))) {
+        outcome = {
+          kind: 'quarantined',
+          message: 'activation Adapter returned an invalid retirement settlement',
+        };
+      }
+      if (request.disposition === 'applied' && outcome.kind === 'settled') {
+        unknownEffectQuarantines.delete(request.sessionId);
+      } else if (request.disposition === 'unknown') {
+        unknownEffectQuarantines.add(request.sessionId);
+      }
+      retirementSettlements.set(receiptKey, {
+        reason: request.reason,
+        disposition: request.disposition,
+        outcome,
+      });
+      return outcome;
+    });
+  };
+
+  return { ensure, retire, settleRetirement };
 }
