@@ -18374,7 +18374,12 @@ async function handleThreadReplyAdmitted(
       });
       return;
     }
-    if (resolvePassthroughCommands(larkAppId).has(cmd)) {
+    // Existing sessions freeze their CLI independently from the bot's current
+    // config. Route passthrough capability from that frozen runtime so changing
+    // `/botconfig cli` cannot make an old Codex App session receive raw_input
+    // (or make an old interactive TUI lose its native slash commands).
+    const passthroughCliId = existingDs?.session.cliId ?? getBot(larkAppId).config.cliId;
+    if (resolvePassthroughCommands(larkAppId, passthroughCliId).has(cmd)) {
       if (!existingDs && threadChatId && isInitialSessionPassthrough(larkAppId, cmd)) {
         await startInitialPassthroughSession({
           larkAppId,

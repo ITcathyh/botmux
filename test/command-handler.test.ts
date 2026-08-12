@@ -1100,6 +1100,21 @@ describe('PASSTHROUGH_COMMANDS set', () => {
     }
   });
 
+  it('keeps raw passthrough off Codex App while honoring a frozen session CLI override', () => {
+    mockCodexAppBot();
+
+    // App Server turns must use the structured message lane; raw_input has no
+    // matching dispatch reservation and would leave the session stuck after
+    // the model final arrives.
+    expect(resolvePassthroughCommands(CODEX_APP_ID).size).toBe(0);
+
+    // Existing sessions freeze their CLI. A pre-switch interactive Codex
+    // session must retain native slash passthrough even if the bot config now
+    // points at Codex App, while the inverse must stay structured.
+    expect(resolvePassthroughCommands(CODEX_APP_ID, 'codex').has('/model')).toBe(true);
+    expect(resolvePassthroughCommands(LARK_APP_ID, 'codex-app').size).toBe(0);
+  });
+
   it('keeps /goal out of the global passthrough list but enables it for Claude and Codex adapters', () => {
     expect(PASSTHROUGH_COMMANDS.has('/goal')).toBe(false);
     expect(resolvePassthroughCommands('app-1').has('/goal')).toBe(true);

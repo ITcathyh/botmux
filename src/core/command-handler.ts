@@ -172,11 +172,25 @@ export function resolveAdapterDefaultPassthroughCommands(larkAppId?: string): st
  * daemon commands must keep their daemon semantics, and passthrough is checked
  * BEFORE DAEMON_COMMANDS in the router, so an un-filtered custom `/status`
  * would hijack the daemon's own.
- * Unknown / no bot → falls back to the builtin set unchanged.
+ * Codex App deliberately resolves to an empty set because its runner speaks
+ * App Server rather than an interactive TUI; slash-looking text must use the
+ * structured turn lane. Unknown / no bot → falls back to the builtin set.
  */
-export function resolvePassthroughCommands(larkAppId?: string): Set<string> {
+export function resolvePassthroughCommands(larkAppId?: string, cliIdOverride?: string): Set<string> {
   const effective = new Set(PASSTHROUGH_COMMANDS);
   if (!larkAppId) return effective;
+  try {
+    const cliId = cliIdOverride ?? getBot(larkAppId).config.cliId;
+    // Codex App speaks the structured app-server protocol: its PTY only hosts
+    // botmux's runner/viewer and is not an interactive Codex TUI. Sending a
+    // slash command through raw_input therefore bypasses the App Server turn
+    // ledger; the model still completes the text as an ordinary turn, but the
+    // worker has no pending dispatch to attribute that final to and the session
+    // remains stuck. Keep these messages on the normal structured turn path.
+    if (cliId === 'codex-app') return new Set();
+  } catch {
+    /* unknown bot — builtin set only */
+  }
   for (const c of resolveAdapterDefaultPassthroughCommands(larkAppId)) {
     effective.add(c);
   }
@@ -3859,7 +3873,7 @@ export async function handleCommand(
           ? sessionCliDisplayName(ds)
           : configuredRuntimeDisplayName(botCfg?.cliRuntime)
             ?? getCliDisplayName(botCfg?.cliId ?? 'claude-code');
-        const passthroughCommands = [...resolvePassthroughCommands(helpAppId)];
+        const passthroughCommands = [...resolvePassthroughCommands(helpAppId, ds?.session.cliId)];
         const help = [
           t('help.heading_session', undefined, loc),
           t('help.close', { cliName }, loc),
