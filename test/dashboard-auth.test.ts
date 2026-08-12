@@ -11,8 +11,9 @@ import { join } from 'node:path';
 import {
   verifyHmac, generateToken, parseCookie, decideDashboardAuth,
   loadPersistedToken, loadOrCreatePersistedToken, persistToken, rotatePersistedToken,
-  loadDashboardSecret, loadOrCreateDashboardSecret,
+  loadDashboardSecret, loadOrCreateDashboardSecret, describeDashboardTokenError,
 } from '../src/dashboard/auth.js';
+import { UnsafeHostAuthorityFileError } from '../src/platform/secure-host-file.js';
 
 const SECRET = 'a'.repeat(43); // base64url 32 bytes
 
@@ -62,6 +63,58 @@ describe('generateToken', () => {
   it('returns 43-char base64url (32 bytes)', () => {
     const t = generateToken();
     expect(t).toMatch(/^[A-Za-z0-9_-]{43}$/);
+  });
+});
+
+describe('describeDashboardTokenError', () => {
+  const TP = '/home/u/.botmux/.dashboard-token';
+
+  it('keeps the bare stable code for non-credential errors', () => {
+    expect(describeDashboardTokenError('token_unavailable', new Error('boom'), TP))
+      .toEqual({ error: 'token_unavailable' });
+    // Preserve the machine code so programmatic callers are unaffected.
+    expect(describeDashboardTokenError('token_persist_failed', undefined, TP))
+      .toEqual({ error: 'token_persist_failed' });
+  });
+
+  it('surfaces a group/other-writable dir reason with a chmod 700 hint', () => {
+    const out = describeDashboardTokenError(
+      'token_unavailable',
+      new UnsafeHostAuthorityFileError('宿主凭证目录可被组内或其它用户写入'),
+      TP,
+    );
+    expect(out.error).toBe('token_unavailable'); // stable code preserved
+    expect(out.reason).toBe('宿主凭证目录可被组内或其它用户写入');
+    expect(out.hint).toContain('chmod 700 /home/u/.botmux');
+  });
+
+  it('surfaces a wrong-mode token reason with a chmod 600 hint', () => {
+    const out = describeDashboardTokenError(
+      'token_persist_failed',
+      new UnsafeHostAuthorityFileError('宿主凭证文件权限必须严格为 0600'),
+      TP,
+    );
+    expect(out.reason).toBe('宿主凭证文件权限必须严格为 0600');
+    expect(out.hint).toContain(`chmod 600 ${TP}`);
+  });
+
+  it('surfaces a symlink/non-regular token reason with an rm hint', () => {
+    const out = describeDashboardTokenError(
+      'token_persist_failed',
+      new UnsafeHostAuthorityFileError('宿主凭证拒绝符号链接'),
+      TP,
+    );
+    expect(out.hint).toContain(`rm -f ${TP}`);
+  });
+
+  it('surfaces an unsafe-ancestor reason without inventing a chmod on the leaf', () => {
+    const out = describeDashboardTokenError(
+      'token_persist_failed',
+      new UnsafeHostAuthorityFileError('宿主凭证目录可被不可信祖先目录替换'),
+      TP,
+    );
+    expect(out.reason).toBe('宿主凭证目录可被不可信祖先目录替换');
+    expect(out.hint).toContain('祖先');
   });
 });
 

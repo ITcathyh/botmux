@@ -6,6 +6,7 @@ import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { dirname } from 'node:path';
 import {
   readSecureHostFileSync,
+  UnsafeHostAuthorityFileError,
   withSecureHostParentSync,
   writeSecureHostFileSync,
 } from '../platform/secure-host-file.js';
@@ -208,6 +209,46 @@ export function rotatePersistedToken(tokenPath: string): string {
       return token;
     }),
   );
+}
+
+/**
+ * Diagnostic body for a dashboard token 500. The `/__cli/*` HTTP layer used to
+ * return a bare `{ error: 'token_persist_failed' | 'token_unavailable' }`, which
+ * the CLI printed verbatim — so a user whose `~/.botmux` (or `.dashboard-token`)
+ * has loose perms only saw an opaque code and had to be diagnosed remotely. The
+ * real, actionable cause is already on the thrown {@link
+ * UnsafeHostAuthorityFileError} (`message` is a precise reason like
+ * "宿主凭证目录可被组内或其它用户写入" / "宿主凭证文件权限必须严格为 0600" /
+ * "宿主凭证拒绝符号链接"). This surfaces that reason plus a one-line remediation
+ * hint WITHOUT changing any validation — every fail-closed check still fails
+ * closed; we only make the failure legible.
+ *
+ * `error` keeps the stable machine code (unchanged for programmatic callers);
+ * `reason`/`hint` are additive human-facing fields.
+ */
+export function describeDashboardTokenError(
+  code: 'token_persist_failed' | 'token_unavailable',
+  err: unknown,
+  tokenPath: string,
+): { error: string; reason?: string; hint?: string } {
+  if (!(err instanceof UnsafeHostAuthorityFileError)) return { error: code };
+  const reason = err.message;
+  // Map the credential-shape reason to a concrete, copy-pasteable fix. The dir
+  // and file remediations are intentionally NOT auto-applied: a group/other-
+  // writable credential dir may already be compromised, so tightening it is the
+  // user's explicit decision, not a silent self-heal.
+  const dir = tokenPath.replace(/\/[^/]*$/, '') || '~/.botmux';
+  let hint: string | undefined;
+  if (reason.includes('组内或其它用户写入') || reason.includes('不属于当前用户')) {
+    hint = `凭证目录权限过松或属主不对。请确认 ${dir} 属当前用户并执行 chmod 700 ${dir} 后重试。`;
+  } else if (reason.includes('权限必须严格为 0600')) {
+    hint = `凭证文件权限过松。请执行 chmod 600 ${tokenPath} 后重试。`;
+  } else if (reason.includes('拒绝符号链接') || reason.includes('必须是普通文件')) {
+    hint = `凭证文件是软链或非普通文件。请 rm -f ${tokenPath} 让其重新生成后重试。`;
+  } else if (reason.includes('祖先目录') || reason.includes('句柄')) {
+    hint = `凭证目录的某级祖先不安全或运行期被改动。请确认 ${dir} 及其上级目录属可信用户后重试。`;
+  }
+  return { error: code, reason, ...(hint ? { hint } : {}) };
 }
 
 /** Extract `botmux_dashboard_token` value from a Cookie header. */
