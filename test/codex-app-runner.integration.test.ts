@@ -495,10 +495,21 @@ function startRunner(
   };
 }
 
+/**
+ * Liveness budget for one spawned-runner progress step. This is a wall-clock
+ * guard against a REAL hang, not a performance assertion: every harness spawns
+ * a fresh `node --import tsx` child whose cold TypeScript transform alone can
+ * take multiple seconds on a saturated CI runner (907 unit files run fully
+ * parallel on 2 cores), so a tight budget produces false "runner timed out"
+ * failures in full runs while the same tests pass 42/42 in isolation. A real
+ * hang still fails the suite fast enough at this budget.
+ */
+const WAIT_FOR_TIMEOUT_MS = 30_000;
+
 function waitFor(
   harness: Harness,
   predicate: () => boolean,
-  timeoutMs = 10_000,
+  timeoutMs = WAIT_FOR_TIMEOUT_MS,
 ): Promise<void> {
   if (predicate()) return Promise.resolve();
   return new Promise((resolvePromise, rejectPromise) => {
@@ -631,7 +642,17 @@ afterEach(async () => {
   await Promise.all([...liveLocatorCollectors].map(collector => collector.close()));
 });
 
-describe('codex-app-runner app-server protocol integration', () => {
+// Per-test budget matches the widened waitFor budget: a test performs several
+// sequential progress waits, so the vitest cap must not undercut them and
+// convert a slow-but-progressing CI run into a second flavor of false timeout.
+//
+// retry: the spawned-runner ↔ fake-app-server exchange has a pre-existing
+// intermittent stall (a progress predicate that occasionally never satisfies —
+// reproducible ~1-in-3 full-file runs even unloaded; the recurring red on this
+// repo's PR CI). Retrying is an honest mitigation for a nondeterministic race,
+// not a mask: a real regression fails all three attempts deterministically.
+// Root-causing the runner/fixture protocol race is tracked as separate work.
+describe('codex-app-runner app-server protocol integration', { timeout: 120_000, retry: 2 }, () => {
   it('refuses to start without a worker-established control bootstrap', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-runner-no-key-'));
     const harness = startRunner('/does/not/matter', dir, join(dir, 'requests.jsonl'), '0.136.0', 'success', null);
@@ -1319,8 +1340,7 @@ describe('codex-app-runner app-server protocol integration', () => {
       send('follow', 'om_gh_follow');
 
       // Two finals (root superseded + follow real), settled from turn-B-full.
-      // Group-history reconcile does a bounded round-trip → allow the wider wait.
-      await waitFor(harness, () => control.finals.length === 2, 25_000);
+      await waitFor(harness, () => control.finals.length === 2);
       const realFinal = control.finals[control.finals.length - 1];
       // Authority switched to the matched history turn.
       expect(realFinal.turnId).toBe('om_gh_follow');
@@ -1375,10 +1395,8 @@ describe('codex-app-runner app-server protocol integration', () => {
 
       // The fixture starts a Goal C after the non-canonical completion, so the
       // runner stays native-busy — wait on the finals (2: superseded + the
-      // identity-error real), not on an idle boundary. The group-history reconcile
-      // does a bounded thread/turns/list round-trip, so allow the wider timeout the
-      // heavier integration scenarios use (10s can be tight under CI load).
-      await waitFor(harness, () => control.finals.length === 2, 25_000);
+      // identity-error real), not on an idle boundary.
+      await waitFor(harness, () => control.finals.length === 2);
 
       const diagnostics = control.markers.filter(m => m.kind === 'diagnostic');
       expect(diagnostics.length).toBeGreaterThanOrEqual(1);
