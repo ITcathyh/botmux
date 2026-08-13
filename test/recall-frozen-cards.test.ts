@@ -555,6 +555,7 @@ describe('reuseThreadStreamingCardForTurn', () => {
     scheduleCardPatch(ds, 'working payload', 'om_next_turn');
     await flush();
     await flush();
+    await flush();
 
     expect(updateMessageMock).toHaveBeenNthCalledWith(
       2, APP_ID, 'om_withdrawn', 'working payload',
@@ -562,6 +563,10 @@ describe('reuseThreadStreamingCardForTurn', () => {
     expect(sessionReplyMock).toHaveBeenCalledTimes(1);
     expect(sessionReplyMock.mock.calls[0][4]).toBe('om_next_turn');
     expect(ds.streamCardId).toBe('om_replacement');
+    expect(updateMessageMock).toHaveBeenNthCalledWith(
+      3, APP_ID, 'om_replacement', 'working payload',
+    );
+    expect(ds.pendingCardJson).toBeUndefined();
   });
 
   it('replays the latest queued status onto the withdrawn-card replacement', async () => {

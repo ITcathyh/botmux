@@ -2080,6 +2080,7 @@ export function scheduleCardPatch(
 function flushCardPatch(ds: DaemonSession): void {
   const json = ds.pendingCardJson;
   const cardId = ds.pendingCardId;
+  const cardTurnId = ds.pendingCardTurnId;
   const withdrawnFallback = ds.pendingCardWithdrawFallback;
   if (!json || !cardId) {
     ds.pendingCardJson = undefined;
@@ -2102,6 +2103,23 @@ function flushCardPatch(ds: DaemonSession): void {
         && withdrawnFallback.generation === (ds.streamCardTurnGeneration ?? 0)
         && (ds.streamCardId === undefined || ds.streamCardId === cardId)
       );
+      const postReplacement = (clearWithdrawnCard: boolean): void => {
+        const fallback = withdrawnFallback!;
+        if (clearWithdrawnCard) ds.streamCardId = undefined;
+        ds.streamCardPending = true;
+        ds.streamCardPendingTurnId = fallback.turnId;
+        if (ds.pendingCardJson) {
+          if (ds.pendingCardId === cardId) ds.pendingCardId = CARD_POSTING_SENTINEL;
+        } else {
+          // No newer latest-wins payload exists, so replay this failed state
+          // after the replacement POST instead of leaving it at "starting".
+          ds.pendingCardJson = json;
+          ds.pendingCardId = CARD_POSTING_SENTINEL;
+          ds.pendingCardTurnId = cardTurnId ?? fallback.turnId;
+        }
+        persistStreamCardState(ds);
+        void postTurnStartingCard(ds, requireCallbacks().sessionReply, fallback.turnId);
+      };
       if (err instanceof MessageWithdrawnError) {
         // Only clear streamCardId when the withdrawn message is still the
         // active one. With auto-recall a new turn may have advanced
@@ -2123,14 +2141,7 @@ function flushCardPatch(ds: DaemonSession): void {
         // for a newer type-ahead turn. `streamCardId` may already be undefined
         // because an earlier queued PATCH discovered the same withdrawal.
         if (fallbackMatches) {
-          ds.streamCardId = undefined;
-          ds.streamCardPending = true;
-          ds.streamCardPendingTurnId = withdrawnFallback.turnId;
-          if (ds.pendingCardJson && ds.pendingCardId === cardId) {
-            ds.pendingCardId = CARD_POSTING_SENTINEL;
-          }
-          persistStreamCardState(ds);
-          void postTurnStartingCard(ds, requireCallbacks().sessionReply, withdrawnFallback.turnId);
+          postReplacement(true);
         }
         return;
       }
@@ -2139,13 +2150,7 @@ function flushCardPatch(ds: DaemonSession): void {
       // the same fresh-card path as an explicit withdrawal. Keep the old card
       // identity until the POST succeeds so it can be recalled afterwards.
       if (fallbackMatches) {
-        ds.streamCardPending = true;
-        ds.streamCardPendingTurnId = withdrawnFallback.turnId;
-        if (ds.pendingCardJson && ds.pendingCardId === cardId) {
-          ds.pendingCardId = CARD_POSTING_SENTINEL;
-        }
-        persistStreamCardState(ds);
-        void postTurnStartingCard(ds, requireCallbacks().sessionReply, withdrawnFallback.turnId);
+        postReplacement(false);
         return;
       }
       logger.debug(`[${tag(ds)}] Failed to update streaming card: ${err}`);

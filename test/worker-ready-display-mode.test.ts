@@ -726,7 +726,8 @@ describe('Worker ready: set_display_mode re-sync', () => {
     await flush();
     await flush();
 
-    expect(updateMessageMock).toHaveBeenCalledTimes(2);
+    expect(updateMessageMock).toHaveBeenCalledTimes(3);
+    expect(updateMessageMock.mock.calls[2][1]).toBe('om_new_card');
     expect(sessionReplyMock).toHaveBeenCalledTimes(1);
     expect(sessionReplyMock.mock.calls[0][4]).toBe('om_new_turn');
     expect(ds.streamCardId).toBe('om_new_card');
@@ -754,11 +755,12 @@ describe('Worker ready: set_display_mode re-sync', () => {
     await flush();
     await flush();
 
-    expect(updateMessageMock).toHaveBeenCalledTimes(1);
+    expect(updateMessageMock).toHaveBeenCalledTimes(2);
     expect(sessionReplyMock).toHaveBeenCalledTimes(1);
     expect(sessionReplyMock.mock.calls[0][4]).toBe('om_new_turn');
     expect(ds.streamCardId).toBe('om_new_card');
     expect(ds.streamCardPending).toBe(false);
+    expect(ds.pendingCardJson).toBeUndefined();
   });
 
   it('silent recovery restores screenshot mode without touching the streaming card', async () => {
