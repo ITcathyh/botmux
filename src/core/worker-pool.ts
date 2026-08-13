@@ -8165,6 +8165,10 @@ function setupWorkerHandlers(
         if (supersededCardVisual) {
           const supersededTurnId = msg.turnId!;
           const settledStatus = msg.usageLimit ? 'limited' : msg.status;
+          // Usage limits are session-wide even when this turn no longer owns
+          // the card. Preserve the limit + retry timer while fencing every
+          // visual/dashboard field below to N+1.
+          updateUsageLimitState(ds, msg.usageLimit);
           // This event still closes the older turn's accounting boundary, but
           // it no longer represents the current session projection. In
           // particular, do not borrow N+1's lastScreenStatus to manufacture a
@@ -8418,6 +8422,9 @@ function setupWorkerHandlers(
           && msg.turnId !== ds.streamCardVisualTurnId
         );
         if (supersededCardVisual) {
+          // The screenshot belongs to the old visual turn, but a structured
+          // usage limit still applies to the whole session.
+          updateUsageLimitState(ds, msg.usageLimit);
           logger.debug(
             `[${t}] Ignored screenshot/session projection for superseded turn ${msg.turnId!.substring(0, 12)} `
             + `(card owner ${ds.streamCardVisualTurnId!.substring(0, 12)})`,

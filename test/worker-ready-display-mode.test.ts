@@ -468,6 +468,54 @@ describe('Worker ready: set_display_mode re-sync', () => {
     expect(ds.currentImageKey).toBe('img_turn_n_plus_1');
   });
 
+  it('preserves a prior-turn usage limit after the thread card changes owner', async () => {
+    const fakeWorker = makeFakeWorker();
+    const retryAtMs = Date.now() + 60_000;
+    const ds = makeDs({
+      scope: 'thread',
+      worker: fakeWorker,
+      workerReady: true,
+      workerPort: 9999,
+      streamCardId: 'om_stable_card',
+      streamCardNonce: 'stable-nonce',
+      streamCardVisualTurnId: 'om_turn_n_plus_1',
+      currentTurnTitle: 'turn n+1',
+      lastScreenContent: 'turn n+1 starting',
+      lastScreenStatus: 'starting',
+      currentImageKey: undefined,
+      displayMode: 'screenshot',
+    });
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', {
+      type: 'screen_update',
+      content: 'turn n reached its usage limit',
+      status: 'limited',
+      turnId: 'om_turn_n',
+      usageLimit: {
+        limited: true,
+        kind: 'usage',
+        retryAtMs,
+        retryLabel: '10:36 PM',
+        retryReady: false,
+      },
+    });
+    await flush();
+
+    expect(ds.usageLimit).toMatchObject({ retryAtMs, retryReady: false });
+    expect(ds.usageLimitRetryTimer).toBeDefined();
+    expect(ds.lastScreenContent).toBe('turn n+1 starting');
+    expect(ds.lastScreenStatus).toBe('starting');
+    expect(ds.currentImageKey).toBeUndefined();
+    expect(recordUsageMock).toHaveBeenCalledWith(ds, { turnId: 'om_turn_n' });
+    expect(dashboardPublishMock).not.toHaveBeenCalled();
+    expect(transitionHookMock).not.toHaveBeenCalled();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+
+    clearTimeout(ds.usageLimitRetryTimer);
+    ds.usageLimitRetryTimer = undefined;
+  });
+
   it('ignores every message from a replaced worker generation', async () => {
     const staleWorker = makeFakeWorker();
     const currentWorker = makeFakeWorker();
