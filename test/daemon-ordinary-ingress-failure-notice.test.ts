@@ -9,6 +9,14 @@
  *   - 提示本身发送失败 → 只降级为 warn，原错误仍然重抛，不被通知错误顶掉；
  *   - 正常投递 → 不发提示（无误报）。
  *
+ * 提示文案按接纳阶段区分（PR #846 review）：本轮 inbound 已被真正接纳后
+ *（durable tail、pendingRepo staging、live worker 收下、fork 成功——注意
+ * messageQueue append 不算接纳，queues/*.jsonl 仅供 dashboard 预览），失败
+ * 只可能出在接纳之后的状态回复支路——此时绝不能提示「请重发」（重发会让同一
+ * 任务再次入队、CLI 重复执行），改回「已接收勿重发」的澄清，且失败处理本身
+ * 不得产生第二个队列项。反向约束同样被钉住：refork 抛错、/vc-auth 纯拒绝等
+ * 未接纳失败必须保持「请重发」。
+ *
  * Run:  pnpm vitest run test/daemon-ordinary-ingress-failure-notice.test.ts
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -124,8 +132,11 @@ vi.mock('../src/im/lark/identity-cache.js', async () => {
   return { ...actual, resolveSender: (...args: any[]) => mocks.resolveSender(...args) };
 });
 
+import { mkdirSync } from 'node:fs';
+
 import { registerBot } from '../src/bot-registry.js';
 import { sessionKey } from '../src/core/types.js';
+import * as messageQueue from '../src/services/message-queue.js';
 import {
   __testOnly_activeSessions as activeSessions,
   __testOnly_handleNewTopic as handleNewTopic,
@@ -269,5 +280,164 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     await handleThreadReply(makeEventData('om_msg_4', 'all good'), makeCtx(anchor, 'om_msg_4'));
 
     expect(repliedText()).not.toContain(expectedNotice());
+  });
+});
+
+/** 让匹配 predicate 的回复失败，其余照常成功（模拟 Lark 瞬时发送故障只打中某一条）。 */
+function failRepliesMatching(predicate: (content: string) => boolean, message: string): void {
+  mocks.replyMessage.mockImplementation(async (...args: any[]) => {
+    if (predicate(String(args[2] ?? ''))) throw new Error(message);
+    return 'om_reply';
+  });
+  mocks.sendMessage.mockImplementation(async (...args: any[]) => {
+    if (predicate(String(args[2] ?? ''))) throw new Error(message);
+    return 'om_top';
+  });
+}
+
+describe('durable admission then failing status reply → no resend advice (PR #846 review)', () => {
+  const resendNotice = () => tr('daemon.ordinary_ingress_failed', undefined, localeForBot(APP));
+  const admittedNotice = () => tr('daemon.ordinary_ingress_admitted_reply_failed', undefined, localeForBot(APP));
+  const chooseRepoNotice = () => tr('daemon.choose_repo_first', undefined, localeForBot(APP));
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mkdirSync(mocks.dataDir, { recursive: true });
+    mocks.replyMessage.mockResolvedValue('om_reply');
+    mocks.sendMessage.mockResolvedValue('om_top');
+    mocks.getChatMode.mockResolvedValue('group');
+    mocks.getChatNameAndMode.mockResolvedValue({ name: null, mode: 'group' });
+    mocks.sessions.clear();
+    mocks.forkWorker.mockImplementation((ds: any) => {
+      ds.worker = { killed: false, send: vi.fn() };
+    });
+    mocks.scanMultipleProjects.mockReturnValue([]);
+    mocks.getAvailableBots.mockResolvedValue([]);
+    mocks.downloadResources.mockResolvedValue({ attachments: [], needLogin: false });
+    activeSessions.clear();
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+  });
+
+  it('pending-repo follower admitted to the durable tail: failing status reply keeps exactly one tail entry and never advises a resend', async () => {
+    const anchor = 'om_thread_pending_repo_1';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.pendingRepo = true;
+    ds.pendingPrompt = 'durable opening';
+    ds.pendingTurnId = 'om_opening_turn';
+    failRepliesMatching(c => c.includes(chooseRepoNotice()), 'lark transient send failure');
+
+    await expect(
+      handleThreadReply(makeEventData('om_msg_pr1', 'follow-up work', anchor), makeCtx(anchor, 'om_msg_pr1')),
+    ).rejects.toThrow('lark transient send failure');
+
+    expect(repliedText()).not.toContain(resendNotice());
+    expect(repliedText()).toContain(admittedNotice());
+    expect(ds.session.queuedActivationTail?.length ?? 0).toBe(1);
+  });
+
+  it('pending-repo opening staged durably: failing status reply never advises a resend', async () => {
+    const anchor = 'om_thread_pending_repo_2';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.pendingRepo = true;
+    ds.pendingPrompt = '';
+    failRepliesMatching(c => c.includes(chooseRepoNotice()), 'lark transient send failure');
+
+    await expect(
+      handleThreadReply(makeEventData('om_msg_pr2', 'becomes the opening', anchor), makeCtx(anchor, 'om_msg_pr2')),
+    ).rejects.toThrow('lark transient send failure');
+
+    expect(repliedText()).not.toContain(resendNotice());
+    expect(repliedText()).toContain(admittedNotice());
+    expect(ds.session.pendingRepoSetup?.turnId).toBe('om_msg_pr2');
+  });
+
+  it('new topic staged + queued durably: failing repo card keeps exactly one queue item and never advises a resend', async () => {
+    const anchor = 'om_msg_nt_admitted';
+    mocks.scanMultipleProjects.mockReturnValue([
+      { name: 'demo', path: '/tmp/botmux-demo', type: 'repo', branch: 'main' },
+    ] as any);
+    failRepliesMatching(() => false, 'unused');
+    mocks.replyMessage.mockImplementation(async (...args: any[]) => {
+      if (args[3] === 'interactive') throw new Error('lark card send failure');
+      return 'om_reply';
+    });
+    mocks.sendMessage.mockImplementation(async (...args: any[]) => {
+      if (args[3] === 'interactive') throw new Error('lark card send failure');
+      return 'om_top';
+    });
+
+    await expect(
+      handleNewTopic(makeEventData(anchor, 'start a durable task'), makeCtx(anchor, anchor)),
+    ).rejects.toThrow('lark card send failure');
+
+    expect(repliedText()).not.toContain(resendNotice());
+    expect(repliedText()).toContain(admittedNotice());
+    expect(messageQueue.readUnread(anchor).length).toBe(1);
+  });
+
+  it('a failing admitted-notice never masks the original status-reply error', async () => {
+    const anchor = 'om_thread_pending_repo_3';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.pendingRepo = true;
+    ds.pendingPrompt = 'durable opening';
+    failRepliesMatching(
+      c => c.includes(chooseRepoNotice()) || c.includes(admittedNotice()),
+      'status reply transport down',
+    );
+
+    await expect(
+      handleThreadReply(makeEventData('om_msg_pr3', 'follow-up work', anchor), makeCtx(anchor, 'om_msg_pr3')),
+    ).rejects.toThrow('status reply transport down');
+
+    expect(repliedText()).not.toContain(resendNotice());
+    expect(ds.session.queuedActivationTail?.length ?? 0).toBe(1);
+  });
+
+  it('pre-admission failure still advises a resend (unchanged behavior)', async () => {
+    const anchor = 'om_thread_pre_admission';
+    seedThreadSession(anchor, 'seeded');
+    mocks.downloadResources.mockRejectedValue(new Error('boom: before any admission'));
+
+    await expect(
+      handleThreadReply(makeEventData('om_msg_pre', 'never admitted', anchor), makeCtx(anchor, 'om_msg_pre')),
+    ).rejects.toThrow('boom: before any admission');
+
+    expect(repliedText()).toContain(resendNotice());
+    expect(repliedText()).not.toContain(admittedNotice());
+  });
+
+  it('worker-dead refork failure still advises a resend: the turn was never accepted anywhere durable', async () => {
+    const anchor = 'om_thread_refork_fail';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.hasHistory = true;
+    mocks.forkWorker.mockImplementation(() => {
+      throw new Error('fork failed: EAGAIN');
+    });
+
+    await expect(
+      handleThreadReply(makeEventData('om_msg_refork', 'run the task', anchor), makeCtx(anchor, 'om_msg_refork')),
+    ).rejects.toThrow('fork failed: EAGAIN');
+
+    expect(repliedText()).toContain(resendNotice());
+    expect(repliedText()).not.toContain(admittedNotice());
+  });
+
+  it('a rejected /vc-auth (pure-reply branch, no side effect) still advises a resend', async () => {
+    const anchor = 'om_thread_vc_auth_help';
+    seedThreadSession(anchor, 'seeded');
+    failRepliesMatching(() => true, 'vc-auth usage send failure');
+
+    await expect(
+      handleThreadReply(makeEventData('om_msg_vcauth', '/vc-auth help', anchor), makeCtx(anchor, 'om_msg_vcauth')),
+    ).rejects.toThrow('vc-auth usage send failure');
+
+    expect(repliedText()).toContain(resendNotice());
+    expect(repliedText()).not.toContain(admittedNotice());
   });
 });

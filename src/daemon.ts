@@ -8297,6 +8297,9 @@ type VcMeetingTemporaryAuthApplyInput = {
   mentions?: LarkMessage['mentions'];
   senderOpenId?: string;
   senderUnionId?: string;
+  /** 见 handleVcMeetingTemporaryAuthCommand.onMutating：即将真实变更授权状态时
+   *  触发；operator 拒绝 / list / 空目标等只回复的分支不触发。 */
+  onMutating?: () => void;
 };
 
 async function applyVcMeetingTemporaryAuthCommand(
@@ -8329,6 +8332,7 @@ async function applyVcMeetingTemporaryAuthCommand(
     return true;
   }
 
+  input.onMutating?.();
   const changed: string[] = [];
   const unchanged: string[] = [];
   for (const target of parsed.targets) {
@@ -8464,6 +8468,9 @@ async function handleVcMeetingTemporaryAuthCommand(input: {
   mentions?: LarkMessage['mentions'];
   senderOpenId?: string;
   senderUnionId?: string;
+  /** 临时授权状态即将发生真实变更时回调（纯拒绝/usage/list 等只回复的分支不触发），
+   *  供 ingress 调用方打接纳标——之后结果回复失败不得再诱导重发重复执行。 */
+  onMutating?: () => void;
 }): Promise<boolean> {
   const parsed = parseVcMeetingTemporaryAuthCommand(
     input.commandContent,
@@ -8491,6 +8498,7 @@ async function handleVcMeetingTemporaryAuthCommand(input: {
     mentions: input.mentions,
     senderOpenId: input.senderOpenId,
     senderUnionId: input.senderUnionId,
+    onMutating: input.onMutating,
   });
 }
 
@@ -16556,6 +16564,10 @@ function deliverPassthroughToExistingSession(
     senderOpenId?: string;
     senderIsBot: boolean;
     substitute: boolean;
+    /** raw input 已写入 worker 后回调（worker 不在线的拒绝分支不触发），供 ingress
+     *  调用方打接纳标——其后同步收尾（落盘/事件派发）抛错不得再诱导重发，否则
+     *  /compact 这类非幂等 passthrough 会被重发重复执行。 */
+    onDelivered?: () => void;
   },
 ): void {
   if ((ds.worker && !ds.worker.killed) || isSessionTransferring(ds)) {
@@ -16595,6 +16607,7 @@ function deliverPassthroughToExistingSession(
       content: commandContent,
       turnId: turn.messageId,
     });
+    turn.onDelivered?.();
     markSessionActivity(ds);
     logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
     return;
@@ -16647,12 +16660,15 @@ async function startInitialPassthroughSession(args: {
   /** This raw cold start came from `/t ...`; seed a visible thread only on the
    *  direct-fork branches that otherwise produce no immediate reply. */
   cardlessForceTopicSeed: boolean;
+  /** 本轮 inbound 进入 durable 队列（staging + append）后回调，供调用方翻转
+   *  ingress 接纳标记——之后的 repo card / 状态回复失败不得再诱导重发。 */
+  onDurablyAdmitted?: () => void;
 }): Promise<void> {
   const {
     larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId,
     parsed, cmd, commandContent, senderOpenId, substitute, senderUnionId,
     memberUnionId, ownerOpenId, ownerUnionId, creatorOpenId, botSender,
-    senderIsBot, cardlessForceTopicSeed,
+    senderIsBot, cardlessForceTopicSeed, onDurablyAdmitted,
     routeToCanonicalOwner,
   } = args;
   if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId, memberUnionId, chatType, botSender)) {
@@ -16747,9 +16763,14 @@ async function startInitialPassthroughSession(args: {
   }
   messageQueue.ensureQueue(anchor);
   messageQueue.appendMessage(anchor, { ...parsed, content: commandContent });
+  // 接纳标记按分支下沉，不绑在 appendMessage 上：queues/*.jsonl 仅供 dashboard
+  // 预览，无投递重放语义；且 replyInvalidWorkingDirs 是「放弃本轮」分支（关闭
+  // 会话后才回复），放弃前的失败必须保持「请重发」提示。
 
   if (pinnedWorkingDir && autoWt) {
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+    // 已 durable staging（auto_worktree）且通过放弃闸：detached 建库流程接管投递。
+    onDurablyAdmitted?.();
     ds.initialStartPending = false; // pendingRepo/worktree now owns buffering
     // 挂起态提交：worktree 建好后经 runAutoWorktreeCommit → commitRepoSelection 拉起
     // pendingRawInput 冷启动会话。detach → 立即返回，不阻塞本条消息处理。
@@ -16767,6 +16788,8 @@ async function startInitialPassthroughSession(args: {
     });
     const availableBots = await getAvailableBots(larkAppId, chatId);
     forkReservedInitialRawSession(ds, availableBots);
+    // fork 成功即开场已交给 CLI；fork 抛错则本轮只存在于内存，保持重发提示。
+    onDurablyAdmitted?.();
     const reason = oncallEntry
       ? `oncall-bound chat ${chatId}`
       : inheritedFrom
@@ -16782,6 +16805,9 @@ async function startInitialPassthroughSession(args: {
   if (projects.length > 0) {
     ds.initialStartPending = false; // pendingRepo/card now owns buffering
     lastRepoScan.set(chatId, projects);
+    // 已 durable staging（picker）且通过放弃闸；接下来卡片发送失败不得诱导重发
+    //（重发会在 pendingRepo 缓冲里再入一份）。
+    onDurablyAdmitted?.();
     const cardJson = buildRepoSelectCard(projects, getSessionWorkingDir(ds), anchor, localeForBot(larkAppId), getBot(larkAppId).config.worktreeMultiPicker);
     ds.repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
     persistPendingRepoCardMessageId(ds, ds.repoCardMessageId);
@@ -16790,6 +16816,9 @@ async function startInitialPassthroughSession(args: {
     return;
   }
 
+  // 已 durable staging（picker，含 rawInput）且通过放弃闸：fork 失败后本条 raw
+  // passthrough 仍 durable 挂在会话上，重发会重复执行非幂等命令——先打接纳标。
+  onDurablyAdmitted?.();
   ds.pendingRepo = false;
   await maybeSeedCardlessForceTopicTurn({
     ds,
@@ -16823,19 +16852,40 @@ function mergeVcMeetingApplicationContext(
   return `${[...new Set(lines)].join('\n')}\n`;
 }
 
+/** 本轮 inbound 已被真正接纳后打标：durable 写入（queuedActivationTail /
+ * pendingRepo staging）且已通过 replyInvalidWorkingDirs 之类的放弃闸，或已实际
+ * 送达 worker（live send 被接受 / refork·初次冷 fork 成功 / PTY raw input 已写入 /
+ * vc-auth 真实变更开始）。标记落在 ctx.ingressAdmission 共享 box 上（见其字段
+ * 注释），notifyOrdinaryIngressFailure 据此区分「没送达请重发」与「已接纳勿重发」。
+ * messageQueue.appendMessage 不算接纳——queues/*.jsonl 仅供 dashboard 预览，
+ * 没有投递重放语义；handleCommand 命令路径不参与（其内部 catch 吞掉一切异常）。 */
+function markIngressAdmitted(ctx: RoutingContext): void {
+  if (ctx.ingressAdmission) ctx.ingressAdmission.admitted = true;
+  else ctx.ingressAdmission = { admitted: true };
+}
+
 /**
  * 普通消息处理链的终态失败收口：transport 已 ACK（用户看到消息发出去了），但
  * 异常把整条投递链掀翻——此前只剩 dispatcher 的 log-only catch，用户视角就是
  * 机器人吞消息。best-effort 回一条可行动提示后原样重抛，dispatcher 既有的错误
  * 日志与调用方语义不变。rejected 类失败（quota/权限拦截）由各自路径回复后正常
  * return，不会走到这里。
+ *
+ * 提示文案按接纳阶段二选一：本轮一旦被 durable queue / worker 接纳
+ * （ctx.ingressAdmission.admitted，各接纳点经 markIngressAdmitted 翻转），失败
+ * 只可能出在接纳之后的状态回复等 UX 支路——此时绝不能提示「请重发」，否则一次
+ * Lark 瞬时发送故障会被放大成同一任务再次入队、CLI 重复执行；改为「已接收，
+ * 勿重发」的澄清。未接纳的失败保持原有重发提示。
  */
 async function notifyOrdinaryIngressFailure(ctx: RoutingContext, err: unknown): Promise<never> {
   const replyAnchor = ctx.scope === 'thread' ? ctx.anchor : ctx.chatId;
+  const noticeKey = ctx.ingressAdmission?.admitted
+    ? 'daemon.ordinary_ingress_admitted_reply_failed'
+    : 'daemon.ordinary_ingress_failed';
   try {
     await sessionReply(
       replyAnchor,
-      tr('daemon.ordinary_ingress_failed', undefined, localeForBot(ctx.larkAppId)),
+      tr(noticeKey, undefined, localeForBot(ctx.larkAppId)),
       'text',
       ctx.larkAppId,
     );
@@ -16849,6 +16899,7 @@ async function notifyOrdinaryIngressFailure(ctx: RoutingContext, err: unknown): 
 }
 
 async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
+  ctx.ingressAdmission ??= { admitted: false };
   return withBotTurnAdmission(
     ctx.larkAppId,
     () => handleNewTopicAdmitted(data, ctx),
@@ -17090,6 +17141,9 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
         mentions: parsed.mentions,
         senderOpenId,
         senderUnionId,
+        // help/invalid/无监听等纯拒绝分支不打接纳标（回复失败应保持「请重发」）；
+        // 只有真正开始改临时授权状态后，结果回复失败才不得诱导重发。
+        onMutating: () => markIngressAdmitted(ctx),
       });
       return;
     }
@@ -17135,6 +17189,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
           ownerOpenId: senderOpenId,
           ownerUnionId: senderUnionId,
           creatorOpenId: senderOpenId,
+          onDurablyAdmitted: () => markIngressAdmitted(ctx),
           routeToCanonicalOwner: () => handleThreadReplyAdmitted(data, {
             ...ctx,
             scope,
@@ -17526,12 +17581,17 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   }
   messageQueue.ensureQueue(anchor);
   messageQueue.appendMessage(anchor, parsed);
+  // 接纳标记按分支下沉，不绑在 appendMessage 上：queues/*.jsonl 仅供 dashboard
+  // 预览，无投递重放语义；且 replyInvalidWorkingDirs 是「放弃本轮」分支（关闭
+  // 会话后才回复），放弃前的失败必须保持「请重发」提示。
 
   // Auto-worktree: session is registered PENDING; build the worktree off the
   // critical path, then commitRepoSelection pins it + forks (folding in any
   // messages buffered during creation). detach → return immediately.
   if (pinnedWorkingDir && autoWt) {
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+    // 已 durable staging（auto_worktree）且通过放弃闸：detached 建库流程接管投递。
+    markIngressAdmitted(ctx);
     ds.initialStartPending = false; // pendingRepo/worktree now owns buffering
     startAutoWorktreePending(ds, { anchor, baseDir: pinnedWorkingDir, title: session.title, prompt: promptContent, operatorOpenId: senderOpenId });
     return;
@@ -17550,6 +17610,8 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     const availableBots = await getAvailableBots(larkAppId, chatId);
     await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     forkReservedInitialSession(ds, availableBots);
+    // fork 成功即开场已交给 CLI；fork 抛错则开场只存在于内存，保持重发提示。
+    markIngressAdmitted(ctx);
     const reason = oncallEntry
       ? `oncall-bound chat ${chatId}`
       : inheritedFrom
@@ -17571,6 +17633,9 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   if (projects.length > 0) {
     ds.initialStartPending = false; // pendingRepo/card now owns buffering
     lastRepoScan.set(chatId, projects);
+    // 已 durable staging（picker）且通过放弃闸；接下来卡片发送失败不得诱导重发
+    //（重发会在 pendingRepo 缓冲里再入一份）。
+    markIngressAdmitted(ctx);
     const currentCwd = getSessionWorkingDir(ds);
     const cardJson = buildRepoSelectCard(projects, currentCwd, anchor, localeForBot(larkAppId), getBot(larkAppId).config.worktreeMultiPicker);
     ds.repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
@@ -17578,7 +17643,11 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     announcePendingRepoSession(ds);
     logger.info(`[${tag(ds)}] Waiting for repo selection (${projects.length} projects)`);
   } else {
-    // No projects found — skip repo selection, spawn directly
+    // No projects found — skip repo selection, spawn directly.
+    // 已 durable staging（picker）且通过放弃闸：即使下面 fork 失败，opening 仍由
+    // 会话 durable 持有（pre-init 回滚恢复 queued journal，重启复活），重发会
+    // 重复执行——先打接纳标。
+    markIngressAdmitted(ctx);
     ds.pendingRepo = false;
     ensureSessionWhiteboard(ds);
     await maybeSeedCardlessForceTopicTurn({
@@ -18144,6 +18213,7 @@ async function handleThreadReply(
   // quota/resource/sender preparation awaits. Synthetic keys share the same
   // lock registry without occupying or mutating an active-session slot.
   const deliveryKey = `\u0000thread-delivery:${ctx.larkAppId}:${ctx.scope}:${ctx.anchor}`;
+  ctx.ingressAdmission ??= { admitted: false };
   return withActiveSessionKeyLock(
     activeSessions,
     deliveryKey,
@@ -18381,6 +18451,8 @@ async function handleThreadReplyAdmitted(
         mentions: parsed.mentions,
         senderOpenId: threadSenderOpenId,
         senderUnionId: threadSenderUnionId,
+        // 同 new-topic 路径：仅在真正开始改状态后打接纳标。
+        onMutating: () => markIngressAdmitted(ctx),
       });
       return;
     }
@@ -18412,6 +18484,7 @@ async function handleThreadReplyAdmitted(
           ownerOpenId: isForeignBot ? undefined : threadSenderOpenId,
           ownerUnionId: isForeignBot ? undefined : data?.sender?.sender_id?.union_id,
           creatorOpenId: threadSenderOpenId,
+          onDurablyAdmitted: () => markIngressAdmitted(ctx),
           routeToCanonicalOwner: () => handleThreadReplyAdmitted(data, {
             ...ctx,
             scope,
@@ -18456,6 +18529,7 @@ async function handleThreadReplyAdmitted(
           senderOpenId: threadSenderOpenId,
           senderIsBot: isForeignBot,
           substitute: !!substituteTrigger,
+          onDelivered: () => markIngressAdmitted(ctx),
         });
       }
       else void sessionReply(anchor, tr('daemon.cmd_needs_active_cli', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
@@ -18548,6 +18622,8 @@ async function handleThreadReplyAdmitted(
         fireSessionlessCommandDetached(cmd, anchor, cmdMessage, larkAppId);
         return;
       }
+      // 命令路径不打接纳标：handleCommand 内部 catch 吞掉一切异常并记日志
+      //（command-handler.ts 收口），异常到不了 ingress catch，标记永远读不到。
       await handleCommand(cmd, anchor, cmdMessage, commandDeps, larkAppId);
       return;
     }
@@ -18800,6 +18876,7 @@ async function handleThreadReplyAdmitted(
         cliInput: followUp,
         turnId: parsed.messageId,
       }, tailReservation);
+      markIngressAdmitted(ctx);
     } finally {
       settleAsyncQueuedActivationTailAdmission(ds);
     }
@@ -18939,6 +19016,9 @@ async function handleThreadReplyAdmitted(
           turnId: parsed.messageId,
         }, durableTailReservation!);
       }
+      // 本轮已持久化接纳（durable opening 或 durable tail）；下面的状态回复再
+      // 失败也不得诱导重发（PR #846 review）。
+      markIngressAdmitted(ctx);
       const pendingReplyKey = ds.worktreeCreating
         ? 'daemon.worktree_building_wait'
         : 'daemon.choose_repo_first';
@@ -19176,10 +19256,13 @@ async function handleThreadReplyAdmitted(
     // creator re-enters the canonical route above, which appends exactly once.
     messageQueue.ensureQueue(anchor);
     messageQueue.appendMessage(anchor, parsed);
+    // 接纳标记按分支下沉（同 handleNewTopicAdmitted）：append 仅供 dashboard 预览，
+    // replyInvalidWorkingDirs 是放弃分支，放弃前的失败必须保持「请重发」提示。
 
     // Auto-worktree: register PENDING, build worktree off-path, commit+fork later.
     if (pinnedWorkingDir && autoWt) {
       if (await replyInvalidWorkingDirs(anchor, larkAppId, newDs)) return;
+      markIngressAdmitted(ctx);
       newDs.initialStartPending = false; // pendingRepo/worktree now owns buffering
       startAutoWorktreePending(newDs, { anchor, baseDir: pinnedWorkingDir, title: parsed.content.substring(0, 50), prompt: promptContent, operatorOpenId: ownerOpenId });
       return;
@@ -19193,6 +19276,8 @@ async function handleThreadReplyAdmitted(
       const availableBots = await getAvailableBots(larkAppId, autoCreateChatId);
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
       forkReservedInitialSession(newDs, availableBots);
+      // fork 成功即开场已交给 CLI；fork 抛错则开场只存在于内存，保持重发提示。
+      markIngressAdmitted(ctx);
       const reason = oncallEntry
         ? `oncall-bound chat ${autoCreateChatId}`
         : inheritedFrom
@@ -19212,6 +19297,8 @@ async function handleThreadReplyAdmitted(
     if (projects.length > 0) {
       newDs.initialStartPending = false; // pendingRepo/card now owns buffering
       lastRepoScan.set(autoCreateChatId, projects);
+      // 已 durable staging（picker）且通过放弃闸；卡片发送失败不得诱导重发。
+      markIngressAdmitted(ctx);
       const currentCwd = getSessionWorkingDir(newDs);
       const cardJson = buildRepoSelectCard(projects, currentCwd, anchor, localeForBot(larkAppId), getBot(larkAppId).config.worktreeMultiPicker);
       newDs.repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
@@ -19219,7 +19306,10 @@ async function handleThreadReplyAdmitted(
       announcePendingRepoSession(newDs);
       logger.info(`[${tag(newDs)}] Waiting for repo selection (${projects.length} projects)`);
     } else {
-      // No projects found — skip repo selection, spawn directly
+      // No projects found — skip repo selection, spawn directly.
+      // 已 durable staging（picker）：fork 失败后 opening 仍由会话 durable 持有，
+      // 先打接纳标（同 handleNewTopicAdmitted 的 no-projects 分支）。
+      markIngressAdmitted(ctx);
       newDs.pendingRepo = false;
       ensureSessionWhiteboard(newDs);
       const availableBots = await getAvailableBots(larkAppId, autoCreateChatId);
@@ -19231,6 +19321,8 @@ async function handleThreadReplyAdmitted(
   }
 
   // Existing-owner route: append once after all pending-repo early returns.
+  // 接纳标记不打在这里：append 仅供 dashboard 预览，真正的接纳在下方 live worker
+  // 送达 / durable tail staging / refork 成功之后。
   messageQueue.ensureQueue(anchor);
   messageQueue.appendMessage(anchor, parsed);
   publishSessionMessagePreviewPatch(ds);
@@ -19322,7 +19414,11 @@ async function handleThreadReplyAdmitted(
       // reached the CLI; a rejected send then left that poison behind, and the
       // next message's worker-null refork would read it as `hadPriorCliInput`
       // and wrongly `--resume` a CLI that never took a real turn.
-      if (accepted) rememberLastCliInput(ds, promptContent, cliInput);
+      if (accepted) {
+        // 消息已实际送入 live worker——之后的收尾失败不得再诱导重发。
+        markIngressAdmitted(ctx);
+        rememberLastCliInput(ds, promptContent, cliInput);
+      }
       else logger.warn(`[${tag(ds)}] Inbound ${parsed.messageId} was not accepted by the live worker`);
     } finally {
       // The opening is one-shot: give it back when the worker died / refused,
@@ -19404,6 +19500,9 @@ async function handleThreadReplyAdmitted(
           cliInput: currentFollowUp,
           turnId: parsed.messageId,
         }, tailReservation);
+        // 本轮已进 durable tail——之后 fork/回执失败可由重启或下一条 inbound 恢复，
+        // 不得再诱导重发。
+        markIngressAdmitted(ctx);
       } finally {
         settleAsyncQueuedActivationTailAdmission(ds);
       }
@@ -19561,6 +19660,7 @@ async function handleThreadReplyAdmitted(
     if (!queuedHasDurableTail) {
       await noteTurnReceived(ds, parsed.messageId, parsed.content, reforkSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     }
+    let reforkAccepted = true;
     try {
       // Adopt sessions must re-fork via forkAdoptWorker, NOT forkWorker: the
       // latter would spawn a fresh botmux-managed bmx-* CLI in the adopt cwd,
@@ -19582,7 +19682,7 @@ async function handleThreadReplyAdmitted(
         if (codexAppSteerable && !queuedDashboardTurn && !queuedHasDurableTail) {
           wrappedInput.codexAppSteerable = true;
         }
-        forkWorker(ds, wrappedInput, {
+        reforkAccepted = forkWorker(ds, wrappedInput, {
           // See `hadPriorCliInput` above — an opening on a CLI that never took any
           // input cold-spawns rather than `--resume`-ing an empty session.
           resume: ds.hasHistory && !(openingTurn && !hadPriorCliInput),
@@ -19595,6 +19695,10 @@ async function handleThreadReplyAdmitted(
       if (openingTurn) releaseInitialUserTurn(ds);
       throw e;
     }
+    // refork 成功才算本轮已交给 CLI。fork 抛错（rethrow）或返回 false（quarantine /
+    // 会话已非 active 的不抛错拒绝腿）时，本轮只存在于内存、无 durable 兜底，
+    // 必须保持「请重发」提示——与 live 分支按 accepted 打标对称。
+    if (reforkAccepted) markIngressAdmitted(ctx);
     // Record the input as the session's last real CLI turn ONLY after the fork
     // succeeded. Recording before the fork (the old order) persisted lastCliInput
     // for a turn that never launched when forkWorker threw; the retry then read

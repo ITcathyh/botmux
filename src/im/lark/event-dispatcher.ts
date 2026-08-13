@@ -1770,6 +1770,12 @@ export interface RoutingContext {
   /** Earlier topic seed coalesced into this root-linked clarification. */
   forwardSeedData?: any;
   larkAppId: string;
+  /** 本轮 inbound 的接纳阶段标记，由 daemon 的普通消息入口初始化、各接纳点翻转。
+   *  必须是共享 mutable box 而非布尔字段：reroute 交接会浅拷贝 ctx
+   *  （`{ ...ctx, scope, anchor }`），box 引用随拷贝共享，接纳发生在拷贝之后
+   *  也能被最外层 ingress catch 看到。admitted 为 true 后该 catch 不得再提示
+   *  重发——本轮已进 durable queue / worker，重发会让同一任务再次入队执行。 */
+  ingressAdmission?: { admitted: boolean };
 }
 
 interface PendingForwardTopicPayload {
