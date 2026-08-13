@@ -1355,6 +1355,73 @@ export function recallFrozenCards(ds: DaemonSession): void {
 }
 
 /**
+ * Start a new turn by PATCHing the existing card in a thread-scoped session.
+ * Final answers are delivered as fresh messages, so keeping one stable status
+ * card avoids a withdraw/repost cycle without hiding conversation history.
+ */
+export function reuseThreadStreamingCardForTurn(
+  ds: DaemonSession,
+  title: string,
+  turnId: string,
+): boolean {
+  if (ds.scope !== 'thread') return false;
+  if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL) return false;
+  if (ds.session.vcMeetingReceiver || streamingCardDisabled(ds, turnId)) return false;
+  if (riffRetirementAdmissionPhase(ds)) return false;
+  if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return false;
+
+  if (ds.usageLimitRetryTimer) {
+    clearTimeout(ds.usageLimitRetryTimer);
+    ds.usageLimitRetryTimer = undefined;
+  }
+  clearUsageRefreshTimer(ds);
+  ds.usageLimit = undefined;
+  ds.streamCardPending = false;
+  ds.streamCardPendingTurnId = undefined;
+  ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
+  ds.currentTurnTitle = title.substring(0, 50);
+  ds.currentImageKey = undefined;
+  // Force the next real worker update to cross a status edge even when the
+  // previous turn was still `working` (type-ahead). Otherwise working→working
+  // would be coalesced and leave this card stuck at "starting" with no usage
+  // refresh timer.
+  ds.lastScreenStatus = 'starting';
+  ds.parkedStreamCardNonce = undefined;
+  if (!ds.streamCardNonce) ds.streamCardNonce = randomBytes(4).toString('hex');
+
+  const botCfg = getBot(ds.larkAppId).config;
+  const effectiveCliId = sessionCliId(ds, botCfg);
+  const cardJson = buildStreamingCard(
+    ds.session.sessionId,
+    sessionAnchorId(ds),
+    readableTerminalUrlFor(ds),
+    ds.currentTurnTitle,
+    '',
+    'starting',
+    effectiveCliId,
+    ds.displayMode ?? 'hidden',
+    ds.streamCardNonce,
+    undefined,
+    !!ds.adoptedFrom,
+    false,
+    localeForBot(ds.larkAppId),
+    undefined,
+    writableTerminalLinkFor(ds),
+    isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+    getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
+    sessionRuntimeDisplayName(ds, botCfg),
+    codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+  );
+  persistStreamCardState(ds);
+  // A stopped worker's ready handler owns the first PATCH because it adds the
+  // newly-established terminal/readiness state. Queuing this older starting
+  // card now could resolve after ready's direct update and overwrite it.
+  if (workerHasInitialized(ds)) scheduleCardPatch(ds, cardJson, turnId);
+  logger.info(`[${tag(ds)}] Reused streaming card for turn ${turnId.substring(0, 12)}`);
+  return true;
+}
+
+/**
  * Post the current turn's starting card as soon as the daemon accepts the
  * inbound message. Terminal redraw is deliberately not part of this trigger:
  * some CLIs consume a turn without emitting another screen_update, which used
@@ -8879,6 +8946,7 @@ function setupWorkerHandlers(
       }
 
       case 'explicit_reply_observed': {
+        void finishDeliveredTurnReactions(ds, msg.turnId);
         if (msg.turnId.startsWith('mlrp_turn_')) {
           markMessageListenerRunPreviewReplied(msg.turnId, {
             sessionId: ds.session.sessionId,
@@ -9645,15 +9713,11 @@ function shouldDropMismatchedHermesFinalOutput(
 }
 
 /**
- * Turn-end half of the two-phase turn reactions (auto-on for card-off sessions,
- * i.e. streaming card disabled). The 冲! "received" reactions are added per-message at the daemon
- * acceptance point (`noteTurnReceived`); the screen_update handler calls this
- * only on working|analyzing → idle|limited (not cold-start starting→idle), to
- * flip every pending ✋ on this session to ✅ DONE and clear the list. When
- * silentTurnReactions is enabled after a ✋ has already landed, we only remove
- * that received reaction and do not add DONE. Binding the start to the message
- * (not a status edge) means type-ahead / busy-batched messages each get their
- * own reaction and all settle together here.
+ * Turn-end handler for card-off progress reactions. Stable-card thread turns
+ * keep their reaction until a reply delivery signal arrives; an idle edge by
+ * itself must not tell the user the reply has landed. The screen_update handler
+ * calls this only on working|analyzing → idle|limited (not cold-start
+ * starting→idle).
  *
  * Every Feishu call is best-effort — a failure only means a missing emoji, so it
  * must never throw into the status pipeline (callers invoke as `void`).
@@ -9661,14 +9725,21 @@ function shouldDropMismatchedHermesFinalOutput(
 async function finishTurnReactions(ds: DaemonSession): Promise<void> {
   const list = ds.pendingAckReactions;
   if (!list || list.length === 0) return;
-  // Detach the batch first so a second idle edge can't double-flip it.
-  ds.pendingAckReactions = [];
   // A dedicated receiver has no progress-reaction channel. Clear any stale
   // in-memory entries restored from an older build without touching Lark.
-  if (ds.session.vcMeetingReceiver) return;
+  if (ds.session.vcMeetingReceiver) {
+    ds.pendingAckReactions = [];
+    return;
+  }
+  // Thread entries are settled by finishDeliveredTurnReactions after an
+  // outbound reply succeeds. Detach only card-off entries here so a second
+  // idle edge cannot double-flip them and concurrent reply delivery can still
+  // find its exact turn.
+  const cardOff = list.filter(ack => ack.clearOnReply !== true);
+  ds.pendingAckReactions = list.filter(ack => ack.clearOnReply === true);
   const silent = silentTurnReactions(ds);
   const doneEmoji = doneReactionEmojiFor(ds);
-  for (const ack of list) {
+  for (const ack of cardOff) {
     if (ack.reactionId) {
       try {
         await removeReaction(ds.larkAppId, ack.messageId, ack.reactionId);
@@ -9681,6 +9752,25 @@ async function finishTurnReactions(ds: DaemonSession): Promise<void> {
       await addReaction(ds.larkAppId, ack.messageId, doneEmoji);
     } catch (err: any) {
       logger.debug(`[reaction] failed to add done reaction to ${ack.messageId}: ${err?.message ?? err}`);
+    }
+  }
+}
+
+/** Remove the exact thread turn's progress reaction after its reply has been
+ * delivered. Card-off entries keep their existing received→DONE idle flow. */
+async function finishDeliveredTurnReactions(ds: DaemonSession, turnId: string): Promise<void> {
+  const list = ds.pendingAckReactions;
+  if (!list || list.length === 0) return;
+  const delivered = list.filter(ack =>
+    ack.clearOnReply === true && (ack.turnId ?? ack.messageId) === turnId);
+  if (delivered.length === 0) return;
+  ds.pendingAckReactions = list.filter(ack => !delivered.includes(ack));
+  for (const ack of delivered) {
+    if (!ack.reactionId) continue;
+    try {
+      await removeReaction(ds.larkAppId, ack.messageId, ack.reactionId);
+    } catch (err: any) {
+      logger.debug(`[reaction] failed to clear delivered reaction ${ack.reactionId}: ${err?.message ?? err}`);
     }
   }
 }
@@ -10145,6 +10235,7 @@ function deliverFinalOutput(
           ? { ...deliveryReplyOptions, replyTarget: frozenReplyTarget }
           : deliveryReplyOptions,
       );
+      await finishDeliveredTurnReactions(ds, msg.turnId);
       if (!isStillOwned()) { onComplete?.(true); return; }
       recordPrimaryOutput(messageId);
       if (msg.turnId.startsWith('mlrp_turn_')) {

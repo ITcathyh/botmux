@@ -246,13 +246,16 @@ export interface DaemonSession {
    *  command so a user can manually summon a live card in an otherwise-quiet
    *  session. In-memory only (resets on daemon restart). */
   streamingCardForced?: boolean;
-  /** Two-phase turn reactions (auto-on for card-off sessions, i.e. streaming
-   *  card disabled). The bot reacts 冲! on each user message the moment it's accepted for the session
-   *  (bound to the message, NOT a worker status edge — so type-ahead / busy-
-   *  batched messages each get their own reaction). Every pending ✋ here is
-   *  flipped to ✅ when the turn returns to idle. In-memory only (a daemon
-   *  restart mid-turn just leaves a stale ✋ — purely cosmetic). */
-  pendingAckReactions?: Array<{ messageId: string; reactionId?: string }>;
+  /** Turn progress reactions bound to the triggering user message. Card-off
+   *  turns flip the received reaction to DONE at idle; thread turns with a
+   *  live status card remove it only once the reply is delivered. In-memory
+   *  only. */
+  pendingAckReactions?: Array<{
+    messageId: string;
+    reactionId?: string;
+    turnId?: string;
+    clearOnReply?: boolean;
+  }>;
   /** Card body display mode. Default 'hidden'. When user clicks 显示输出, defaults to 'screenshot'. */
   displayMode?: DisplayMode;
   /** Latest uploaded screenshot image_key for the streaming card. */

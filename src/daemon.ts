@@ -172,6 +172,7 @@ import {
   getDaemonBootId,
   getDaemonStreamingCardUsageSnapshot,
   postTurnStartingCard,
+  reuseThreadStreamingCardForTurn,
   isSessionTransferring,
   snapshotCodexAppFinalSettlements,
   codexAppFinalSettlementCount,
@@ -3135,7 +3136,7 @@ export async function noteTurnReceived(
   triggerMessageId: string,
   _prompt?: string,
   _sender?: { name?: string },
-  _turnId?: string,
+  turnId?: string,
   receivedReactionEmoji?: string,
 ): Promise<void> {
   // Replaces the old 「处理中」 placeholder card. That card existed only to be
@@ -3145,10 +3146,10 @@ export async function noteTurnReceived(
   // fresh message (deliverFinalOutput / `botmux send`).
   //
   // This call site is the per-message acceptance point, so it also drives the
-  // two-phase turn reaction. It's auto-enabled exactly for card-off sessions
-  // (streaming card disabled): those have no live status card, so the ✋→✅ on
-  // the user's message is the only lightweight progress signal. Bots can opt
-  // out via silentTurnReactions for low-noise observer scenarios.
+  // turn reaction. Card-off sessions retain the existing received→DONE flow.
+  // Thread sessions also react while their stable status card is running, then
+  // remove that reaction after the reply lands so a reused card never makes a
+  // newly accepted turn feel silent. Bots can opt out via silentTurnReactions.
   // React 冲! on the triggering message the instant it's accepted. Binding to the
   // message — not a worker status edge — means type-ahead / busy-batched messages
   // each get their own ✋. `finishTurnReactions` flips every pending ✋ to ✅ when
@@ -3156,7 +3157,9 @@ export async function noteTurnReceived(
   if (ds.session.vcMeetingReceiver) return;
   // Turn-exact card-off check: the reaction ack belongs to THIS message's turn,
   // not to whichever turn most recently overwrote currentReplyTarget.
-  if (!streamingCardDisabledFor(ds, triggerMessageId)) return;
+  const cardDisabled = streamingCardDisabledFor(ds, turnId ?? triggerMessageId);
+  const clearOnReply = ds.scope === 'thread' && !cardDisabled;
+  if (!cardDisabled && !clearOnReply) return;
   if (silentTurnReactionsFor(ds)) return;
   // Only Lark messages carry reactions — doc-comment ids / chat anchors can't.
   if (!triggerMessageId.startsWith('om_')) return;
@@ -3174,7 +3177,12 @@ export async function noteTurnReceived(
     logger.debug(`[reaction] received add failed for ${triggerMessageId}: ${err instanceof Error ? err.message : String(err)}`);
     return;
   }
-  (ds.pendingAckReactions ??= []).push({ messageId: triggerMessageId, reactionId });
+  (ds.pendingAckReactions ??= []).push({
+    messageId: triggerMessageId,
+    reactionId,
+    turnId: turnId ?? triggerMessageId,
+    ...(clearOnReply ? { clearOnReply: true } : {}),
+  });
 }
 
 async function sessionReply(
@@ -4314,12 +4322,10 @@ function getActiveCount(): number {
 }
 
 /**
- * Freeze the previous turn's streaming card at "idle" and mark a new turn so the
- * next screen_update from the worker POSTs a fresh streaming card instead of
- * PATCH-ing the previous one. Shared by the normal-message path and the
- * passthrough slash-command path (/model, /clear, /compact, etc.) — without
- * this, passthrough commands silently PATCH the previous card and the user
- * sees no visible response.
+ * Start a new streaming-card turn. Thread sessions PATCH their existing status
+ * card in place; flat chat sessions freeze the previous card and POST a fresh
+ * one so the new activity remains visible in the main timeline. Shared by the
+ * normal-message and passthrough slash-command paths.
  */
 function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
   // docCommentTargets 改为 per-turn map（按 turnId 索引），不再需要每轮清空：
@@ -4329,6 +4335,7 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
   // in. A new turn returns to the config default (noCardChats / disableStreamingCard).
   // Use `/card on` to persistently restore cards for the chat.
   ds.streamingCardForced = undefined;
+  if (reuseThreadStreamingCardForTurn(ds, title, turnId)) return;
   const previousUsageLimit = ds.usageLimit;
   const previousStatus = ds.lastScreenStatus === 'limited' && previousUsageLimit ? 'limited' : 'idle';
   if (ds.streamCardId && workerHasInitialized(ds)) {
@@ -19566,37 +19573,30 @@ async function handleThreadReplyAdmitted(
       if (openingTurn && !accepted) releaseInitialUserTurn(ds);
     }
   } else {
-    // Worker not running — re-fork with resume. This is a NEW turn, so drop
-    // any restored streaming-card reference; worker_ready will POST a fresh
-    // card instead of PATCHing the previous turn's card in place.
+    // Worker not running — re-fork with resume. Thread sessions keep their
+    // stable status card for worker_ready to PATCH; flat chats retain the
+    // fresh-card handoff so new activity appears in the main timeline.
     logger.info(`[${tag(ds)}] Worker not running, re-forking...`);
     // 飞书消息轮（非文档评论轮）：docCommentTargets 是 per-turn map，本轮 turnId
     // 不会命中文档评论的 key，无需显式清盘。
-    if (ds.usageLimitRetryTimer) {
-      clearTimeout(ds.usageLimitRetryTimer);
-      ds.usageLimitRetryTimer = undefined;
+    if (!reuseThreadStreamingCardForTurn(ds, parsed.content, parsed.messageId)) {
+      if (ds.usageLimitRetryTimer) {
+        clearTimeout(ds.usageLimitRetryTimer);
+        ds.usageLimitRetryTimer = undefined;
+      }
+      ds.usageLimit = undefined;
+      ds.currentTurnTitle = parsed.content.substring(0, 50);
+      // With no worker, park the current card until its flat-chat successor is
+      // visible. If fork / worker_ready / POST fails, the old card remains.
+      parkStreamCard(ds);
+      ds.streamCardId = undefined;
+      ds.streamCardNonce = undefined;
+      ds.streamCardPending = true;
+      ds.streamCardPendingTurnId = parsed.messageId;
+      ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
+      ds.currentImageKey = undefined;
+      persistStreamCardState(ds);
     }
-    ds.usageLimit = undefined;
-    ds.currentTurnTitle = parsed.content.substring(0, 50);
-    // The cosmetic freeze step (above) is gated on a live worker. With no
-    // worker we just park the current card in frozenCards — the upcoming
-    // new POST will recall it. Parking instead of deleting preserves the
-    // "old card stays until a new one is live" invariant: if fork /
-    // worker_ready / POST fails, the user still sees the previous card.
-    parkStreamCard(ds);
-    ds.streamCardId = undefined;
-    ds.streamCardNonce = undefined;
-    // This is a new turn even though the worker is currently down. Force the
-    // first screen_update from the re-forked worker to POST a fresh card and
-    // drop any persisted screenshot from the previous turn. Otherwise a stale
-    // image_key (for example an old Claude Code frame) can be reused on the
-    // new Worker card until the next screenshot upload, which makes a fresh
-    // @mention appear to resurrect the wrong CLI UI.
-    ds.streamCardPending = true;
-    ds.streamCardPendingTurnId = parsed.messageId;
-    ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
-    ds.currentImageKey = undefined;
-    persistStreamCardState(ds);
     // Wrap the user message in the same `<user_message>` / `<session_id>` /
     // `<botmux_reminder>` envelope as live-worker turns. Without this, the
     // initial prompt that worker queues for the freshly-spawned CLI is the
@@ -20208,17 +20208,19 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
 
       // Worker 挂起 / 已退出 —— resume 重 fork（与 handleThreadReply 同路）。
       logger.info(`[${tag(ds)}] Worker not running for doc-comment, re-forking...`);
-      if (ds.usageLimitRetryTimer) { clearTimeout(ds.usageLimitRetryTimer); ds.usageLimitRetryTimer = undefined; }
-      ds.usageLimit = undefined;
-      ds.currentTurnTitle = text.substring(0, 50);
-      parkStreamCard(ds);
-      ds.streamCardId = undefined;
-      ds.streamCardNonce = undefined;
-      ds.streamCardPending = true;
-      ds.streamCardPendingTurnId = turnId;
-      ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
-      ds.currentImageKey = undefined;
-      persistStreamCardState(ds);
+      if (!reuseThreadStreamingCardForTurn(ds, text, turnId)) {
+        if (ds.usageLimitRetryTimer) { clearTimeout(ds.usageLimitRetryTimer); ds.usageLimitRetryTimer = undefined; }
+        ds.usageLimit = undefined;
+        ds.currentTurnTitle = text.substring(0, 50);
+        parkStreamCard(ds);
+        ds.streamCardId = undefined;
+        ds.streamCardNonce = undefined;
+        ds.streamCardPending = true;
+        ds.streamCardPendingTurnId = turnId;
+        ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
+        ds.currentImageKey = undefined;
+        persistStreamCardState(ds);
+      }
       // Skip whiteboard ensure for adopted (bridge) sessions on re-fork — mirrors
       // the live-worker branch above (if (!isBridge) ensure…).
       if (!ds.adoptedFrom) ensureSessionWhiteboard(ds);

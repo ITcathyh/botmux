@@ -115,6 +115,7 @@ import {
   parkStreamCard,
   postFreshStreamingCard,
   postTurnStartingCard,
+  reuseThreadStreamingCardForTurn,
   setActiveSessionsRegistry,
   restoreUsageLimitRuntimeState,
   scheduleCardPatch,
@@ -161,6 +162,7 @@ function makeDs(frozenCards?: Map<string, FrozenCard>): DaemonSession {
     larkAppId: APP_ID,
     chatId: 'oc_chat',
     chatType: 'group',
+    scope: 'thread',
     spawnedAt: Date.now(),
     cliVersion: '1.0',
     lastMessageAt: Date.now(),
@@ -434,6 +436,70 @@ describe('restoreUsageLimitRuntimeState', () => {
   });
 });
 
+describe('reuseThreadStreamingCardForTurn', () => {
+  it('PATCHes the existing thread card instead of withdrawing and posting another', async () => {
+    vi.useFakeTimers();
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardId = 'om_stable';
+    ds.streamCardNonce = 'nonce_stable';
+    ds.streamCardPending = true;
+    ds.streamCardPendingTurnId = 'om_old_turn';
+    ds.streamCardTurnGeneration = 3;
+    ds.currentImageKey = 'img_previous';
+    ds.lastScreenStatus = 'working';
+    ds.usageLimit = { limited: true, kind: 'usage', retryReady: false };
+    ds.usageLimitRetryTimer = setTimeout(() => {}, 60_000);
+    ds.usageRefreshTimer = setInterval(() => {}, 60_000);
+
+    expect(reuseThreadStreamingCardForTurn(ds, 'next question', 'om_next_turn')).toBe(true);
+
+    expect(ds.streamCardId).toBe('om_stable');
+    expect(ds.streamCardNonce).toBe('nonce_stable');
+    expect(ds.streamCardPending).toBe(false);
+    expect(ds.streamCardPendingTurnId).toBeUndefined();
+    expect(ds.streamCardTurnGeneration).toBe(4);
+    expect(ds.currentTurnTitle).toBe('next question');
+    expect(ds.currentImageKey).toBeUndefined();
+    expect(ds.lastScreenStatus).toBe('starting');
+    expect(ds.usageLimit).toBeUndefined();
+    expect(ds.usageLimitRetryTimer).toBeUndefined();
+    expect(ds.usageRefreshTimer).toBeUndefined();
+    expect(updateMessageMock).toHaveBeenCalledWith(APP_ID, 'om_stable', '{}');
+    expect(deleteMessageMock).not.toHaveBeenCalled();
+    expect(saveFrozenCardsMock).not.toHaveBeenCalled();
+  });
+
+  it('also preserves the stable thread card while a stopped worker is re-forked', () => {
+    const ds = makeDs();
+    ds.worker = null;
+    ds.workerReady = false;
+    ds.streamCardId = 'om_stable';
+    ds.streamCardNonce = 'nonce_stable';
+
+    expect(reuseThreadStreamingCardForTurn(ds, 'resume question', 'om_resume_turn')).toBe(true);
+
+    expect(ds.streamCardId).toBe('om_stable');
+    expect(ds.streamCardPending).toBe(false);
+    expect(updateMessageMock).not.toHaveBeenCalled();
+    expect(deleteMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps the fresh-card flow for flat chat sessions', () => {
+    const ds = makeDs();
+    ds.scope = 'chat';
+    ds.workerReady = true;
+    ds.streamCardId = 'om_previous';
+    ds.streamCardNonce = 'nonce_previous';
+
+    expect(reuseThreadStreamingCardForTurn(ds, 'next question', 'om_next_turn')).toBe(false);
+
+    expect(ds.streamCardId).toBe('om_previous');
+    expect(ds.streamCardTurnGeneration).toBeUndefined();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+});
+
 describe('receiver streaming card boundary', () => {
   it('refuses a fresh group-visible streaming card for a dedicated receiver', async () => {
     const ds = makeDs();
@@ -485,6 +551,23 @@ describe('postTurnStartingCard', () => {
     expect(ds.streamCardId).toBe('om_turn_card_1');
     expect(ds.streamCardPending).toBe(false);
     expect(ds.streamCardPendingTurnId).toBeUndefined();
+  });
+
+  it('still recalls the previous card after posting in a chat-scoped session', async () => {
+    const ds = makeDs();
+    ds.scope = 'chat';
+    ds.workerReady = true;
+    ds.streamCardId = 'om_previous';
+    ds.streamCardNonce = 'nonce_previous';
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+    const sessionReply = vi.fn(async () => 'om_turn_card_1');
+
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_1')).resolves.toBe(true);
+
+    expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_previous');
+    expect(ds.frozenCards?.size).toBe(0);
   });
 
   it('posts the newest queued turn after an older card POST finishes', async () => {

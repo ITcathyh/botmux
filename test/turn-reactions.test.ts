@@ -1,9 +1,9 @@
 /**
- * Two-phase turn reactions (auto-on for card-off sessions, i.e. streaming card disabled):
+ * Turn progress reactions:
  *   - noteTurnReceived(ds, msgId): react 冲! (GoGoGo) the instant a user message
  *     is accepted for the session, tracked per-message in ds.pendingAckReactions.
- *   - finishTurnReactions(ds): when the worker next goes idle, flip every pending
- *     ✋ to ✅ (DONE) and clear the list.
+ *   - card-off turns flip pending reactions to DONE at idle.
+ *   - stable-card thread turns clear the reaction after reply delivery.
  *
  * Binding the "received" reaction to the message (not a worker status edge) is
  * what makes type-ahead / busy-batched messages each get their own reaction —
@@ -91,6 +91,21 @@ describe('two-phase turn reactions', () => {
     await noteTurnReceived(ds, 'om_a');
     expect(mocks.addReaction).not.toHaveBeenCalled();
     expect(ds.pendingAckReactions ?? []).toEqual([]);
+  });
+
+  it('stable-card thread turns react on receipt and mark the reaction clear-on-reply', async () => {
+    registerWith(false);
+    const ds = makeDs({ scope: 'thread' });
+
+    await noteTurnReceived(ds, 'om_a', undefined, undefined, 'om_a');
+
+    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'GoGoGo');
+    expect(ds.pendingAckReactions).toEqual([{
+      messageId: 'om_a',
+      reactionId: 'rid_om_a',
+      turnId: 'om_a',
+      clearOnReply: true,
+    }]);
   });
 
   it('dedicated VC receivers never add or finish progress reactions', async () => {
@@ -440,6 +455,73 @@ describe('turn reaction screen_update behavioral gate', () => {
     expect(ds.pendingAckReactions).toEqual([]);
   });
 
+  it('explicit reply delivery removes the exact thread reaction without adding DONE', async () => {
+    registerWith(false);
+    const worker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'thread',
+      worker,
+      workerPort: 9999,
+      pendingAckReactions: [{
+        messageId: 'om_a', reactionId: 'rid_om_a', turnId: 'om_a', clearOnReply: true,
+      }],
+    });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'explicit_reply_observed', turnId: 'om_a', messageId: 'om_reply',
+    });
+    await flush();
+
+    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_a', 'rid_om_a');
+    expect(mocks.addReaction).not.toHaveBeenCalledWith(APP, 'om_a', 'DONE');
+    expect(ds.pendingAckReactions).toEqual([]);
+  });
+
+  it('reply delivery clears only its exact turn and leaves a newer turn pending', async () => {
+    registerWith(false);
+    const worker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'thread',
+      worker,
+      workerPort: 9999,
+      pendingAckReactions: [
+        { messageId: 'om_a', reactionId: 'rid_om_a', turnId: 'om_a', clearOnReply: true },
+        { messageId: 'om_b', reactionId: 'rid_om_b', turnId: 'om_b', clearOnReply: true },
+      ],
+    });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'explicit_reply_observed', turnId: 'om_a', messageId: 'om_reply_a',
+    });
+    await flush();
+
+    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_a', 'rid_om_a');
+    expect(mocks.removeReaction).not.toHaveBeenCalledWith(APP, 'om_b', 'rid_om_b');
+    expect(ds.pendingAckReactions).toEqual([{
+      messageId: 'om_b', reactionId: 'rid_om_b', turnId: 'om_b', clearOnReply: true,
+    }]);
+  });
+
+  it('idle does not clear a stable-card thread reaction before reply delivery', async () => {
+    registerWith(false);
+    const ds = makeDs({
+      scope: 'thread',
+      pendingAckReactions: [{
+        messageId: 'om_a', reactionId: 'rid_om_a', turnId: 'om_a', clearOnReply: true,
+      }],
+    });
+
+    await finishTurnReactions(ds);
+
+    expect(mocks.removeReaction).not.toHaveBeenCalled();
+    expect(mocks.addReaction).not.toHaveBeenCalledWith(APP, 'om_a', 'DONE');
+    expect(ds.pendingAckReactions).toEqual([{
+      messageId: 'om_a', reactionId: 'rid_om_a', turnId: 'om_a', clearOnReply: true,
+    }]);
+  });
+
   it('working→limited flips DONE (rate-limit banner on settle; synthetic working must not be rewritten)', async () => {
     // Review third round: if both seeds classify to limited, gate never sees
     // working. Forced synthetic working + limited settle must still DONE.
@@ -508,5 +590,3 @@ describe('turn reaction screen_update behavioral gate', () => {
     expect(ds.pendingAckReactions?.map(a => a.messageId)).toEqual(['om_a']);
   });
 });
-
-

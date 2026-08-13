@@ -15,13 +15,14 @@ import { normalizeFeedbackPolicy } from '../src/services/feedback-policy.js';
 
 const updateMessageMock = vi.fn(async () => {});
 const addReactionMock = vi.fn(async () => 'reaction_id');
+const removeReactionMock = vi.fn(async () => {});
 const replyToDocCommentMock = vi.fn(async () => {});
 const removeCommentReactionMock = vi.fn(async () => {});
 const updateSessionMock = vi.fn();
 vi.mock('../src/im/lark/client.js', () => ({
   updateMessage: (...args: any[]) => updateMessageMock(...args),
   addReaction: (...args: any[]) => addReactionMock(...args),
-  removeReaction: vi.fn(async () => {}),
+  removeReaction: (...args: any[]) => removeReactionMock(...args),
   sendUserMessage: vi.fn(async () => {}),
   deleteMessage: vi.fn(async () => {}),
   getChatInfo: vi.fn(),
@@ -1470,6 +1471,9 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
     const ds = makeDs();
     ds.session.quoteTargetId = 'om_user';
+    ds.pendingAckReactions = [{
+      messageId: 'om_user', reactionId: 'reaction_progress', turnId: 'turn-1', clearOnReply: true,
+    }];
 
     const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
     __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
@@ -1478,9 +1482,9 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
     expect(sessionReply).toHaveBeenCalledTimes(1);
     expect(updateMessageMock).not.toHaveBeenCalled();
-    // Turn reactions are driven off message acceptance (noteTurnReceived) and
-    // the idle edge (finishTurnReactions), not the bridge final-output path.
+    expect(removeReactionMock).toHaveBeenCalledWith('app_test', 'om_user', 'reaction_progress');
     expect(addReactionMock).not.toHaveBeenCalled();
+    expect(ds.pendingAckReactions).toEqual([]);
     expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
   });
 

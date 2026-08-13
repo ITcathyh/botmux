@@ -67,14 +67,25 @@ describe('CLI runtime display identity', () => {
     expect(body).toMatch(/getDaemonStreamingCardUsageSnapshot[\s\S]*runtimeDisplayName,/);
   });
 
-  it('starts the current turn card at message acceptance instead of waiting for terminal redraw', () => {
+  it('reuses a thread card at acceptance and keeps the fresh-card fallback', () => {
     const source = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
     const begin = source.indexOf('function beginNewTurn(');
     const end = source.indexOf('\nfunction ', begin + 1);
     const body = source.slice(begin, end);
 
+    const reuse = body.indexOf('reuseThreadStreamingCardForTurn(ds, title, turnId)');
+    const freeze = body.indexOf('const previousUsageLimit = ds.usageLimit');
+    expect(reuse).toBeGreaterThan(-1);
+    expect(freeze).toBeGreaterThan(reuse);
     expect(body).toContain('postTurnStartingCard(ds, sessionReply, turnId)');
     expect(body).toContain('ds.streamCardPendingTurnId = turnId');
     expect(body).toContain('ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1');
+  });
+
+  it('keeps the stable thread card across normal and doc-comment re-forks', () => {
+    const source = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
+
+    expect(source).toContain('reuseThreadStreamingCardForTurn(ds, parsed.content, parsed.messageId)');
+    expect(source).toContain('reuseThreadStreamingCardForTurn(ds, text, turnId)');
   });
 });
