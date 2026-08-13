@@ -4466,9 +4466,8 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
     if (!sendWorkerInput(ds, cliInput, turnId)) {
       throw new Error('doc-watch warmup worker input was not accepted');
     }
-    beginNewTurn(ds, title, turnId);
     rememberLastCliInput(ds, promptContent, cliInput);
-    sessionStore.updateSession(ds.session);
+    beginNewTurn(ds, title, turnId);
     markSessionActivity(ds);
   } else {
     ensureSessionWhiteboard(ds);
@@ -4484,9 +4483,8 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
     if (!forkWorker(ds, wrappedInput, ds.hasHistory)) {
       throw new Error('doc-watch warmup worker fork was not accepted');
     }
-    beginNewTurn(ds, title, turnId);
     rememberLastCliInput(ds, promptContent, wrappedInput);
-    sessionStore.updateSession(ds.session);
+    beginNewTurn(ds, title, turnId);
   }
   logger.info(`[${tag(ds)}] doc-comment watch prewarm injected file=${sub.fileToken.slice(0, 12)}`);
 }
@@ -18306,6 +18304,7 @@ async function handleBotAdded(
       }
       await noteTurnReceived(ds, anchor, promptBody);
       if (joinBootstrapWasTakenOver()) {
+        await discardTurnReceivedReaction(ds, anchor);
         withdrawSharedReplySeed();
         return;
       }

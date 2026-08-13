@@ -2796,6 +2796,30 @@ describe('document comment canonical ownership and single-flight delivery', () =
     removeDocSubscription(config.session.dataDir, APP, sub.fileToken);
   });
 
+  it.each(['live', 'refork'] as const)(
+    'persists accepted %s doc-watch input before card-state persistence fails',
+    async (mode) => {
+      const sub = docSub(`doc-prewarm-${mode}-persist-${Date.now()}`);
+      const ds = seedThreadSession(sub.sessionAnchor, `prewarm ${mode} persist`);
+      const liveSend = vi.fn();
+      if (mode === 'live') ds.worker = { killed: false, send: liveSend } as any;
+      mocks.updateSession
+        .mockImplementationOnce((session: any) => { mocks.sessions.set(session.sessionId, session); })
+        .mockImplementationOnce(() => { throw new Error('card state persistence failed'); });
+
+      await expect(prewarmDocCommentSession(ds, sub)).rejects.toThrow('card state persistence failed');
+
+      if (mode === 'live') expect(liveSend).toHaveBeenCalledTimes(1);
+      else expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+      expect(ds.lastUserPrompt).toContain(sub.fileToken);
+      expect(ds.lastCliInput).toContain(sub.fileToken);
+      expect(ds.session.lastUserPrompt).toContain(sub.fileToken);
+      expect(ds.session.lastCliInput).toContain(sub.fileToken);
+      expect(mocks.updateSession).toHaveBeenCalledTimes(2);
+      removeDocSubscription(config.session.dataDir, APP, sub.fileToken);
+    },
+  );
+
   it('serializes concurrent get-or-create, merges targets, and reuses canonical state after restart', async () => {
     const fileToken = `doc-concurrent-${Date.now()}`;
     const sub = docSub(fileToken);

@@ -411,7 +411,10 @@ describe('document-comment routing integration', () => {
     expect(guard).toBeGreaterThanOrEqual(0);
     const liveSend = region.indexOf('sendWorkerInput(ds, cliInput', guard);
     expect(liveSend).toBeGreaterThan(guard);
-    expect(region.indexOf('beginNewTurn(ds, title, turnId)')).toBeGreaterThan(liveSend);
+    const remember = region.indexOf('rememberLastCliInput(ds, promptContent, cliInput)');
+    const begin = region.indexOf('beginNewTurn(ds, title, turnId)');
+    expect(remember).toBeGreaterThan(liveSend);
+    expect(begin).toBeGreaterThan(remember);
     expect(region.indexOf('forkWorker(ds, wrappedInput', guard)).toBeGreaterThan(guard);
   });
 

@@ -27,6 +27,8 @@ const mocks = vi.hoisted(() => ({
   )),
   listChatMemberOpenIds: vi.fn(async () => ['ou_owner']),
   replyMessage: vi.fn(async () => 'om_reply'),
+  addReaction: vi.fn(async () => 'reaction_received'),
+  removeReaction: vi.fn(async () => undefined),
   scanMultipleProjects: vi.fn(() => [] as Array<{ name: string; path: string; type: 'repo' | 'worktree'; branch: string }>),
   sendMessage: vi.fn(async () => 'om_join_seed'),
 }));
@@ -51,6 +53,8 @@ vi.mock('../src/im/lark/client.js', async () => {
     getChatContext: mocks.getChatContext,
     listChatMemberOpenIds: mocks.listChatMemberOpenIds,
     replyMessage: mocks.replyMessage,
+    addReaction: mocks.addReaction,
+    removeReaction: mocks.removeReaction,
     sendMessage: mocks.sendMessage,
   };
 });
@@ -133,6 +137,8 @@ beforeEach(() => {
   ));
   mocks.listChatMemberOpenIds.mockResolvedValue(['ou_owner']);
   mocks.replyMessage.mockResolvedValue('om_reply');
+  mocks.addReaction.mockResolvedValue('reaction_received');
+  mocks.removeReaction.mockResolvedValue(undefined);
   mocks.scanMultipleProjects.mockReturnValue([]);
   mocks.sendMessage.mockResolvedValue('om_join_seed');
 });
@@ -562,6 +568,50 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       type: 'message',
       turnId: userMessageId,
     }));
+  });
+
+  it('clears the topic seed reaction when no-project startup is taken over after reaction creation', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_topic_reaction_takeover';
+    const chatId = 'oc_join_topic_reaction_takeover';
+    const seedId = 'om_join_seed';
+    const key = types.sessionKey(seedId, appId);
+    mocks.getChatContext.mockResolvedValueOnce({
+      chatId,
+      name: '话题群',
+      description: null,
+      mode: 'topic',
+      fetchStatus: 'ok',
+    });
+    let releaseReaction!: (reactionId: string) => void;
+    const reactionPending = new Promise<string>((resolve) => { releaseReaction = resolve; });
+    let reactionStarted!: () => void;
+    const reactionStartedPromise = new Promise<void>((resolve) => { reactionStarted = resolve; });
+    mocks.addReaction.mockImplementationOnce(async () => {
+      reactionStarted();
+      return reactionPending;
+    });
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      regularGroupReplyMode: 'shared',
+    });
+
+    const joinPromise = daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+    await reactionStartedPromise;
+    const ds = daemon.__testOnly_activeSessions.get(key)!;
+    ds.worker = { killed: false, send: vi.fn(), pid: 4321 } as any;
+
+    releaseReaction('reaction_seed');
+    await joinPromise;
+
+    expect(mocks.removeReaction).toHaveBeenCalledWith(appId, seedId, 'reaction_seed');
+    expect(ds.pendingAckReactions).toEqual([]);
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
   });
 
   it('yields without re-forking when a non-message entry starts the registered session', async () => {
