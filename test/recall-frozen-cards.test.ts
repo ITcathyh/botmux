@@ -125,6 +125,7 @@ import {
   refreshStreamingCardUsage,
   syncUsageRefreshTimer,
   USAGE_REFRESH_INTERVAL_MS,
+  CARD_POSTING_SENTINEL,
 } from '../src/core/worker-pool.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
 import { buildStreamingCard } from '../src/im/lark/card-builder.js';
@@ -657,11 +658,10 @@ describe('postTurnStartingCard', () => {
     expect(ds.frozenCards?.size).toBe(0);
   });
 
-  it('posts the newest queued turn after an older card POST finishes', async () => {
+  it('retargets a newly-landed thread card when a newer turn supersedes its POST', async () => {
     let resolveFirst!: (messageId: string) => void;
     const sessionReply = vi.fn()
-      .mockImplementationOnce(() => new Promise<string>(resolve => { resolveFirst = resolve; }))
-      .mockResolvedValueOnce('om_turn_card_2');
+      .mockImplementationOnce(() => new Promise<string>(resolve => { resolveFirst = resolve; }));
     const ds = makeDs();
     ds.workerReady = true;
     ds.streamCardId = 'om_previous';
@@ -678,18 +678,28 @@ describe('postTurnStartingCard', () => {
     ds.streamCardPendingTurnId = 'om_turn_2';
     ds.currentTurnTitle = 'second turn';
     await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_2')).resolves.toBe(false);
+    // Simulate the newest turn reaching working while the original POST still
+    // owns the sentinel. Retargeting must not overwrite this fresher payload
+    // with another synthetic starting state.
+    ds.pendingCardJson = '{"status":"working"}';
+    ds.pendingCardId = CARD_POSTING_SENTINEL;
 
     resolveFirst('om_turn_card_1');
     await firstPost;
     await flush();
     await flush();
 
-    expect(sessionReply).toHaveBeenCalledTimes(2);
-    expect(sessionReply.mock.calls[1][4]).toBe('om_turn_2');
-    expect(ds.streamCardId).toBe('om_turn_card_2');
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(updateMessageMock).toHaveBeenCalledWith(
+      APP_ID,
+      'om_turn_card_1',
+      '{"status":"working"}',
+    );
+    expect(ds.streamCardId).toBe('om_turn_card_1');
     expect(ds.streamCardPending).toBe(false);
     expect(ds.streamCardPendingTurnId).toBeUndefined();
-    expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_turn_card_1');
+    expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_previous');
+    expect(deleteMessageMock).not.toHaveBeenCalledWith(APP_ID, 'om_turn_card_1');
   });
 
   it('restores the previous live card when the starting-card POST fails', async () => {

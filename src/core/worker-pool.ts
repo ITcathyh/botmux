@@ -1426,6 +1426,36 @@ export function reuseThreadStreamingCardForTurn(
   return true;
 }
 
+function buildTurnStartingCardJson(
+  ds: DaemonSession,
+  botCfg: ReturnType<typeof getBot>['config'],
+  nonce: string,
+): string {
+  const effectiveCliId = sessionCliId(ds, botCfg);
+  const status = ds.usageLimit ? 'limited' : 'starting';
+  return buildStreamingCard(
+    ds.session.sessionId,
+    sessionAnchorId(ds),
+    readableTerminalUrlFor(ds),
+    ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
+    '',
+    status,
+    effectiveCliId,
+    ds.displayMode ?? 'hidden',
+    nonce,
+    undefined,
+    !!ds.adoptedFrom,
+    false,
+    localeForBot(ds.larkAppId),
+    ds.usageLimit,
+    writableTerminalLinkFor(ds),
+    isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+    getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
+    sessionRuntimeDisplayName(ds, botCfg),
+    codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+  );
+}
+
 /**
  * Post the current turn's starting card as soon as the daemon accepts the
  * inbound message. Terminal redraw is deliberately not part of this trigger:
@@ -1454,7 +1484,6 @@ export async function postTurnStartingCard(
   const anchorAtPost = sessionAnchorId(ds);
   const registryKeyAtPost = sessionKey(anchorAtPost, larkAppIdAtPost);
   const botCfg = getBot(ds.larkAppId).config;
-  const effectiveCliId = sessionCliId(ds, botCfg);
   const previousCardId = ds.streamCardId;
   const previousNonce = ds.streamCardNonce;
   // A newer turn may have arrived while the previous turn's POST was still in
@@ -1462,28 +1491,7 @@ export async function postTurnStartingCard(
   // predecessor here before replacing its identity.
   parkStreamCard(ds);
   const nonce = randomBytes(4).toString('hex');
-  const status = ds.usageLimit ? 'limited' : 'starting';
-  const cardJson = buildStreamingCard(
-    ds.session.sessionId,
-    sessionAnchorId(ds),
-    readableTerminalUrlFor(ds),
-    ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
-    '',
-    status,
-    effectiveCliId,
-    ds.displayMode ?? 'hidden',
-    nonce,
-    undefined,
-    !!ds.adoptedFrom,
-    false,
-    localeForBot(ds.larkAppId),
-    ds.usageLimit,
-    writableTerminalLinkFor(ds),
-    isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
-    getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
-    sessionRuntimeDisplayName(ds, botCfg),
-    codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-  );
+  const cardJson = buildTurnStartingCardJson(ds, botCfg, nonce);
 
   ds.streamCardNonce = nonce;
   ds.streamCardId = CARD_POSTING_SENTINEL;
@@ -1524,7 +1532,34 @@ export async function postTurnStartingCard(
     }
     ds.parkedStreamCardNonce = undefined;
     const superseded = (ds.streamCardTurnGeneration ?? 0) !== generation;
-    if (!superseded) {
+    const latestPendingTurnId = superseded && ds.scope === 'thread'
+      ? ds.streamCardPendingTurnId
+      : undefined;
+    if (latestPendingTurnId) {
+      // The POST was admitted before the stable thread card had a real message
+      // id. If a newer turn arrived while it was in flight, this newly-landed
+      // card is the stable card: retarget it to the latest turn instead of
+      // posting a second card and withdrawing this one.
+      ds.streamCardVisualTurnId = latestPendingTurnId;
+      ds.streamCardPending = false;
+      ds.streamCardPendingTurnId = undefined;
+      const withdrawnFallback = {
+        turnId: latestPendingTurnId,
+        generation: ds.streamCardTurnGeneration ?? 0,
+      };
+      if (ds.pendingCardJson) {
+        // Preserve a newer working/idle payload that raced the POST; it is more
+        // current than another synthetic "starting" card.
+        ds.pendingCardWithdrawFallback = withdrawnFallback;
+      } else {
+        scheduleCardPatch(
+          ds,
+          buildTurnStartingCardJson(ds, botCfg, nonce),
+          latestPendingTurnId,
+          { withdrawnFallback },
+        );
+      }
+    } else if (!superseded) {
       ds.streamCardPending = false;
       ds.streamCardPendingTurnId = undefined;
     }
@@ -3469,6 +3504,12 @@ export async function closeSession(
   const preparedRiffRequestId = ds?.riffCloseState?.phase === 'prepared'
     ? ds.riffCloseState.requestId
     : undefined;
+  // A closed session has no later reply/idle edge that could settle progress
+  // reactions. Detach them inside the close critical section so concurrent
+  // terminal paths cannot remove the same reaction twice; the remote cleanup
+  // below remains best-effort.
+  const closeAckReactions = ds?.pendingAckReactions ?? [];
+  if (ds) ds.pendingAckReactions = [];
 
   // 会话关闭即可回收其崩溃重启计数；否则每个曾崩溃过的 session 会在 daemon
   // 生命周期内永久占位（restartCounts 此前无任何 delete）。
@@ -3568,6 +3609,17 @@ export async function closeSession(
   // best-effort and can be slow; it must not leave a resurrection window.
   const cleanupAppId = ds?.larkAppId ?? stored?.larkAppId;
   if (cleanupAppId) {
+    for (const ack of closeAckReactions) {
+      if (!ack.reactionId) continue;
+      try {
+        await removeReaction(cleanupAppId, ack.messageId, ack.reactionId);
+      } catch (err: any) {
+        logger.debug(
+          `[reaction] close cleanup could not remove reaction ${ack.reactionId}: ${err?.message ?? err}`,
+        );
+      }
+    }
+
     for (const target of docReactionTargets) {
       try {
         await removeCommentReaction(
