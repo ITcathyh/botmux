@@ -8089,14 +8089,36 @@ function setupWorkerHandlers(
           && msg.turnId
           && msg.turnId !== ds.streamCardVisualTurnId
         );
-        const preservedCardContent = ds.lastScreenContent;
-        const preservedCardStatus = ds.lastScreenStatus;
+        if (supersededCardVisual) {
+          const supersededTurnId = msg.turnId!;
+          const settledStatus = msg.usageLimit ? 'limited' : msg.status;
+          // This event still closes the older turn's accounting boundary, but
+          // it no longer represents the current session projection. In
+          // particular, do not borrow N+1's lastScreenStatus to manufacture a
+          // dashboard/lifecycle edge, clear its usage timer, or satisfy its
+          // deferred suspend claim.
+          if (settledStatus === 'idle' || settledStatus === 'limited') {
+            recordUsageForDaemonSession(ds, { turnId: supersededTurnId });
+          }
+          if (
+            settledStatus === 'idle'
+            && ds.session.deferredScheduleRun?.turnId === supersededTurnId
+          ) {
+            void cb.onDeferredScheduleTurnSettled?.(ds, { turnId: supersededTurnId, source: 'idle' });
+          }
+          if (settledStatus === 'idle' && cb.enforceLiveSessionCap) {
+            queueMicrotask(cb.enforceLiveSessionCap);
+          }
+          logger.debug(
+            `[${t}] Settled bookkeeping but ignored card/session projection for superseded turn ${supersededTurnId.substring(0, 12)} `
+            + `(card owner ${ds.streamCardVisualTurnId!.substring(0, 12)})`,
+          );
+          break;
+        }
         const prevStatus = ds.lastScreenStatus;
-        if (!supersededCardVisual) updateUsageLimitState(ds, msg.usageLimit);
+        updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenContent = msg.content;
-        ds.lastScreenStatus = (msg.usageLimit ?? (supersededCardVisual ? undefined : ds.usageLimit))
-          ? 'limited'
-          : msg.status;
+        ds.lastScreenStatus = (msg.usageLimit ?? ds.usageLimit) ? 'limited' : msg.status;
         // A suspend that arrived mid-turn parked itself here. Defer until this
         // screen_update has finished using process state — suspendWorker nulls
         // `worker` + `lastScreenStatus`, which everything below still reads
@@ -8174,16 +8196,6 @@ function setupWorkerHandlers(
             // The newly-idle session itself may be the oldest eviction target.
             queueMicrotask(cb.enforceLiveSessionCap);
           }
-        }
-
-        if (supersededCardVisual) {
-          ds.lastScreenContent = preservedCardContent;
-          ds.lastScreenStatus = preservedCardStatus;
-          logger.debug(
-            `[${t}] Kept bookkeeping but ignored card update for superseded turn ${msg.turnId!.substring(0, 12)} `
-            + `(card owner ${ds.streamCardVisualTurnId!.substring(0, 12)})`,
-          );
-          break;
         }
 
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) { clearUsageRefreshTimer(ds); break; }
@@ -8332,17 +8344,20 @@ function setupWorkerHandlers(
           && msg.turnId
           && msg.turnId !== ds.streamCardVisualTurnId
         );
-        const preservedCardImageKey = ds.currentImageKey;
-        const preservedCardStatus = ds.lastScreenStatus;
+        if (supersededCardVisual) {
+          logger.debug(
+            `[${t}] Ignored screenshot/session projection for superseded turn ${msg.turnId!.substring(0, 12)} `
+            + `(card owner ${ds.streamCardVisualTurnId!.substring(0, 12)})`,
+          );
+          break;
+        }
         // Drop uploads that arrived during a new-turn handoff — the image_key may
         // reflect previous turn's content. Next 10s cycle picks up fresh content.
         if (ds.streamCardPending) break;
         ds.currentImageKey = msg.imageKey;
         const prevStatus = ds.lastScreenStatus;
-        if (!supersededCardVisual) updateUsageLimitState(ds, msg.usageLimit);
-        ds.lastScreenStatus = (msg.usageLimit ?? (supersededCardVisual ? undefined : ds.usageLimit))
-          ? 'limited'
-          : msg.status;
+        updateUsageLimitState(ds, msg.usageLimit);
+        ds.lastScreenStatus = (msg.usageLimit ?? ds.usageLimit) ? 'limited' : msg.status;
         // Same deferred-suspend checkpoint as the screen_update branch, and
         // deferred for the same reason (see runPendingSuspendIfSettled).
         // The predicate is defense-in-depth here: the handler's fence already
@@ -8356,15 +8371,6 @@ function setupWorkerHandlers(
           imageKey: msg.imageKey,
           content: ds.lastScreenContent ?? '',
         });
-        if (supersededCardVisual) {
-          ds.currentImageKey = preservedCardImageKey;
-          ds.lastScreenStatus = preservedCardStatus;
-          logger.debug(
-            `[${t}] Kept bookkeeping but ignored screenshot for superseded turn ${msg.turnId!.substring(0, 12)} `
-            + `(card owner ${ds.streamCardVisualTurnId!.substring(0, 12)})`,
-          );
-          break;
-        }
         persistStreamCardState(ds);
         // screenshot_uploaded never ARMS the usage refresh — screen_update owns
         // the authorized arm. Here we only tear it down: unconditionally on

@@ -19,9 +19,11 @@ import { EventEmitter } from 'node:events';
 // ─── Mocks ─────────────────────────────────────────────────────────────────
 
 const updateMessageMock = vi.fn(async () => {});
-const { loggerInfoMock, recordUsageMock } = vi.hoisted(() => ({
+const { loggerInfoMock, recordUsageMock, dashboardPublishMock, transitionHookMock } = vi.hoisted(() => ({
   loggerInfoMock: vi.fn(),
   recordUsageMock: vi.fn(),
+  dashboardPublishMock: vi.fn(),
+  transitionHookMock: vi.fn(),
 }));
 
 vi.mock('../src/im/lark/client.js', () => {
@@ -88,7 +90,7 @@ vi.mock('../src/core/session-manager.js', () => ({
 }));
 
 vi.mock('../src/core/dashboard-events.js', () => ({
-  dashboardEventBus: { publish: vi.fn() },
+  dashboardEventBus: { publish: (...args: any[]) => dashboardPublishMock(...args) },
 }));
 
 vi.mock('../src/core/dashboard-rows.js', () => ({
@@ -98,6 +100,11 @@ vi.mock('../src/core/dashboard-rows.js', () => ({
 vi.mock('../src/services/usage-ledger.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../src/services/usage-ledger.js')>()),
   recordUsageForDaemonSession: (...args: any[]) => recordUsageMock(...args),
+}));
+
+vi.mock('../src/services/session-lifecycle-hooks.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/services/session-lifecycle-hooks.js')>()),
+  emitSessionStateTransitionHook: (...args: any[]) => transitionHookMock(...args),
 }));
 
 vi.mock('../src/skills/installer.js', () => ({
@@ -408,8 +415,8 @@ describe('Worker ready: set_display_mode re-sync', () => {
       streamCardNonce: 'stable-nonce',
       streamCardVisualTurnId: 'om_turn_n_plus_1',
       currentTurnTitle: 'turn n+1',
-      lastScreenContent: '',
-      lastScreenStatus: 'starting',
+      lastScreenContent: 'turn n+1 running',
+      lastScreenStatus: 'working',
       currentImageKey: undefined,
       displayMode: 'screenshot',
     });
@@ -429,27 +436,29 @@ describe('Worker ready: set_display_mode re-sync', () => {
     });
     await flush();
 
-    expect(ds.lastScreenContent).toBe('');
-    expect(ds.lastScreenStatus).toBe('starting');
+    expect(ds.lastScreenContent).toBe('turn n+1 running');
+    expect(ds.lastScreenStatus).toBe('working');
     expect(ds.currentImageKey).toBeUndefined();
-    expect(recordUsageMock).toHaveBeenCalledWith(ds);
+    expect(recordUsageMock).toHaveBeenCalledWith(ds, { turnId: 'om_turn_n' });
+    expect(dashboardPublishMock).not.toHaveBeenCalled();
+    expect(transitionHookMock).not.toHaveBeenCalled();
 
     fakeWorker.emit('message', {
       type: 'screen_update',
-      content: 'turn n+1 running',
-      status: 'working',
+      content: 'turn n+1 completed',
+      status: 'idle',
       turnId: 'om_turn_n_plus_1',
     });
     fakeWorker.emit('message', {
       type: 'screenshot_uploaded',
       imageKey: 'img_turn_n_plus_1',
-      status: 'working',
+      status: 'idle',
       turnId: 'om_turn_n_plus_1',
     });
     await flush();
 
-    expect(ds.lastScreenContent).toBe('turn n+1 running');
-    expect(ds.lastScreenStatus).toBe('working');
+    expect(ds.lastScreenContent).toBe('turn n+1 completed');
+    expect(ds.lastScreenStatus).toBe('idle');
     expect(ds.currentImageKey).toBe('img_turn_n_plus_1');
   });
 

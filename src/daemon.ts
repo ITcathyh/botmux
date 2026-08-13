@@ -157,7 +157,6 @@ import {
   setCurrentCliVersion,
   getCurrentCliVersion,
   CARD_POSTING_SENTINEL,
-  parkStreamCard,
   closeSession as closeSessionHelper,
   setActiveSessionIfActive,
   rollbackRejectedSessionAndGetWinner,
@@ -19631,24 +19630,6 @@ async function handleThreadReplyAdmitted(
     logger.info(`[${tag(ds)}] Worker not running, re-forking...`);
     // 飞书消息轮（非文档评论轮）：docCommentTargets 是 per-turn map，本轮 turnId
     // 不会命中文档评论的 key，无需显式清盘。
-    if (!reuseThreadStreamingCardForTurn(ds, parsed.content, parsed.messageId)) {
-      if (ds.usageLimitRetryTimer) {
-        clearTimeout(ds.usageLimitRetryTimer);
-        ds.usageLimitRetryTimer = undefined;
-      }
-      ds.usageLimit = undefined;
-      ds.currentTurnTitle = parsed.content.substring(0, 50);
-      // With no worker, park the current card until its flat-chat successor is
-      // visible. If fork / worker_ready / POST fails, the old card remains.
-      parkStreamCard(ds);
-      ds.streamCardId = undefined;
-      ds.streamCardNonce = undefined;
-      ds.streamCardPending = true;
-      ds.streamCardPendingTurnId = parsed.messageId;
-      ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
-      ds.currentImageKey = undefined;
-      persistStreamCardState(ds);
-    }
     // Wrap the user message in the same `<user_message>` / `<session_id>` /
     // `<botmux_reminder>` envelope as live-worker turns. Without this, the
     // initial prompt that worker queues for the freshly-spawned CLI is the
@@ -19715,7 +19696,7 @@ async function handleThreadReplyAdmitted(
       await stageCurrentBehindQueuedActivation();
       try {
         const recoverThroughCodexLedger = (ds.session.cliId ?? dsBotCfgForFork.cliId) === 'codex-app';
-        forkWorker(
+        const recoveryAccepted = forkWorker(
           ds,
           recoverThroughCodexLedger ? '' : (ds.session.queuedActivationInput ?? ''),
           {
@@ -19724,6 +19705,7 @@ async function handleThreadReplyAdmitted(
             dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
           },
         );
+        if (recoveryAccepted) beginNewTurn(ds, parsed.content, parsed.messageId);
         if (ownsInitialStartClaim()) retainInitialStartClaim = true;
       } catch (err) {
         ds.initialStartPending = false;
@@ -19742,11 +19724,12 @@ async function handleThreadReplyAdmitted(
     if (retainedQueuedActivation) {
       await stageCurrentBehindQueuedActivation();
       try {
-        forkWorker(ds, retainedQueuedActivation, {
+        const recoveryAccepted = forkWorker(ds, retainedQueuedActivation, {
           resume: ds.hasHistory,
           turnId: ds.session.queuedActivationTurnId,
           dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
         });
+        if (recoveryAccepted) beginNewTurn(ds, parsed.content, parsed.messageId);
         if (ownsInitialStartClaim()) retainInitialStartClaim = true;
       } catch (err) {
         // Keep the staged tail for a later activation attempt, but release the
@@ -19891,8 +19874,16 @@ async function handleThreadReplyAdmitted(
     // refork 成功才算本轮已交给 CLI。fork 抛错（rethrow）或返回 false（quarantine /
     // 会话已非 active 的不抛错拒绝腿）时，本轮只存在于内存、无 durable 兜底，
     // 必须保持「请重发」提示——与 live 分支按 accepted 打标对称。
-    if (reforkAccepted) markIngressAdmitted(ctx);
-    else if (!queuedHasDurableTail) await discardTurnReceivedReaction(ds, parsed.messageId);
+    if (reforkAccepted) {
+      markIngressAdmitted(ctx);
+      // The stable card changes owner only after the replacement worker has
+      // accepted this turn. beginNewTurn also binds fresh-card reforks where no
+      // reusable message id exists, so their worker events cannot inherit the
+      // previous turn's visual fence.
+      beginNewTurn(ds, parsed.content, parsed.messageId);
+    } else if (!queuedHasDurableTail) {
+      await discardTurnReceivedReaction(ds, parsed.messageId);
+    }
     // Record the input as the session's last real CLI turn ONLY after the fork
     // succeeded. Recording before the fork (the old order) persisted lastCliInput
     // for a turn that never launched when forkWorker threw; the retry then read
@@ -20262,19 +20253,6 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
 
       // Worker 挂起 / 已退出 —— resume 重 fork（与 handleThreadReply 同路）。
       logger.info(`[${tag(ds)}] Worker not running for doc-comment, re-forking...`);
-      if (!reuseThreadStreamingCardForTurn(ds, text, turnId)) {
-        if (ds.usageLimitRetryTimer) { clearTimeout(ds.usageLimitRetryTimer); ds.usageLimitRetryTimer = undefined; }
-        ds.usageLimit = undefined;
-        ds.currentTurnTitle = text.substring(0, 50);
-        parkStreamCard(ds);
-        ds.streamCardId = undefined;
-        ds.streamCardNonce = undefined;
-        ds.streamCardPending = true;
-        ds.streamCardPendingTurnId = turnId;
-        ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
-        ds.currentImageKey = undefined;
-        persistStreamCardState(ds);
-      }
       // Skip whiteboard ensure for adopted (bridge) sessions on re-fork — mirrors
       // the live-worker branch above (if (!isBridge) ensure…).
       if (!ds.adoptedFrom) ensureSessionWhiteboard(ds);
@@ -20298,8 +20276,11 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
       if (ds.adoptedFrom) {
         forkAdoptWorker(ds, { prompt: wrappedInput.content, turnId });
       } else {
-        forkWorker(ds, wrappedInput, { resume: ds.hasHistory, turnId });
+        if (!forkWorker(ds, wrappedInput, { resume: ds.hasHistory, turnId })) {
+          throw new Error('doc-comment refork was not accepted');
+        }
       }
+      beginNewTurn(ds, text, turnId);
     }, cleanupFailedDelivery);
   } catch (err) {
     if (err instanceof DocCommentDeferredError) {

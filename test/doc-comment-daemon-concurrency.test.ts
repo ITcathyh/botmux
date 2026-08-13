@@ -423,6 +423,7 @@ describe('document-comment routing integration', () => {
     expect(region).toMatch(/await noteTurnReceived[\s\S]*ensureCurrentRoutingGeneration\(generation, 'comment:live-note'\)[\s\S]*sendWorkerInput/);
     expect(region).toMatch(/sendWorkerInput\(ds, cliInput, turnId\)[\s\S]*beginNewTurn\(ds, text, turnId\)/);
     expect(region).toMatch(/await noteTurnReceived[\s\S]*ensureCurrentRoutingGeneration\(generation, 'comment:refork-note'\)[\s\S]*forkWorker/);
+    expect(region).toMatch(/forkWorker\(ds, wrappedInput, \{ resume: ds\.hasHistory, turnId \}\)[\s\S]*beginNewTurn\(ds, text, turnId\)/);
   });
 
   it('rolls back only this turn target and an already-landed Typing reaction before releasing the claim', () => {

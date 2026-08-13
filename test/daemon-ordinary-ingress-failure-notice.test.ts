@@ -509,6 +509,13 @@ describe('durable admission then failing status reply → no resend advice (PR #
     const anchor = 'om_thread_refork_fail';
     const ds = seedThreadSession(anchor, 'seeded') as any;
     ds.hasHistory = true;
+    ds.streamCardId = 'om_stable_status';
+    ds.streamCardNonce = 'stable-nonce';
+    ds.streamCardVisualTurnId = 'om_previous_turn';
+    ds.streamCardTurnGeneration = 7;
+    ds.currentTurnTitle = 'previous completed turn';
+    ds.currentImageKey = 'img_previous';
+    ds.lastScreenStatus = 'idle';
     mocks.forkWorker.mockImplementation(() => {
       throw new Error('fork failed: EAGAIN');
     });
@@ -525,6 +532,27 @@ describe('durable admission then failing status reply → no resend advice (PR #
       'reaction_received',
     );
     expect(ds.pendingAckReactions ?? []).toEqual([]);
+    expect(ds.streamCardId).toBe('om_stable_status');
+    expect(ds.streamCardVisualTurnId).toBe('om_previous_turn');
+    expect(ds.streamCardTurnGeneration).toBe(7);
+    expect(ds.currentTurnTitle).toBe('previous completed turn');
+    expect(ds.currentImageKey).toBe('img_previous');
+    expect(ds.lastScreenStatus).toBe('idle');
+  });
+
+  it('binds a successful fresh-card refork to the accepted turn', async () => {
+    const anchor = 'om_thread_refork_fresh';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.hasHistory = true;
+    ds.streamCardVisualTurnId = 'om_previous_turn';
+
+    await handleThreadReply(
+      makeEventData('om_msg_refork_fresh', 'run the fresh task', anchor),
+      makeCtx(anchor, 'om_msg_refork_fresh'),
+    );
+
+    expect(ds.streamCardVisualTurnId).toBe('om_msg_refork_fresh');
+    expect(ds.streamCardPendingTurnId).toBe('om_msg_refork_fresh');
   });
 
   it('a rejected /vc-auth (pure-reply branch, no side effect) still advises a resend', async () => {

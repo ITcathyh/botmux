@@ -82,10 +82,10 @@ describe('CLI runtime display identity', () => {
     expect(body).toContain('ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1');
   });
 
-  it('keeps the stable thread card across normal and doc-comment re-forks', () => {
+  it('routes normal and doc-comment reforks through the post-admission turn handoff', () => {
     const source = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
 
-    expect(source).toContain('reuseThreadStreamingCardForTurn(ds, parsed.content, parsed.messageId)');
-    expect(source).toContain('reuseThreadStreamingCardForTurn(ds, text, turnId)');
+    expect(source).toMatch(/reforkAccepted = forkWorker[\s\S]*if \(reforkAccepted\) \{[\s\S]*beginNewTurn\(ds, parsed\.content, parsed\.messageId\)/);
+    expect(source).toMatch(/forkWorker\(ds, wrappedInput, \{ resume: ds\.hasHistory, turnId \}\)[\s\S]*beginNewTurn\(ds, text, turnId\)/);
   });
 });

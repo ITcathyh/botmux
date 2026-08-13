@@ -2636,6 +2636,7 @@ describe('document comment canonical ownership and single-flight delivery', () =
     mocks.sessions.clear();
     mocks.forkWorker.mockImplementation((ds: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      return true;
     });
     mocks.getAvailableBots.mockResolvedValue([]);
     activeSessions.clear();
@@ -2824,6 +2825,7 @@ describe('document comment canonical ownership and single-flight delivery', () =
     // Failure was not recorded as completed: a later poll retry can deliver.
     mocks.forkWorker.mockImplementation((ds: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      return true;
     });
     await expect(handleDocComment(ctx)).resolves.toBe(true);
     expect(mocks.forkWorker).toHaveBeenCalledTimes(2);
