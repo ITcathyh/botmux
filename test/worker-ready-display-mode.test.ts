@@ -389,6 +389,61 @@ describe('Worker ready: set_display_mode re-sync', () => {
     expect(ds.currentImageKey).toBe('img_zmx_history');
   });
 
+  it('ignores prior-turn visual events after a stable thread card changes owner', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'thread',
+      worker: fakeWorker,
+      workerReady: true,
+      workerPort: 9999,
+      streamCardId: 'om_stable_card',
+      streamCardNonce: 'stable-nonce',
+      streamCardVisualTurnId: 'om_turn_n_plus_1',
+      currentTurnTitle: 'turn n+1',
+      lastScreenContent: '',
+      lastScreenStatus: 'starting',
+      currentImageKey: undefined,
+      displayMode: 'screenshot',
+    });
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', {
+      type: 'screen_update',
+      content: 'turn n completed',
+      status: 'idle',
+      turnId: 'om_turn_n',
+    });
+    fakeWorker.emit('message', {
+      type: 'screenshot_uploaded',
+      imageKey: 'img_turn_n',
+      status: 'idle',
+      turnId: 'om_turn_n',
+    });
+    await flush();
+
+    expect(ds.lastScreenContent).toBe('');
+    expect(ds.lastScreenStatus).toBe('starting');
+    expect(ds.currentImageKey).toBeUndefined();
+
+    fakeWorker.emit('message', {
+      type: 'screen_update',
+      content: 'turn n+1 running',
+      status: 'working',
+      turnId: 'om_turn_n_plus_1',
+    });
+    fakeWorker.emit('message', {
+      type: 'screenshot_uploaded',
+      imageKey: 'img_turn_n_plus_1',
+      status: 'working',
+      turnId: 'om_turn_n_plus_1',
+    });
+    await flush();
+
+    expect(ds.lastScreenContent).toBe('turn n+1 running');
+    expect(ds.lastScreenStatus).toBe('working');
+    expect(ds.currentImageKey).toBe('img_turn_n_plus_1');
+  });
+
   it('ignores every message from a replaced worker generation', async () => {
     const staleWorker = makeFakeWorker();
     const currentWorker = makeFakeWorker();

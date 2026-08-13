@@ -469,6 +469,7 @@ describe('reuseThreadStreamingCardForTurn', () => {
     expect(ds.streamCardPending).toBe(false);
     expect(ds.streamCardPendingTurnId).toBeUndefined();
     expect(ds.streamCardTurnGeneration).toBe(4);
+    expect(ds.streamCardVisualTurnId).toBe('om_next_turn');
     expect(ds.currentTurnTitle).toBe('next question');
     expect(ds.currentImageKey).toBeUndefined();
     expect(ds.lastScreenStatus).toBe('starting');

@@ -1370,6 +1370,7 @@ export function reuseThreadStreamingCardForTurn(
   if (riffRetirementAdmissionPhase(ds)) return false;
   if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return false;
 
+  ds.streamCardVisualTurnId = turnId;
   if (ds.usageLimitRetryTimer) {
     clearTimeout(ds.usageLimitRetryTimer);
     ds.usageLimitRetryTimer = undefined;
@@ -8082,6 +8083,18 @@ function setupWorkerHandlers(
         // ZMX intentionally reports ready with port=0, but its plain-history
         // screenshots and idle/status transitions must keep flowing.
         if (!startupState.ready && !workerHasInitialized(ds)) break;
+        if (
+          ds.scope === 'thread'
+          && ds.streamCardVisualTurnId
+          && msg.turnId
+          && msg.turnId !== ds.streamCardVisualTurnId
+        ) {
+          logger.debug(
+            `[${t}] Ignored visual update for superseded turn ${msg.turnId.substring(0, 12)} `
+            + `(card owner ${ds.streamCardVisualTurnId.substring(0, 12)})`,
+          );
+          break;
+        }
         const prevStatus = ds.lastScreenStatus;
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenContent = msg.content;
@@ -8305,6 +8318,18 @@ function setupWorkerHandlers(
       }
 
       case 'screenshot_uploaded': {
+        if (
+          ds.scope === 'thread'
+          && ds.streamCardVisualTurnId
+          && msg.turnId
+          && msg.turnId !== ds.streamCardVisualTurnId
+        ) {
+          logger.debug(
+            `[${t}] Ignored screenshot for superseded turn ${msg.turnId.substring(0, 12)} `
+            + `(card owner ${ds.streamCardVisualTurnId.substring(0, 12)})`,
+          );
+          break;
+        }
         // Drop uploads that arrived during a new-turn handoff — the image_key may
         // reflect previous turn's content. Next 10s cycle picks up fresh content.
         if (ds.streamCardPending) break;
