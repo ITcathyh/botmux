@@ -49,7 +49,7 @@ import {
 } from './core/supervisor-shutdown-protocol.js';
 import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
 import { statSync } from 'node:fs';
-import { addReaction, deleteMessage, getChatContext, getChatMode, getChatNameAndMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
+import { addReaction, deleteMessage, getChatContext, getChatMode, getChatNameAndMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, removeReaction, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigAtIndex,
@@ -3183,6 +3183,25 @@ export async function noteTurnReceived(
     turnId: turnId ?? triggerMessageId,
     ...(clearOnReply ? { clearOnReply: true } : {}),
   });
+}
+
+/** Undo the progress reaction when a turn never reaches durable worker
+ * ownership. Detach the exact turn before awaiting Lark so a concurrent reply
+ * signal cannot remove the same reaction twice. */
+async function discardTurnReceivedReaction(ds: DaemonSession, turnId: string): Promise<void> {
+  const list = ds.pendingAckReactions;
+  if (!list || list.length === 0) return;
+  const discarded = list.filter(ack => (ack.turnId ?? ack.messageId) === turnId);
+  if (discarded.length === 0) return;
+  ds.pendingAckReactions = list.filter(ack => !discarded.includes(ack));
+  for (const ack of discarded) {
+    if (!ack.reactionId) continue;
+    try {
+      await removeReaction(ds.larkAppId, ack.messageId, ack.reactionId);
+    } catch (err) {
+      logger.debug(`[reaction] failed to clear unaccepted reaction ${ack.reactionId}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
 }
 
 async function sessionReply(
@@ -19571,6 +19590,7 @@ async function handleThreadReplyAdmitted(
       // The opening is one-shot: give it back when the worker died / refused,
       // so the next message re-opens instead of silently losing the context.
       if (openingTurn && !accepted) releaseInitialUserTurn(ds);
+      if (!accepted) await discardTurnReceivedReaction(ds, parsed.messageId);
     }
   } else {
     // Worker not running — re-fork with resume. Thread sessions keep their
@@ -19833,12 +19853,14 @@ async function handleThreadReplyAdmitted(
       }
     } catch (e) {
       if (openingTurn) releaseInitialUserTurn(ds);
+      if (!queuedHasDurableTail) await discardTurnReceivedReaction(ds, parsed.messageId);
       throw e;
     }
     // refork 成功才算本轮已交给 CLI。fork 抛错（rethrow）或返回 false（quarantine /
     // 会话已非 active 的不抛错拒绝腿）时，本轮只存在于内存、无 durable 兜底，
     // 必须保持「请重发」提示——与 live 分支按 accepted 打标对称。
     if (reforkAccepted) markIngressAdmitted(ctx);
+    else if (!queuedHasDurableTail) await discardTurnReceivedReaction(ds, parsed.messageId);
     // Record the input as the session's last real CLI turn ONLY after the fork
     // succeeded. Recording before the fork (the old order) persisted lastCliInput
     // for a turn that never launched when forkWorker threw; the retry then read

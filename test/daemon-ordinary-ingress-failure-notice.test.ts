@@ -34,6 +34,7 @@ const mocks = vi.hoisted(() => {
     replyMessage: vi.fn(async () => 'om_reply'),
     sendMessage: vi.fn(async () => 'om_top'),
     addReaction: vi.fn(async () => 'reaction_received'),
+    removeReaction: vi.fn(async () => undefined),
     getChatMode: vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p'),
     getChatNameAndMode: vi.fn(async () => ({ name: null, mode: 'group' as const })),
     resolveSender: vi.fn(async (_appId: string, openId: string | undefined, senderType: string | undefined) => (
@@ -63,7 +64,9 @@ const mocks = vi.hoisted(() => {
     }),
     forkWorker: vi.fn((ds: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      return true;
     }),
+    sendWorkerInput: vi.fn(() => true),
     scanMultipleProjects: vi.fn(() => [] as any[]),
     getAvailableBots: vi.fn(async () => [] as any[]),
     downloadResources: vi.fn(async () => ({ attachments: [], needLogin: false })),
@@ -92,6 +95,7 @@ vi.mock('../src/im/lark/client.js', async () => {
     replyMessage: mocks.replyMessage,
     sendMessage: mocks.sendMessage,
     addReaction: mocks.addReaction,
+    removeReaction: mocks.removeReaction,
     getChatMode: mocks.getChatMode,
     getChatNameAndMode: mocks.getChatNameAndMode,
   };
@@ -110,7 +114,11 @@ vi.mock('../src/services/session-store.js', async () => {
 
 vi.mock('../src/core/worker-pool.js', async () => {
   const actual = await vi.importActual<any>('../src/core/worker-pool.js');
-  return { ...actual, forkWorker: mocks.forkWorker };
+  return {
+    ...actual,
+    forkWorker: mocks.forkWorker,
+    sendWorkerInput: mocks.sendWorkerInput,
+  };
 });
 
 vi.mock('../src/core/session-manager.js', async () => {
@@ -224,7 +232,9 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     mocks.sessions.clear();
     mocks.forkWorker.mockImplementation((ds: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      return true;
     });
+    mocks.sendWorkerInput.mockReturnValue(true);
     mocks.scanMultipleProjects.mockReturnValue([]);
     mocks.getAvailableBots.mockResolvedValue([]);
     mocks.downloadResources.mockResolvedValue({ attachments: [], needLogin: false });
@@ -281,6 +291,25 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
 
     expect(repliedText()).not.toContain(expectedNotice());
   });
+
+  it('live worker rejection removes the exact thread progress reaction', async () => {
+    const anchor = 'om_thread_live_reject';
+    const ds = seedThreadSession(anchor, 'seeded');
+    (ds as any).worker = { killed: false, send: vi.fn() };
+    mocks.sendWorkerInput.mockReturnValueOnce(false);
+
+    await handleThreadReply(
+      makeEventData('om_msg_live_reject', 'please retry', anchor),
+      makeCtx(anchor, 'om_msg_live_reject'),
+    );
+
+    expect(mocks.removeReaction).toHaveBeenCalledWith(
+      APP,
+      'om_msg_live_reject',
+      'reaction_received',
+    );
+    expect(ds.pendingAckReactions ?? []).toEqual([]);
+  });
 });
 
 /** 让匹配 predicate 的回复失败，其余照常成功（模拟 Lark 瞬时发送故障只打中某一条）。 */
@@ -310,7 +339,9 @@ describe('durable admission then failing status reply → no resend advice (PR #
     mocks.sessions.clear();
     mocks.forkWorker.mockImplementation((ds: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      return true;
     });
+    mocks.sendWorkerInput.mockReturnValue(true);
     mocks.scanMultipleProjects.mockReturnValue([]);
     mocks.getAvailableBots.mockResolvedValue([]);
     mocks.downloadResources.mockResolvedValue({ attachments: [], needLogin: false });
@@ -426,6 +457,12 @@ describe('durable admission then failing status reply → no resend advice (PR #
 
     expect(repliedText()).toContain(resendNotice());
     expect(repliedText()).not.toContain(admittedNotice());
+    expect(mocks.removeReaction).toHaveBeenCalledWith(
+      APP,
+      'om_msg_refork',
+      'reaction_received',
+    );
+    expect(ds.pendingAckReactions ?? []).toEqual([]);
   });
 
   it('a rejected /vc-auth (pure-reply branch, no side effect) still advises a resend', async () => {
