@@ -2060,9 +2060,16 @@ export function scheduleCardPatch(
   const pendingCardId = ds.streamCardId;
   if (options?.withdrawnFallback) {
     ds.pendingCardWithdrawFallback = options.withdrawnFallback;
-  } else if (ds.pendingCardId !== pendingCardId) {
-    // A same-card status refresh must not erase a queued reuse fallback. A
-    // different card identity owns a different lifecycle and must not inherit it.
+  } else if (
+    ds.pendingCardWithdrawFallback
+    && (
+      ds.pendingCardWithdrawFallback.generation !== (ds.streamCardTurnGeneration ?? 0)
+      || (turnId !== undefined && turnId !== ds.pendingCardWithdrawFallback.turnId)
+    )
+  ) {
+    // Keep the fallback for every same-turn update, including updates queued
+    // after the initial reuse PATCH has completed. A new generation or an
+    // explicitly different turn owns a different card lifecycle.
     ds.pendingCardWithdrawFallback = undefined;
   }
   ds.pendingCardId = pendingCardId;
@@ -2078,7 +2085,6 @@ function flushCardPatch(ds: DaemonSession): void {
     ds.pendingCardJson = undefined;
     ds.pendingCardId = undefined;
     ds.pendingCardTurnId = undefined;
-    ds.pendingCardWithdrawFallback = undefined;
     return;
   }
   // A starting-card POST will replace the sentinel with its real message id
@@ -2088,10 +2094,14 @@ function flushCardPatch(ds: DaemonSession): void {
   ds.pendingCardJson = undefined;
   ds.pendingCardId = undefined;
   ds.pendingCardTurnId = undefined;
-  ds.pendingCardWithdrawFallback = undefined;
   ds.cardPatchInFlight = true;
   updateMessage(ds.larkAppId, cardId, json)
     .catch(err => {
+      const fallbackMatches = (
+        withdrawnFallback
+        && withdrawnFallback.generation === (ds.streamCardTurnGeneration ?? 0)
+        && (ds.streamCardId === undefined || ds.streamCardId === cardId)
+      );
       if (err instanceof MessageWithdrawnError) {
         // Only clear streamCardId when the withdrawn message is still the
         // active one. With auto-recall a new turn may have advanced
@@ -2112,11 +2122,7 @@ function flushCardPatch(ds: DaemonSession): void {
         // Generation matching prevents an older in-flight PATCH from posting
         // for a newer type-ahead turn. `streamCardId` may already be undefined
         // because an earlier queued PATCH discovered the same withdrawal.
-        if (
-          withdrawnFallback
-          && withdrawnFallback.generation === (ds.streamCardTurnGeneration ?? 0)
-          && (ds.streamCardId === undefined || ds.streamCardId === cardId)
-        ) {
+        if (fallbackMatches) {
           ds.streamCardId = undefined;
           ds.streamCardPending = true;
           ds.streamCardPendingTurnId = withdrawnFallback.turnId;
@@ -2126,6 +2132,20 @@ function flushCardPatch(ds: DaemonSession): void {
           persistStreamCardState(ds);
           void postTurnStartingCard(ds, requireCallbacks().sessionReply, withdrawnFallback.turnId);
         }
+        return;
+      }
+      // A queued worker-ready PATCH cannot throw back into its caller. For an
+      // accepted reused-card turn, converge ordinary transport/API failures to
+      // the same fresh-card path as an explicit withdrawal. Keep the old card
+      // identity until the POST succeeds so it can be recalled afterwards.
+      if (fallbackMatches) {
+        ds.streamCardPending = true;
+        ds.streamCardPendingTurnId = withdrawnFallback.turnId;
+        if (ds.pendingCardJson && ds.pendingCardId === cardId) {
+          ds.pendingCardId = CARD_POSTING_SENTINEL;
+        }
+        persistStreamCardState(ds);
+        void postTurnStartingCard(ds, requireCallbacks().sessionReply, withdrawnFallback.turnId);
         return;
       }
       logger.debug(`[${tag(ds)}] Failed to update streaming card: ${err}`);

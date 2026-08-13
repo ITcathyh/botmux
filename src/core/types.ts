@@ -335,8 +335,9 @@ export interface DaemonSession {
   pendingCardJson?: string;       // queued card JSON — flushed when in-flight PATCH completes (latest wins)
   pendingCardId?: string;         // card message_id captured at schedule time — prevents stale reads when streamCardId changes between schedule and flush
   pendingCardTurnId?: string;     // exact turn that produced pendingCardJson; undefined for predecessor/auxiliary snapshots
-  /** Exact reused-card turn that should fall back to POST if this queued PATCH
-   *  discovers the persisted message was withdrawn. In-memory only. */
+  /** Exact reused-card turn that should fall back to POST if any same-turn
+   *  PATCH fails. Kept across successful PATCHes for the active generation;
+   *  in-memory only. */
   pendingCardWithdrawFallback?: { turnId: string; generation: number };
   frozenCards?: Map<string, FrozenCard>;  // nonce → FrozenCard (historical cards' cached state for toggle)
   /** Wait Mode / HTTP Sync integration: pending Promise handlers for synchronous

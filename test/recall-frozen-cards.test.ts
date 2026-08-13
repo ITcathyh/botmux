@@ -539,6 +539,31 @@ describe('reuseThreadStreamingCardForTurn', () => {
     expect(ds.streamCardId).toBe('om_replacement');
   });
 
+  it('keeps the withdrawal fallback after the initial reuse PATCH succeeds', async () => {
+    updateMessageMock
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new MessageWithdrawnError('om_withdrawn'));
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardId = 'om_withdrawn';
+    ds.streamCardNonce = 'nonce_withdrawn';
+
+    expect(reuseThreadStreamingCardForTurn(ds, 'next question', 'om_next_turn')).toBe(true);
+    await flush();
+    expect(updateMessageMock).toHaveBeenCalledTimes(1);
+
+    scheduleCardPatch(ds, 'working payload', 'om_next_turn');
+    await flush();
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenNthCalledWith(
+      2, APP_ID, 'om_withdrawn', 'working payload',
+    );
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+    expect(sessionReplyMock.mock.calls[0][4]).toBe('om_next_turn');
+    expect(ds.streamCardId).toBe('om_replacement');
+  });
+
   it('replays the latest queued status onto the withdrawn-card replacement', async () => {
     let rejectReusePatch!: (error: Error) => void;
     updateMessageMock.mockImplementationOnce(

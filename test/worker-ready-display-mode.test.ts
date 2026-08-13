@@ -732,6 +732,35 @@ describe('Worker ready: set_display_mode re-sync', () => {
     expect(ds.streamCardId).toBe('om_new_card');
   });
 
+  it('posts a replacement when a reused-card ready PATCH fails', async () => {
+    updateMessageMock.mockRejectedValueOnce(new Error('temporary Lark failure'));
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'thread',
+      worker: fakeWorker,
+      workerReady: false,
+      streamCardPending: false,
+      streamCardId: 'om_existing_card',
+      streamCardNonce: 'stable-nonce',
+      streamCardTurnGeneration: 4,
+      streamCardVisualTurnId: 'om_previous_turn',
+    });
+
+    expect(reuseThreadStreamingCardForTurn(ds, 'new turn', 'om_new_turn')).toBe(true);
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', {
+      type: 'ready', port: 9999, token: 'tok_abc', turnId: 'om_new_turn',
+    });
+    await flush();
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenCalledTimes(1);
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+    expect(sessionReplyMock.mock.calls[0][4]).toBe('om_new_turn');
+    expect(ds.streamCardId).toBe('om_new_card');
+    expect(ds.streamCardPending).toBe(false);
+  });
+
   it('silent recovery restores screenshot mode without touching the streaming card', async () => {
     const fakeWorker = makeFakeWorker();
     const ds = makeDs({
