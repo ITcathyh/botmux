@@ -44,6 +44,7 @@ const mocks = vi.hoisted(() => {
     sendMessage: vi.fn(async () => 'om_top'),
     sendEphemeralCard: vi.fn(async () => 'om_ephemeral'),
     addReaction: vi.fn(async () => 'reaction_received'),
+    removeReaction: vi.fn(async () => undefined),
     getChatMode: vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p'),
     getChatNameAndMode: vi.fn(async () => ({ name: null, mode: 'group' as const })),
     resolveSender: vi.fn(async (_appId: string, openId: string | undefined, senderType: string | undefined) => (
@@ -73,6 +74,7 @@ const mocks = vi.hoisted(() => {
     }),
     forkWorker: vi.fn((ds: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      return true;
     }),
     closeWorkerPoolSession: vi.fn(async () => undefined),
     discoverAdoptableSessions: vi.fn(() => [] as any[]),
@@ -109,6 +111,7 @@ vi.mock('../src/im/lark/client.js', async () => {
     sendMessage: mocks.sendMessage,
     sendEphemeralCard: mocks.sendEphemeralCard,
     addReaction: mocks.addReaction,
+    removeReaction: mocks.removeReaction,
     getChatMode: mocks.getChatMode,
     getChatNameAndMode: mocks.getChatNameAndMode,
   };
@@ -527,6 +530,7 @@ describe('/rename production routing — must not pre-create a session (review P
     mocks.sessions.clear();
     mocks.forkWorker.mockImplementation((ds: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      return true;
     });
     mocks.closeWorkerPoolSession.mockImplementation(async (sessionId: string) => {
       for (const [key, candidate] of activeSessions) {
@@ -1308,6 +1312,34 @@ describe('/rename production routing — must not pre-create a session (review P
       'om_force_topic_with_content',
       expect.any(String),
     );
+  });
+
+  it('treats a refused pinned initial fork as unaccepted and removes its reaction', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      defaultWorkingDir: '/tmp',
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    mocks.forkWorker.mockReturnValueOnce(false);
+    const ctx = makeCtx('om_refused_pinned', 'om_refused_pinned');
+
+    await expect(handleNewTopic(
+      makeEventData('om_refused_pinned', 'start work'),
+      ctx,
+    )).rejects.toThrow('Worker refused pinned initial turn');
+
+    expect(ctx.ingressAdmission).toEqual({ admitted: false });
+    expect(mocks.removeReaction).toHaveBeenCalledWith(
+      APP,
+      'om_refused_pinned',
+      'reaction_received',
+    );
+    const ds = activeSessions.get(sessionKey('om_refused_pinned', APP));
+    expect(ds?.worker).toBeNull();
+    expect(ds?.pendingAckReactions).toEqual([]);
   });
 
   it('routes a colliding daemon command to the canonical pending owner and closes only the loser', async () => {

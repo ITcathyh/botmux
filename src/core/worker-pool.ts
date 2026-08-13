@@ -3504,13 +3504,6 @@ export async function closeSession(
   const preparedRiffRequestId = ds?.riffCloseState?.phase === 'prepared'
     ? ds.riffCloseState.requestId
     : undefined;
-  // A closed session has no later reply/idle edge that could settle progress
-  // reactions. Detach them inside the close critical section so concurrent
-  // terminal paths cannot remove the same reaction twice; the remote cleanup
-  // below remains best-effort.
-  const closeAckReactions = ds?.pendingAckReactions ?? [];
-  if (ds) ds.pendingAckReactions = [];
-
   // 会话关闭即可回收其崩溃重启计数；否则每个曾崩溃过的 session 会在 daemon
   // 生命周期内永久占位（restartCounts 此前无任何 delete）。
   restartCounts.delete(sessionId);
@@ -3556,6 +3549,13 @@ export async function closeSession(
       ds.session.closedAt = after?.closedAt ?? ds.session.closedAt;
     }
   }
+
+  // A closed session has no later reply/idle edge that could settle progress
+  // reactions. Detach only after the durable transition succeeds: failed Riff
+  // commit and non-Riff store exceptions leave the session live and must retain
+  // their reaction ownership for a later reply or close retry.
+  const closeAckReactions = ds?.pendingAckReactions ?? [];
+  if (ds) ds.pendingAckReactions = [];
 
   if (ds) {
     killWorker(ds, {

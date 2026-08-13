@@ -116,6 +116,7 @@ beforeEach(() => {
   modules.daemon.__testOnly_setAutoStartJoinReadyMaxWaitMs();
   vi.clearAllMocks();
   mocks.forkWorker.mockReset();
+  mocks.forkWorker.mockReturnValue(true);
   mocks.getChatContext.mockImplementation(async (_appId: string, chatId: string) => ({
     chatId,
     name: '【Pippit】【BUG】测试群',
@@ -431,6 +432,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     });
     mocks.forkWorker.mockImplementation((ds: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      return true;
     });
     registry.registerBot({
       larkAppId: appId,
@@ -509,6 +511,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     });
     mocks.forkWorker.mockImplementation((ds: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      return true;
     });
     registry.registerBot({
       larkAppId: appId,
@@ -624,6 +627,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     });
     mocks.forkWorker.mockImplementation((ds: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      return true;
     });
     registry.registerBot({
       larkAppId: appId,
@@ -703,6 +707,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     });
     mocks.forkWorker.mockImplementation((ds: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      return true;
     });
     registry.registerBot({
       larkAppId: appId,
@@ -869,6 +874,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     });
     mocks.forkWorker.mockImplementation((ds: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      return true;
     });
     registry.registerBot({
       larkAppId: appId,

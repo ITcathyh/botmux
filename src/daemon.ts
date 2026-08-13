@@ -16497,12 +16497,12 @@ export const __testOnly_onQueuedActivationSubmitted = onQueuedActivationSubmitte
  * deliberately no await between the final buffered-input snapshot, fork, and
  * release: a later handler either buffers before this block or observes the
  * live worker after it. */
-function forkReservedInitialSession(ds: DaemonSession, availableBots: AvailableBot[]): void {
+function forkReservedInitialSession(ds: DaemonSession, availableBots: AvailableBot[]): boolean {
   const userPrompt = ds.pendingPrompt ?? '';
   const input = buildReservedInitialInput(ds, availableBots);
   rememberLastCliInput(ds, userPrompt, input);
   const turnId = ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId;
-  forkWorker(ds, input, turnId ? { turnId } : false);
+  if (!forkWorker(ds, input, turnId ? { turnId } : false)) return false;
   ds.pendingTurnId = undefined;
   // A no-project pendingRepo fallback enters forkWorker with `session.queued`
   // still set. forkWorker materializes the exact opening as a tokened
@@ -16518,6 +16518,7 @@ function forkReservedInitialSession(ds: DaemonSession, availableBots: AvailableB
     // still being built. Hand off now, or defer until its reservation settles.
     void releaseQueuedActivationReservation(ds);
   }
+  return true;
 }
 
 /** A pinned initial session has no durable pending-repo journal. If its fork
@@ -16528,7 +16529,9 @@ async function forkPinnedInitialSession(
   turnId: string,
 ): Promise<void> {
   try {
-    forkReservedInitialSession(ds, availableBots);
+    if (!forkReservedInitialSession(ds, availableBots)) {
+      throw new Error(`Worker refused pinned initial turn ${turnId}`);
+    }
   } catch (err) {
     await discardTurnReceivedReaction(ds, turnId);
     throw err;
