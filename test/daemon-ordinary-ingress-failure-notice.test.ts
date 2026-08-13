@@ -352,6 +352,9 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     const anchor = 'om_thread_live_reject';
     const ds = seedThreadSession(anchor, 'seeded');
     (ds as any).worker = { killed: false, send: vi.fn() };
+    ds.streamCardId = 'om_stable_status';
+    ds.currentTurnTitle = 'previous completed turn';
+    ds.lastScreenStatus = 'idle';
     mocks.sendWorkerInput.mockReturnValueOnce(false);
 
     await handleThreadReply(
@@ -365,6 +368,9 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
       'reaction_received',
     );
     expect(ds.pendingAckReactions ?? []).toEqual([]);
+    expect(ds.streamCardId).toBe('om_stable_status');
+    expect(ds.currentTurnTitle).toBe('previous completed turn');
+    expect(ds.lastScreenStatus).toBe('idle');
   });
 });
 

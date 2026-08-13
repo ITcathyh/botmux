@@ -19582,7 +19582,6 @@ async function handleThreadReplyAdmitted(
           codexAppApplicationContext,
           codexAppMessageContext,
         });
-    beginNewTurn(ds, parsed.content, parsed.messageId);
     await noteTurnReceived(ds, parsed.messageId, parsed.content, turnSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     // Codex App steer authorization was computed ONCE before the branch split
     // above (R4-B1); reuse the same frozen value here for the live-worker path.
@@ -19600,6 +19599,10 @@ async function handleThreadReplyAdmitted(
         // 消息已实际送入 live worker——之后的收尾失败不得再诱导重发。
         markIngressAdmitted(ctx);
         rememberLastCliInput(ds, promptContent, cliInput);
+        // A stable thread card represents work that the CLI actually accepted.
+        // Keep the previous completed card intact when the live worker refuses
+        // or throws before admission.
+        beginNewTurn(ds, parsed.content, parsed.messageId);
       }
       else logger.warn(`[${tag(ds)}] Inbound ${parsed.messageId} was not accepted by the live worker`);
     } finally {

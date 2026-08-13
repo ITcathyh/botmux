@@ -20,6 +20,7 @@ import { join } from 'path';
 const mocks = vi.hoisted(() => ({
   addReaction: vi.fn(),
   removeReaction: vi.fn(),
+  sessionReply: vi.fn(),
 }));
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
@@ -407,9 +408,10 @@ describe('turn reaction screen_update behavioral gate', () => {
     process.env.SESSION_DATA_DIR = mkdtempSync(join(tmpdir(), 'botmux-react-behav-'));
     mocks.addReaction.mockImplementation(async (_app: string, msgId: string) => `rid_${msgId}`);
     mocks.removeReaction.mockResolvedValue(undefined);
+    mocks.sessionReply.mockResolvedValue('om_reply');
     registerWith(true);
     initWorkerPool({
-      sessionReply: vi.fn(async () => 'om_reply'),
+      sessionReply: mocks.sessionReply,
       getSessionWorkingDir: () => '/repo',
       getActiveCount: () => 1,
       closeSession: vi.fn(),
@@ -531,6 +533,92 @@ describe('turn reaction screen_update behavioral gate', () => {
     expect(mocks.removeReaction).not.toHaveBeenCalledWith(APP, 'om_b', 'rid_om_b');
     expect(ds.pendingAckReactions).toEqual([{
       messageId: 'om_b', reactionId: 'rid_om_b', turnId: 'om_b', clearOnReply: true,
+    }]);
+  });
+
+  it('terminal worker notice clears the exact reaction only after its reply is delivered', async () => {
+    registerWith(false);
+    const worker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'thread',
+      worker,
+      workerPort: 9999,
+      pendingAckReactions: [
+        { messageId: 'om_a', reactionId: 'rid_om_a', turnId: 'om_a', clearOnReply: true },
+        { messageId: 'om_b', reactionId: 'rid_om_b', turnId: 'om_b', clearOnReply: true },
+      ],
+    });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'user_notify',
+      turnId: 'om_a',
+      settlesTurn: true,
+      message: 'CLI did not accept this message.',
+    });
+    await flush();
+
+    expect(mocks.sessionReply).toHaveBeenCalledWith(
+      'om_root', 'CLI did not accept this message.', 'text', APP, 'om_a', undefined,
+    );
+    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_a', 'rid_om_a');
+    expect(mocks.sessionReply.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.removeReaction.mock.invocationCallOrder[0],
+    );
+    expect(ds.pendingAckReactions).toEqual([{
+      messageId: 'om_b', reactionId: 'rid_om_b', turnId: 'om_b', clearOnReply: true,
+    }]);
+  });
+
+  it('informational worker notice does not settle a pending thread reaction', async () => {
+    registerWith(false);
+    const worker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'thread',
+      worker,
+      workerPort: 9999,
+      pendingAckReactions: [{
+        messageId: 'om_a', reactionId: 'rid_om_a', turnId: 'om_a', clearOnReply: true,
+      }],
+    });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'user_notify', turnId: 'om_a', message: 'Informational notice.',
+    });
+    await flush();
+
+    expect(mocks.sessionReply).toHaveBeenCalledWith(
+      'om_root', 'Informational notice.', 'text', APP, 'om_a', undefined,
+    );
+    expect(mocks.removeReaction).not.toHaveBeenCalled();
+    expect(ds.pendingAckReactions).toEqual([{
+      messageId: 'om_a', reactionId: 'rid_om_a', turnId: 'om_a', clearOnReply: true,
+    }]);
+  });
+
+  it('failed terminal-notice delivery keeps the reaction pending', async () => {
+    registerWith(false);
+    mocks.sessionReply.mockRejectedValueOnce(new Error('Lark unavailable'));
+    const worker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'thread',
+      worker,
+      workerPort: 9999,
+      pendingAckReactions: [{
+        messageId: 'om_a', reactionId: 'rid_om_a', turnId: 'om_a', clearOnReply: true,
+      }],
+    });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'user_notify', turnId: 'om_a', settlesTurn: true, message: 'Submit failed.',
+    });
+    await flush();
+
+    expect(mocks.removeReaction).not.toHaveBeenCalled();
+    expect(ds.pendingAckReactions).toEqual([{
+      messageId: 'om_a', reactionId: 'rid_om_a', turnId: 'om_a', clearOnReply: true,
     }]);
   });
 

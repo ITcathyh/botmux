@@ -9611,6 +9611,7 @@ function scheduleSubmitFailureNotify(
       send({
         type: 'user_notify',
         turnId: turnIdentity?.turnId ?? currentBotmuxTurnId,
+        settlesTurn: true,
         message: t('worker.submit_impossible', { cliName: cliName(), reason, preview }),
       });
     }
@@ -9700,6 +9701,7 @@ function scheduleSubmitFailureNotify(
       send({
         type: 'user_notify',
         turnId: turnIdentity?.turnId ?? currentBotmuxTurnId,
+        settlesTurn: true,
         message: t(
           effectiveBackendType === 'zmx'
             ? 'worker.submit_unconfirmed_zmx'

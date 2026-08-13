@@ -9001,6 +9001,9 @@ function setupWorkerHandlers(
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
         try {
           await scopedReply(msg.message, 'text', msg.turnId);
+          if (msg.settlesTurn === true && msg.turnId) {
+            await finishDeliveredTurnReactions(ds, msg.turnId);
+          }
         } catch (err: any) {
           logger.error(`[${t}] Failed to deliver user_notify to Lark: ${err.message}`);
         }
@@ -9800,8 +9803,8 @@ async function finishTurnReactions(ds: DaemonSession): Promise<void> {
   }
 }
 
-/** Remove the exact thread turn's progress reaction after its reply has been
- * delivered, or after positive terminal evidence says no reply will be sent.
+/** Remove the exact thread turn's progress reaction after its reply or terminal
+ * notice has been delivered, or after positive evidence says no reply will be sent.
  * Card-off entries keep their existing received→DONE idle flow. */
 async function finishDeliveredTurnReactions(ds: DaemonSession, turnId: string): Promise<void> {
   const list = ds.pendingAckReactions;
