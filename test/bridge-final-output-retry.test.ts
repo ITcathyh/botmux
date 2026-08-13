@@ -2604,8 +2604,12 @@ describe('Worker turn_terminal routing', () => {
   it('reports a managed CLI exit even when the Node worker stays alive', async () => {
     const ds = makeDs();
     const onCliExit = vi.fn(async () => {});
+    const sessionReply = vi.fn(async () => 'om_reply');
+    ds.pendingAckReactions = [{
+      messageId: 'om_live', reactionId: 'reaction_live', turnId: 'om_live', clearOnReply: true,
+    }];
     initWorkerPool({
-      sessionReply: vi.fn(async () => 'om_reply'),
+      sessionReply,
       getSessionWorkingDir: () => '/tmp',
       getActiveCount: () => 1,
       closeSession: vi.fn(),
@@ -2625,9 +2629,11 @@ describe('Worker turn_terminal routing', () => {
     });
 
     (ds.worker as any).emit('message', {
-      type: 'claude_exit', code: 9, signal: 'SIGKILL',
+      type: 'claude_exit', code: 9, signal: 'SIGKILL', turnId: 'om_live',
     } satisfies Extract<WorkerToDaemon, { type: 'claude_exit' }>);
-    await Promise.resolve();
+    await vi.waitFor(() => expect(removeReactionMock).toHaveBeenCalledWith(
+      'app_test', 'om_live', 'reaction_live',
+    ));
 
     expect(onCliExit).toHaveBeenCalledWith(ds, {
       sessionId: ds.session.sessionId,
@@ -2636,6 +2642,7 @@ describe('Worker turn_terminal routing', () => {
       signal: 'SIGKILL',
     });
     expect(ds.managedTurnOrigin).toBeUndefined();
+    expect(ds.pendingAckReactions).toEqual([]);
   });
 
   it('ignores stale-worker CLI exit authority changes after replacement', async () => {

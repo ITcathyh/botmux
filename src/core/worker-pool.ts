@@ -6873,7 +6873,7 @@ export function forkWorker(
       ds.session.vcMeetingReceiver
         ? { sourceSessionId: ds.session.sessionId }
         : undefined,
-    ).then(() => finishDeliveredTurnReactions(ds, replyTurnId))
+    ).then(() => replyTurnId ? finishDeliveredTurnReactions(ds, replyTurnId) : undefined)
       .catch(replyErr => logger.error(`[${t}] Failed to deliver worker fork error to Lark: ${replyErr}`));
   });
 
@@ -8698,6 +8698,7 @@ function setupWorkerHandlers(
           break;
         }
         const suppressExitUi = managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt);
+        const exitTurnId = fallbackTurnId(ds, msg.turnId);
 
         // Do NOT auto-restart in adopt mode — there's nothing to restart
         if (ds.adoptedFrom) {
@@ -8726,7 +8727,8 @@ function setupWorkerHandlers(
           // leave status='active' and still get the notice.
           if (!suppressExitUi && ds.session.status !== 'closed') {
             try {
-              await scopedReply(tr('worker.adopted_session_exited', undefined, loc), 'text', undefined);
+              await scopedReply(tr('worker.adopted_session_exited', undefined, loc), 'text', exitTurnId);
+              if (exitTurnId) await finishDeliveredTurnReactions(ds, exitTurnId);
             } catch { /* best effort */ }
           }
           break;
@@ -8747,7 +8749,8 @@ function setupWorkerHandlers(
           // lifecycle. Only an unexpected backend exit needs recovery guidance.
           if (!retirementPhase && !suppressExitUi) {
             try {
-              await scopedReply(tr('cmd.restart.riff_unsupported', undefined, loc), 'text', undefined);
+              await scopedReply(tr('cmd.restart.riff_unsupported', undefined, loc), 'text', exitTurnId);
+              if (exitTurnId) await finishDeliveredTurnReactions(ds, exitTurnId);
             } catch (replyErr) {
               if (replyErr instanceof MessageWithdrawnError) {
                 logger.warn(`[${t}] Root message withdrawn, closing stale session`);
@@ -8826,7 +8829,8 @@ function setupWorkerHandlers(
           }
           if (!suppressExitUi) {
             try {
-              await scopedReply(parts.join('\n\n'), 'text', undefined);
+              await scopedReply(parts.join('\n\n'), 'text', exitTurnId);
+              if (exitTurnId) await finishDeliveredTurnReactions(ds, exitTurnId);
             } catch (replyErr) {
               if (replyErr instanceof MessageWithdrawnError && ownsLifecycleMutation()) {
                 await closeWithdrawnSessionIfLedgerEmpty(ds, 'Root message withdrawn while sending crash diagnostic');
@@ -10529,7 +10533,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
       'text',
       ds.larkAppId,
       replyTurnId,
-    ).then(() => finishDeliveredTurnReactions(ds, replyTurnId))
+    ).then(() => replyTurnId ? finishDeliveredTurnReactions(ds, replyTurnId) : undefined)
       .catch(replyErr => logger.error(`[${t}] Failed to deliver adopt worker fork error to Lark: ${replyErr}`));
   });
 
