@@ -10515,13 +10515,15 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
       reason: 'worker_fork_error',
       message: reason,
     });
+    const replyTurnId = fallbackTurnId(ds, opts?.turnId);
     void cb.sessionReply(
       sessionAnchorId(ds),
       message,
       'text',
       ds.larkAppId,
-      fallbackTurnId(ds, undefined),
-    ).catch(replyErr => logger.error(`[${t}] Failed to deliver adopt worker fork error to Lark: ${replyErr}`));
+      replyTurnId,
+    ).then(() => finishDeliveredTurnReactions(ds, replyTurnId))
+      .catch(replyErr => logger.error(`[${t}] Failed to deliver adopt worker fork error to Lark: ${replyErr}`));
   });
 
   // Pipe worker stdout/stderr — both go through logger.info (→ daemon.log,

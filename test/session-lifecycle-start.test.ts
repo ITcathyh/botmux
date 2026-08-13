@@ -2,10 +2,11 @@ import { EventEmitter } from 'node:events';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { applyQueuedCodexAppLegacyFallback } from '../src/core/session-create.js';
 
-const { emitHookEventMock, forkMock, execSyncMock } = vi.hoisted(() => ({
+const { emitHookEventMock, forkMock, execSyncMock, removeReactionMock } = vi.hoisted(() => ({
   emitHookEventMock: vi.fn(),
   forkMock: vi.fn(),
   execSyncMock: vi.fn(),
+  removeReactionMock: vi.fn(async () => undefined),
 }));
 
 vi.mock('node:child_process', async (importOriginal) => {
@@ -28,6 +29,7 @@ vi.mock('../src/im/lark/client.js', () => {
   return {
     updateMessage: vi.fn(async () => {}),
     deleteMessage: vi.fn(async () => {}),
+    removeReaction: removeReactionMock,
     MessageWithdrawnError,
   };
 });
@@ -2921,8 +2923,14 @@ describe('worker startup failure delivery', () => {
         cliId: 'codex',
         cwd: '/repo',
       },
+      pendingAckReactions: [{
+        messageId: 'om_adopt_turn',
+        reactionId: 'reaction_adopt_turn',
+        turnId: 'om_adopt_turn',
+        clearOnReply: true,
+      }],
     });
-    forkAdoptWorker(ds);
+    forkAdoptWorker(ds, { turnId: 'om_adopt_turn' });
     const worker = forkMock.mock.results.at(-1)!.value;
 
     worker.emit('error', new Error('adopt fork ENOENT'));
@@ -2931,11 +2939,54 @@ describe('worker startup failure delivery', () => {
 
     expect(sessionReply).toHaveBeenCalledTimes(1);
     expect(sessionReply.mock.calls[0]?.[1]).toContain('adopt fork ENOENT');
+    expect(removeReactionMock).toHaveBeenCalledWith(
+      'app_test', 'om_adopt_turn', 'reaction_adopt_turn',
+    );
+    expect(ds.pendingAckReactions).toEqual([]);
     expect(emitHookEventMock).toHaveBeenCalledWith('session.requires_attention', expect.objectContaining({
       sessionId: 'sid-start-test',
       reason: 'worker_fork_error',
       message: 'adopt fork ENOENT',
     }));
+  });
+
+  it('keeps the adopted turn reaction when its fork-error reply fails', async () => {
+    const sessionReply = vi.fn(async () => { throw new Error('Lark unavailable'); });
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs({
+      adoptedFrom: {
+        tmuxTarget: 'bmx-deadbeef:0.0',
+        originalCliPid: 23456,
+        sessionId: 'codex-session',
+        cliId: 'codex',
+        cwd: '/repo',
+      },
+      pendingAckReactions: [{
+        messageId: 'om_adopt_turn',
+        reactionId: 'reaction_adopt_turn',
+        turnId: 'om_adopt_turn',
+        clearOnReply: true,
+      }],
+    });
+    forkAdoptWorker(ds, { turnId: 'om_adopt_turn' });
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    worker.emit('error', new Error('adopt fork ENOENT'));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(removeReactionMock).not.toHaveBeenCalled();
+    expect(ds.pendingAckReactions).toEqual([{
+      messageId: 'om_adopt_turn',
+      reactionId: 'reaction_adopt_turn',
+      turnId: 'om_adopt_turn',
+      clearOnReply: true,
+    }]);
   });
 });
 
