@@ -4111,10 +4111,11 @@ function failOrdinaryImDelivery(record: OrdinaryImDelivery, reason: string): voi
     'text',
     record.ds.larkAppId,
     record.turnId,
-  ).catch(err => logger.error(
-    `[${tag(record.ds)}] Failed to report ordinary IM worker delivery failure: `
-    + `${err instanceof Error ? err.message : String(err)}`,
-  ));
+  ).then(() => finishDeliveredTurnReactions(record.ds, record.turnId))
+    .catch(err => logger.error(
+      `[${tag(record.ds)}] Failed to report ordinary IM worker delivery failure: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    ));
 }
 
 function retryOrFailOrdinaryImDelivery(record: OrdinaryImDelivery, reason: string): void {
@@ -9353,6 +9354,9 @@ function setupWorkerHandlers(
             settlement.generation,
             settlement.seq,
           )) {
+            if (msg.disposition === 'steer_superseded') {
+              await finishDeliveredTurnReactions(ds, msg.turnId);
+            }
             acknowledge(true);
             if (!hasUnsettledCodexAppDispatch(ds.session.codexAppDispatchLedger)) {
               try { await cb.onCodexAppLedgerDrained?.(ds); }
@@ -9499,6 +9503,9 @@ function setupWorkerHandlers(
             codexAppFinalSettlementInFlight.set(key, inFlight);
           }
           const persisted = await inFlight;
+          if (persisted && msg.disposition === 'steer_superseded') {
+            await finishDeliveredTurnReactions(ds, msg.turnId);
+          }
           acknowledge(persisted, persisted ? undefined : 'final_settlement_failed');
           if (persisted && !hasUnsettledCodexAppDispatch(ds.session.codexAppDispatchLedger)) {
             try { await cb.onCodexAppLedgerDrained?.(ds); }

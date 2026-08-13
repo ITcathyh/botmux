@@ -4443,7 +4443,6 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
     );
   }
 
-  beginNewTurn(ds, title, turnId);
   ds.lastMessageAt = Date.now();
   ds.session.lastMessageAt = new Date(ds.lastMessageAt).toISOString();
   if (sub.workingDir && (!ds.worker || ds.worker.killed)) {
@@ -4464,11 +4463,12 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
       sender,
       mode: 'live',
     });
-    rememberLastCliInput(ds, promptContent, cliInput);
-    sessionStore.updateSession(ds.session);
     if (!sendWorkerInput(ds, cliInput, turnId)) {
       throw new Error('doc-watch warmup worker input was not accepted');
     }
+    beginNewTurn(ds, title, turnId);
+    rememberLastCliInput(ds, promptContent, cliInput);
+    sessionStore.updateSession(ds.session);
     markSessionActivity(ds);
   } else {
     ensureSessionWhiteboard(ds);
@@ -4481,9 +4481,12 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
       sender,
       mode: 'refork',
     });
+    if (!forkWorker(ds, wrappedInput, ds.hasHistory)) {
+      throw new Error('doc-watch warmup worker fork was not accepted');
+    }
+    beginNewTurn(ds, title, turnId);
     rememberLastCliInput(ds, promptContent, wrappedInput);
     sessionStore.updateSession(ds.session);
-    forkWorker(ds, wrappedInput, ds.hasHistory);
   }
   logger.info(`[${tag(ds)}] doc-comment watch prewarm injected file=${sub.fileToken.slice(0, 12)}`);
 }
@@ -20230,7 +20233,6 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
           sender,
           mode: 'live',
         });
-        beginNewTurn(ds, text, turnId);
         (ds.session.docCommentTargets ??= {})[turnId] = docTarget; // per-turn map，不覆盖其他并发轮
         // rememberLastCliInput persists both the exact comment target and the
         // structured sidecar before any worker-visible delivery can occur.
@@ -20243,6 +20245,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
         if (!sendWorkerInput(ds, cliInput, turnId)) {
           throw new Error('worker became unavailable during comment:live-send');
         }
+        beginNewTurn(ds, text, turnId);
         logger.info(`[${tag(ds)}] doc-comment turn injected (turn ${turnId.slice(0, 8)})`);
         return;
       }

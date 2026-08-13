@@ -266,7 +266,14 @@ describe('ordinary IM worker receipt acknowledgement', () => {
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
-    const ds = makeDs();
+    const ds = makeDs({
+      pendingAckReactions: [{
+        messageId: 'om_business',
+        reactionId: 'reaction_business',
+        turnId: 'om_business',
+        clearOnReply: true,
+      }],
+    });
     forkWorker(ds, 'hello', false);
     const worker = forkMock.mock.results.at(-1)!.value;
 
@@ -286,6 +293,10 @@ describe('ordinary IM worker receipt acknowledgement', () => {
       'app_test',
       'om_business',
     );
+    expect(removeReactionMock).toHaveBeenCalledWith(
+      'app_test', 'om_business', 'reaction_business',
+    );
+    expect(ds.pendingAckReactions).toEqual([]);
     businessSends = vi.mocked(worker.send).mock.calls
       .map(call => call[0])
       .filter(message => message?.type === 'message' && message?.turnId === 'om_business');

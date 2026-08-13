@@ -637,6 +637,10 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       { dispatchId: 'dispatch-ok-head', turnId: 'turn-ok-head', state: 'prepared', content: 'superseded', deliverySink: 'lark', codexAppSteerable: true },
       { dispatchId: 'dispatch-ok-next', turnId: 'turn-ok-next', state: 'accepted', content: 'real', deliverySink: 'lark', codexAppSteerable: true },
     ];
+    ds.pendingAckReactions = [
+      { messageId: 'om_superseded', reactionId: 'reaction_superseded', turnId: 'turn-ok-head', clearOnReply: true },
+      { messageId: 'om_next', reactionId: 'reaction_next', turnId: 'turn-ok-next', clearOnReply: true },
+    ];
     __testOnly_setupWorkerHandlers(ds, ds.worker as any);
 
     (ds.worker as any).emit('message', {
@@ -658,6 +662,12 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       }),
     ));
     expect(sessionReply).not.toHaveBeenCalled();
+    expect(removeReactionMock).toHaveBeenCalledWith(
+      'app_test', 'om_superseded', 'reaction_superseded',
+    );
+    expect(ds.pendingAckReactions).toEqual([{
+      messageId: 'om_next', reactionId: 'reaction_next', turnId: 'turn-ok-next', clearOnReply: true,
+    }]);
     await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger?.length).toBe(1));
     expect(ds.session.codexAppDispatchLedger?.[0]?.dispatchId).toBe('dispatch-ok-next');
   });
