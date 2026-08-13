@@ -2106,6 +2106,10 @@ function flushCardPatch(ds: DaemonSession): void {
       const postReplacement = (clearWithdrawnCard: boolean): void => {
         const fallback = withdrawnFallback!;
         if (clearWithdrawnCard) ds.streamCardId = undefined;
+        // One accepted turn gets at most one replacement. Consume the fallback
+        // before replaying the failed payload so a persistently failing PATCH
+        // cannot recurse into an unbounded POST → PATCH → POST loop.
+        ds.pendingCardWithdrawFallback = undefined;
         ds.streamCardPending = true;
         ds.streamCardPendingTurnId = fallback.turnId;
         if (ds.pendingCardJson) {
