@@ -504,6 +504,63 @@ describe('turn reaction screen_update behavioral gate', () => {
     }]);
   });
 
+  it('nothing-to-send terminal clears the exact thread reaction without a reply event', async () => {
+    registerWith(false);
+    const worker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'thread',
+      worker,
+      workerPort: 9999,
+      pendingAckReactions: [
+        { messageId: 'om_a', reactionId: 'rid_om_a', turnId: 'om_a', clearOnReply: true },
+        { messageId: 'om_b', reactionId: 'rid_om_b', turnId: 'om_b', clearOnReply: true },
+      ],
+    });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_a',
+      status: 'completed',
+      outputDisposition: 'nothing_to_send',
+    });
+    await flush();
+
+    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_a', 'rid_om_a');
+    expect(mocks.removeReaction).not.toHaveBeenCalledWith(APP, 'om_b', 'rid_om_b');
+    expect(ds.pendingAckReactions).toEqual([{
+      messageId: 'om_b', reactionId: 'rid_om_b', turnId: 'om_b', clearOnReply: true,
+    }]);
+  });
+
+  it('bare completed terminal does not clear a thread reaction before a trailing reply', async () => {
+    registerWith(false);
+    const worker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'thread',
+      worker,
+      workerPort: 9999,
+      pendingAckReactions: [{
+        messageId: 'om_a', reactionId: 'rid_om_a', turnId: 'om_a', clearOnReply: true,
+      }],
+    });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_a',
+      status: 'completed',
+    });
+    await flush();
+
+    expect(mocks.removeReaction).not.toHaveBeenCalled();
+    expect(ds.pendingAckReactions).toEqual([{
+      messageId: 'om_a', reactionId: 'rid_om_a', turnId: 'om_a', clearOnReply: true,
+    }]);
+  });
+
   it('idle does not clear a stable-card thread reaction before reply delivery', async () => {
     registerWith(false);
     const ds = makeDs({

@@ -9056,6 +9056,14 @@ function setupWorkerHandlers(
           // never let a projection/store failure crash the worker IPC loop.
           logger.error(`[${t}] Failed to persist turn_terminal for ${msg.turnId.substring(0, 8)}: ${err.message}`);
         }
+        // A stable-card thread normally clears its progress reaction when the
+        // reply lands. Genuine nothing-to-send has no reply event, so its
+        // positive terminal evidence is the only safe point to clear the exact
+        // turn. Bare completed is intentionally insufficient: a trailing reply
+        // may still be materializing after the terminal edge.
+        if (msg.status === 'completed' && msg.outputDisposition === 'nothing_to_send') {
+          await finishDeliveredTurnReactions(ds, msg.turnId);
+        }
         // Async-HTTP settle-on-terminal (core-only completion bug #70): a turn
         // the worker's bridge gate suppressed as GENUINE SILENCE (the model
         // terminated with a bare nothing-to-send sentinel, no `botmux send`)
@@ -9793,7 +9801,8 @@ async function finishTurnReactions(ds: DaemonSession): Promise<void> {
 }
 
 /** Remove the exact thread turn's progress reaction after its reply has been
- * delivered. Card-off entries keep their existing received→DONE idle flow. */
+ * delivered, or after positive terminal evidence says no reply will be sent.
+ * Card-off entries keep their existing received→DONE idle flow. */
 async function finishDeliveredTurnReactions(ds: DaemonSession, turnId: string): Promise<void> {
   const list = ds.pendingAckReactions;
   if (!list || list.length === 0) return;
