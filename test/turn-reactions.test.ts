@@ -622,6 +622,62 @@ describe('turn reaction screen_update behavioral gate', () => {
     }]);
   });
 
+  it('startup-failure reply clears the exact thread reaction after delivery', async () => {
+    registerWith(false);
+    const worker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'thread',
+      worker,
+      workerPort: 9999,
+      pendingAckReactions: [
+        { messageId: 'om_a', reactionId: 'rid_om_a', turnId: 'om_a', clearOnReply: true },
+        { messageId: 'om_b', reactionId: 'rid_om_b', turnId: 'om_b', clearOnReply: true },
+      ],
+    });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'error', turnId: 'om_a', message: 'CLI startup failed.',
+    });
+    await flush();
+
+    expect(mocks.sessionReply).toHaveBeenCalledWith(
+      'om_root', expect.stringContaining('CLI startup failed.'), 'text', APP, 'om_a', undefined,
+    );
+    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_a', 'rid_om_a');
+    expect(mocks.sessionReply.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.removeReaction.mock.invocationCallOrder[0],
+    );
+    expect(ds.pendingAckReactions).toEqual([{
+      messageId: 'om_b', reactionId: 'rid_om_b', turnId: 'om_b', clearOnReply: true,
+    }]);
+  });
+
+  it('failed startup-failure reply keeps the reaction pending', async () => {
+    registerWith(false);
+    mocks.sessionReply.mockRejectedValueOnce(new Error('Lark unavailable'));
+    const worker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'thread',
+      worker,
+      workerPort: 9999,
+      pendingAckReactions: [{
+        messageId: 'om_a', reactionId: 'rid_om_a', turnId: 'om_a', clearOnReply: true,
+      }],
+    });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'error', turnId: 'om_a', message: 'CLI startup failed.',
+    });
+    await flush();
+
+    expect(mocks.removeReaction).not.toHaveBeenCalled();
+    expect(ds.pendingAckReactions).toEqual([{
+      messageId: 'om_a', reactionId: 'rid_om_a', turnId: 'om_a', clearOnReply: true,
+    }]);
+  });
+
   it('bare completed terminal does not clear a thread reaction before a trailing reply', async () => {
     registerWith(false);
     const worker = makeFakeWorker();

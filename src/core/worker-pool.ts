@@ -6862,16 +6862,18 @@ export function forkWorker(
     }
     const cliName = sessionCliDisplayName(ds, botCfg);
     const message = tr('worker.start_failed', { cliName, reason }, botLocale(botCfg));
+    const replyTurnId = fallbackTurnId(ds, initAttributionTurnId);
     void cb.sessionReply(
       sessionAnchorId(ds),
       message,
       'text',
       ds.larkAppId,
-      fallbackTurnId(ds, initAttributionTurnId),
+      replyTurnId,
       ds.session.vcMeetingReceiver
         ? { sourceSessionId: ds.session.sessionId }
         : undefined,
-    ).catch(replyErr => logger.error(`[${t}] Failed to deliver worker fork error to Lark: ${replyErr}`));
+    ).then(() => finishDeliveredTurnReactions(ds, replyTurnId))
+      .catch(replyErr => logger.error(`[${t}] Failed to deliver worker fork error to Lark: ${replyErr}`));
   });
 
   // Pipe worker stdout/stderr to daemon logger.
@@ -7409,6 +7411,7 @@ function setupWorkerHandlers(
     const message = tr('worker.start_failed', { cliName, reason }, loc);
     try {
       await scopedReply(message, 'text', turnId);
+      if (turnId) await finishDeliveredTurnReactions(ds, turnId);
     } catch (err: any) {
       logger.error(`[${t}] Failed to deliver worker startup failure to Lark: ${err?.message ?? err}`);
     }
