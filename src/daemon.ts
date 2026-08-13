@@ -16743,13 +16743,22 @@ function deliverPassthroughToExistingSession(
     // clearing the marker would lose the opening for the next real turn.
     // `/model` on an empty-started session therefore stays literal and the
     // FOLLOWING business message still opens as a new topic.
-    beginNewTurn(ds, commandContent, turn.messageId);
-    sendWorkerSessionInput(ds, {
+    const accepted = sendWorkerSessionInput(ds, {
       type: 'raw_input',
       content: commandContent,
       turnId: turn.messageId,
     });
+    if (!accepted) {
+      void sessionReply(
+        anchor,
+        tr('daemon.cmd_needs_active_cli', { cmd }, localeForBot(larkAppId)),
+        'text',
+        larkAppId,
+      );
+      return;
+    }
     turn.onDelivered?.();
+    beginNewTurn(ds, commandContent, turn.messageId);
     markSessionActivity(ds);
     logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
     return;
