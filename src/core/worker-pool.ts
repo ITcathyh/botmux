@@ -1515,6 +1515,12 @@ export async function postTurnStartingCard(
       return false;
     }
     ds.streamCardId = messageId;
+    // Screen/status updates can arrive while the starting-card POST owns the
+    // sentinel. Keep their latest-wins payload queued, then retarget it to the
+    // real message id once the POST lands.
+    if (ds.pendingCardJson && ds.pendingCardId === CARD_POSTING_SENTINEL) {
+      ds.pendingCardId = messageId;
+    }
     ds.parkedStreamCardNonce = undefined;
     const superseded = (ds.streamCardTurnGeneration ?? 0) !== generation;
     if (!superseded) {
@@ -1528,6 +1534,7 @@ export async function postTurnStartingCard(
     flushPendingActiveRuntimePatch(ds);
     flushPendingCodexServiceTierPatch(ds);
     syncUsageRefreshTimer(ds);
+    if (ds.pendingCardJson && !ds.cardPatchInFlight) flushCardPatch(ds);
     logger.info(`[${tag(ds)}] Posted starting card for turn ${turnId.substring(0, 12)}`);
     if (superseded && ds.streamCardPendingTurnId) {
       void postTurnStartingCard(ds, sessionReply, ds.streamCardPendingTurnId);
@@ -2030,12 +2037,16 @@ function flushCardPatch(ds: DaemonSession): void {
   const json = ds.pendingCardJson;
   const cardId = ds.pendingCardId;
   const withdrawnFallback = ds.pendingCardWithdrawFallback;
-  if (!json || !cardId || cardId === CARD_POSTING_SENTINEL) {
+  if (!json || !cardId) {
     ds.pendingCardJson = undefined;
     ds.pendingCardId = undefined;
     ds.pendingCardWithdrawFallback = undefined;
     return;
   }
+  // A starting-card POST will replace the sentinel with its real message id
+  // and flush this latest payload. Clearing here loses working/idle updates
+  // that raced the POST and can leave the visible replacement at "starting".
+  if (cardId === CARD_POSTING_SENTINEL) return;
   ds.pendingCardJson = undefined;
   ds.pendingCardId = undefined;
   ds.pendingCardWithdrawFallback = undefined;
@@ -2070,6 +2081,9 @@ function flushCardPatch(ds: DaemonSession): void {
           ds.streamCardId = undefined;
           ds.streamCardPending = true;
           ds.streamCardPendingTurnId = withdrawnFallback.turnId;
+          if (ds.pendingCardJson && ds.pendingCardId === cardId) {
+            ds.pendingCardId = CARD_POSTING_SENTINEL;
+          }
           persistStreamCardState(ds);
           void postTurnStartingCard(ds, requireCallbacks().sessionReply, withdrawnFallback.turnId);
         }

@@ -537,6 +537,40 @@ describe('reuseThreadStreamingCardForTurn', () => {
     expect(ds.streamCardId).toBe('om_replacement');
   });
 
+  it('replays the latest queued status onto the withdrawn-card replacement', async () => {
+    let rejectReusePatch!: (error: Error) => void;
+    updateMessageMock.mockImplementationOnce(
+      () => new Promise<void>((_resolve, reject) => { rejectReusePatch = reject; }),
+    );
+    let resolveReplacementPost!: (messageId: string) => void;
+    sessionReplyMock.mockImplementationOnce(
+      () => new Promise<string>((resolve) => { resolveReplacementPost = resolve; }),
+    );
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardId = 'om_withdrawn';
+    ds.streamCardNonce = 'nonce_withdrawn';
+
+    expect(reuseThreadStreamingCardForTurn(ds, 'next question', 'om_next_turn')).toBe(true);
+    scheduleCardPatch(ds, 'completed payload', 'om_next_turn');
+    rejectReusePatch(new MessageWithdrawnError('om_withdrawn'));
+    await flush();
+    await flush();
+
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+    expect(updateMessageMock).toHaveBeenCalledTimes(1);
+    expect(ds.pendingCardJson).toBe('completed payload');
+
+    resolveReplacementPost('om_replacement');
+    await flush();
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenNthCalledWith(
+      2, APP_ID, 'om_replacement', 'completed payload',
+    );
+    expect(ds.pendingCardJson).toBeUndefined();
+  });
+
   it('keeps the fresh-card flow for flat chat sessions', () => {
     const ds = makeDs();
     ds.scope = 'chat';
