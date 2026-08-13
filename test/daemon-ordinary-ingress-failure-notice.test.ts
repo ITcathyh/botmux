@@ -282,6 +282,62 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     expect(repliedText()).toContain(expectedNotice());
   });
 
+  it('pinned new-topic fork failure removes its thread progress reaction', async () => {
+    mkdirSync(mocks.dataDir, { recursive: true });
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+      defaultWorkingDir: mocks.dataDir,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    mocks.forkWorker.mockImplementation(() => {
+      throw new Error('new topic fork failed: EAGAIN');
+    });
+
+    await expect(
+      handleNewTopic(
+        makeEventData('om_msg_new_pinned', 'start pinned task'),
+        makeCtx('om_msg_new_pinned', 'om_msg_new_pinned'),
+      ),
+    ).rejects.toThrow('new topic fork failed: EAGAIN');
+
+    expect(mocks.removeReaction).toHaveBeenCalledWith(
+      APP,
+      'om_msg_new_pinned',
+      'reaction_received',
+    );
+  });
+
+  it('pinned thread auto-create fork failure removes its progress reaction', async () => {
+    mkdirSync(mocks.dataDir, { recursive: true });
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+      defaultWorkingDir: mocks.dataDir,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    mocks.forkWorker.mockImplementation(() => {
+      throw new Error('auto-create fork failed: EAGAIN');
+    });
+
+    await expect(
+      handleThreadReply(
+        makeEventData('om_msg_auto_pinned', 'continue pinned task', 'om_auto_root'),
+        makeCtx('om_auto_root', 'om_msg_auto_pinned'),
+      ),
+    ).rejects.toThrow('auto-create fork failed: EAGAIN');
+
+    expect(mocks.removeReaction).toHaveBeenCalledWith(
+      APP,
+      'om_msg_auto_pinned',
+      'reaction_received',
+    );
+  });
+
   it('successful delivery sends no failure notice', async () => {
     const anchor = 'om_thread_root_3';
     const ds = seedThreadSession(anchor, 'seeded');

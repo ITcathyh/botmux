@@ -16517,6 +16517,21 @@ function forkReservedInitialSession(ds: DaemonSession, availableBots: AvailableB
   }
 }
 
+/** A pinned initial session has no durable pending-repo journal. If its fork
+ * fails, undo the reaction registered immediately before admission. */
+async function forkPinnedInitialSession(
+  ds: DaemonSession,
+  availableBots: AvailableBot[],
+  turnId: string,
+): Promise<void> {
+  try {
+    forkReservedInitialSession(ds, availableBots);
+  } catch (err) {
+    await discardTurnReceivedReaction(ds, turnId);
+    throw err;
+  }
+}
+
 /** Raw slash-command cold starts type the raw command only after prompt_ready.
  * Buffer later same-anchor messages into the ordered follow-up payload carried
  * on that same raw_input IPC; a separate worker message could overtake the
@@ -17753,7 +17768,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     });
     const availableBots = await getAvailableBots(larkAppId, chatId);
     await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-    forkReservedInitialSession(ds, availableBots);
+    await forkPinnedInitialSession(ds, availableBots, messageId);
     // fork 成功即开场已交给 CLI；fork 抛错则开场只存在于内存，保持重发提示。
     markIngressAdmitted(ctx);
     const reason = oncallEntry
@@ -18226,11 +18241,12 @@ async function handleBotAdded(
       }
       await noteTurnReceived(ds, anchor, promptBody);
       if (joinBootstrapWasTakenOver()) {
+        await discardTurnReceivedReaction(ds, anchor);
         withdrawSharedReplySeed();
         return;
       }
       armSharedReplyTarget();
-      forkReservedInitialSession(ds, availableBots);
+      await forkPinnedInitialSession(ds, availableBots, anchor);
       ds.pendingTurnId = undefined;
       ds.pendingChatContext = undefined;
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 自动开工（${mode}/${scope}），workingDir=${pinnedWorkingDir}`);
@@ -19441,7 +19457,7 @@ async function handleThreadReplyAdmitted(
       ensureSessionWhiteboard(newDs);
       const availableBots = await getAvailableBots(larkAppId, autoCreateChatId);
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-      forkReservedInitialSession(newDs, availableBots);
+      await forkPinnedInitialSession(newDs, availableBots, parsed.messageId);
       // fork 成功即开场已交给 CLI；fork 抛错则开场只存在于内存，保持重发提示。
       markIngressAdmitted(ctx);
       const reason = oncallEntry
