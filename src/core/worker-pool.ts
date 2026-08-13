@@ -7732,12 +7732,30 @@ function setupWorkerHandlers(
               sessionRuntimeDisplayName(ds, botCfg),
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
             );
-            await updateMessage(ds.larkAppId, restoredCardId, streamCardJson);
+            // A previous worker generation may still own an in-flight PATCH
+            // for this same stable card. Queue readiness behind it so the old
+            // payload cannot finish after ready and overwrite the new turn.
+            // The exact fallback also makes a withdrawal discovered by either
+            // serialized request converge to a replacement for this turn.
+            const readyTurnId = msg.turnId ?? ds.streamCardVisualTurnId;
+            scheduleCardPatch(
+              ds,
+              streamCardJson,
+              readyTurnId,
+              readyTurnId && ds.scope === 'thread'
+                ? {
+                    withdrawnFallback: {
+                      turnId: readyTurnId,
+                      generation: ds.streamCardTurnGeneration ?? 0,
+                    },
+                  }
+                : undefined,
+            );
             if (!ownsLifecycleMutation()) break;
             ds.parkedStreamCardNonce = undefined;
-            // Worker IPC handlers may run while the direct restore PATCH is in
-            // flight. Re-queue readiness after it completes so an older
-            // not-ready payload can never overwrite the cli_session_id PATCH.
+            // Worker IPC handlers may run while the queued restore PATCH is in
+            // flight. Re-queue readiness so the serialized latest-wins payload
+            // includes any newly available local CLI capability.
             if (!localCliReadyAtBuild && isLocalCliOpenReady(ds, { cliId: effectiveCliId })) {
               scheduleLocalCliOpenReadinessPatch(ds);
             }

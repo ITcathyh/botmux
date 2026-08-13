@@ -148,7 +148,13 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 
 // ─── Imports under test ────────────────────────────────────────────────────
 
-import { CARD_POSTING_SENTINEL, initWorkerPool, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
+import {
+  CARD_POSTING_SENTINEL,
+  initWorkerPool,
+  reuseThreadStreamingCardForTurn,
+  scheduleCardPatch,
+  __testOnly_setupWorkerHandlers,
+} from '../src/core/worker-pool.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { getBot } from '../src/bot-registry.js';
@@ -636,6 +642,48 @@ describe('Worker ready: set_display_mode re-sync', () => {
     );
   });
 
+  it('serializes refork readiness behind an older PATCH and recovers withdrawal for the new turn', async () => {
+    let rejectOldPatch!: (error: Error) => void;
+    updateMessageMock
+      .mockImplementationOnce(() => new Promise<void>((_resolve, reject) => {
+        rejectOldPatch = reject;
+      }))
+      .mockRejectedValueOnce(new MessageWithdrawnError('om_existing_card'));
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'thread',
+      worker: fakeWorker,
+      workerReady: false,
+      streamCardPending: false,
+      streamCardId: 'om_existing_card',
+      streamCardNonce: 'stable-nonce',
+      streamCardTurnGeneration: 4,
+      streamCardVisualTurnId: 'om_previous_turn',
+    });
+
+    scheduleCardPatch(ds, 'previous-generation payload');
+    expect(reuseThreadStreamingCardForTurn(ds, 'new turn', 'om_new_turn')).toBe(true);
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', {
+      type: 'ready', port: 9999, token: 'tok_abc', turnId: 'om_new_turn',
+    });
+    await flush();
+
+    // ready must queue behind the prior generation instead of issuing a
+    // concurrent direct PATCH that the old request could overwrite later.
+    expect(updateMessageMock).toHaveBeenCalledTimes(1);
+
+    rejectOldPatch(new MessageWithdrawnError('om_existing_card'));
+    await flush();
+    await flush();
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenCalledTimes(2);
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+    expect(sessionReplyMock.mock.calls[0][4]).toBe('om_new_turn');
+    expect(ds.streamCardId).toBe('om_new_card');
+  });
+
   it('silent recovery restores screenshot mode without touching the streaming card', async () => {
     const fakeWorker = makeFakeWorker();
     const ds = makeDs({
@@ -682,14 +730,13 @@ describe('Worker ready: set_display_mode re-sync', () => {
 
     fakeWorker.emit('message', { type: 'cli_session_id', cliSessionId: 'trae-native-ready' });
     await flush();
-    expect(updateMessageMock).toHaveBeenCalledTimes(2);
-    expect(JSON.parse(updateMessageMock.mock.calls[1][2])).toMatchObject({ localCliReady: true });
+    expect(updateMessageMock).toHaveBeenCalledTimes(1);
 
     resolveRestorePatch();
     await flush();
     await flush();
 
-    expect(updateMessageMock).toHaveBeenCalledTimes(3);
+    expect(updateMessageMock).toHaveBeenCalledTimes(2);
     expect(JSON.parse(updateMessageMock.mock.calls.at(-1)![2])).toMatchObject({ localCliReady: true });
   });
 
