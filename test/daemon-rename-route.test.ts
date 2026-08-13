@@ -725,6 +725,32 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
   });
 
+  it('does not establish a visual turn fence for a card-off thread turn', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      disableStreamingCard: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const ds = seedThreadSession('om_card_off_root', 'card off');
+    ds.streamCardVisualTurnId = 'om_previous_turn';
+    const send = vi.fn();
+    ds.worker = { killed: false, send } as any;
+
+    await handleThreadReply(
+      makeEventData('om_card_off_next', 'next task', 'om_card_off_root'),
+      makeCtx('om_card_off_root', 'om_card_off_next'),
+    );
+
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message',
+      turnId: 'om_card_off_next',
+    }));
+    expect(ds.streamCardVisualTurnId).toBeUndefined();
+  });
+
   it('`/t <content>` preserves a paired forward seed in the first worker input', async () => {
     const bot = registerBot({
       larkAppId: APP,

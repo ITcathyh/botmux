@@ -4354,7 +4354,12 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
   // Use `/card on` to persistently restore cards for the chat.
   ds.streamingCardForced = undefined;
   if (reuseThreadStreamingCardForTurn(ds, title, turnId)) return;
-  if (ds.scope === 'thread') ds.streamCardVisualTurnId = turnId;
+  if (ds.scope === 'thread') {
+    // Card-off turns have no visual surface to own. Leaving an exact turn fence
+    // here would make an older turn's idle look visually superseded and skip
+    // its dashboard/reaction settlement.
+    ds.streamCardVisualTurnId = streamingCardDisabledFor(ds, turnId) ? undefined : turnId;
+  }
   const previousUsageLimit = ds.usageLimit;
   const previousStatus = ds.lastScreenStatus === 'limited' && previousUsageLimit ? 'limited' : 'idle';
   if (ds.streamCardId && workerHasInitialized(ds)) {
