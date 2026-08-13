@@ -1416,7 +1416,11 @@ export function reuseThreadStreamingCardForTurn(
   // A stopped worker's ready handler owns the first PATCH because it adds the
   // newly-established terminal/readiness state. Queuing this older starting
   // card now could resolve after ready's direct update and overwrite it.
-  if (workerHasInitialized(ds)) scheduleCardPatch(ds, cardJson, turnId);
+  if (workerHasInitialized(ds)) {
+    scheduleCardPatch(ds, cardJson, turnId, {
+      withdrawnFallback: { turnId, generation: ds.streamCardTurnGeneration },
+    });
+  }
   logger.info(`[${tag(ds)}] Reused streaming card for turn ${turnId.substring(0, 12)}`);
   return true;
 }
@@ -1990,7 +1994,12 @@ export async function deliverEphemeralOrReply(
  * Otherwise stores the card JSON on `ds.pendingCardJson` (overwriting
  * any previously queued value — only the latest state matters).
  */
-export function scheduleCardPatch(ds: DaemonSession, cardJson: string, turnId?: string): void {
+export function scheduleCardPatch(
+  ds: DaemonSession,
+  cardJson: string,
+  turnId?: string,
+  options?: { withdrawnFallback?: { turnId: string; generation: number } },
+): void {
   // Defense-in-depth transport gate: a no-transport session (apiOnly bot or HTTP
   // virtual chat) has no real Feishu card to PATCH. Callers already suppress via
   // managedAuxUiSuppressed, but guarding the flush entry too means a stray direct
@@ -2004,7 +2013,15 @@ export function scheduleCardPatch(ds: DaemonSession, cardJson: string, turnId?: 
   ds.pendingCardJson = cardJson;
   // Capture the card ID now — by the time flushCardPatch runs, ds.streamCardId
   // may have been overwritten by a new turn's card (CARD_POSTING_SENTINEL).
-  ds.pendingCardId = ds.streamCardId;
+  const pendingCardId = ds.streamCardId;
+  if (options?.withdrawnFallback) {
+    ds.pendingCardWithdrawFallback = options.withdrawnFallback;
+  } else if (ds.pendingCardId !== pendingCardId) {
+    // A same-card status refresh must not erase a queued reuse fallback. A
+    // different card identity owns a different lifecycle and must not inherit it.
+    ds.pendingCardWithdrawFallback = undefined;
+  }
+  ds.pendingCardId = pendingCardId;
   if (ds.cardPatchInFlight) return;
   flushCardPatch(ds);
 }
@@ -2012,13 +2029,16 @@ export function scheduleCardPatch(ds: DaemonSession, cardJson: string, turnId?: 
 function flushCardPatch(ds: DaemonSession): void {
   const json = ds.pendingCardJson;
   const cardId = ds.pendingCardId;
+  const withdrawnFallback = ds.pendingCardWithdrawFallback;
   if (!json || !cardId || cardId === CARD_POSTING_SENTINEL) {
     ds.pendingCardJson = undefined;
     ds.pendingCardId = undefined;
+    ds.pendingCardWithdrawFallback = undefined;
     return;
   }
   ds.pendingCardJson = undefined;
   ds.pendingCardId = undefined;
+  ds.pendingCardWithdrawFallback = undefined;
   ds.cardPatchInFlight = true;
   updateMessage(ds.larkAppId, cardId, json)
     .catch(err => {
@@ -2036,6 +2056,22 @@ function flushCardPatch(ds: DaemonSession): void {
           persistStreamCardState(ds);
         } else {
           logger.debug(`[${tag(ds)}] Stale card ${cardId.substring(0, 12)} withdrawn (current: ${ds.streamCardId?.substring(0, 12) ?? 'none'})`);
+        }
+        // A turn that intentionally reused a stable thread card must still
+        // surface a status card when that persisted message was withdrawn.
+        // Generation matching prevents an older in-flight PATCH from posting
+        // for a newer type-ahead turn. `streamCardId` may already be undefined
+        // because an earlier queued PATCH discovered the same withdrawal.
+        if (
+          withdrawnFallback
+          && withdrawnFallback.generation === (ds.streamCardTurnGeneration ?? 0)
+          && (ds.streamCardId === undefined || ds.streamCardId === cardId)
+        ) {
+          ds.streamCardId = undefined;
+          ds.streamCardPending = true;
+          ds.streamCardPendingTurnId = withdrawnFallback.turnId;
+          persistStreamCardState(ds);
+          void postTurnStartingCard(ds, requireCallbacks().sessionReply, withdrawnFallback.turnId);
         }
         return;
       }
