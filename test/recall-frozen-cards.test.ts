@@ -683,6 +683,7 @@ describe('postTurnStartingCard', () => {
     // with another synthetic starting state.
     ds.pendingCardJson = '{"status":"working"}';
     ds.pendingCardId = CARD_POSTING_SENTINEL;
+    ds.pendingCardTurnId = 'om_turn_2';
 
     resolveFirst('om_turn_card_1');
     await firstPost;
@@ -700,6 +701,39 @@ describe('postTurnStartingCard', () => {
     expect(ds.streamCardPendingTurnId).toBeUndefined();
     expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_previous');
     expect(deleteMessageMock).not.toHaveBeenCalledWith(APP_ID, 'om_turn_card_1');
+  });
+
+  it('replaces a predecessor snapshot queued during a superseded thread POST', async () => {
+    let resolveFirst!: (messageId: string) => void;
+    const sessionReply = vi.fn()
+      .mockImplementationOnce(() => new Promise<string>(resolve => { resolveFirst = resolve; }));
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+    ds.currentTurnTitle = 'first turn';
+
+    const firstPost = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
+    ds.streamCardTurnGeneration = 2;
+    ds.streamCardPendingTurnId = 'om_turn_2';
+    ds.currentTurnTitle = 'second turn';
+    // beginNewTurn freezes N without assigning N+1 as the payload owner.
+    ds.pendingCardJson = '{"status":"idle","title":"first turn"}';
+    ds.pendingCardId = CARD_POSTING_SENTINEL;
+
+    resolveFirst('om_turn_card_1');
+    await firstPost;
+    await flush();
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(updateMessageMock).toHaveBeenCalledWith(APP_ID, 'om_turn_card_1', '{}');
+    expect(updateMessageMock).not.toHaveBeenCalledWith(
+      APP_ID,
+      'om_turn_card_1',
+      '{"status":"idle","title":"first turn"}',
+    );
+    expect(ds.streamCardVisualTurnId).toBe('om_turn_2');
   });
 
   it('restores the previous live card when the starting-card POST fails', async () => {

@@ -1547,7 +1547,7 @@ export async function postTurnStartingCard(
         turnId: latestPendingTurnId,
         generation: ds.streamCardTurnGeneration ?? 0,
       };
-      if (ds.pendingCardJson) {
+      if (ds.pendingCardJson && ds.pendingCardTurnId === latestPendingTurnId) {
         // Preserve a newer working/idle payload that raced the POST; it is more
         // current than another synthetic "starting" card.
         ds.pendingCardWithdrawFallback = withdrawnFallback;
@@ -2054,6 +2054,7 @@ export function scheduleCardPatch(
   // versa) just because it overwrote the latest-turn slot.
   if (streamingCardDisabled(ds, turnId)) return;
   ds.pendingCardJson = cardJson;
+  ds.pendingCardTurnId = turnId;
   // Capture the card ID now — by the time flushCardPatch runs, ds.streamCardId
   // may have been overwritten by a new turn's card (CARD_POSTING_SENTINEL).
   const pendingCardId = ds.streamCardId;
@@ -2076,6 +2077,7 @@ function flushCardPatch(ds: DaemonSession): void {
   if (!json || !cardId) {
     ds.pendingCardJson = undefined;
     ds.pendingCardId = undefined;
+    ds.pendingCardTurnId = undefined;
     ds.pendingCardWithdrawFallback = undefined;
     return;
   }
@@ -2085,6 +2087,7 @@ function flushCardPatch(ds: DaemonSession): void {
   if (cardId === CARD_POSTING_SENTINEL) return;
   ds.pendingCardJson = undefined;
   ds.pendingCardId = undefined;
+  ds.pendingCardTurnId = undefined;
   ds.pendingCardWithdrawFallback = undefined;
   ds.cardPatchInFlight = true;
   updateMessage(ds.larkAppId, cardId, json)
