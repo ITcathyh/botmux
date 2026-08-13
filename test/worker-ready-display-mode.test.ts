@@ -19,7 +19,10 @@ import { EventEmitter } from 'node:events';
 // ─── Mocks ─────────────────────────────────────────────────────────────────
 
 const updateMessageMock = vi.fn(async () => {});
-const { loggerInfoMock } = vi.hoisted(() => ({ loggerInfoMock: vi.fn() }));
+const { loggerInfoMock, recordUsageMock } = vi.hoisted(() => ({
+  loggerInfoMock: vi.fn(),
+  recordUsageMock: vi.fn(),
+}));
 
 vi.mock('../src/im/lark/client.js', () => {
   class MessageWithdrawnError extends Error {
@@ -90,6 +93,11 @@ vi.mock('../src/core/dashboard-events.js', () => ({
 
 vi.mock('../src/core/dashboard-rows.js', () => ({
   composeRowFromActive: vi.fn(() => ({ tokenUsage: undefined })),
+}));
+
+vi.mock('../src/services/usage-ledger.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/services/usage-ledger.js')>()),
+  recordUsageForDaemonSession: (...args: any[]) => recordUsageMock(...args),
 }));
 
 vi.mock('../src/skills/installer.js', () => ({
@@ -424,6 +432,7 @@ describe('Worker ready: set_display_mode re-sync', () => {
     expect(ds.lastScreenContent).toBe('');
     expect(ds.lastScreenStatus).toBe('starting');
     expect(ds.currentImageKey).toBeUndefined();
+    expect(recordUsageMock).toHaveBeenCalledWith(ds);
 
     fakeWorker.emit('message', {
       type: 'screen_update',

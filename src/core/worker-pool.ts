@@ -8083,22 +8083,20 @@ function setupWorkerHandlers(
         // ZMX intentionally reports ready with port=0, but its plain-history
         // screenshots and idle/status transitions must keep flowing.
         if (!startupState.ready && !workerHasInitialized(ds)) break;
-        if (
+        const supersededCardVisual = (
           ds.scope === 'thread'
           && ds.streamCardVisualTurnId
           && msg.turnId
           && msg.turnId !== ds.streamCardVisualTurnId
-        ) {
-          logger.debug(
-            `[${t}] Ignored visual update for superseded turn ${msg.turnId.substring(0, 12)} `
-            + `(card owner ${ds.streamCardVisualTurnId.substring(0, 12)})`,
-          );
-          break;
-        }
+        );
+        const preservedCardContent = ds.lastScreenContent;
+        const preservedCardStatus = ds.lastScreenStatus;
         const prevStatus = ds.lastScreenStatus;
-        updateUsageLimitState(ds, msg.usageLimit);
+        if (!supersededCardVisual) updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenContent = msg.content;
-        ds.lastScreenStatus = (msg.usageLimit ?? ds.usageLimit) ? 'limited' : msg.status;
+        ds.lastScreenStatus = (msg.usageLimit ?? (supersededCardVisual ? undefined : ds.usageLimit))
+          ? 'limited'
+          : msg.status;
         // A suspend that arrived mid-turn parked itself here. Defer until this
         // screen_update has finished using process state — suspendWorker nulls
         // `worker` + `lastScreenStatus`, which everything below still reads
@@ -8176,6 +8174,16 @@ function setupWorkerHandlers(
             // The newly-idle session itself may be the oldest eviction target.
             queueMicrotask(cb.enforceLiveSessionCap);
           }
+        }
+
+        if (supersededCardVisual) {
+          ds.lastScreenContent = preservedCardContent;
+          ds.lastScreenStatus = preservedCardStatus;
+          logger.debug(
+            `[${t}] Kept bookkeeping but ignored card update for superseded turn ${msg.turnId!.substring(0, 12)} `
+            + `(card owner ${ds.streamCardVisualTurnId!.substring(0, 12)})`,
+          );
+          break;
         }
 
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) { clearUsageRefreshTimer(ds); break; }
@@ -8318,25 +8326,23 @@ function setupWorkerHandlers(
       }
 
       case 'screenshot_uploaded': {
-        if (
+        const supersededCardVisual = (
           ds.scope === 'thread'
           && ds.streamCardVisualTurnId
           && msg.turnId
           && msg.turnId !== ds.streamCardVisualTurnId
-        ) {
-          logger.debug(
-            `[${t}] Ignored screenshot for superseded turn ${msg.turnId.substring(0, 12)} `
-            + `(card owner ${ds.streamCardVisualTurnId.substring(0, 12)})`,
-          );
-          break;
-        }
+        );
+        const preservedCardImageKey = ds.currentImageKey;
+        const preservedCardStatus = ds.lastScreenStatus;
         // Drop uploads that arrived during a new-turn handoff — the image_key may
         // reflect previous turn's content. Next 10s cycle picks up fresh content.
         if (ds.streamCardPending) break;
         ds.currentImageKey = msg.imageKey;
         const prevStatus = ds.lastScreenStatus;
-        updateUsageLimitState(ds, msg.usageLimit);
-        ds.lastScreenStatus = (msg.usageLimit ?? ds.usageLimit) ? 'limited' : msg.status;
+        if (!supersededCardVisual) updateUsageLimitState(ds, msg.usageLimit);
+        ds.lastScreenStatus = (msg.usageLimit ?? (supersededCardVisual ? undefined : ds.usageLimit))
+          ? 'limited'
+          : msg.status;
         // Same deferred-suspend checkpoint as the screen_update branch, and
         // deferred for the same reason (see runPendingSuspendIfSettled).
         // The predicate is defense-in-depth here: the handler's fence already
@@ -8350,6 +8356,15 @@ function setupWorkerHandlers(
           imageKey: msg.imageKey,
           content: ds.lastScreenContent ?? '',
         });
+        if (supersededCardVisual) {
+          ds.currentImageKey = preservedCardImageKey;
+          ds.lastScreenStatus = preservedCardStatus;
+          logger.debug(
+            `[${t}] Kept bookkeeping but ignored screenshot for superseded turn ${msg.turnId!.substring(0, 12)} `
+            + `(card owner ${ds.streamCardVisualTurnId!.substring(0, 12)})`,
+          );
+          break;
+        }
         persistStreamCardState(ds);
         // screenshot_uploaded never ARMS the usage refresh — screen_update owns
         // the authorized arm. Here we only tear it down: unconditionally on
