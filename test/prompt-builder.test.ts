@@ -315,8 +315,8 @@ describe('botmux routing prose XML boundaries', () => {
   });
 
   it.each([
-    ['zh', '&lt;对方 bot 的 open_id&gt;'],
-    ['en', '&lt;other-bot-open-id&gt;'],
+    ['zh', '&lt;对方 open_id&gt;'],
+    ['en', '&lt;their open_id&gt;'],
   ] as const)('escapes tag-like placeholders in the %s system-prompt prose while preserving real structure and heredoc syntax', (locale, mentionPlaceholder) => {
     const prompt = buildBotmuxSystemPromptText({
       locale,
@@ -330,8 +330,8 @@ describe('botmux routing prose XML boundaries', () => {
     expect(prompt).toContain(mentionPlaceholder);
     expect(prompt).toContain('&lt;available_bots&gt;');
     expect(prompt).toContain('&lt;whiteboard&gt;');
-    expect(prompt).toContain("botmux send <<'EOF'");
-    expect(prompt).not.toContain("botmux send &lt;&lt;'EOF'");
+    expect(prompt).toContain('botmux send <<EOF');
+    expect(prompt).not.toContain('botmux send &lt;&lt;EOF');
     expect(prose.match(/<[^<>\r\n]+>/g) ?? []).toEqual([]);
   });
 });
