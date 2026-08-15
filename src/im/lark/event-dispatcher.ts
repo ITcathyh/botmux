@@ -3464,11 +3464,14 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // 已拥有会话的话题内免 @ 续话：
         //   • 'topic'       —— 任意群（话题群 + 普通群 shared/new-topic 话题）
         //   • 'topic-group' —— 默认档，仅话题群（chat_mode=topic）；普通群仍需 @
-        // decideRouting 已为群消息预热 chat_mode 缓存，getChatMode 命中缓存不产生
-        // API 往返；短路保证仅在 topic-group 且其余条件满足时才读取。
-        const ownedTopicNoMention = ownsSession && !!message.thread_id && !mentionsOther
+        // 话题群判定用 forceRefresh 重新拉取：real-thread 消息在 decideRoutingWithSource
+        // 提前返回（root_id+thread_id 分支），不会预热/校验 chat_mode 缓存，若管理员在
+        // 缓存 TTL 内把话题群转回普通群，复用旧值会误放行。显式 @ 本 bot 的消息走
+        // checkGroupMessageAccess，无需此放宽，短路掉避免一次 API 调用。
+        const ownedTopicNoMention = !explicitlyMentionedThisBot
+          && ownsSession && !!message.thread_id && !mentionsOther
           && (mentionMode === 'topic'
-            || (mentionMode === 'topic-group' && (await getChatMode(larkAppId, chatId)) === 'topic'));
+            || (mentionMode === 'topic-group' && (await getChatMode(larkAppId, chatId, { forceRefresh: true })) === 'topic'));
         let stats: { userCount: number; botCount: number } | null = null;
         if (ownsSession && !replyRootId && !mentionsOther && mentionMode !== 'never' && !ownedTopicNoMention) {
           stats = await getGroupStats(larkAppId, chatId);
