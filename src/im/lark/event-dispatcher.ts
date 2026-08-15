@@ -3241,17 +3241,17 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       // Shared-mode follow-up: a non-@ message inside a Lark thread can belong
       // to the regular group's chat-scope session when that root was registered
       // as a shared-topic alias. Whether a 普通群 answers it without an @mention
-      // is governed by the bot-global mention policy: 'always' (default) keeps
-      // "@ required" so this fold-back is skipped (non-@ thread chatter falls
-      // through to the gate below and is ignored — only an explicit @ continues
-      // a shared topic); 'topic', 'never' and 'ambient' enable the seamless
-      // no-@ fold-back. Carve-out: under 'topic' / 'ambient', a non-@ reply
-      // that @mentions another specific member (person/bot) is a redirect to
-      // someone else → back off, don't fold it in (mentionsAnotherMember).
-      // 'never' stays unconditional by design.
+      // is governed by the bot-global mention policy: 'always' and the default
+      // 'topic-group' both keep "@ required" in 普通群 so this fold-back is
+      // skipped (non-@ thread chatter falls through to the gate below and is
+      // ignored — only an explicit @ continues a shared topic); 'topic', 'never'
+      // and 'ambient' enable the seamless no-@ fold-back. Carve-out: under
+      // 'topic' / 'ambient', a non-@ reply that @mentions another specific
+      // member (person/bot) is a redirect to someone else → back off, don't
+      // fold it in (mentionsAnotherMember). 'never' stays unconditional by design.
       const mentionModeForAlias = resolveGroupMentionMode(larkAppId);
       if (!explicitlyMentionedThisBot
-          && mentionModeForAlias !== 'always'
+          && (mentionModeForAlias === 'topic' || mentionModeForAlias === 'never' || mentionModeForAlias === 'ambient')
           && !((mentionModeForAlias === 'topic' || mentionModeForAlias === 'ambient') && mentionsAnotherMember(larkAppId, message))
           && routing.scope === 'thread' && message.root_id && message.thread_id && chatType === 'group') {
         const alias = handlers.resolveReplyThreadAlias?.(message.root_id, chatId, larkAppId) ?? null;
@@ -3461,8 +3461,16 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // 昂贵的）人数查询。这在「刚拉了新 bot、用户 @ 新 bot」窗口里尤为重要：
         // 拦截老 bot 的同时不再为它反复刷新陈旧缓存。
         const mentionsOther = mentionsAnotherMember(larkAppId, message);
+        // 已拥有会话的话题内免 @ 续话：
+        //   • 'topic'       —— 任意群（话题群 + 普通群 shared/new-topic 话题）
+        //   • 'topic-group' —— 默认档，仅话题群（chat_mode=topic）；普通群仍需 @
+        // decideRouting 已为群消息预热 chat_mode 缓存，getChatMode 命中缓存不产生
+        // API 往返；短路保证仅在 topic-group 且其余条件满足时才读取。
+        const ownedTopicNoMention = ownsSession && !!message.thread_id && !mentionsOther
+          && (mentionMode === 'topic'
+            || (mentionMode === 'topic-group' && (await getChatMode(larkAppId, chatId)) === 'topic'));
         let stats: { userCount: number; botCount: number } | null = null;
-        if (ownsSession && !replyRootId && !mentionsOther && mentionMode !== 'never') {
+        if (ownsSession && !replyRootId && !mentionsOther && mentionMode !== 'never' && !ownedTopicNoMention) {
           stats = await getGroupStats(larkAppId, chatId);
         }
         // replyRootId means this turn has already been explicitly addressed
@@ -3487,14 +3495,19 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         //     brand-new top-level conversation still requires @. If the user
         //     explicitly @mentions another member/bot without @ing this bot,
         //     treat it as a hand-off and stay quiet.
+        //   • 'topic-group' (default) — like 'topic', but the no-@ follow-up is
+        //     scoped to 话题群 (chat_mode=topic) owned threads only; 普通群 keeps
+        //     requiring @. 新建话题的 agent 在话题内免 @ 续话。This re-opens the
+        //     #336 trade-off (bystanders in a multi-person 话题群 topic can still
+        //     trigger the bot) deliberately, scoped to topic groups; set 'always'
+        //     to opt out.
         // Both gated on isAllowed so restricted groups still only react to
         // permitted senders. (The shared fold-back's replyRootId is already
         // handled by the first clause. `mentionMode` 已在块首解析,用于 stats
         // 惰性获取。)
-        // 话题群 owned-topic 免@续话不再无条件放行（#336 引入的默认行为回归：
-        // 多人群里旁人不 @ 也会触发 bot）。现在与普通群共用同一套「群聊 @ 策略」:
-        // 默认 'always' 在多人群里必须 @，想要话题内免@续话就把 mentionMode 配成
-        // 'topic'（下方条款已同时覆盖话题群 thread 与普通群 shared topic），
+        // 默认 'topic-group'：话题群内 bot 已拥有会话的话题免 @ 续话，普通群仍需
+        // @。#336 曾因多人群话题旁人误触发而回退为默认 'always'，本次再放开但收窄
+        // 到话题群；不想要可显式配 'always'。'topic' 在任意群的已拥有话题内免 @，
         // 'never'/'ambient' 亦按各自语义生效。1人1bot 的 solo 群仍走末条放行。
         // 注：pairedForwardSeed 仅在 never/ambient 模式下产生，且 ambient redirect
         // 已在配对前排除，故 isAllowed=true 时下方 never/ambient 条款必然放行；
@@ -3508,7 +3521,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           || !!messageListener
           || (isAllowed && mentionMode === 'never')
           || (isAllowed && mentionMode === 'ambient' && !mentionsOther)
-          || (isAllowed && mentionMode === 'topic' && ownsSession && !!message.thread_id && !mentionsOther)
+          || (isAllowed && ownedTopicNoMention)
           || (ownsSession && isAllowed && !!stats && !mentionsOther && stats.userCount <= 1 && stats.botCount <= 1);
         if (!relax) {
           const access = await checkGroupMessageAccess(larkAppId, message, chatId, senderOpenId, humanSenderUnionId);
