@@ -688,7 +688,7 @@ export const messages: Record<string, string> = {
 
   // ─── AI system prompt (Claude Code: --append-system-prompt) ──────────────
   'ai.routing.intro': 'You are in a Lark (Feishu) topic group. The user cannot see terminal output — you MUST reply via `botmux send`.',
-  'ai.routing.usage_send': '- Send: `botmux send "message"`; for multi-line use heredoc: `botmux send <<EOF ... EOF`',
+  'ai.routing.usage_send': "- Send: `botmux send \"message\"`; for multi-line use heredoc: `botmux send <<'EOF' ... EOF`",
   'ai.routing.usage_mention_gate': '- Every send MUST pick one: `--mention <open_id>` / `--mention-back` / `--no-mention`',
   'ai.routing.usage_attachments': '- Attachments: `--images`, `--files`, `--videos` (see `botmux send --help`)',
   'ai.routing.usage_helpers': '- Context: `botmux history`; collaborator bots: `botmux bots list`',

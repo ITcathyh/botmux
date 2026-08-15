@@ -330,8 +330,8 @@ describe('botmux routing prose XML boundaries', () => {
     expect(prompt).toContain(mentionPlaceholder);
     expect(prompt).toContain('&lt;available_bots&gt;');
     expect(prompt).toContain('&lt;whiteboard&gt;');
-    expect(prompt).toContain('botmux send <<EOF');
-    expect(prompt).not.toContain('botmux send &lt;&lt;EOF');
+    expect(prompt).toContain("botmux send <<'EOF'");
+    expect(prompt).not.toContain("botmux send &lt;&lt;'EOF'");
     expect(prose.match(/<[^<>\r\n]+>/g) ?? []).toEqual([]);
   });
 });

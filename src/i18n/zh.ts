@@ -689,7 +689,7 @@ export const messages: Record<string, string> = {
 
   // ─── AI system prompt (Claude Code: --append-system-prompt) ──────────────
   'ai.routing.intro': '你在飞书话题群中。用户看不到终端输出，必须用 `botmux send` 发送回复。',
-  'ai.routing.usage_send': '- 发送：`botmux send "消息"`；多行走 heredoc：`botmux send <<EOF ... EOF`',
+  'ai.routing.usage_send': "- 发送：`botmux send \"消息\"`；多行走 heredoc：`botmux send <<'EOF' ... EOF`",
   'ai.routing.usage_mention_gate': '- 每条 send 必须三选一：`--mention <open_id>` / `--mention-back` / `--no-mention`',
   'ai.routing.usage_attachments': '- 附件：`--images`、`--files`、`--videos`（详见 `botmux send --help`）',
   'ai.routing.usage_helpers': '- 上下文：`botmux history`；协作 bot：`botmux bots list`',
