@@ -689,8 +689,8 @@ export const messages: Record<string, string> = {
 
   // ─── AI system prompt (Claude Code: --append-system-prompt) ──────────────
   'ai.routing.intro': '你在飞书话题群中。用户看不到终端输出，必须用 `botmux send` 发送回复。',
-  'ai.routing.usage_send': "- 发送：`botmux send \"消息\"`；多行走 heredoc：`botmux send <<'EOF' ... EOF`",
-  'ai.routing.usage_mention_gate': '- 每条 send 必须三选一：`--mention <open_id>` / `--mention-back` / `--no-mention`',
+  'ai.routing.usage_send': '- 发送：`botmux send "消息"`',
+  'ai.routing.usage_mention_gate': '- 每条 send 必须三选一：`--mention <open_id>` / `--mention-back` / `--no-mention`——按内容价值选：有实质结论要对方看/确认/决策 → @；纯记录/低优先级进度/简短确认 → --no-mention；没信息量的"收到"不如不发',
   'ai.routing.usage_attachments': '- 附件：`--images`、`--files`、`--videos`（详见 `botmux send --help`）',
   'ai.routing.usage_helpers': '- 上下文：`botmux history`；协作 bot：`botmux bots list`',
   'ai.routing.usage_silence': '- 不是发给你的消息，最终回复只输出 `BOTMUX_NOTHING_TO_SEND`',
@@ -705,7 +705,8 @@ export const messages: Record<string, string> = {
   'ai.identity.rule_no_proactive_pull': '- 默认不拉别的 bot 进来，除非用户明确要求',
   'ai.identity.mention_must': '- 跟别的 bot 协作必须 `botmux send --mention <对方 open_id>`，否则对方收不到',
 
-  // ─── AI hints (non-Claude CLIs: BOTMUX_SHELL_HINTS) ──────────────────────
+  // ─── AI hints（非注入式 CLI 的 BOTMUX_SHELL_HINTS；multiline_heredoc /
+  // heredoc_example 同时被 system-prompt 路径复用——两个 locale 保持一致）──
   'ai.shell.intro': '你运行在飞书（Lark）话题群中。用户在飞书阅读回复，看不到你的终端输出。',
   'ai.shell.commands_are_shell': '重要：botmux send / botmux history / botmux quoted / botmux bots 都是 shell 命令（CLI 程序，已安装在 $PATH），不是 MCP 工具。必须通过 Bash 工具执行，不要到 MCP 工具列表里找。',
   'ai.shell.how_to_send': '把消息发给用户（唯一方式）：用 Bash 执行 `botmux send "消息内容"`；附带图片用 `--images /path`，附带文件用 `--files /path`，附带视频预览用 `--videos /path.mp4 --video-covers /cover.png`。',

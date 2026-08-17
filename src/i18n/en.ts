@@ -688,8 +688,8 @@ export const messages: Record<string, string> = {
 
   // ─── AI system prompt (Claude Code: --append-system-prompt) ──────────────
   'ai.routing.intro': 'You are in a Lark (Feishu) topic group. The user cannot see terminal output — you MUST reply via `botmux send`.',
-  'ai.routing.usage_send': "- Send: `botmux send \"message\"`; for multi-line use heredoc: `botmux send <<'EOF' ... EOF`",
-  'ai.routing.usage_mention_gate': '- Every send MUST pick one: `--mention <open_id>` / `--mention-back` / `--no-mention`',
+  'ai.routing.usage_send': '- Send: `botmux send "message"`',
+  'ai.routing.usage_mention_gate': '- Every send MUST pick one: `--mention <open_id>` / `--mention-back` / `--no-mention` — pick by VALUE: substantive conclusions the other party should read/confirm/decide → @; pure record / low-priority progress / short ack → --no-mention; a contentless "got it" is better not sent',
   'ai.routing.usage_attachments': '- Attachments: `--images`, `--files`, `--videos` (see `botmux send --help`)',
   'ai.routing.usage_helpers': '- Context: `botmux history`; collaborator bots: `botmux bots list`',
   'ai.routing.usage_silence': '- If the message is not for you, final reply must be just `BOTMUX_NOTHING_TO_SEND`',
@@ -704,7 +704,8 @@ export const messages: Record<string, string> = {
   'ai.identity.rule_no_proactive_pull': '- Do not pull other bots in unless the user explicitly asks',
   'ai.identity.mention_must': '- To collaborate with another bot you MUST `botmux send --mention <their open_id>` — without it they receive nothing',
 
-  // ─── AI hints (non-Claude CLIs: BOTMUX_SHELL_HINTS) ──────────────────────
+  // ─── AI hints (BOTMUX_SHELL_HINTS for non-injecting CLIs; multiline_heredoc /
+  // heredoc_example are also reused by the system-prompt path — keep both locales aligned) ──
   'ai.shell.intro': 'You are running inside a Lark (Feishu) topic group. The user reads on Lark and cannot see your terminal output.',
   'ai.shell.commands_are_shell': 'IMPORTANT: `botmux send` / `botmux history` / `botmux quoted` / `botmux bots` are SHELL commands (CLI programs installed in $PATH), NOT MCP tools. Run them via the Bash tool — don\'t look for them in the MCP tool list.',
   'ai.shell.how_to_send': 'To send a message to the user (the only way): run `botmux send "your message"` via Bash. Attach images with `--images /path`, files with `--files /path`, video previews with `--videos /path.mp4 --video-covers /cover.png`.',

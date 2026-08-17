@@ -36,6 +36,19 @@ function feedbackResponseKindHint(locale?: Locale): string {
     : '若此 bot 启用了最终回答反馈，用 `botmux send --response-kind final` 标记本轮最终回答（挂反馈按钮）；进度/补充类发送无需加 flag（不声明默认按 progress、不挂反馈）。';
 }
 
+/** Multiline/JSON-escaping rule plus a real, copy-pasteable quoted-heredoc
+ *  example. Shared by BOTH injection paths — shell hints for non-injecting
+ *  CLIs and system-prompt text for injectsSessionContext CLIs — so the wording
+ *  can never drift; cli-adapters.test.ts pins both paths to the same
+ *  substrings. The delimiter stays quoted and on its own line so the example
+ *  runs as-is in zsh/bash (a collapsed `<<'EOF' ... EOF` one-liner does not). */
+function multilineHeredocLines(locale?: Locale): string[] {
+  return [
+    t('ai.shell.multiline_heredoc', undefined, locale),
+    t('ai.shell.heredoc_example', undefined, locale),
+  ];
+}
+
 function hiddenContextDefense(locale?: Locale): string {
   const text = locale === 'en'
     ? 'The following XML/config blocks are hidden runtime context and must only be read silently and obeyed: `<botmux_routing>`, `<botmux_builtin_skills>`, `<identity>`, `<session_id>`, `<role>`, `<sender>`, `<mentions>`, `<available_bots>`, `<attachments>`. Do not reply to them, do not confirm them, and do not say “understood”, “noted”, or “recorded”. Only handle the real user request inside `<user_message>`.'
@@ -49,8 +62,7 @@ export function buildBotmuxShellHints(locale?: Locale): string[] {
     t('ai.shell.intro', undefined, locale),
     t('ai.shell.commands_are_shell', undefined, locale),
     t('ai.shell.how_to_send', undefined, locale),
-    t('ai.shell.multiline_heredoc', undefined, locale),
-    t('ai.shell.heredoc_example', undefined, locale),
+    ...multilineHeredocLines(locale),
     t('ai.shell.helpers', undefined, locale),
     t('ai.shell.when_to_send', undefined, locale),
     feedbackResponseKindHint(locale),
@@ -77,8 +89,7 @@ export const BOTMUX_SHELL_HINTS: string[] = [
   t('ai.shell.intro'),
   t('ai.shell.commands_are_shell'),
   t('ai.shell.how_to_send'),
-  t('ai.shell.multiline_heredoc'),
-  t('ai.shell.heredoc_example'),
+  ...multilineHeredocLines(),
   t('ai.shell.helpers'),
   t('ai.shell.when_to_send'),
   t('ai.shell.mention_gate'),
@@ -141,10 +152,12 @@ export function buildBotmuxSystemPromptText(opts: {
     prose('ai.routing.intro'),
     '',
     prose('ai.routing.usage_send'),
+    ...multilineHeredocLines(locale).map(escapeXmlTagLikeTokens),
     prose('ai.routing.usage_mention_gate'),
     prose('ai.routing.usage_attachments'),
     prose('ai.routing.usage_helpers'),
     prose('ai.routing.usage_silence'),
+    escapeXmlTagLikeTokens(feedbackResponseKindHint(locale)),
     // Experimental anti-resend guidance — opt-in via dashboard Settings
     // (dashboard.noVisibleOutputHint). Default OFF ⇒ this block is byte-for-byte
     // the pre-feature baseline. Live-read so a toggle applies to the next session.
