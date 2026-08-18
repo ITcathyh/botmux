@@ -85,6 +85,16 @@ function respond(id, result) {
   write({ id, result });
 }
 
+/** Write several JSON-RPC messages in ONE stdout chunk so the runner receives
+ * them in a single read. Adjacent pipe writes coalesce whenever the reader is
+ * scheduled late; this makes that transport condition deterministic for the
+ * completion-race regression repros. */
+function writeBatch(messages) {
+  process.stdout.write(messages
+    .map(message => JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n')
+    .join(''));
+}
+
 function reject(id, code, message) {
   write({ id, error: { code, message } });
 }
@@ -430,6 +440,49 @@ function handle(request) {
         emitTurnCompletion(activeTurn.threadId, activeTurn.turnId, activeTurn.outputSchema);
         activeTurn = undefined;
       }
+      return;
+    }
+    if (behavior === 'steer-admit-reject-buffered' || behavior === 'steer-admit-reject-noncanon') {
+      if (!activeTurn || request.params.expectedTurnId !== activeTurn.turnId) {
+        reject(request.id, -32602, 'expectedTurnId does not match active turn');
+        return;
+      }
+      // The race this repro pins: the turn actually COMPLETED at the exact moment
+      // tryAdmitSteer's steer RPC lands. Emit turn/completed AND a definite steer
+      // rejection in ONE stdout chunk. The runner buffers the completion while
+      // steerInFlight is set, then the rejection catch must settle it —
+      // accepted.length is still 1 here (first steer never appended), so any
+      // inGroupMode-gated resume path would strand it (hang).
+      const { threadId, turnId } = activeTurn;
+      // noncanon: a DIFFERENT native id with NO full items. The rejection branch
+      // must NOT blindly trust it (that would attribute foreign/streamed text);
+      // it must route to bounded-history reconcile and fail closed (no match).
+      const completion = behavior === 'steer-admit-reject-noncanon'
+        ? {
+            method: 'turn/completed',
+            params: { threadId, turn: { id: 'turn-foreign-nc', status: 'completed' } },
+          }
+        : {
+            method: 'turn/completed',
+            params: {
+              threadId,
+              turn: {
+                id: turnId,
+                status: 'completed',
+                itemsView: 'full',
+                error: null,
+                items: [
+                  { id: 'user-root', type: 'userMessage', clientId: groupClientIds[0], content: [] },
+                  { id: 'message-final', type: 'agentMessage', phase: 'final_answer', text: 'buffered canonical answer' },
+                ],
+              },
+            },
+          };
+      writeBatch([
+        completion,
+        { id: request.id, error: { code: -32601, message: 'active turn not steerable' } },
+      ]);
+      activeTurn = undefined;
       return;
     }
     if (behavior === 'steer-group-mismatch') {
@@ -780,6 +833,21 @@ function handle(request) {
     });
     // The original turn/start is answered later — as an explicit RPC error — from
     // the turn/steer handler, after the steer is accepted.
+    return;
+  }
+  if ((behavior === 'steer-admit-reject-buffered' || behavior === 'steer-admit-reject-noncanon') && turnAttempt === 1) {
+    // Canonical proven by the START RESPONSE (not an exact turn/started): respond
+    // with the canonical id and emit only a BARE turn/started (no exact-client
+    // items), then HOLD the turn open. identityProof stays 'start_response', so
+    // the tryAdmitSteer rejection catch is the SOLE settle point for the buffered
+    // canonical completion. The follow-up (turnAttempt 2) that falls back after
+    // the rejection completes normally through completeTurn.
+    const threadId = request.params.threadId;
+    const turnId = `turn-fake-${turnAttempt}`;
+    activeTurn = { threadId, turnId, outputSchema: request.params.outputSchema };
+    groupClientIds = [request.params.clientUserMessageId ?? null];
+    respond(request.id, { turn: { id: turnId } });
+    notify('turn/started', { threadId, turn: { id: turnId } });
     return;
   }
   completeTurn(request);
