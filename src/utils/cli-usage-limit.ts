@@ -119,6 +119,40 @@ export interface DetectUsageLimitOptions {
 }
 
 /**
+ * Whether a runtime screen status proves the CLI is actively doing work.
+ *
+ * The screen-scan detector cannot tell a live limit block from limit-shaped
+ * text the CLI itself put on screen — a model answer quoting a business 429,
+ * tool output, docs, test fixtures. The runtime status disambiguates: a
+ * rate/usage limit blocks the CLI, and a blocked CLI sits at an error/prompt
+ * screen (`idle`/`stalled`); it does not keep producing output. So while the
+ * CLI is `working`/`analyzing`, any "429 / rate limit / usage limit" text on
+ * screen is the CLI's own output or a transient retry it is handling
+ * internally, and a screen-scan verdict must be suppressed. Root cause of the
+ * "CLI 还在跑却提示限额已达" false reports (Codex/Hermes, 2026-08).
+ */
+export function isActiveWorkRuntimeStatus(status: string | null | undefined): boolean {
+  return status === 'working' || status === 'analyzing';
+}
+
+/**
+ * Screen-frame detection: `detectCliUsageLimit` gated on the frame's runtime
+ * status. The worker's per-frame classify path goes through here so a single
+ * choke point owns the "active work suppresses the verdict" policy — keeping
+ * it out of the pure text classifier, whose existing callers (turn-start
+ * stale-banner snapshot) have no fresh status context.
+ */
+export function detectScreenUsageLimit(
+  text: string,
+  status: string | null | undefined,
+  now: Date = new Date(),
+  opts: DetectUsageLimitOptions = {},
+): CliUsageLimitDetection {
+  if (isActiveWorkRuntimeStatus(status)) return { limited: false };
+  return detectCliUsageLimit(text, now, opts);
+}
+
+/**
  * Whether a CLI adapter is authoritative for structured rate limits — i.e. it
  * actually PUBLISHES a `limited` screen_update from a machine signal in its
  * transcript rather than from scraping screen text. Two families qualify:
