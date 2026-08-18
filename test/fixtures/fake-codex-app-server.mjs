@@ -744,6 +744,26 @@ function handle(request) {
     setTimeout(() => respond(request.id, { turn: { id: 'turn-response-B' } }), 120);
     return;
   }
+  if (behavior === 'pre-response-foreign-completion' && turnAttempt === 1) {
+    // A foreign turn/completed (NO client items, id unrelated to this turn)
+    // arrives BEFORE the turn/start response. Unlike completion-before-response-
+    // mismatch, this carries no exact-client items, so the runner cannot upgrade
+    // it to canonical proof. It must buffer it (requestAccepted=false), then
+    // after the response binds the real native id, replay it through the
+    // pendingCompletions else branch into reconcile — settling fail-closed
+    // (identity conflict, history has no match), NOT hanging forever. Direct
+    // regression for the else branch master lacked (silent drop → permanent
+    // pending → 90s no-progress alert).
+    const threadId = request.params.threadId;
+    const turnId = `turn-fake-${turnAttempt}`;
+    notify('turn/completed', {
+      threadId,
+      turn: { id: 'turn-foreign-pre-response', status: 'completed' },
+    });
+    respond(request.id, { turn: { id: turnId } });
+    notify('turn/started', { threadId, turn: { id: turnId } });
+    return;
+  }
   if (behavior === 'completion-A-started-B') {
     // R4-B2 crossing 1: exact completion A proves canonical=A; then an exact
     // turn/started B (DIFFERENT id) arrives → first-proof-wins must fence (a later

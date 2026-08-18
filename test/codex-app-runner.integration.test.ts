@@ -1851,6 +1851,54 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     });
   }
 
+  it('settles (fail-closed, not hang) when a pre-response foreign completion has no exact items and mismatches the native id', async () => {
+    // REGRESSION for the pendingCompletions replay else branch: a foreign
+    // turn/completed (no client items, id unrelated to this turn) arrives
+    // BEFORE the start response. Master silently dropped it on replay (no
+    // exact/native match), so if it was the real terminal event the turn hung
+    // forever (busy never returned to false → 90s no-progress alert). The fix
+    // routes it through reconcile, which fails closed with an identity conflict.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-preresp-foreign-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'pre-response-foreign-completion', control.bootstrap.path);
+
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('legacy', {
+        text: 'foreign completion before response',
+        clientUserMessageId: 'om_foreign_pre',
+      })}\r`);
+      // The turn MUST settle. A hang here (busy stuck true) is the regression:
+      // master dropped the buffered foreign completion on replay, so turn.done
+      // never resolved. The fix reconciles and fails closed.
+      await waitFor(harness, () => control.markers.some(marker => marker.kind === 'diagnostic')
+        && control.finals.length === 1
+        && control.states.filter(state => state.busy === false).length >= 2);
+      // Reconcile ran (thread/turns/list) — proof the else branch fired, not a
+      // silent drop.
+      expect(readRequests(logPath).some(request => request.method === 'thread/turns/list')).toBe(true);
+      const diagnostic = control.markers.find(marker => marker.kind === 'diagnostic');
+      expect(diagnostic?.payload).toMatchObject({
+        code: 'native_turn_identity_conflict',
+        turnId: 'om_foreign_pre',
+      });
+      expect(control.finals[0]).toMatchObject({
+        turnId: 'om_foreign_pre',
+        content: expect.stringContaining('Codex App native turn identity conflict'),
+      });
+      expect(harness.child.exitCode).toBeNull();
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('keeps the startup deadline armed through initialize and never exposes a pre-ready prompt', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-runner-startup-deadline-'));
     const fakeCodex = join(dir, 'fake-codex');
