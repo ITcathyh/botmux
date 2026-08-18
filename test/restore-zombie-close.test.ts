@@ -280,6 +280,7 @@ import {
 } from '../src/core/worker-pool.js';
 import { announceSessionRow } from '../src/core/session-activity.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
+import { getAllBots } from '../src/bot-registry.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -1196,6 +1197,43 @@ describe('resumeSession — disk-only legacy anchor collision', () => {
     expect(sessionStore.getSession(target.sessionId)?.status).toBe('active');
     expect(map.get(sessionKey('om_resume_legacy_scratch', 'app_test'))?.session.sessionId)
       .toBe(target.sessionId);
+  });
+
+  it('caps recovery forks per-bot: one bot unlimited does not uncap another bot', async () => {
+    // Regression: the recovery budget used getAllBots()[0].maxLiveWorkers for
+    // ALL bots. If bot[0] set cap=0 (unlimited), the total budget became
+    // Infinity and bot[1]'s cap was ignored — multi-bot OOM risk.
+    const original = vi.mocked(getAllBots).getMockImplementation();
+    vi.mocked(getAllBots).mockImplementation(() => [
+      { config: { larkAppId: 'app_test', cliId: bot.cliId, maxLiveWorkers: 0 }, botName: 'Bot0', botOpenId: 'ou_0', resolvedAllowedUsers: [] },
+      { config: { larkAppId: 'app_bot1', cliId: bot.cliId, maxLiveWorkers: 5 }, botName: 'Bot1', botOpenId: 'ou_1', resolvedAllowedUsers: [] },
+    ] as any);
+    try {
+      // 3 sessions for bot[0] (unlimited) — all should fork.
+      for (let i = 0; i < 3; i++) {
+        makeActivePersistentSession(`om_bot0_${i}`);
+      }
+      // 10 sessions for bot[1] (cap=5) — only 5 should fork.
+      for (let i = 0; i < 10; i++) {
+        const s = makeActivePersistentSession(`om_bot1_${i}`);
+        s.larkAppId = 'app_bot1';
+        sessionStore.updateSession(s);
+      }
+      const map = new Map<string, DaemonSession>();
+      wp.registry = map;
+      await restoreActiveSessions(map);
+
+      const bot0Forks = vi.mocked(forkWorker).mock.calls.filter(
+        ([ds]) => (ds as any).session.larkAppId === 'app_test',
+      );
+      const bot1Forks = vi.mocked(forkWorker).mock.calls.filter(
+        ([ds]) => (ds as any).session.larkAppId === 'app_bot1',
+      );
+      expect(bot0Forks).toHaveLength(3); // unlimited → all forked
+      expect(bot1Forks).toHaveLength(5); // capped at 5 despite bot[0] unlimited
+    } finally {
+      vi.mocked(getAllBots).mockImplementation(original!);
+    }
   });
 });
 

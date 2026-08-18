@@ -2623,57 +2623,69 @@ export async function restoreActiveSessions(
   // Staggered re-fork (see staggeredRecoveryFork): empty prompt = re-attach
   // only, no new turn — same as the old per-session eager fork.
   //
-  // Cap the TOTAL recovery forks to the bot's live-worker cap so a daemon with
+  // Cap recovery forks PER BOT to each bot's live-worker cap so a daemon with
   // hundreds of surviving sessions doesn't spawn hundreds of Node.js worker
   // processes at once (memory/FD exhaustion → OOM → daemon crash; the daemon
-  // has no global uncaughtException trap). Sessions beyond the budget stay
+  // has no global uncaughtException trap). Sessions beyond a bot's budget stay
   // worker-less and lazily cold-resume on their next message — the same
   // worker-null resume path the idle-worker-sweeper relies on.
-  const recoveryCapConfig = getAllBots()[0]?.config.maxLiveWorkers;
-  const recoveryCap = recoveryCapConfig === undefined ? DEFAULT_MAX_LIVE_WORKERS : recoveryCapConfig;
-  const currentLiveWorkers = [...activeSessions.values()]
-    .filter(ds => ds.worker && !ds.worker.killed).length;
-  const recoveryForkBudget = recoveryCap <= 0
-    ? Infinity
-    : Math.max(0, recoveryCap - currentLiveWorkers);
-  if (toReattach.length > recoveryForkBudget) {
-    logger.info(
-      `Recovery fork budget: ${recoveryForkBudget} of ${toReattach.length} candidate(s) `
-      + `(cap=${recoveryCap}, live=${currentLiveWorkers}); rest stay worker-less until next message`,
+  const recoveryFork = (ds: DaemonSession) => {
+    // A quarantined tail-only owner (restore promotion failed transiently) is
+    // handled by the CENTRAL guard inside forkWorker: this blank fork retries
+    // the old head's promotion first and, if it still fails, refuses to fork
+    // (returns false) — keeping the worker:null owner so a blank fork never
+    // leaves a live worker beside an unpromoted tail. `recoverExactNonCodex`
+    // below is the DIFFERENT, already-tokened recovery case (queuedActivation
+    // is pending), which a quarantined owner is not (its promotion failed, so
+    // queuedActivationPending stayed false) — the guard rewrites the fork args
+    // in that case instead.
+    const recoverExactNonCodex = ds.session.queuedActivationPending
+      && ds.session.cliId !== 'codex-app'
+      && ds.session.queuedActivationInput;
+    forkWorker(
+      ds,
+      recoverExactNonCodex || '',
+      recoverExactNonCodex
+        ? {
+            resume: ds.session.queuedActivationResume ?? ds.hasHistory,
+            turnId: ds.session.queuedActivationTurnId,
+            dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
+          }
+        : true,
+    );
+  };
+  const stillOwnedRestore = (ds: DaemonSession) =>
+    activeSessions.get(activeSessionKey(ds)) === ds;
+  // Group candidates by bot so each bot's cap is enforced independently —
+  // one bot's unlimited (cap≤0) config must not uncap another bot's recovery.
+  const toReattachByBot = new Map<string, DaemonSession[]>();
+  for (const ds of toReattach) {
+    const group = toReattachByBot.get(ds.larkAppId) ?? [];
+    group.push(ds);
+    toReattachByBot.set(ds.larkAppId, group);
+  }
+  for (const [appId, group] of toReattachByBot) {
+    const bot = getAllBots().find(b => b.config.larkAppId === appId);
+    const capConfig = bot?.config.maxLiveWorkers;
+    const cap = capConfig === undefined ? DEFAULT_MAX_LIVE_WORKERS : capConfig;
+    const live = [...activeSessions.values()]
+      .filter(ds => ds.larkAppId === appId && ds.worker && !ds.worker.killed).length;
+    const budget = cap <= 0 ? Infinity : Math.max(0, cap - live);
+    if (group.length > budget) {
+      logger.info(
+        `[${appId}] Recovery fork budget: ${budget} of ${group.length} candidate(s) `
+        + `(cap=${cap}, live=${live}); rest stay worker-less until next message`,
+      );
+    }
+    await staggeredRecoveryFork(
+      group,
+      recoveryFork,
+      RECOVERY_FORK_BATCH_SIZE,
+      RECOVERY_FORK_DELAY_MS,
+      stillOwnedRestore,
+      budget,
     );
   }
-  await staggeredRecoveryFork(
-    toReattach,
-    (ds) => {
-      // A quarantined tail-only owner (restore promotion failed transiently) is
-      // handled by the CENTRAL guard inside forkWorker: this blank fork retries
-      // the old head's promotion first and, if it still fails, refuses to fork
-      // (returns false) — keeping the worker:null owner so a blank fork never
-      // leaves a live worker beside an unpromoted tail. `recoverExactNonCodex`
-      // below is the DIFFERENT, already-tokened recovery case (queuedActivation
-      // is pending), which a quarantined owner is not (its promotion failed, so
-      // queuedActivationPending stayed false) — the guard rewrites the fork args
-      // in that case instead.
-      const recoverExactNonCodex = ds.session.queuedActivationPending
-        && ds.session.cliId !== 'codex-app'
-        && ds.session.queuedActivationInput;
-      forkWorker(
-        ds,
-        recoverExactNonCodex || '',
-        recoverExactNonCodex
-          ? {
-              resume: ds.session.queuedActivationResume ?? ds.hasHistory,
-              turnId: ds.session.queuedActivationTurnId,
-              dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
-            }
-          : true,
-      );
-    },
-    RECOVERY_FORK_BATCH_SIZE,
-    RECOVERY_FORK_DELAY_MS,
-    ds => activeSessions.get(activeSessionKey(ds)) === ds,
-    recoveryForkBudget,
-  );
 
   const hasPersistentBackend = [...activeSessions.values()].some(ds => !!getSessionPersistentBackendType(ds));
   logger.info(`Restored ${active.length} session(s)${hasPersistentBackend ? '' : ', waiting for messages to resume'}`);
