@@ -69,6 +69,7 @@ import {
 import type { DaemonSession } from './types.js';
 import { stagePendingRepoSetup, persistPendingRepoCardMessageId, restorePendingRepoRuntime } from './pending-repo-journal.js';
 import { announceSessionRow, markSessionActivity, announcePendingRepoSession } from './session-activity.js';
+import { DEFAULT_MAX_LIVE_WORKERS } from './idle-worker-sweeper.js';
 import { scanMultipleProjects } from '../services/project-scanner.js';
 import { buildRepoSelectCard } from '../im/lark/card-builder.js';
 import { repoPickerScanOptions } from '../global-config.js';
@@ -1714,6 +1715,14 @@ const RECOVERY_FORK_DELAY_MS = config.daemon.recoveryForkDelayMs ?? 250;
  * held behind restore, but lifecycle callbacks or a future recovery path can
  * still close/replace/wake an entry during one of the batch delays; re-forking
  * that stale object would kill the current worker via the double-fork guard.
+ *
+ * `maxForks` caps the TOTAL number of workers this pass may spawn. The daemon
+ * has no global uncaughtException trap, and each recovery worker is a full
+ * Node.js process (plus its CLI); forking every surviving session on a box with
+ * hundreds of active sessions exhausts memory/FDs and crashes the daemon.
+ * Sessions beyond the cap stay worker-less and lazily cold-resume on their
+ * next message (the existing worker-null resume path). Default Infinity keeps
+ * the old behaviour for callers that don't pass a cap.
  */
 export async function staggeredRecoveryFork(
   sessions: readonly DaemonSession[],
@@ -1721,14 +1730,24 @@ export async function staggeredRecoveryFork(
   batchSize: number = RECOVERY_FORK_BATCH_SIZE,
   delayMs: number = RECOVERY_FORK_DELAY_MS,
   stillOwned: (ds: DaemonSession) => boolean = ds => ds.session.status === 'active',
+  maxForks: number = Infinity,
 ): Promise<void> {
   let spawnedInBatch = 0;
+  let totalForked = 0;
   for (const ds of sessions) {
     // The batch delay is a lifecycle boundary: close/replace can remove this
     // exact object while we sleep. Never resurrect a closed or orphaned ds.
     if (ds.worker || ds.session.status !== 'active' || !stillOwned(ds)) continue;
+    if (totalForked >= maxForks) {
+      logger.info(
+        `Recovery fork cap reached (${maxForks}); remaining session(s) stay `
+        + `worker-less until their next message (lazy cold-resume)`,
+      );
+      break;
+    }
     try {
       fork(ds);
+      totalForked++;
     } catch (err) {
       // One malformed/stale pane or synchronous init-IPC failure must not
       // abort recovery for every later durable owner. forkWorker compensates
@@ -2603,6 +2622,26 @@ export async function restoreActiveSessions(
 
   // Staggered re-fork (see staggeredRecoveryFork): empty prompt = re-attach
   // only, no new turn — same as the old per-session eager fork.
+  //
+  // Cap the TOTAL recovery forks to the bot's live-worker cap so a daemon with
+  // hundreds of surviving sessions doesn't spawn hundreds of Node.js worker
+  // processes at once (memory/FD exhaustion → OOM → daemon crash; the daemon
+  // has no global uncaughtException trap). Sessions beyond the budget stay
+  // worker-less and lazily cold-resume on their next message — the same
+  // worker-null resume path the idle-worker-sweeper relies on.
+  const recoveryCapConfig = getAllBots()[0]?.config.maxLiveWorkers;
+  const recoveryCap = recoveryCapConfig === undefined ? DEFAULT_MAX_LIVE_WORKERS : recoveryCapConfig;
+  const currentLiveWorkers = [...activeSessions.values()]
+    .filter(ds => ds.worker && !ds.worker.killed).length;
+  const recoveryForkBudget = recoveryCap <= 0
+    ? Infinity
+    : Math.max(0, recoveryCap - currentLiveWorkers);
+  if (toReattach.length > recoveryForkBudget) {
+    logger.info(
+      `Recovery fork budget: ${recoveryForkBudget} of ${toReattach.length} candidate(s) `
+      + `(cap=${recoveryCap}, live=${currentLiveWorkers}); rest stay worker-less until next message`,
+    );
+  }
   await staggeredRecoveryFork(
     toReattach,
     (ds) => {
@@ -2633,6 +2672,7 @@ export async function restoreActiveSessions(
     RECOVERY_FORK_BATCH_SIZE,
     RECOVERY_FORK_DELAY_MS,
     ds => activeSessions.get(activeSessionKey(ds)) === ds,
+    recoveryForkBudget,
   );
 
   const hasPersistentBackend = [...activeSessions.values()].some(ds => !!getSessionPersistentBackendType(ds));

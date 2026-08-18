@@ -11457,6 +11457,11 @@ function setupWorkerHandlers(
   });
 
   worker.on('exit', (code, signal) => {
+    // The daemon has no global uncaughtException trap: a single throwing exit
+    // handler (e.g. sessionStore.updateSession hitting a file-lock timeout when
+    // the sessions file is huge, or a dashboard publish failing) would crash
+    // the whole daemon and take down every other session. Isolate and log.
+    try {
     abandonOrdinaryImDeliveriesForWorker(worker);
     const transferRetirement = transferRetiringWorkers.has(worker);
     transferRetiringWorkers.delete(worker);
@@ -11471,7 +11476,8 @@ function setupWorkerHandlers(
       // Carry the frozen init attribution so an abrupt pre-ready exit of a
       // durable VC delivery is fenced to the receipt/lease chain, not replied
       // out-of-band (which could post on a silent delivery).
-      void notifyStartupFailure(reason, startupState.initTurnId, startupState.initDispatchAttempt);
+      void notifyStartupFailure(reason, startupState.initTurnId, startupState.initDispatchAttempt)
+        .catch(err => logger.error(`[${t}] notifyStartupFailure failed: ${err instanceof Error ? err.message : String(err)}`));
     }
     // Clear the current child before notifying durable consumers. A callback
     // may schedule a retry; it must not observe/send to this dead IPC channel.
@@ -11558,6 +11564,9 @@ function setupWorkerHandlers(
         reason: code === 0 ? 'graceful' : `exit_code_${code}`,
         code,
       });
+    }
+    } catch (err) {
+    logger.error(`[${t}] Worker exit handler failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   });
 }
