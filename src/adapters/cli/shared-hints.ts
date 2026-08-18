@@ -147,12 +147,19 @@ export function buildBotmuxSystemPromptText(opts: {
       escapeXmlTagLikeTokens('出现 <whiteboard> 时可用本地白板：按需 `botmux whiteboard read/update`；不要写密钥/隐私；更新默认用中文；用户可见结论仍必须`botmux send`。'),
     ]
     : [];
+  // The multiline rule reads as a peer bullet of usage_send here (the
+  // system-prompt path bullets its usage lines); the fenced example that
+  // follows stays flush so it renders as that bullet's example. The shared
+  // i18n key stays bullet-free so the paragraph-style shell-hints path is
+  // unaffected — the `- ` prefix lives only at this composition site.
+  const [heredocRule, heredocExample] = multilineHeredocLines(locale).map(escapeXmlTagLikeTokens);
   return [
     '<botmux_routing>',
     prose('ai.routing.intro'),
     '',
     prose('ai.routing.usage_send'),
-    ...multilineHeredocLines(locale).map(escapeXmlTagLikeTokens),
+    `- ${heredocRule}`,
+    heredocExample,
     prose('ai.routing.usage_mention_gate'),
     prose('ai.routing.usage_attachments'),
     prose('ai.routing.usage_helpers'),
