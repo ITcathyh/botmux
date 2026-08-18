@@ -350,6 +350,20 @@ export interface CliAdapter {
    *  contain old busy text; existing adapters remain opt-out by default. */
   readonly idleToBusyPattern?: RegExp;
 
+  /** Opt-in PRE-idle busy latch for static busy screens that emit no further
+   *  PTY bytes after the initial render (e.g. a capacity-queue notice drawn
+   *  alongside a readyPattern status bar). Unlike busyPattern — a viewport
+   *  probe that only runs on backends whose screen cache is authoritative for
+   *  mutation — this consumes raw PTY evidence inside IdleDetector, so it also
+   *  holds on backends where screen capture must not mutate state (ZMX):
+   *  while latched, screen-derived idle is suppressed until a PTY chunk with
+   *  readyPattern evidence but WITHOUT this marker arrives (the queue screen
+   *  itself matches readyPattern's status-bar arm, so readyPattern alone can
+   *  never clear it). The latch is set/cleared from the current chunk only;
+   *  reset() rebases it. External structured completion (fireIdle) bypasses
+   *  the latch — it is authoritative independently of the screen observer. */
+  readonly staticBusyPattern?: RegExp;
+
   /** Ready marker regex — matches when the CLI's input prompt is rendered and
    *  functional.  When set, the idle detector suppresses quiescence-based idle
    *  until this pattern appears in the PTY output.  Checked every cycle (reset

@@ -21,13 +21,20 @@ export class IdleDetector {
   private busyCallback: (() => void) | null = null;
   private completionPattern: RegExp | undefined;
   private idleToBusyPattern: RegExp | undefined;
+  private staticBusyPattern: RegExp | undefined;
   private busyTransitionArmed = false;
   private readyPattern: RegExp | undefined;
   private readySeen = false;
+  /** Pre-idle latch for static busy screens (capacity queue). Set from a PTY
+   *  chunk carrying explicit static-busy evidence; suppresses screen-derived
+   *  idle until a chunk with readyPattern evidence but no static-busy marker
+   *  redraws. See CliAdapter.staticBusyPattern. */
+  private staticBusyLatch = false;
 
   constructor(cli: CliAdapter) {
     this.completionPattern = cli.completionPattern;
     this.idleToBusyPattern = cli.idleToBusyPattern;
+    this.staticBusyPattern = cli.staticBusyPattern;
     this.readyPattern = cli.readyPattern;
   }
 
@@ -100,6 +107,21 @@ export class IdleDetector {
       this.readySeen = true;
     }
 
+    // Pre-idle static-busy latch (capacity-queue screens). Decided from the
+    // CURRENT chunk only: the queue text and the queue screen's `100% left`
+    // status bar both linger in outputTail, so tail matching could never
+    // clear the latch and a stale tail ready marker would clear it mid-queue.
+    // A chunk carrying the static-busy marker means the latest redraw still
+    // shows the queue; a chunk carrying fresh ready evidence without it means
+    // the composer is back.
+    if (this.staticBusyPattern) {
+      if (this.staticBusyPattern.test(stripped)) {
+        this.staticBusyLatch = true;
+      } else if (this.readyPattern?.test(stripped)) {
+        this.staticBusyLatch = false;
+      }
+    }
+
     // Track spinner — but not if it's part of completion marker,
     // and not after ready pattern is seen (status bar chars like · are not real spinners)
     if (SPINNER_RE.test(stripped) && !(this.completionPattern?.test(stripped) || this.completionPattern?.test(this.outputTail)) && !this.readySeen) {
@@ -114,7 +136,9 @@ export class IdleDetector {
       this.clearTimer();
       this.quiescenceTimer = setTimeout(() => {
         this.quiescenceTimer = null;
-        if (!this.isIdle) this.markIdle('screen');
+        // A static-busy latch outranks a completion marker: the queue screen
+        // can carry both, and the latch only clears on a composer redraw.
+        if (!this.isIdle && !this.staticBusyLatch) this.markIdle('screen');
       }, 500);
       return;
     }
@@ -132,6 +156,7 @@ export class IdleDetector {
     this.busyTransitionArmed = false;
     this.outputTail = '';
     this.readySeen = false;
+    this.staticBusyLatch = false;
     this.lastSpinnerAt = Date.now();
     this.clearTimer();
   }
@@ -147,6 +172,7 @@ export class IdleDetector {
     this.busyTransitionArmed = false;
     this.outputTail = '';
     this.readySeen = false;
+    this.staticBusyLatch = false;
     this.lastSpinnerAt = 0;
     this.clearTimer();
   }
@@ -166,11 +192,17 @@ export class IdleDetector {
     this.idleCallback = null;
     this.busyCallback = null;
     this.busyTransitionArmed = false;
+    this.staticBusyLatch = false;
   }
 
   private quiescenceCheck(): void {
     this.quiescenceTimer = null;
     if (this.isIdle) return;
+    // Explicit static-busy evidence (capacity queue): the screen is not
+    // quiescing into a prompt — it is parked on a queue notice. Do not mark
+    // idle and do not re-arm: the latch clears on the composer redraw, whose
+    // feed() re-arms quiescence.
+    if (this.staticBusyLatch) return;
     const sinceSpinner = Date.now() - this.lastSpinnerAt;
     if (sinceSpinner < SPINNER_GUARD_MS) {
       this.quiescenceTimer = setTimeout(
