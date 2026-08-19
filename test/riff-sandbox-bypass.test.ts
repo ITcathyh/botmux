@@ -22,12 +22,12 @@ describe('localSandboxApplies', () => {
 describe('localSandboxRequested (shared worker ↔ auto-worktree fail-closed predicate)', () => {
   // The ONE predicate both the worker (sandboxRequested) and the auto-worktree
   // fail-closed gate use, so the two can never drift again. The remote exemption
-  // must wrap the WHOLE union (sandbox / readIsolation / noTransport / env), and
-  // mojo is exempt ONLY when provably fully remote.
+  // must wrap the WHOLE union (sandbox / readIsolation / env), and mojo is
+  // exempt ONLY when provably fully remote. The no-transport arm was removed
+  // with #899 (forkWorker no longer force-isolates a no-transport session).
   it('requests the sandbox for a local backend with any union arm on', () => {
     expect(localSandboxRequested({ backendType: 'pty', sandbox: true })).toBe(true);
     expect(localSandboxRequested({ backendType: 'pty', readIsolation: true })).toBe(true);
-    expect(localSandboxRequested({ backendType: 'pty', noTransport: true })).toBe(true);
     expect(localSandboxRequested({ backendType: 'pty', envSandboxEnabled: true })).toBe(true);
   });
 
@@ -39,7 +39,6 @@ describe('localSandboxRequested (shared worker ↔ auto-worktree fail-closed pre
   it('exempts riff with ANY union arm — the remote exemption wraps the whole union', () => {
     expect(localSandboxRequested({ backendType: 'riff', sandbox: true })).toBe(false);
     expect(localSandboxRequested({ backendType: 'riff', readIsolation: true })).toBe(false);
-    expect(localSandboxRequested({ backendType: 'riff', noTransport: true })).toBe(false);
     expect(localSandboxRequested({ backendType: 'riff', envSandboxEnabled: true })).toBe(false);
   });
 
@@ -51,9 +50,6 @@ describe('localSandboxRequested (shared worker ↔ auto-worktree fail-closed pre
     })).toBe(false);
     expect(localSandboxRequested({
       backendType: 'mojo', mojoConfig: { cloud: true }, envSandboxEnabled: true,
-    })).toBe(false);
-    expect(localSandboxRequested({
-      backendType: 'mojo', mojoConfig: { cloud: true }, noTransport: true,
     })).toBe(false);
   });
 

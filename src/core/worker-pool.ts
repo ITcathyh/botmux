@@ -89,6 +89,7 @@ import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { recordQuarantinedLauncherEnvKeys } from './mojo-launcher-env-quarantine.js';
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
 import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
+import type { BotConfig } from '../bot-registry.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
@@ -8077,6 +8078,62 @@ export function resolveQuarantinedForkPlan(
  * staged behind an ACK, routed through a live owner, or spawn-deferred during
  * device isolation — returns `true`.
  */
+/**
+ * Freeze the worker's sandbox DECISION INPUTS on the session record — the SAME
+ * fields forkWorker's SpawnOpts consumes (`sandbox` / `readIsolation` + the
+ * path lists). Called at TWO edges:
+ *   - pending-session establishment (runAutoWorktreeCommit), BEFORE any git /
+ *     notice await, so the auto-worktree fail-closed gate and the later fork
+ *     consume ONE snapshot; and
+ *   - forkWorker itself (below), preserving the original "recorded at creation"
+ *     semantics for sessions that never went through a pendingRepo phase.
+ *
+ * Without the early freeze, a dashboard `PUT /api/bot-sandbox` toggle landing
+ * while the worktree build is in flight made the gate degrade on the OLD value
+ * while the fork adopted the NEW one: the gate allowed the fallback to the
+ * real default dir and the worker engaged the local sandbox there — the exact
+ * write-escape the fail-closed gate exists to prevent. Re-reading live config
+ * only after the fallback would still leave the recheck→fork await window, so
+ * the decision is frozen ONCE, here, and both consumers read the session.
+ *
+ * Idempotent: an already-frozen session (`sandbox !== undefined`) keeps its
+ * recorded decision — a historical session is never retroactively re-frozen
+ * from a toggled live flag. A `resume` session pre-dating the field stays NOT
+ * sandboxed (same as the fork-time freeze this replaces), and its
+ * `readIsolation` stays undefined so the SpawnOpts live-config fallback
+ * preserves the legacy restore behavior.
+ */
+export function freezeSessionSandboxDecision(
+  ds: DaemonSession,
+  botCfg: Pick<BotConfig, 'sandbox' | 'sandboxPaths' | 'sandboxHidePaths' | 'sandboxReadonlyPaths' | 'sandboxNetwork' | 'readIsolation'>,
+  opts: { resume?: boolean } = {},
+): void {
+  let mutated = false;
+  if (ds.session.sandbox === undefined) {
+    if (!opts.resume) {
+      ds.session.sandbox = botCfg.sandbox === true;
+      ds.session.sandboxPaths = botCfg.sandboxPaths;
+      ds.session.sandboxHidePaths = botCfg.sandboxHidePaths ?? [];
+      ds.session.sandboxReadonlyPaths = botCfg.sandboxReadonlyPaths ?? [];
+      ds.session.sandboxNetwork = botCfg.sandboxNetwork !== false;
+    } else {
+      ds.session.sandbox = false;
+      ds.session.sandboxHidePaths = [];
+      ds.session.sandboxReadonlyPaths = [];
+      ds.session.sandboxNetwork = true;
+    }
+    mutated = true;
+  }
+  // readIsolation is frozen symmetrically: forkWorker's SpawnOpts reads the
+  // session value (with a live-config fallback ONLY for sessions persisted
+  // before this field existed), so the gate and the fork agree on it too.
+  if (ds.session.readIsolation === undefined && !opts.resume) {
+    ds.session.readIsolation = botCfg.readIsolation === true;
+    mutated = true;
+  }
+  if (mutated) sessionStore.updateSession(ds.session);
+}
+
 export function forkWorker(
   ds: DaemonSession,
   promptInput: string | CliTurnPayload,
@@ -8375,22 +8432,11 @@ export function forkWorker(
   // restore — so toggling the live bot flag never retroactively (un)sandboxes a
   // historical session. A brand-new session (resume=false) with no recorded
   // decision adopts the live bot flag; a restore (resume=true) with no recorded
-  // decision predates the sandbox feature → stays NOT sandboxed.
-  if (ds.session.sandbox === undefined) {
-    if (!resume) {
-      ds.session.sandbox = botCfg.sandbox === true;
-      ds.session.sandboxPaths = botCfg.sandboxPaths;
-      ds.session.sandboxHidePaths = botCfg.sandboxHidePaths ?? [];
-      ds.session.sandboxReadonlyPaths = botCfg.sandboxReadonlyPaths ?? [];
-      ds.session.sandboxNetwork = botCfg.sandboxNetwork !== false;
-    } else {
-      ds.session.sandbox = false;
-      ds.session.sandboxHidePaths = [];
-      ds.session.sandboxReadonlyPaths = [];
-      ds.session.sandboxNetwork = true;
-    }
-    sessionStore.updateSession(ds.session);
-  }
+  // decision predates the sandbox feature, so it stays NOT sandboxed. A
+  // pendingRepo session was already frozen at its establishment
+  // (runAutoWorktreeCommit), so this is a no-op there and the fork consumes
+  // the SAME snapshot the auto-worktree gate consumed.
+  freezeSessionSandboxDecision(ds, botCfg, { resume });
 
   // Reserve and durably publish the replacement lifetime before killing an
   // existing worker. A failed reservation leaves the old worker untouched;
@@ -8774,23 +8820,23 @@ export function forkWorker(
     // Per-bot local read isolation (enforced worker-side; the worker gates it).
     // Sibling data needs no app-id enumeration: per-bot dirs are denied wholesale
     // and per-bot session files by filename pattern (see buildV2DenyPaths).
-    // Opt-in only, driven purely by explicit per-bot `readIsolation`. A
-    // no-transport session (apiOnly bot OR HTTP virtual chat) is NO LONGER
-    // force-isolated: disk read scope now follows the owner's own sandbox config,
-    // symmetric with a normal chat session (unset/false → not isolated). Accepted
-    // trade-off: a no-transport session with no sandbox config can read the full
-    // bots.json / sibling BOT_HOME on disk; protecting sibling creds from lateral
-    // read on a multi-bot host now depends on the owner explicitly enabling
-    // sandbox/readIsolation, not on this force. Two adjacent boundaries are
-    // unchanged and independent: (1) this bot's own transport secret is still
-    // withheld from the CLI env (gated on larkTransportEnabled below), so a
-    // no-transport session cannot drive Botmux's own send path even though it can
-    // read the file; (2) mandatory device-credential isolation (worker.ts) still
-    // masks the device authority dir / enrolled creds on enrolled hosts. Full-file
-    // sandbox stays independently driven worker-side by sandboxRequested
-    // (cfg.sandbox || cfg.readIsolation || BOTMUX_SANDBOX=1); session.sandbox is
-    // frozen from botCfg.sandbox at create time, so "follow local sandbox" holds.
-    readIsolation: botCfg.readIsolation === true,
+    // FROZEN at session creation (freezeSessionSandboxDecision) — same snapshot
+    // the auto-worktree fail-closed gate consumes — so a dashboard readIsolation
+    // toggle landing while a worktree build is in flight can't diverge the gate
+    // from the fork. The live-config fallback only covers sessions persisted
+    // before the freeze field existed. A no-transport session (apiOnly bot OR
+    // HTTP virtual chat) is NOT force-isolated: disk read scope follows the
+    // owner's own config, symmetric with a normal chat session. Two adjacent
+    // boundaries are unchanged and independent: (1) this bot's own transport
+    // secret is still withheld from the CLI env (gated on larkTransportEnabled
+    // below), so a no-transport session cannot drive Botmux's own send path even
+    // though it can read the file; (2) mandatory device-credential isolation
+    // (worker.ts) still masks the device authority dir / enrolled creds on
+    // enrolled hosts. Full-file sandbox stays independently driven worker-side by
+    // sandboxRequested (cfg.sandbox || cfg.readIsolation || BOTMUX_SANDBOX=1);
+    // session.sandbox is frozen from botCfg.sandbox at create time, so "follow
+    // local sandbox" holds.
+    readIsolation: ds.session.readIsolation ?? botCfg.readIsolation === true,
     readDenyExtraPaths: botCfg.readDenyExtraPaths ?? [],
     // Identifies THIS daemon lifetime. Stamped onto isolated panes so the worker
     // can tell a suspend→resume reattach (same boot id, still isolated) from a

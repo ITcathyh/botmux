@@ -90,7 +90,7 @@ import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
 import { AutoWorktreeFailClosedError } from '../../services/default-worktree.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
-import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, type WorkerSessionReplyOptions } from '../../core/worker-pool.js';
+import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, type WorkerSessionReplyOptions } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
 import { publishAttentionPatch, publishClosedSessionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
@@ -865,6 +865,21 @@ export async function runAutoWorktreeCommit(deps: {
 }): Promise<void> {
   const { ds, anchor, larkAppId, baseDir, title, prompt, operatorOpenId, activeSessions, notify } = deps;
   ds.worktreeCreating = true;
+  // Freeze the worker's sandbox decision inputs on the session BEFORE the first
+  // git/notice await: the fail-closed gate below and the later fork must consume
+  // ONE snapshot. A dashboard `PUT /api/bot-sandbox` toggle landing during the
+  // up-to-30s build would otherwise make the gate degrade on the OLD value
+  // (fallback to the real default dir) while the fork adopts the NEW one and
+  // engages the local sandbox there — the write-escape the gate exists to
+  // prevent. Re-reading live config only after the fallback would still leave
+  // the recheck→fork await window, so the decision is frozen once, here.
+  try {
+    freezeSessionSandboxDecision(ds, getBot(ds.larkAppId).config);
+  } catch (e) {
+    // Bot deregistered between pending creation and here: the gate and the fork
+    // fail independently on getBot, so a missed freeze can't open the window.
+    logger.warn(`[${tag(ds)}] sandbox decision freeze skipped (bot unavailable): ${e instanceof Error ? e.message : e}`);
+  }
   // Surface the pending row NOW (all three callers funnel through here, so this is
   // the single place that guarantees the session is visible on SSE-only dashboards
   // during the up-to-30s build) — commitRepoSelection's forkWorker is what would
@@ -874,7 +889,12 @@ export async function runAutoWorktreeCommit(deps: {
     const { maybeCreateDefaultWorktree } = await import('../../services/default-worktree.js');
     const wt = await maybeCreateDefaultWorktree(larkAppId, baseDir, {
       isBotDefaultDir: true, title, prompt, locale: localeForBot(larkAppId), notify,
-      chatId: ds.chatId,
+      // The gate consumes the session's FROZEN decision (just recorded above),
+      // never live bot config — see freezeSessionSandboxDecision.
+      frozenSandboxDecision: {
+        sandbox: ds.session.sandbox === true,
+        readIsolation: ds.session.readIsolation === true,
+      },
     });
     // The pendingRepo placeholder can legitimately be consumed WHILE this
     // up-to-30s build runs — e.g. the Codex-notifier「继续处理」callback adopts

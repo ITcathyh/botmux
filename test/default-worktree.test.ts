@@ -233,6 +233,97 @@ describe('maybeCreateDefaultWorktree', () => {
     expect(notices.some(n => n.includes('回退'))).toBe(true); // fallback notice posted
   });
 
+  it('fail-open window: sandbox off→on flip DURING the build is ignored — the gate consumes the frozen session snapshot', async () => {
+    // R3 regression: the gate used to compute fail-closed from LIVE bot config
+    // before any await, while the fork adopted the live value later. A dashboard
+    // PUT /api/bot-sandbox flipping sandbox off→on while the "creating…" notice
+    // was in flight made the gate degrade on the OLD value (fallback to the real
+    // default dir) while the fork engaged the local sandbox on the NEW value
+    // there — the write-escape the gate exists to prevent. The decision is now
+    // frozen at pending-session establishment (freezeSessionSandboxDecision) and
+    // handed to the gate via frozenSandboxDecision; a mid-build flip changes
+    // neither the gate nor the fork (both read the session snapshot).
+    const empty = join(tempRoot, 'empty-repo-flip');
+    mkdirSync(empty);
+    execFileSync('git', ['init', '-b', 'master'], { cwd: empty, stdio: 'ignore' });
+    const { registry, mod } = await loadWithBot(empty, true); // sandbox OFF at freeze time
+
+    // Simulate the pending-session freeze (runAutoWorktreeCommit does this before
+    // any git/notice await): snapshot the decision inputs ONCE.
+    const liveCfg = registry.getBot('app_wt').config;
+    const frozen = {
+      sandbox: liveCfg.sandbox === true,
+      readIsolation: liveCfg.readIsolation === true,
+    };
+    expect(frozen.sandbox).toBe(false);
+
+    const notices: string[] = [];
+    // Flip the LIVE config while the "creating…" notice is in flight — exactly
+    // what updateBotSandbox's in-memory publish does (bot.config.sandbox = true).
+    const flipDuringNotice = (m: string) => {
+      notices.push(m);
+      if (notices.length === 1) {
+        registry.getBot('app_wt').config.sandbox = true;
+      }
+    };
+
+    const r = await mod.maybeCreateDefaultWorktree('app_wt', empty, {
+      isBotDefaultDir: true, locale: 'zh', notify: flipDuringNotice,
+      frozenSandboxDecision: frozen,
+    });
+
+    // The flip really happened on the live config…
+    expect(registry.getBot('app_wt').config.sandbox).toBe(true);
+    // …but the gate consumed the FROZEN snapshot (sandbox:false), so it degrades
+    // instead of refusing — and the fork would read the same frozen session
+    // fields, so no sandbox engages on the real dir (no fallback escape).
+    expect(r.dir).toBe(empty);
+    expect(notices.some(n => n.includes('回退'))).toBe(true);
+
+    // Contrast: a decision computed from the NEW live config (what the OLD gate
+    // would have re-read after the fallback) now REFUSES — proving the flip is
+    // real and the freeze is what kept this build on the degraded path.
+    await expect(mod.maybeCreateDefaultWorktree('app_wt', empty, {
+      isBotDefaultDir: true, locale: 'zh',
+      frozenSandboxDecision: { sandbox: true, readIsolation: false },
+    })).rejects.toBeInstanceOf(mod.AutoWorktreeFailClosedError);
+  });
+
+  it('fail-open window: sandbox on→off flip DURING the build is ignored — the gate still refuses on the frozen snapshot', async () => {
+    // The symmetric direction: frozen ON, live flips OFF mid-build. The gate must
+    // still refuse (fail-closed) — degrading would hand the fork a real dir while
+    // the frozen decision (which the fork consumes) keeps the sandbox engaged.
+    const empty = join(tempRoot, 'empty-repo-flip-off');
+    mkdirSync(empty);
+    execFileSync('git', ['init', '-b', 'master'], { cwd: empty, stdio: 'ignore' });
+    const { registry, mod } = await loadWithBot(empty, true, { sandbox: true });
+
+    const liveCfg = registry.getBot('app_wt').config;
+    const frozen = {
+      sandbox: liveCfg.sandbox === true,
+      readIsolation: liveCfg.readIsolation === true,
+    };
+    expect(frozen.sandbox).toBe(true);
+
+    const notices: string[] = [];
+    const flipDuringNotice = (m: string) => {
+      notices.push(m);
+      if (notices.length === 1) {
+        registry.getBot('app_wt').config.sandbox = false;
+      }
+    };
+
+    await expect(mod.maybeCreateDefaultWorktree('app_wt', empty, {
+      isBotDefaultDir: true, locale: 'zh', notify: flipDuringNotice,
+      frozenSandboxDecision: frozen,
+    })).rejects.toBeInstanceOf(mod.AutoWorktreeFailClosedError);
+
+    // The flip really happened…
+    expect(registry.getBot('app_wt').config.sandbox).toBe(false);
+    // …but the gate refused on the frozen ON decision (only the creating notice).
+    expect(notices).toHaveLength(1);
+  });
+
   it('fail-closed does NOT apply to the riff remote backend: sandbox on still DEGRADES', async () => {
     // The worker's sandboxRequested excludes riff (`!riffRemoteBackend` —
     // localSandboxApplies): riff has no local CLI process, the agent runs in
@@ -362,32 +453,37 @@ describe('maybeCreateDefaultWorktree', () => {
     })).rejects.toBeInstanceOf(mod.AutoWorktreeFailClosedError);
   });
 
-  it('fail-closed: apiOnly bot with NO explicit sandbox flag REFUSES (forkWorker forces readIsolation on no-transport sessions)', async () => {
-    // P1 review: an apiOnly (core-only) bot has no Lark transport, so forkWorker
-    // forces readIsolation=true for it (worker-pool.ts) — the local sandbox IS
-    // engaged even with no sandbox flag. The fail-closed gate must track that
-    // forced isolation, or a worktree failure would fall back to the real
-    // default dir and launch the forced sandbox there (the exact escape this
-    // change prevents).
+  it('apiOnly bot with NO explicit sandbox flag DEGRADES (no-transport sessions are no longer force-isolated)', async () => {
+    // #899 removed forkWorker's forced readIsolation for a no-transport session
+    // (apiOnly bot or HTTP virtual chat): disk read scope now follows the owner's
+    // own sandbox config, symmetric with a normal chat session. The worker
+    // therefore engages NO local sandbox here, so the fail-closed gate must not
+    // refuse either — degrading to the base dir is safe (nothing to escape from).
     const plain = join(tempRoot, 'not-a-repo-apionly');
     mkdirSync(plain);
     const { mod } = await loadWithBot(plain, true, { apiOnly: true }); // no sandbox flag
+    const notices: string[] = [];
 
-    await expect(mod.maybeCreateDefaultWorktree('app_wt', plain, {
-      isBotDefaultDir: true, locale: 'zh',
-    })).rejects.toBeInstanceOf(mod.AutoWorktreeFailClosedError);
+    const r = await mod.maybeCreateDefaultWorktree('app_wt', plain, {
+      isBotDefaultDir: true, locale: 'zh', notify: (m) => { notices.push(m); },
+    });
+
+    expect(r.dir).toBe(plain); // degraded — no local sandbox would have engaged
+    expect(notices.some(n => n.includes('回退'))).toBe(true);
   });
 
-  it('fail-closed: HTTP virtual chat with NO explicit sandbox flag REFUSES (no-transport forced isolation)', async () => {
-    // Same forced-isolation rule for a synthetic HTTP virtual chat (webhook /
-    // trigger session): forkWorker forces readIsolation on it too.
+  it('HTTP virtual chat with NO explicit sandbox flag DEGRADES (no forced isolation)', async () => {
+    // Same rule for a synthetic HTTP virtual chat (webhook / trigger session):
+    // no forced readIsolation anymore, so no fail-closed refusal.
     const plain = join(tempRoot, 'not-a-repo-httpvirtual');
     mkdirSync(plain);
     const { mod } = await loadWithBot(plain, true); // no sandbox flag
 
-    await expect(mod.maybeCreateDefaultWorktree('app_wt', plain, {
-      isBotDefaultDir: true, locale: 'zh', chatId: 'http_async_abc123',
-    })).rejects.toBeInstanceOf(mod.AutoWorktreeFailClosedError);
+    const r = await mod.maybeCreateDefaultWorktree('app_wt', plain, {
+      isBotDefaultDir: true, locale: 'zh',
+    });
+
+    expect(r.dir).toBe(plain); // degraded — no local sandbox would have engaged
   });
 
   it('fail-closed does NOT apply to apiOnly + riff (the remote exemption wraps the no-transport arm too)', async () => {

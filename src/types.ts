@@ -642,6 +642,17 @@ export interface Session {
   sandboxReadonlyPaths?: string[];
   /** Network access decision recorded alongside `sandbox` at session creation. */
   sandboxNetwork?: boolean;
+  /**
+   * Read-isolation decision RECORDED AT SESSION CREATION — the SAME freeze
+   * rationale as `sandbox`. The live bot flag (BotConfig.readIsolation) can be
+   * toggled later, but a session's isolation is frozen here so the auto-worktree
+   * fail-closed gate and the worker fork consume ONE snapshot: a toggle landing
+   * while a worktree build is in flight can't make the gate degrade on the old
+   * value while the fork isolates on the new one (a fail-open window). Undefined
+   * on sessions created before this field existed → the fork falls back to the
+   * live bot flag.
+   */
+  readIsolation?: boolean;
   /** Persisted adopt metadata — allows adopt sessions to survive daemon restarts.
    *  Either tmuxTarget (tmux backend) OR zellijSession+zellijPaneId (zellij). */
   adoptedFrom?: {

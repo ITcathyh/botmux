@@ -412,7 +412,7 @@ export function localSandboxApplies(
  * provably-remote mojo session.
  *
  * Shape:
- *   localSandboxApplies(backend, mojoConfig) && (sandbox || readIsolation || noTransport || BOTMUX_SANDBOX)
+ *   localSandboxApplies(backend, mojoConfig) && (sandbox || readIsolation || BOTMUX_SANDBOX)
  *
  * - The REMOTE exemption (riff / provably-remote mojo) wraps the WHOLE union: a
  *   remote backend has no local CLI process, so even BOTMUX_SANDBOX=1 must not
@@ -420,12 +420,10 @@ export function localSandboxApplies(
  * - mojo is NOT exempt by name alone: only a PROVABLY remote mojo session is
  *   (see localSandboxApplies / isMojoFullyRemote — cloud on, localDaemon off,
  *   no wrapperCli, no unprovable env). A local mojo session stays fail-closed.
- * - `noTransport` mirrors forkWorker's forced readIsolation for a no-transport
- *   session (apiOnly bot or HTTP virtual chat — worker-pool.ts), which engages
- *   the local sandbox even with no explicit sandbox flag. The worker folds that
- *   forcing into `readIsolation` before this predicate runs, so it omits the arm;
- *   callers that decide BEFORE the SpawnOpts forcing exists (auto-worktree
- *   fail-closed) must pass it explicitly.
+ * - The no-transport arm was REMOVED: forkWorker no longer force-isolates a
+ *   no-transport session (#899 dropped the forced readIsolation), so the arm
+ *   that mirrored it here is dead — the gate must not be stricter than the
+ *   worker it tracks.
  */
 export function localSandboxRequested(input: {
   backendType: string;
@@ -438,13 +436,11 @@ export function localSandboxRequested(input: {
   };
   sandbox?: boolean;
   readIsolation?: boolean;
-  noTransport?: boolean;
   envSandboxEnabled?: boolean;
 }): boolean {
   if (!localSandboxApplies(input.backendType, input.mojoConfig)) return false;
   return input.sandbox === true
     || input.readIsolation === true
-    || input.noTransport === true
     || input.envSandboxEnabled === true;
 }
 

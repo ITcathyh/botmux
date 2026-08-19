@@ -98,6 +98,12 @@ vi.mock('../src/core/worker-pool.js', () => {
   deliverEphemeralOrReply: vi.fn(),
   closeSession: vi.fn(async () => ({ ok: true, outcome: 'closed', alreadyClosed: false })),
   withActiveSessionKeyLock,
+  // Simulate the real freeze: record the decision on the session so
+  // runAutoWorktreeCommit's frozenSandboxDecision ctx carries the snapshot.
+  freezeSessionSandboxDecision: vi.fn((ds: any, botCfg: any) => {
+    if (ds.session.sandbox === undefined) ds.session.sandbox = botCfg.sandbox === true;
+    if (ds.session.readIsolation === undefined) ds.session.readIsolation = botCfg.readIsolation === true;
+  }),
   CARD_POSTING_SENTINEL: '__posting__',
   };
 });
@@ -166,7 +172,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 // ─── Imports ──────────────────────────────────────────────────────────────
 
 import { handleCardAction, runAutoWorktreeCommit, type CardHandlerDeps } from '../src/im/lark/card-handler.js';
-import { forkWorker, killWorker, teardownAuthoritativePersistentBackingBeforeClose, deliverEphemeralOrReply, deliverWriteLinkCard, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock } from '../src/core/worker-pool.js';
+import { forkWorker, killWorker, teardownAuthoritativePersistentBackingBeforeClose, deliverEphemeralOrReply, deliverWriteLinkCard, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, freezeSessionSandboxDecision } from '../src/core/worker-pool.js';
 import { buildNewTopicCliInput, getAvailableBots, getSessionWorkingDir } from '../src/core/session-manager.js';
 import { getBot } from '../src/bot-registry.js';
 import { createSession, closeSession, updateSession } from '../src/services/session-store.js';
@@ -1365,6 +1371,47 @@ describe('repo select card — worktree open', () => {
     expect(forkWorker).not.toHaveBeenCalled();
     expect(killWorker).not.toHaveBeenCalled();
     expect(ds.worktreeCreating).toBe(false);
+  });
+
+  it('runAutoWorktreeCommit freezes the sandbox decision BEFORE the worktree build and hands the snapshot to the gate', async () => {
+    // R2: the fail-closed gate and the later fork must consume ONE sandbox
+    // snapshot. runAutoWorktreeCommit freezes the decision on the session
+    // (freezeSessionSandboxDecision) before any git/notice await, and passes
+    // the frozen values to maybeCreateDefaultWorktree via frozenSandboxDecision.
+    // A dashboard sandbox toggle landing during the build then changes neither.
+    vi.mocked(getBot).mockImplementation(() => ({
+      config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', sandbox: true },
+      resolvedAllowedUsers: [],
+      botName: 'testbot',
+      botOpenId: 'ou_bot',
+    }) as any);
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
+    const { deps } = makeDeps(ds);
+    const notify = vi.fn();
+    const gateCtx: any = {};
+    vi.mocked(maybeCreateDefaultWorktree).mockImplementationOnce(async (_app, _dir, ctx) => {
+      Object.assign(gateCtx, ctx);
+      return { dir: '/repos/alpha-wt' };
+    });
+
+    await runAutoWorktreeCommit({
+      ds,
+      anchor: ROOT_ID,
+      larkAppId: APP_ID,
+      baseDir: '/repos/alpha',
+      activeSessions: deps.activeSessions,
+      notify,
+    });
+
+    // The freeze ran and recorded the decision on the session.
+    expect(freezeSessionSandboxDecision).toHaveBeenCalledTimes(1);
+    expect(ds.session.sandbox).toBe(true);
+    // The gate received the FROZEN snapshot (not a live-config re-read).
+    expect(gateCtx.frozenSandboxDecision).toEqual({ sandbox: true, readIsolation: false });
+    // The freeze happened BEFORE the gate (no live-config window between them).
+    const freezeOrder = vi.mocked(freezeSessionSandboxDecision).mock.invocationCallOrder[0]!;
+    const gateOrder = vi.mocked(maybeCreateDefaultWorktree).mock.invocationCallOrder[0]!;
+    expect(freezeOrder).toBeLessThan(gateOrder);
   });
 
   it('double click starts ONE background creation and commits once', async () => {

@@ -18,7 +18,11 @@
  * the sandbox promises. A REMOTE backend is exempt: it has no local CLI process
  * (the agent runs in the backend's own remote sandbox), so the local-escape
  * rationale does not apply and it keeps degrading — matching the worker's
- * `sandboxRequested` via the shared `localSandboxRequested` predicate.
+ * `sandboxRequested` via the shared `localSandboxRequested` predicate. The
+ * sandbox decision itself is FROZEN on the session at pending-session
+ * establishment (freezeSessionSandboxDecision) and handed in via
+ * `ctx.frozenSandboxDecision`, so a dashboard toggle landing during the build
+ * can't diverge this gate from the later fork.
  *
  * ALL user-facing notices are posted from here via the caller-supplied `notify`
  * callback (best-effort — a failed send never propagates), so the three spawn
@@ -32,7 +36,6 @@
 import { getBot } from '../bot-registry.js';
 import { config } from '../config.js';
 import { resolvePairedSpawnBackendType } from '../core/persistent-backend.js';
-import { larkTransportEnabled } from '../core/types.js';
 import { sanitizePerBotEnv } from '../core/per-bot-env.js';
 import { localSandboxRequested } from '../adapters/backend/sandbox.js';
 import { buildEffectiveMojoConfig, normalizeMojoConfig } from '../adapters/backend/mojo-types.js';
@@ -78,12 +81,16 @@ export interface MaybeCreateWorktreeCtx {
   /** Best-effort chat notice sink. Omit for silent (e.g. HTTP-virtual sessions). */
   notify?: (message: string) => Promise<unknown> | void;
   /**
-   * The session's chatId, when known at this point. Used to detect a no-transport
-   * session (apiOnly bot OR HTTP virtual chat), which forkWorker forces
-   * readIsolation on — that forced isolation engages the local sandbox even with
-   * no explicit sandbox flag, so fail-closed must track it here too.
+   * The session's FROZEN sandbox decision, recorded at pending-session
+   * establishment (freezeSessionSandboxDecision) — the SAME snapshot the later
+   * fork consumes. The gate's boolean arms (sandbox / readIsolation) read THIS,
+   * never live bot config: a dashboard `PUT /api/bot-sandbox` toggle landing
+   * during the up-to-30s build must not change the decision the fork will
+   * adopt (gate degrades on the old value while the fork isolates on the new
+   * one = a fail-open window). When omitted (legacy callers/tests) the gate
+   * falls back to live config, preserving the pre-freeze behavior.
    */
-  chatId?: string;
+  frozenSandboxDecision?: { sandbox: boolean; readIsolation: boolean };
 }
 
 /**
@@ -128,7 +135,14 @@ export async function maybeCreateDefaultWorktree(
   // localSandboxRequested predicate (worker.ts computes sandboxRequested with
   // the same call), so this gate can never drift from the worker's real sandbox
   // state again:
-  //   localSandboxApplies(backend, mojoConfig) && (sandbox || readIsolation || noTransport || BOTMUX_SANDBOX)
+  //   localSandboxApplies(backend, mojoConfig) && (sandbox || readIsolation || BOTMUX_SANDBOX)
+  // - The BOOLEAN arms (sandbox / readIsolation) come from the session's FROZEN
+  //   decision (ctx.frozenSandboxDecision, recorded at pending-session
+  //   establishment) — NOT live bot config. A dashboard sandbox toggle landing
+  //   during this build must not change the decision the fork will consume:
+  //   the gate degrading on the old value while the fork isolates on the new
+  //   one is the fail-open window the freeze closes (re-reading live config
+  //   only after the fallback would still leave the recheck→fork await window).
   // - The REMOTE exemption wraps the WHOLE union: riff, and a PROVABLY remote
   //   mojo session (#803), have no local CLI process (the agent runs in the
   //   backend's own remote sandbox, its writes never touch the real local dir),
@@ -141,9 +155,6 @@ export async function maybeCreateDefaultWorktree(
   // - `readIsolation` is in the union because the worker still honors it for an
   //   unmigrated BOTS_CONFIG (it's auto-migrated to `sandbox` at daemon startup,
   //   but a read-only config can still carry the legacy flag).
-  // - `noTransport` mirrors forkWorker's forced readIsolation for a no-transport
-  //   session (apiOnly bot or HTTP virtual chat — worker-pool.ts), which engages
-  //   the local sandbox even with no explicit sandbox flag.
   const failClosed = (() => {
     try {
       const c = getBot(larkAppId).config;
@@ -167,9 +178,8 @@ export async function maybeCreateDefaultWorktree(
       return localSandboxRequested({
         backendType: effectiveBackend,
         mojoConfig: effectiveMojo,
-        sandbox: c.sandbox === true,
-        readIsolation: c.readIsolation === true,
-        noTransport: !larkTransportEnabled({ chatId: ctx.chatId ?? '', apiOnly: c.apiOnly }),
+        sandbox: ctx.frozenSandboxDecision ? ctx.frozenSandboxDecision.sandbox : c.sandbox === true,
+        readIsolation: ctx.frozenSandboxDecision ? ctx.frozenSandboxDecision.readIsolation : c.readIsolation === true,
         envSandboxEnabled: process.env.BOTMUX_SANDBOX === '1',
       });
     } catch { return false; }
