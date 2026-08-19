@@ -1187,4 +1187,55 @@ describe('handleBotAdded — 非 shared 首轮 turn 身份与 provenance', () =>
       target: { mode: 'plain', chatId },
     });
   });
+
+  it('provenance 持久化失败时回滚会话注册，下次 bot.added 不被去重', async () => {
+    // 回归：首轮 turn provenance 的 sessionStore.updateSession 若抛错（文件系统/
+    // 数据库瞬态失败），会话已发布到 activeSessions 且 groupJoinAnchorByChat 已
+    // 登记。修复前 finally 只 settle barrier/释放 in-flight 锁，留下 active 但
+    // worker-null 的会话，后续 bot.added 被无限去重，自动开工无法重试。
+    const { daemon, registry, types } = modules;
+    const sessionStore = await import('../src/services/session-store.js');
+    const appId = 'app_join_provenance_persist_failure';
+    const chatId = 'oc_join_provenance_persist_failure';
+    const key = types.sessionKey(chatId, appId);
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-provenance-persist-failure'),
+      regularGroupReplyMode: 'chat',
+    });
+
+    // 只在「带 turn provenance 的那次落盘」上注入一次瞬态失败（ENOSPC 替身）：
+    // 注册前的初始字段落盘不带 replyTargets，照常透传。
+    const realUpdateSession = sessionStore.updateSession;
+    let failedOnce = false;
+    let failedSessionId: string | undefined;
+    const updateSpy = vi.spyOn(sessionStore, 'updateSession').mockImplementation((s) => {
+      if (!failedOnce && s.replyTargets && Object.keys(s.replyTargets).length > 0) {
+        failedOnce = true;
+        failedSessionId = s.sessionId;
+        throw new Error('ENOSPC: no space left on device');
+      }
+      return realUpdateSession(s);
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    // 回滚：会话从 activeSessions 移除、store 记录被 close、没有 fork——
+    // 不留下 worker-null 的 active 会话。
+    expect(failedOnce).toBe(true);
+    expect(daemon.__testOnly_activeSessions.get(key)).toBeUndefined();
+    expect(sessionStore.getSession(failedSessionId!)?.status).toBe('closed');
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    updateSpy.mockRestore();
+
+    // 重试：下一次 bot.added 不被去重，正常注册并 fork。
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+    expect(daemon.__testOnly_activeSessions.get(key)).toBeDefined();
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+  });
 });

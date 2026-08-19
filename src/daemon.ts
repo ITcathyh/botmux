@@ -18356,6 +18356,10 @@ async function handleBotAdded(
       // slow best-effort cleanup cannot block a retry or erase a replacement.
       const closing = closeSessionHelper(session.sessionId);
       if (activeSessions.get(dsKey) === ds) activeSessions.delete(dsKey);
+      // 入群去重锚点同样只清自己登记的那条：shared 路径在登记锚点之前就可能
+      // 回滚（此时 get 为 undefined，no-op）；非 shared 路径在锚点登记之后
+      // 回滚，不清掉会让后续 bot.added 带着 stale 锚点走进来。
+      if (groupJoinAnchorByChat.get(chatLiveKey) === dsKey) groupJoinAnchorByChat.delete(chatLiveKey);
       await closing;
     };
 
@@ -18416,13 +18420,27 @@ async function handleBotAdded(
     // 显式指定的安全方向。没有这条记录，worker 虽带 turnId fork，daemon 侧的
     // 首轮回复目标/参与者窗口仍无据可查。
     if (!needsSharedReply) {
-      beginReplyTargetTurn(
-        ds,
-        scope === 'thread' ? anchor : undefined,
-        joinTurnId,
-        new Date(now).toISOString(),
-      );
-      sessionStore.updateSession(ds.session);
+      try {
+        beginReplyTargetTurn(
+          ds,
+          scope === 'thread' ? anchor : undefined,
+          joinTurnId,
+          new Date(now).toISOString(),
+        );
+        sessionStore.updateSession(ds.session);
+      } catch (err) {
+        // 持久化失败（文件系统/数据库瞬态错误）时必须回滚已发布的会话：此时
+        // 会话已进 activeSessions 且 groupJoinAnchorByChat 已登记，finally 只
+        // settle barrier 和释放 in-flight 锁——留下 active 但 worker-null 的会话
+        // 会让后续 bot.added 被无限去重，自动开工无法重试。同
+        // stageClaimedPendingRepoSetup 的 unpublish/close 回滚。
+        logger.warn(
+          `[auto-start:入群] ${chatId.substring(0, 12)} 首轮 turn provenance 持久化失败，回滚会话注册：`
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+        await rollbackRegisteredJoinSession();
+        return;
+      }
     }
 
     // Auto-worktree: register PENDING, build worktree off-path, commit+fork later.
