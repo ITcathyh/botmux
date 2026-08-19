@@ -160,4 +160,26 @@ describe('staggeredRecoveryFork', () => {
     );
     expect(forked).toHaveLength(10);
   });
+
+  it('does not count refused forks (forkWorker returned false) against the maxForks cap', async () => {
+    // A quarantined tail-only owner whose promotion still fails makes
+    // forkWorker return false — no worker was spawned, so no budget slot was
+    // used. Such candidates must not starve later healthy sessions.
+    const sessions = [ds('quarantined'), ds('a'), ds('b'), ds('c')];
+    const forked: string[] = [];
+    await staggeredRecoveryFork(
+      sessions,
+      (d) => {
+        if (d.session.sessionId === 'quarantined') return false; // refused: no worker
+        forked.push(d.session.sessionId);
+        return true;
+      },
+      5,
+      0,
+      undefined,
+      3, // maxForks
+    );
+    // The refused fork consumed no budget: a/b/c all forked (3 = cap).
+    expect(forked).toEqual(['a', 'b', 'c']);
+  });
 });

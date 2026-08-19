@@ -1723,10 +1723,15 @@ const RECOVERY_FORK_DELAY_MS = config.daemon.recoveryForkDelayMs ?? 250;
  * Sessions beyond the cap stay worker-less and lazily cold-resume on their
  * next message (the existing worker-null resume path). Default Infinity keeps
  * the old behaviour for callers that don't pass a cap.
+ *
+ * Only ACCEPTED forks count toward the cap: `fork` may return false to report
+ * that no worker was spawned (e.g. forkWorker refusing a quarantined
+ * tail-only owner whose promotion still fails). A refused fork consumes no
+ * budget, so later healthy sessions are not starved by earlier dead candidates.
  */
 export async function staggeredRecoveryFork(
   sessions: readonly DaemonSession[],
-  fork: (ds: DaemonSession) => void,
+  fork: (ds: DaemonSession) => boolean | void,
   batchSize: number = RECOVERY_FORK_BATCH_SIZE,
   delayMs: number = RECOVERY_FORK_DELAY_MS,
   stillOwned: (ds: DaemonSession) => boolean = ds => ds.session.status === 'active',
@@ -1746,8 +1751,11 @@ export async function staggeredRecoveryFork(
       break;
     }
     try {
-      fork(ds);
-      totalForked++;
+      const accepted = fork(ds);
+      // A refused fork (forkWorker returned false) started no worker and must
+      // not consume the budget — otherwise quarantined candidates appearing
+      // before healthy sessions could spend the whole per-bot budget.
+      if (accepted !== false) totalForked++;
     } catch (err) {
       // One malformed/stale pane or synchronous init-IPC failure must not
       // abort recovery for every later durable owner. forkWorker compensates
@@ -2629,7 +2637,14 @@ export async function restoreActiveSessions(
   // has no global uncaughtException trap). Sessions beyond a bot's budget stay
   // worker-less and lazily cold-resume on their next message — the same
   // worker-null resume path the idle-worker-sweeper relies on.
-  const recoveryFork = (ds: DaemonSession) => {
+  //
+  // The budget trims ORDINARY idle sessions only. Protected owners
+  // (queuedActivationPending, activation tail, unsettled Codex App dispatch,
+  // pending repo setup) represent already-accepted durable work: leaving them
+  // worker-less would silently stall a task that may never receive another
+  // message. They resume first and are NOT truncated by the idle-reattach
+  // budget, even when that transiently exceeds the cap.
+  const recoveryFork = (ds: DaemonSession): boolean => {
     // A quarantined tail-only owner (restore promotion failed transiently) is
     // handled by the CENTRAL guard inside forkWorker: this blank fork retries
     // the old head's promotion first and, if it still fails, refuses to fork
@@ -2642,7 +2657,7 @@ export async function restoreActiveSessions(
     const recoverExactNonCodex = ds.session.queuedActivationPending
       && ds.session.cliId !== 'codex-app'
       && ds.session.queuedActivationInput;
-    forkWorker(
+    return forkWorker(
       ds,
       recoverExactNonCodex || '',
       recoverExactNonCodex
@@ -2671,14 +2686,29 @@ export async function restoreActiveSessions(
     const live = [...activeSessions.values()]
       .filter(ds => ds.larkAppId === appId && ds.worker && !ds.worker.killed).length;
     const budget = cap <= 0 ? Infinity : Math.max(0, cap - live);
-    if (group.length > budget) {
+    // Protected owners resume first, outside the idle-reattach budget.
+    const protectedOwners = group.filter(ds => hasProtectedSessionMutationOwnership(ds));
+    // Ordinary idle sessions: most-recently-active first, trimmed by budget.
+    const idleSessions = group
+      .filter(ds => !hasProtectedSessionMutationOwnership(ds))
+      .sort((a, b) => (b.lastMessageAt ?? 0) - (a.lastMessageAt ?? 0));
+    if (idleSessions.length > budget) {
       logger.info(
-        `[${appId}] Recovery fork budget: ${budget} of ${group.length} candidate(s) `
-        + `(cap=${cap}, live=${live}); rest stay worker-less until next message`,
+        `[${appId}] Recovery fork budget: ${budget} of ${idleSessions.length} idle `
+        + `candidate(s) (cap=${cap}, live=${live}); rest stay worker-less until next `
+        + `message. ${protectedOwners.length} protected owner(s) resume untruncated.`,
       );
     }
     await staggeredRecoveryFork(
-      group,
+      protectedOwners,
+      recoveryFork,
+      RECOVERY_FORK_BATCH_SIZE,
+      RECOVERY_FORK_DELAY_MS,
+      stillOwnedRestore,
+      Infinity,
+    );
+    await staggeredRecoveryFork(
+      idleSessions,
       recoveryFork,
       RECOVERY_FORK_BATCH_SIZE,
       RECOVERY_FORK_DELAY_MS,

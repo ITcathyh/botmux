@@ -495,7 +495,15 @@ describe('worker-pool lifecycle hook integration', () => {
     });
   });
 
-  it('exit handler isolates sessionStore.updateSession failures without crashing the daemon', async () => {
+  it('exit handler isolates sessionStore.updateSession failures without skipping reconciliation', async () => {
+    const onWorkerExit = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onWorkerExit,
+    });
     const worker = makeFakeWorker();
     const ds = makeDs({ worker });
     __testOnly_setupWorkerHandlers(ds, worker);
@@ -507,13 +515,29 @@ describe('worker-pool lifecycle hook integration', () => {
       throw new Error('file-lock timeout waiting for sessions.json.lock');
     });
 
-    // The emit must NOT throw — the try/catch inside the exit handler isolates
-    // the failure and logs it instead of propagating an uncaught exception.
+    // The emit must NOT throw — the narrow try/catch around the persistence
+    // write isolates the failure and logs it instead of propagating.
     expect(() => worker.emit('exit', 1, null)).not.toThrow();
     await flush();
 
+    // The persistence failure was logged at the narrow catch site.
     expect(logger.error).toHaveBeenCalledWith(
-      expect.stringContaining('Worker exit handler failed: file-lock timeout'),
+      expect.stringContaining('Failed to persist worker exit generation'),
+    );
+    // Durable-exit reconciliation still ran exactly once despite the write failure.
+    expect(onWorkerExit).toHaveBeenCalledTimes(1);
+    expect(onWorkerExit).toHaveBeenCalledWith(
+      ds,
+      expect.objectContaining({ sessionId: 'sid-lifecycle-test', code: 1 }),
+    );
+    // Dashboard exited event and session.exit lifecycle hook still fired once.
+    expect(dashboardEventBus.publish).toHaveBeenCalledTimes(1);
+    expect(dashboardEventBus.publish).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'session.exited' }),
+    );
+    expect(emitHookEventMock).toHaveBeenCalledWith(
+      'session.exit',
+      expect.objectContaining({ sessionId: 'sid-lifecycle-test', reason: 'exit_code_1' }),
     );
   });
 });
