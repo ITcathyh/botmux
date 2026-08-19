@@ -1903,6 +1903,119 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     }
   });
 
+  it('does not let an autonomous Goal turn/started flip the keep-pending reconcile into a false kill', async () => {
+    // REGRESSION for the keep-pending exit condition: a stale foreign completion
+    // before the start response replays into reconcile with keepPendingWhileActive.
+    // An autonomous Goal turn/started then flips the GLOBAL nativeActiveTurnId
+    // slot while the accepted turn is still running. The global slot flip is not
+    // proof this turn terminated — the turn must stay pending and settle with
+    // its own real completion (arriving 1.5s after the response), not fail-closed
+    // on the Goal's turn/started. The old exit condition (nativeActiveTurnId !==
+    // turn.nativeTurnId) killed the turn here and swallowed the real answer.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-goal-switch-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'pre-response-foreign-completion-goal-switch', control.bootstrap.path);
+
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('legacy', {
+        text: 'stale completion then goal switch',
+        clientUserMessageId: 'om_goal_switch_pre',
+      })}\r`);
+      // The turn MUST settle with the REAL answer arriving after the Goal's
+      // turn/started flipped the global native slot — not an identity-conflict
+      // error. A fail-closed here is the regression: the Goal's lifecycle edge
+      // was misread as this turn's termination. The final transaction is only
+      // emitted after await turn.done, so finals.length===1 proves the turn
+      // settled (the autonomous Goal stays native-busy by design, so the runner
+      // intentionally does NOT go idle here).
+      await waitFor(harness, () => control.finals.length === 1);
+      // The else branch fired (reconcile scanned history while pending) — proof
+      // the stale completion was replayed — and it did NOT kill the turn.
+      expect(readRequests(logPath).some(request => request.method === 'thread/turns/list')).toBe(true);
+      const diagnostics = control.markers.filter(
+        marker => marker.kind === 'diagnostic' && marker.payload.code === 'native_turn_identity_conflict',
+      );
+      expect(diagnostics).toHaveLength(0);
+      expect(control.finals[0]).toMatchObject({
+        turnId: 'om_goal_switch_pre',
+        content: 'real answer despite goal switch',
+      });
+      expect(harness.child.exitCode).toBeNull();
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('bounds the keep-pending re-scan loop and fail-closes when the native turn never completes', async () => {
+    // REGRESSION for the unbounded history poll: a stale foreign completion
+    // before the start response replays into reconcile with keepPendingWhileActive,
+    // and the accepted native turn hangs forever. The re-scan loop must stop
+    // after its wall-clock ceiling (shrunk to 1s here via the test override) and
+    // fail-closed — identity conflict + turn.done settles — instead of polling
+    // thread/turns/list (~5Hz) forever. The no-progress watchdog is not a safety
+    // net here: it only projects a stalled UI state and never cancels the runner.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-keep-pending-bound-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(
+      fakeCodex,
+      dir,
+      logPath,
+      '0.144.6',
+      'pre-response-foreign-completion-hang',
+      control.bootstrap.path,
+      { env: { BOTMUX_TEST_CODEX_APP_KEEP_PENDING_TIMEOUT_MS: '1000' } },
+    );
+
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('legacy', {
+        text: 'stale completion then hang',
+        clientUserMessageId: 'om_keep_pending_hang',
+      })}\r`);
+      // The ceiling (1s) trips: reconcile fail-closes with an identity conflict
+      // and the turn settles with an explicit error final.
+      await waitFor(harness, () => control.markers.some(
+        marker => marker.kind === 'diagnostic' && marker.payload.code === 'native_turn_identity_conflict',
+      ));
+      await waitFor(harness, () => control.finals.length === 1
+        && control.states.filter(state => state.busy === false).length >= 2);
+      expect(control.finals[0]).toMatchObject({
+        turnId: 'om_keep_pending_hang',
+      });
+      expect(String(control.finals[0].content ?? '')).toContain('identity conflict');
+      // The re-scan count is bounded by the ceiling: 1000ms / 200ms retry ≈ 5-6
+      // scans (one turns/list page each). A runaway loop would dwarf this.
+      const listCountAtSettle = readRequests(logPath)
+        .filter(request => request.method === 'thread/turns/list').length;
+      expect(listCountAtSettle).toBeGreaterThanOrEqual(1);
+      expect(listCountAtSettle).toBeLessThanOrEqual(8);
+      // After fail-closed the loop must NOT keep polling: observe for 600ms
+      // (3x the retry interval) and assert the count did not grow.
+      await new Promise(resolvePromise => setTimeout(resolvePromise, 600));
+      const listCountAfterQuiet = readRequests(logPath)
+        .filter(request => request.method === 'thread/turns/list').length;
+      expect(listCountAfterQuiet).toBe(listCountAtSettle);
+      expect(harness.child.exitCode).toBeNull();
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('keeps the startup deadline armed through initialize and never exposes a pre-ready prompt', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-runner-startup-deadline-'));
     const fakeCodex = join(dir, 'fake-codex');

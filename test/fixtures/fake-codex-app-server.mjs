@@ -788,6 +788,73 @@ function handle(request) {
     }, 100);
     return;
   }
+  if (behavior === 'pre-response-foreign-completion-goal-switch' && turnAttempt === 1) {
+    // REGRESSION for the keep-pending exit condition: a STALE foreign completion
+    // (no client items, unrelated id) arrives BEFORE the start response and is
+    // replayed into reconcile with keepPendingWhileActive. 250ms later an
+    // autonomous Goal turn/started flips the GLOBAL nativeActiveTurnId slot;
+    // 1.5s later THIS turn's real completion arrives. The global slot flip is
+    // NOT proof this turn terminated — the runner must keep the turn pending
+    // and settle it with the real answer, not fail-closed on the Goal's
+    // turn/started (which would discard the real completion).
+    const threadId = request.params.threadId;
+    const turnId = `turn-fake-${turnAttempt}`;
+    const clientId = request.params.clientUserMessageId ?? null;
+    notify('turn/completed', {
+      threadId,
+      turn: { id: 'turn-stale-pre-response', status: 'completed' },
+    });
+    respond(request.id, { turn: { id: turnId } });
+    notify('turn/started', { threadId, turn: { id: turnId } });
+    setTimeout(() => {
+      notify('turn/started', {
+        threadId,
+        turn: { id: 'turn-goal-auto', status: 'inProgress', itemsView: 'full', items: [] },
+      });
+    }, 250);
+    setTimeout(() => {
+      notify('item/completed', {
+        threadId,
+        turnId,
+        item: {
+          id: `message-real-${turnAttempt}`,
+          type: 'agentMessage',
+          phase: 'final_answer',
+          text: 'real answer despite goal switch',
+        },
+      });
+      notify('turn/completed', {
+        threadId,
+        turn: {
+          id: turnId,
+          status: 'completed',
+          itemsView: 'full',
+          error: null,
+          items: [
+            { id: `user-${turnAttempt}`, type: 'userMessage', clientId, content: request.params.input },
+            { id: `message-real-${turnAttempt}`, type: 'agentMessage', phase: 'final_answer', text: 'real answer despite goal switch' },
+          ],
+        },
+      });
+    }, 1500);
+    return;
+  }
+  if (behavior === 'pre-response-foreign-completion-hang' && turnAttempt === 1) {
+    // REGRESSION for the keep-pending re-scan bound: a STALE foreign completion
+    // before the start response replays into reconcile with keepPendingWhileActive,
+    // and the accepted native turn NEVER completes (hang). The re-scan loop must
+    // stop after its wall-clock ceiling and fail-closed (identity conflict +
+    // turn.done settles) — not poll thread/turns/list (~5Hz) forever.
+    const threadId = request.params.threadId;
+    const turnId = `turn-fake-${turnAttempt}`;
+    notify('turn/completed', {
+      threadId,
+      turn: { id: 'turn-stale-pre-response', status: 'completed' },
+    });
+    respond(request.id, { turn: { id: turnId } });
+    notify('turn/started', { threadId, turn: { id: turnId } });
+    return;
+  }
   if (behavior === 'completion-A-started-B') {
     // R4-B2 crossing 1: exact completion A proves canonical=A; then an exact
     // turn/started B (DIFFERENT id) arrives → first-proof-wins must fence (a later

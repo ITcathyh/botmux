@@ -161,6 +161,24 @@ const RECONCILIATION_PAGE_SIZE = 50;
  * handler settles the turn the moment its real completion arrives, so this only
  * paces the fallback scan (a thin completion whose full record is history-only). */
 const RECONCILIATION_KEEP_PENDING_RETRY_MS = 200;
+/** Wall-clock ceiling for a keep-pending reconcile's re-scan loop. The accepted
+ * native turn's own lifecycle normally bounds the wait (its completion settles
+ * the turn through the regular notification handler); this ceiling is the
+ * fail-closed safety net for a turn that never completes — without it the loop
+ * would poll thread/turns/list (~5Hz) forever. The no-progress watchdog only
+ * projects a stalled UI state and never cancels the runner, so it is NOT a
+ * safety net for this loop. */
+const RECONCILIATION_KEEP_PENDING_TIMEOUT_MS = 30_000;
+
+/** Test-only shrink for the keep-pending ceiling (same convention as the
+ * startup timeout override); production always uses the constant above. */
+function keepPendingTimeoutMs(): number {
+  if (process.env.NODE_ENV === 'test') {
+    const override = Number(process.env.BOTMUX_TEST_CODEX_APP_KEEP_PENDING_TIMEOUT_MS);
+    if (Number.isFinite(override) && override > 0) return override;
+  }
+  return RECONCILIATION_KEEP_PENDING_TIMEOUT_MS;
+}
 /** Consecutive app-server lifecycle notifications may arrive in separate stdout
  * reads. Briefly debounce an idle edge so turn/completed followed immediately
  * by an autonomous turn/started never exposes a false ready boundary. */
@@ -957,14 +975,23 @@ async function reconcileCompletedTurn(
   }
   const epoch = turn.epoch;
   const sleep = (ms: number) => new Promise<void>(resolvePromise => setTimeout(resolvePromise, ms));
+  // keepPendingWhileActive: wall-clock ceiling for the re-scan loop below.
+  const keepPendingDeadlineAtMs = options.keepPendingWhileActive
+    ? Date.now() + keepPendingTimeoutMs()
+    : 0;
+  let conflictReason = 'bounded history lookup found no match';
   turn.reconciliation = (async () => {
     for (;;) {
-      // Each scan gets a fresh RPC budget. With keepPendingWhileActive the outer
-      // loop is intentionally unbounded — the accepted native turn's own
-      // lifecycle bounds the wait, and the no-progress watchdog is the safety
-      // net for a turn that never completes.
+      // Each scan gets a fresh RPC budget.
       const scanDeadlineAtMs = Date.now() + RECONCILIATION_TIMEOUT_MS;
       const matches: Array<{ turn: JsonObject; itemIndex: number }> = [];
+      // Whether THIS turn's own native turn has a terminal record in the
+      // scanned history. The GLOBAL nativeActiveTurnId slot flipping to a
+      // different id is NOT proof this turn terminated — an autonomous Goal
+      // turn/started (or a late edge from another turn) flips it while the
+      // accepted turn is still running. Only the accepted turn's own terminal
+      // record is, so it is tracked per scan instead of comparing global slots.
+      let acceptedTurnWentTerminal = false;
       let cursor: string | null | undefined;
       for (let page = 0; page < RECONCILIATION_PAGE_LIMIT; page++) {
         const remaining = scanDeadlineAtMs - Date.now();
@@ -978,6 +1005,9 @@ async function reconcileCompletedTurn(
         }, { timeoutMs: remaining });
         for (const candidate of Array.isArray(result?.data) ? result.data : []) {
           if (!isTerminalNativeTurn(candidate)) continue;
+          if (turn.nativeTurnId && candidate?.id === turn.nativeTurnId) {
+            acceptedTurnWentTerminal = true;
+          }
           const indexes = exactClientItemIndexes(candidate, clientUserMessageId);
           if (indexes.length === 1) matches.push({ turn: candidate, itemIndex: indexes[0] });
           else if (indexes.length > 1) {
@@ -1007,18 +1037,28 @@ async function reconcileCompletedTurn(
       // completion when it arrives moments later.
       //
       // keepPendingWhileActive: keep the turn pending and re-scan while the
-      // accepted native turn is still active. The turn's own completion settles
-      // it through the regular notification handler (tripping the turn.completed
-      // guard above); a thin completion whose full record exists only in history
-      // is picked up by a re-scan. Fail closed only once the native turn is no
-      // longer active with still no match. The wait is bounded by the turn's own
-      // lifecycle and the no-progress watchdog, not a timer.
+      // accepted native turn has NOT itself gone terminal in history. The
+      // turn's own completion settles it through the regular notification
+      // handler (tripping the turn.completed guard above); a thin completion
+      // whose full record exists only in history is picked up by a re-scan.
+      // Fail closed only when (a) the accepted turn's OWN terminal record is
+      // in history with still no exact match — a genuine identity conflict,
+      // distinct from another turn merely starting — or (b) the wall-clock
+      // ceiling is reached (the turn never completes), so the loop cannot
+      // poll thread/turns/list forever.
       if (!options.keepPendingWhileActive) break;
-      if (nativeActiveTurnId !== turn.nativeTurnId) break;
+      if (acceptedTurnWentTerminal) {
+        conflictReason = 'accepted native turn terminated without an exact client id match';
+        break;
+      }
+      if (Date.now() >= keepPendingDeadlineAtMs) {
+        conflictReason = 'bounded history lookup found no match within the keep-pending deadline';
+        break;
+      }
       await sleep(RECONCILIATION_KEEP_PENDING_RETRY_MS);
       if (activeTurn !== turn || turn.epoch !== epoch || turn.completed) return;
     }
-    reportIdentityConflict(turn, observedNativeTurnId, 'bounded history lookup found no match');
+    reportIdentityConflict(turn, observedNativeTurnId, conflictReason);
   })().catch(err => {
     if (activeTurn === turn && !turn.completed) {
       reportIdentityConflict(turn, observedNativeTurnId, `bounded history lookup failed: ${asError(err).message}`);
