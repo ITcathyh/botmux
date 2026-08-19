@@ -156,6 +156,11 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const RECONCILIATION_TIMEOUT_MS = 5_000;
 const RECONCILIATION_PAGE_LIMIT = 3;
 const RECONCILIATION_PAGE_SIZE = 50;
+/** Delay between bounded-history re-scans while a keep-pending reconcile waits
+ * for the accepted native turn's own completion. The regular notification
+ * handler settles the turn the moment its real completion arrives, so this only
+ * paces the fallback scan (a thin completion whose full record is history-only). */
+const RECONCILIATION_KEEP_PENDING_RETRY_MS = 200;
 /** Consecutive app-server lifecycle notifications may arrive in separate stdout
  * reads. Briefly debounce an idle edge so turn/completed followed immediately
  * by an autonomous turn/started never exposes a false ready boundary. */
@@ -939,7 +944,11 @@ function reportIdentityConflict(turn: ActiveTurn, observedNativeTurnId?: string,
   turn.resolveDone();
 }
 
-async function reconcileCompletedTurn(turn: ActiveTurn, observedNativeTurnId?: string): Promise<void> {
+async function reconcileCompletedTurn(
+  turn: ActiveTurn,
+  observedNativeTurnId?: string,
+  options: { keepPendingWhileActive?: boolean } = {},
+): Promise<void> {
   if (turn.reconciliation || turn.completed) return turn.reconciliation;
   const clientUserMessageId = turn.clientUserMessageId;
   if (!clientUserMessageId || !threadId) {
@@ -947,42 +956,69 @@ async function reconcileCompletedTurn(turn: ActiveTurn, observedNativeTurnId?: s
     return;
   }
   const epoch = turn.epoch;
-  const deadlineAtMs = Date.now() + RECONCILIATION_TIMEOUT_MS;
+  const sleep = (ms: number) => new Promise<void>(resolvePromise => setTimeout(resolvePromise, ms));
   turn.reconciliation = (async () => {
-    const matches: Array<{ turn: JsonObject; itemIndex: number }> = [];
-    let cursor: string | null | undefined;
-    for (let page = 0; page < RECONCILIATION_PAGE_LIMIT; page++) {
-      const remaining = deadlineAtMs - Date.now();
-      if (remaining <= 0) break;
-      const result = await client.request('thread/turns/list', {
-        threadId,
-        ...(cursor ? { cursor } : {}),
-        limit: RECONCILIATION_PAGE_SIZE,
-        sortDirection: 'desc',
-        itemsView: 'full',
-      }, { timeoutMs: remaining });
-      for (const candidate of Array.isArray(result?.data) ? result.data : []) {
-        if (!isTerminalNativeTurn(candidate)) continue;
-        const indexes = exactClientItemIndexes(candidate, clientUserMessageId);
-        if (indexes.length === 1) matches.push({ turn: candidate, itemIndex: indexes[0] });
-        else if (indexes.length > 1) {
-          reportIdentityConflict(turn, observedNativeTurnId, 'client id appears more than once in one turn');
-          return;
+    for (;;) {
+      // Each scan gets a fresh RPC budget. With keepPendingWhileActive the outer
+      // loop is intentionally unbounded — the accepted native turn's own
+      // lifecycle bounds the wait, and the no-progress watchdog is the safety
+      // net for a turn that never completes.
+      const scanDeadlineAtMs = Date.now() + RECONCILIATION_TIMEOUT_MS;
+      const matches: Array<{ turn: JsonObject; itemIndex: number }> = [];
+      let cursor: string | null | undefined;
+      for (let page = 0; page < RECONCILIATION_PAGE_LIMIT; page++) {
+        const remaining = scanDeadlineAtMs - Date.now();
+        if (remaining <= 0) break;
+        const result = await client.request('thread/turns/list', {
+          threadId,
+          ...(cursor ? { cursor } : {}),
+          limit: RECONCILIATION_PAGE_SIZE,
+          sortDirection: 'desc',
+          itemsView: 'full',
+        }, { timeoutMs: remaining });
+        for (const candidate of Array.isArray(result?.data) ? result.data : []) {
+          if (!isTerminalNativeTurn(candidate)) continue;
+          const indexes = exactClientItemIndexes(candidate, clientUserMessageId);
+          if (indexes.length === 1) matches.push({ turn: candidate, itemIndex: indexes[0] });
+          else if (indexes.length > 1) {
+            reportIdentityConflict(turn, observedNativeTurnId, 'client id appears more than once in one turn');
+            return;
+          }
         }
+        cursor = typeof result?.nextCursor === 'string' ? result.nextCursor : null;
+        if (!cursor) break;
       }
-      cursor = typeof result?.nextCursor === 'string' ? result.nextCursor : null;
-      if (!cursor) break;
+      if (activeTurn !== turn || turn.epoch !== epoch || turn.completed) return;
+      if (matches.length === 1) {
+        completeActiveTurnFromNative(turn, matches[0].turn, matches[0].itemIndex);
+        return;
+      }
+      if (matches.length > 1) {
+        reportIdentityConflict(turn, observedNativeTurnId, 'bounded history lookup found multiple matches');
+        return;
+      }
+      // No terminal turn with an exact client-id match in bounded history.
+      //
+      // A single foreign-id completion buffered before the start/steer response
+      // is not causal proof that the ACCEPTED turn terminated: it can be a late
+      // arrival from a previous / autonomous turn while the accepted turn is
+      // still running, whose terminal record cannot be in history yet. Failing
+      // closed immediately would kill the running turn and discard its real
+      // completion when it arrives moments later.
+      //
+      // keepPendingWhileActive: keep the turn pending and re-scan while the
+      // accepted native turn is still active. The turn's own completion settles
+      // it through the regular notification handler (tripping the turn.completed
+      // guard above); a thin completion whose full record exists only in history
+      // is picked up by a re-scan. Fail closed only once the native turn is no
+      // longer active with still no match. The wait is bounded by the turn's own
+      // lifecycle and the no-progress watchdog, not a timer.
+      if (!options.keepPendingWhileActive) break;
+      if (nativeActiveTurnId !== turn.nativeTurnId) break;
+      await sleep(RECONCILIATION_KEEP_PENDING_RETRY_MS);
+      if (activeTurn !== turn || turn.epoch !== epoch || turn.completed) return;
     }
-    if (activeTurn !== turn || turn.epoch !== epoch || turn.completed) return;
-    if (matches.length === 1) {
-      completeActiveTurnFromNative(turn, matches[0].turn, matches[0].itemIndex);
-      return;
-    }
-    reportIdentityConflict(
-      turn,
-      observedNativeTurnId,
-      matches.length === 0 ? 'bounded history lookup found no match' : 'bounded history lookup found multiple matches',
-    );
+    reportIdentityConflict(turn, observedNativeTurnId, 'bounded history lookup found no match');
   })().catch(err => {
     if (activeTurn === turn && !turn.completed) {
       reportIdentityConflict(turn, observedNativeTurnId, `bounded history lookup failed: ${asError(err).message}`);
@@ -2043,9 +2079,12 @@ async function runTurn(message: QueuedInput): Promise<void> {
   // R4-B2 defense-in-depth: the buffered terminal's id MUST equal the proven
   // canonical id before we settle from it — a first-proof-wins violation upstream
   // would otherwise let terminal A's content ship under a different native id.
+  // A MISSING id must NOT settle directly: it routes through bounded-history
+  // reconcile (the same rule resumeBufferedGroupCompletion applies), so a
+  // malformed payload can never bypass attribution by omitting its id.
   const bufferedTerminalMatchesCanonical = turn.terminalCompletion !== undefined
-    && (typeof turn.terminalCompletion.id !== 'string'
-      || turn.terminalCompletion.id === turn.canonicalNativeTurnId);
+    && typeof turn.terminalCompletion.id === 'string'
+    && turn.terminalCompletion.id === turn.canonicalNativeTurnId;
   const settleBufferedCanonical = !turn.completed
     && turn.completionSeen
     && turn.terminalCompletion
@@ -2091,10 +2130,17 @@ async function runTurn(message: QueuedInput): Promise<void> {
       // A mismatched completion can share one stdout read with turn/start's
       // response. It was buffered while requestAccepted was false; replay the
       // regular reconciliation path instead of silently dropping it.
+      //
+      // keepPendingWhileActive: this single foreign-id completion is not proof
+      // the accepted turn terminated — it may be a late arrival from a previous
+      // / autonomous turn while the accepted turn is still running (its terminal
+      // record cannot be in history yet). Keep the turn pending until its own
+      // completion settles it; fail closed only if the native turn is no longer
+      // active with no exact match in bounded history.
       const observedId = pendingCompletions.slice().reverse().find(
         (completion: JsonObject) => typeof completion?.id === 'string',
       )?.id;
-      void reconcileCompletedTurn(turn, observedId);
+      void reconcileCompletedTurn(turn, observedId, { keepPendingWhileActive: true });
     }
   }
   // B4: only NOW, after buffered completions were replayed, admit a follow-up.

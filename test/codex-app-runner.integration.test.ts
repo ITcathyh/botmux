@@ -1851,14 +1851,18 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     });
   }
 
-  it('settles (fail-closed, not hang) when a pre-response foreign completion has no exact items and mismatches the native id', async () => {
-    // REGRESSION for the pendingCompletions replay else branch: a foreign
-    // turn/completed (no client items, id unrelated to this turn) arrives
-    // BEFORE the start response. Master silently dropped it on replay (no
-    // exact/native match), so if it was the real terminal event the turn hung
-    // forever (busy never returned to false → 90s no-progress alert). The fix
-    // routes it through reconcile, which fails closed with an identity conflict.
-    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-preresp-foreign-'));
+  it('keeps the accepted turn pending and settles on its real completion when a stale pre-response completion mismatches the native id', async () => {
+    // REGRESSION for the pendingCompletions replay else branch: a STALE
+    // turn/completed (previous/autonomous turn, no client items, unrelated id)
+    // arrives BEFORE the start response. Master silently dropped it on replay
+    // (hang risk if it was the real terminal event); the initial fix reconciled
+    // immediately and failed closed — but the accepted turn was still running,
+    // so bounded history had no terminal record yet and the REAL completion
+    // arriving 100ms later was discarded (identity-conflict false kill, real
+    // answer lost). The fix keeps the turn pending while the native turn is
+    // active: the real completion settles it with the real answer, no identity
+    // conflict.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-stale-preresp-'));
     const fakeCodex = join(dir, 'fake-codex');
     const logPath = join(dir, 'requests.jsonl');
     copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
@@ -1870,26 +1874,26 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     try {
       await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
       harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('legacy', {
-        text: 'foreign completion before response',
-        clientUserMessageId: 'om_foreign_pre',
+        text: 'stale completion before response',
+        clientUserMessageId: 'om_stale_pre',
       })}\r`);
-      // The turn MUST settle. A hang here (busy stuck true) is the regression:
-      // master dropped the buffered foreign completion on replay, so turn.done
-      // never resolved. The fix reconciles and fails closed.
-      await waitFor(harness, () => control.markers.some(marker => marker.kind === 'diagnostic')
-        && control.finals.length === 1
+      // The turn MUST settle with the REAL answer (arriving 100ms after the
+      // response), not an identity-conflict error. A fail-closed here is the
+      // regression: the stale pre-response completion killed a still-running
+      // turn and swallowed its real completion.
+      await waitFor(harness, () => control.finals.length === 1
         && control.states.filter(state => state.busy === false).length >= 2);
-      // Reconcile ran (thread/turns/list) — proof the else branch fired, not a
-      // silent drop.
+      // The else branch fired (reconcile scanned history) — proof the stale
+      // completion was replayed, not silently dropped — and it did NOT kill the
+      // turn: no identity-conflict diagnostic.
       expect(readRequests(logPath).some(request => request.method === 'thread/turns/list')).toBe(true);
-      const diagnostic = control.markers.find(marker => marker.kind === 'diagnostic');
-      expect(diagnostic?.payload).toMatchObject({
-        code: 'native_turn_identity_conflict',
-        turnId: 'om_foreign_pre',
-      });
+      const diagnostics = control.markers.filter(
+        marker => marker.kind === 'diagnostic' && marker.payload.code === 'native_turn_identity_conflict',
+      );
+      expect(diagnostics).toHaveLength(0);
       expect(control.finals[0]).toMatchObject({
-        turnId: 'om_foreign_pre',
-        content: expect.stringContaining('Codex App native turn identity conflict'),
+        turnId: 'om_stale_pre',
+        content: 'real answer after response',
       });
       expect(harness.child.exitCode).toBeNull();
     } finally {

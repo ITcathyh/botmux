@@ -745,23 +745,47 @@ function handle(request) {
     return;
   }
   if (behavior === 'pre-response-foreign-completion' && turnAttempt === 1) {
-    // A foreign turn/completed (NO client items, id unrelated to this turn)
-    // arrives BEFORE the turn/start response. Unlike completion-before-response-
-    // mismatch, this carries no exact-client items, so the runner cannot upgrade
-    // it to canonical proof. It must buffer it (requestAccepted=false), then
-    // after the response binds the real native id, replay it through the
-    // pendingCompletions else branch into reconcile — settling fail-closed
-    // (identity conflict, history has no match), NOT hanging forever. Direct
-    // regression for the else branch master lacked (silent drop → permanent
-    // pending → 90s no-progress alert).
+    // A STALE completion (previous/autonomous turn, NO client items, id unrelated
+    // to this turn) arrives BEFORE the turn/start response. The runner buffers it
+    // (requestAccepted=false). After the response binds the real native id, the
+    // pendingCompletions replay must NOT fail-closed on it: the accepted turn is
+    // still running, so bounded history cannot yet contain its terminal record.
+    // 100ms later the REAL completion arrives and must settle the turn with the
+    // real answer — the stale completion must be ignored, not kill the turn.
     const threadId = request.params.threadId;
     const turnId = `turn-fake-${turnAttempt}`;
+    const clientId = request.params.clientUserMessageId ?? null;
     notify('turn/completed', {
       threadId,
-      turn: { id: 'turn-foreign-pre-response', status: 'completed' },
+      turn: { id: 'turn-stale-pre-response', status: 'completed' },
     });
     respond(request.id, { turn: { id: turnId } });
     notify('turn/started', { threadId, turn: { id: turnId } });
+    setTimeout(() => {
+      notify('item/completed', {
+        threadId,
+        turnId,
+        item: {
+          id: `message-real-${turnAttempt}`,
+          type: 'agentMessage',
+          phase: 'final_answer',
+          text: 'real answer after response',
+        },
+      });
+      notify('turn/completed', {
+        threadId,
+        turn: {
+          id: turnId,
+          status: 'completed',
+          itemsView: 'full',
+          error: null,
+          items: [
+            { id: `user-${turnAttempt}`, type: 'userMessage', clientId, content: request.params.input },
+            { id: `message-real-${turnAttempt}`, type: 'agentMessage', phase: 'final_answer', text: 'real answer after response' },
+          ],
+        },
+      });
+    }, 100);
     return;
   }
   if (behavior === 'completion-A-started-B') {
