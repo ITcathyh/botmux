@@ -329,7 +329,10 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     // config reads bots.json like a normal chat (accepted trade-off — lateral
     // sibling-cred protection now depends on the owner enabling sandbox).
     const wp = readFileSync(resolve('src/core/worker-pool.ts'), 'utf8');
-    expect(wp).toContain('readIsolation: botCfg.readIsolation === true,');
+    // readIsolation is FROZEN at session creation (freezeSessionSandboxDecision)
+    // — the same snapshot the auto-worktree fail-closed gate consumes — with a
+    // live-config fallback only for sessions persisted before the freeze field.
+    expect(wp).toContain('readIsolation: ds.session.readIsolation ?? botCfg.readIsolation === true,');
     // The old forced-isolation disjunct is gone: readIsolation must NOT be tied to
     // transport state anymore.
     expect(wp).not.toContain('readIsolation: botCfg.readIsolation === true\n      || !larkTransportEnabled(');
