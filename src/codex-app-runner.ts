@@ -28,6 +28,7 @@ import {
   parseCodexAppControlWireRecord,
   takeCodexAppControlLocatorEndpoint,
 } from './utils/codex-app-control.js';
+import { CODEX_APP_NO_PROGRESS_TIMEOUT_MS } from './utils/codex-app-turn-liveness.js';
 import {
   TurnTokenUsageAccumulator,
   parseTokenUsagePair,
@@ -119,6 +120,12 @@ interface ActiveTurn {
    * completion seen while a steer RPC is still in flight is buffered here as a
    * barrier and only settles the group after the steer response resolves. */
   completionSeen?: boolean;
+  /** Wall-clock ceiling for a keep-pending reconcile's re-scan loop, stored on
+   * the turn so the notification handler can RESET it on forward progress. A
+   * fixed deadline would kill a legitimate long-running turn before the 90s
+   * liveness window fires; resetting on progress aligns the two: the loop only
+   * fail-closes after the same no-progress interval the watchdog projects. */
+  keepPendingDeadlineAtMs?: number;
 }
 
 /** One admitted input tracked inside an ActiveTurn's ordered accepted group. */
@@ -161,14 +168,19 @@ const RECONCILIATION_PAGE_SIZE = 50;
  * handler settles the turn the moment its real completion arrives, so this only
  * paces the fallback scan (a thin completion whose full record is history-only). */
 const RECONCILIATION_KEEP_PENDING_RETRY_MS = 200;
-/** Wall-clock ceiling for a keep-pending reconcile's re-scan loop. The accepted
- * native turn's own lifecycle normally bounds the wait (its completion settles
- * the turn through the regular notification handler); this ceiling is the
- * fail-closed safety net for a turn that never completes — without it the loop
- * would poll thread/turns/list (~5Hz) forever. The no-progress watchdog only
- * projects a stalled UI state and never cancels the runner, so it is NOT a
- * safety net for this loop. */
-const RECONCILIATION_KEEP_PENDING_TIMEOUT_MS = 30_000;
+/** Fail-closed window for a keep-pending reconcile's re-scan loop, structurally
+ * aligned with the worker's Codex App no-progress liveness window by reusing
+ * its constant: the loop must never fail-closed while the watchdog still
+ * considers the turn alive. The deadline is RESET on every forward-progress
+ * notification for the accepted turn (see handleNotification), so a legitimate
+ * long tool/model turn that keeps emitting activity is not killed by a stale
+ * fixed ceiling. The accepted native turn's own lifecycle normally bounds the
+ * wait (its completion settles the turn through the regular notification
+ * handler); this window is the fail-closed safety net for a turn that goes
+ * silent — without it the loop would poll thread/turns/list (~5Hz) forever.
+ * The no-progress watchdog only projects a stalled UI state and never cancels
+ * the runner, so it is NOT a safety net for this loop. */
+const RECONCILIATION_KEEP_PENDING_TIMEOUT_MS = CODEX_APP_NO_PROGRESS_TIMEOUT_MS;
 
 /** Test-only shrink for the keep-pending ceiling (same convention as the
  * startup timeout override); production always uses the constant above. */
@@ -976,9 +988,12 @@ async function reconcileCompletedTurn(
   const epoch = turn.epoch;
   const sleep = (ms: number) => new Promise<void>(resolvePromise => setTimeout(resolvePromise, ms));
   // keepPendingWhileActive: wall-clock ceiling for the re-scan loop below.
-  const keepPendingDeadlineAtMs = options.keepPendingWhileActive
-    ? Date.now() + keepPendingTimeoutMs()
-    : 0;
+  // Stored on the turn (not a closure local) so handleNotification can RESET
+  // it on every forward-progress notification — a fixed deadline would kill a
+  // legitimate long-running turn before the 90s liveness window fires.
+  if (options.keepPendingWhileActive) {
+    turn.keepPendingDeadlineAtMs = Date.now() + keepPendingTimeoutMs();
+  }
   let conflictReason = 'bounded history lookup found no match';
   turn.reconciliation = (async () => {
     for (;;) {
@@ -1051,7 +1066,7 @@ async function reconcileCompletedTurn(
         conflictReason = 'accepted native turn terminated without an exact client id match';
         break;
       }
-      if (Date.now() >= keepPendingDeadlineAtMs) {
+      if (Date.now() >= (turn.keepPendingDeadlineAtMs ?? 0)) {
         conflictReason = 'bounded history lookup found no match within the keep-pending deadline';
         break;
       }
@@ -1303,6 +1318,12 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
   // Every notification for the active app-server turn is evidence of forward
   // progress, including reasoning/status events that do not render text.
   emitTurnActivity(turn, 'progress');
+  // Reset the keep-pending reconcile ceiling on progress: a turn that is still
+  // emitting activity must not be killed by a stale fixed deadline while the
+  // 90s liveness window is being refreshed by the same progress markers.
+  if (turn.keepPendingDeadlineAtMs !== undefined) {
+    turn.keepPendingDeadlineAtMs = Date.now() + keepPendingTimeoutMs();
+  }
 
   if (msg.method === 'item/started') {
     const item = params.item;

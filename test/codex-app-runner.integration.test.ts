@@ -2016,6 +2016,62 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     }
   });
 
+  it('resets the keep-pending ceiling on progress so a long-running turn is not killed before its real completion', async () => {
+    // REGRESSION for the keep-pending ceiling semantics: a stale pre-response
+    // completion triggers keepPendingWhileActive. The accepted turn then emits
+    // periodic progress for ~5s — longer than the test's 3s keep-pending
+    // ceiling — and only then sends its REAL completion. A FIXED 3s ceiling
+    // would reportIdentityConflict at 3s and discard the real answer; a
+    // progress-resettable ceiling must keep the turn pending and deliver it.
+    // This aligns the runner's fail-closed with the worker's 90s no-progress
+    // liveness window: both are refreshed by the same activity.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-keep-pending-progress-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(
+      fakeCodex,
+      dir,
+      logPath,
+      '0.144.6',
+      'pre-response-foreign-completion-long-progress',
+      control.bootstrap.path,
+      { env: { BOTMUX_TEST_CODEX_APP_KEEP_PENDING_TIMEOUT_MS: '3000' } },
+    );
+
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('legacy', {
+        text: 'stale completion then long progress',
+        clientUserMessageId: 'om_keep_pending_progress',
+      })}\r`);
+      // The turn MUST settle with the REAL answer arriving at ~5s — well past
+      // the 3s fixed ceiling. A fail-closed identity-conflict here is the
+      // regression: the stale ceiling killed a turn that was still making
+      // progress.
+      await waitFor(harness, () => control.finals.length === 1
+        && control.states.filter(state => state.busy === false).length >= 2);
+      const diagnostics = control.markers.filter(
+        marker => marker.kind === 'diagnostic' && marker.payload.code === 'native_turn_identity_conflict',
+      );
+      expect(diagnostics).toHaveLength(0);
+      expect(control.finals[0]).toMatchObject({
+        turnId: 'om_keep_pending_progress',
+        content: 'real answer after long progress',
+      });
+      // Reconcile ran (the stale completion was replayed into keep-pending).
+      expect(readRequests(logPath).some(request => request.method === 'thread/turns/list')).toBe(true);
+      expect(harness.child.exitCode).toBeNull();
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('keeps the startup deadline armed through initialize and never exposes a pre-ready prompt', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-runner-startup-deadline-'));
     const fakeCodex = join(dir, 'fake-codex');

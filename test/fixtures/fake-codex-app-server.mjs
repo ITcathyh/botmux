@@ -855,6 +855,63 @@ function handle(request) {
     notify('turn/started', { threadId, turn: { id: turnId } });
     return;
   }
+  if (behavior === 'pre-response-foreign-completion-long-progress' && turnAttempt === 1) {
+    // REGRESSION for the keep-pending ceiling semantics: a STALE foreign
+    // completion before the start response replays into reconcile with
+    // keepPendingWhileActive. The accepted turn then emits periodic progress
+    // (item/agentMessage/delta) for ~5s — LONGER than the test's 3s keep-pending
+    // ceiling — and only then sends its REAL completion. A fixed ceiling would
+    // kill the turn at 3s (identity conflict, real answer discarded); a
+    // progress-resettable ceiling must keep the turn pending and deliver the
+    // real answer.
+    const threadId = request.params.threadId;
+    const turnId = `turn-fake-${turnAttempt}`;
+    const clientId = request.params.clientUserMessageId ?? null;
+    notify('turn/completed', {
+      threadId,
+      turn: { id: 'turn-stale-pre-response', status: 'completed' },
+    });
+    respond(request.id, { turn: { id: turnId } });
+    notify('turn/started', { threadId, turn: { id: turnId } });
+    // Periodic progress every 1s — each delta resets the keep-pending ceiling.
+    const progressTimer = setInterval(() => {
+      notify('item/agentMessage/delta', {
+        threadId,
+        turnId,
+        itemId: 'message-progress',
+        delta: '.',
+      });
+    }, 1000);
+    // Real completion after 5s — beyond the 3s test ceiling but within the
+    // progress-resettable window (ceiling refreshed at 1s/2s/3s/4s).
+    setTimeout(() => {
+      clearInterval(progressTimer);
+      notify('item/completed', {
+        threadId,
+        turnId,
+        item: {
+          id: 'message-final',
+          type: 'agentMessage',
+          phase: 'final_answer',
+          text: 'real answer after long progress',
+        },
+      });
+      notify('turn/completed', {
+        threadId,
+        turn: {
+          id: turnId,
+          status: 'completed',
+          itemsView: 'full',
+          error: null,
+          items: [
+            { id: 'user-root', type: 'userMessage', clientId, content: request.params.input },
+            { id: 'message-final', type: 'agentMessage', phase: 'final_answer', text: 'real answer after long progress' },
+          ],
+        },
+      });
+    }, 5000);
+    return;
+  }
   if (behavior === 'completion-A-started-B') {
     // R4-B2 crossing 1: exact completion A proves canonical=A; then an exact
     // turn/started B (DIFFERENT id) arrives → first-proof-wins must fence (a later
