@@ -78,7 +78,7 @@ describe('staggeredRecoveryFork', () => {
       },
       5,
       0,
-    )).resolves.toBeUndefined();
+    )).resolves.toBe(1);
     expect(forked).toEqual(['healthy']);
   });
 

@@ -1728,6 +1728,11 @@ const RECOVERY_FORK_DELAY_MS = config.daemon.recoveryForkDelayMs ?? 250;
  * that no worker was spawned (e.g. forkWorker refusing a quarantined
  * tail-only owner whose promotion still fails). A refused fork consumes no
  * budget, so later healthy sessions are not starved by earlier dead candidates.
+ *
+ * Returns the number of ACCEPTED forks (refused forks excluded). Callers that
+ * run a later phase against the SAME capacity budget (e.g. the idle-reattach
+ * pass after the untruncated protected-owner pass) subtract this to recompute
+ * their remaining budget instead of reusing a stale pre-phase figure.
  */
 export async function staggeredRecoveryFork(
   sessions: readonly DaemonSession[],
@@ -1736,7 +1741,7 @@ export async function staggeredRecoveryFork(
   delayMs: number = RECOVERY_FORK_DELAY_MS,
   stillOwned: (ds: DaemonSession) => boolean = ds => ds.session.status === 'active',
   maxForks: number = Infinity,
-): Promise<void> {
+): Promise<number> {
   let spawnedInBatch = 0;
   let totalForked = 0;
   for (const ds of sessions) {
@@ -1771,6 +1776,7 @@ export async function staggeredRecoveryFork(
       if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
     }
   }
+  return totalForked;
 }
 
 export async function restoreActiveSessions(
@@ -2644,6 +2650,13 @@ export async function restoreActiveSessions(
   // worker-less would silently stall a task that may never receive another
   // message. They resume first and are NOT truncated by the idle-reattach
   // budget, even when that transiently exceeds the cap.
+  //
+  // The idle budget is computed from the REMAINING capacity AFTER the protected
+  // pass, not once up front: protected owners are allowed to transiently exceed
+  // the cap, but cold-recoverable idle workers must not pile on top of that
+  // restart spike. When protected owners already reached/exceeded the cap, the
+  // idle budget is 0 — the runtime sweeper reclaims later, but restart must not
+  // add avoidable spawns.
   const recoveryFork = (ds: DaemonSession): boolean => {
     // A quarantined tail-only owner (restore promotion failed transiently) is
     // handled by the CENTRAL guard inside forkWorker: this blank fork retries
@@ -2692,14 +2705,7 @@ export async function restoreActiveSessions(
     const idleSessions = group
       .filter(ds => !hasProtectedSessionMutationOwnership(ds))
       .sort((a, b) => (b.lastMessageAt ?? 0) - (a.lastMessageAt ?? 0));
-    if (idleSessions.length > budget) {
-      logger.info(
-        `[${appId}] Recovery fork budget: ${budget} of ${idleSessions.length} idle `
-        + `candidate(s) (cap=${cap}, live=${live}); rest stay worker-less until next `
-        + `message. ${protectedOwners.length} protected owner(s) resume untruncated.`,
-      );
-    }
-    await staggeredRecoveryFork(
+    const protectedForked = await staggeredRecoveryFork(
       protectedOwners,
       recoveryFork,
       RECOVERY_FORK_BATCH_SIZE,
@@ -2707,13 +2713,34 @@ export async function restoreActiveSessions(
       stillOwnedRestore,
       Infinity,
     );
+    // Recompute the idle budget from remaining capacity: subtract the protected
+    // forks ACCEPTED this pass (refused forks spawned no worker and don't count).
+    // Protected owners may legitimately leave the bot at/over the cap; idle
+    // workers get only what's left, and 0 when the cap is already reached.
+    const idleBudget = budget === Infinity
+      ? Infinity
+      : Math.max(0, budget - protectedForked);
+    if (budget !== Infinity && protectedForked > 0 && idleBudget < budget) {
+      logger.info(
+        `[${appId}] Protected recovery forked ${protectedForked} owner(s) `
+        + `untruncated; idle budget reduced ${budget} → ${idleBudget} `
+        + `(cap=${cap}, live=${live}).`,
+      );
+    }
+    if (idleSessions.length > idleBudget) {
+      logger.info(
+        `[${appId}] Recovery fork budget: ${idleBudget} of ${idleSessions.length} idle `
+        + `candidate(s) (cap=${cap}, live=${live}, protected forked=${protectedForked}); `
+        + `rest stay worker-less until next message.`,
+      );
+    }
     await staggeredRecoveryFork(
       idleSessions,
       recoveryFork,
       RECOVERY_FORK_BATCH_SIZE,
       RECOVERY_FORK_DELAY_MS,
       stillOwnedRestore,
-      budget,
+      idleBudget,
     );
   }
 
