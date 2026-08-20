@@ -603,7 +603,6 @@ function SettingsPage() {
       const needsRestart = updateResponseNeedsRestart(body);
       if (needsRestart) {
         setUpBusy(false);
-<<<<<<< HEAD
         // `changed` reflects whether the source actually advanced; a build-only
         // local-dev update (HEAD unchanged) still needs a restart to apply.
         setUpMsg({
@@ -910,7 +909,6 @@ function SettingsBody(props: {
             }}
           />
         </SettingsBlock>
-<<<<<<< HEAD
         <SettingsBlock title={tr('settings.sectionWorkflow')}>
           <ToggleRow
             title={tr('settings.workflowEnable')}
