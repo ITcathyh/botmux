@@ -855,6 +855,33 @@ function handle(request) {
     notify('turn/started', { threadId, turn: { id: turnId } });
     return;
   }
+  if (behavior === 'pre-response-foreign-completion-unbound-id' && turnAttempt === 1) {
+    // REGRESSION for the keep-pending arm guard: the turn/start response SUCCEEDS
+    // but carries NO native id (protocol anomaly: result.turn.id and
+    // result.turnId both absent), and no exact turn/started proved the id first.
+    // The runner binds turn.nativeTurnId = undefined, then arms keep-pending on
+    // the stale foreign completion. handleNotification's progress-reset guard
+    // (notificationTurnId !== turn.nativeTurnId) falls fully open on the unset
+    // id, so a FOREIGN turn's periodic progress would otherwise keep resetting
+    // the deadline forever while acceptedTurnWentTerminal can never fire — an
+    // unbounded hang. The fix refuses to arm keep-pending without a native id,
+    // so the loop fails closed immediately instead of hanging on foreign activity.
+    const threadId = request.params.threadId;
+    // Stale foreign completion BEFORE the response (buffered, requestAccepted=false).
+    notify('turn/completed', { threadId, turn: { id: 'turn-stale-unbound', status: 'completed' } });
+    // Success response with NO native id (anomaly).
+    respond(request.id, {});
+    // A foreign turn emits progress forever; our turn never speaks / goes terminal.
+    setInterval(() => {
+      notify('item/agentMessage/delta', {
+        threadId,
+        turnId: 'turn-foreign-keepalive',
+        itemId: 'message-foreign',
+        delta: '.',
+      });
+    }, 300);
+    return;
+  }
   if (behavior === 'pre-response-foreign-completion-long-progress' && turnAttempt === 1) {
     // REGRESSION for the keep-pending ceiling semantics: a STALE foreign
     // completion before the start response replays into reconcile with

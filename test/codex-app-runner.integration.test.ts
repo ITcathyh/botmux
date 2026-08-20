@@ -2016,6 +2016,60 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     }
   });
 
+  it('fails closed (does not hang on foreign progress) when keep-pending arms without a bound native id', async () => {
+    // REGRESSION for the keep-pending arm guard: the turn/start response succeeds
+    // but returns NO native id (protocol anomaly) and no exact turn/started proved
+    // one first, so turn.nativeTurnId stays undefined. A stale foreign completion
+    // arms keep-pending. handleNotification's progress-reset guard
+    // (notificationTurnId !== turn.nativeTurnId) falls fully open on the unset id,
+    // so a FOREIGN turn's periodic progress would keep resetting the deadline
+    // forever while acceptedTurnWentTerminal (which needs the id) can never fire —
+    // an unbounded hang that blocks the runner FIFO. The fix refuses to arm
+    // keep-pending without a native id, so the loop fails closed on the first scan
+    // regardless of foreign chatter. A hang here (no diagnostic, no final) is the
+    // regression.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-keep-pending-unbound-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(
+      fakeCodex,
+      dir,
+      logPath,
+      '0.144.6',
+      'pre-response-foreign-completion-unbound-id',
+      control.bootstrap.path,
+      { env: { BOTMUX_TEST_CODEX_APP_KEEP_PENDING_TIMEOUT_MS: '1000' } },
+    );
+
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('legacy', {
+        text: 'unbound id start response then foreign progress',
+        clientUserMessageId: 'om_keep_pending_unbound',
+      })}\r`);
+      // Must fail closed promptly (the deadline was never armed, so the first
+      // scan trips `?? 0`) despite the foreign turn's progress every 300ms. A
+      // hang here — no diagnostic, no final — is the regression: foreign activity
+      // resetting a fallen-open guard's deadline forever.
+      await waitFor(harness, () => control.markers.some(
+        marker => marker.kind === 'diagnostic' && marker.payload.code === 'native_turn_identity_conflict',
+      ));
+      await waitFor(harness, () => control.finals.length === 1
+        && control.states.filter(state => state.busy === false).length >= 2);
+      expect(control.finals[0]).toMatchObject({ turnId: 'om_keep_pending_unbound' });
+      expect(String(control.finals[0].content ?? '')).toContain('identity conflict');
+      expect(harness.child.exitCode).toBeNull();
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('resets the keep-pending ceiling on progress so a long-running turn is not killed before its real completion', async () => {
     // REGRESSION for the keep-pending ceiling semantics: a stale pre-response
     // completion triggers keepPendingWhileActive. The accepted turn then emits

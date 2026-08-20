@@ -991,7 +991,18 @@ async function reconcileCompletedTurn(
   // Stored on the turn (not a closure local) so handleNotification can RESET
   // it on every forward-progress notification — a fixed deadline would kill a
   // legitimate long-running turn before the 90s liveness window fires.
-  if (options.keepPendingWhileActive) {
+  //
+  // Gate arming on a bound native id. The progress-reset guard in
+  // handleNotification is `notificationTurnId !== turn.nativeTurnId` — when
+  // nativeTurnId is unset (a protocol-anomaly start response that returned no
+  // id and had no prior exact turn/started proof) that guard falls fully open,
+  // so ANY foreign/autonomous turn's progress would keep resetting this
+  // deadline while `acceptedTurnWentTerminal` can never fire (it needs the id).
+  // The loop would then never terminate. Without a native id we cannot track
+  // this turn's own liveness at all, so fail closed immediately (leave the
+  // deadline unset → the `?? 0` check below trips on the first scan) rather
+  // than hang on unrelated activity.
+  if (options.keepPendingWhileActive && turn.nativeTurnId) {
     turn.keepPendingDeadlineAtMs = Date.now() + keepPendingTimeoutMs();
   }
   let conflictReason = 'bounded history lookup found no match';
