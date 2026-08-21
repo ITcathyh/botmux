@@ -98,3 +98,102 @@ describe('usage-limit tracker — 结构化限流粘性重发', () => {
     expect(suppressed.classify('output', 'working').status).toBe('limited');
   });
 });
+
+describe('usage-limit tracker — adopted 会话本地恢复后清除结构化 latch', () => {
+  it('本地 turn 成功完成（noteTurnCompleted）后不再重发旧限额', () => {
+    // 场景：adopted Claude/Codex 会话命中结构化限流（latch 置位），用户在本地
+    // 终端直接恢复——不触发 beginTurn()。daemon 的 final_output handler 已清
+    // ds.usageLimit，但 tracker 的 activeStructured latch 仍在；若不清，下次
+    // periodic / prompt-ready classify 会重发旧限额，把卡片/Dashboard 重新钉住。
+    const tracker = createUsageLimitTracker({ isRateKindSuppressed: () => false });
+    const seq = tracker.beginTurn('');
+    const limit = structuredLimit();
+    tracker.noteStructuredLimit(limit);
+    // 恢复前：working 帧仍重发（防 daemon 自愈误清的既有保护）。
+    expect(tracker.classify('anything', 'working').status).toBe('limited');
+
+    // bridge 收获到本地 turn 的 final_output → noteTurnCompleted（与 daemon
+    // final_output handler 清 ds.usageLimit 同一恢复路径）。
+    tracker.noteTurnCompleted();
+
+    // 恢复后：不再重发旧限额。
+    expect(tracker.classify('anything', 'working').status).toBe('working');
+    expect(tracker.classify('anything', 'idle').status).toBe('idle');
+    // 历史事实保留：本轮确实命中过限额（detectedThisTurn 供 submit-confirmation
+    // recheck 读取），latch 清除不影响该标记。
+    expect(tracker.detectedThisTurn(seq)).toBe(true);
+  });
+
+  it('noteTurnCompleted 后下一轮 beginTurn 行为不变', () => {
+    const tracker = createUsageLimitTracker({ isRateKindSuppressed: () => false });
+    tracker.beginTurn('');
+    tracker.noteStructuredLimit(structuredLimit());
+    tracker.noteTurnCompleted();
+    // 新一轮正常开始：扫屏判定恢复工作。
+    tracker.beginTurn('');
+    expect(tracker.classify('429 Too Many Requests', 'idle').status).toBe('limited');
+  });
+
+  it('未命中结构化限流时 noteTurnCompleted 是 no-op', () => {
+    const tracker = createUsageLimitTracker({ isRateKindSuppressed: () => false });
+    tracker.beginTurn('');
+    tracker.noteTurnCompleted(); // 不应抛错，也不影响普通判定。
+    expect(tracker.classify('plain output', 'idle').status).toBe('idle');
+  });
+});
+
+describe('usage-limit tracker — outputActive 门控（working 不等于输出在进展）', () => {
+  const blocked429Screen = 'exceeded retry limit, last status: 429 Too Many Requests, request id: req_x';
+
+  it('working + outputActive=false 仍检出阻塞 429（非结构化 CLI 卡死错误屏）', () => {
+    // 非结构化 CLI（codex/grok/traex/pi）的限额错误屏不渲染配置的 ready
+    // prompt，idle detector 永不转 idle，状态一直是 working（只有 Codex App
+    // 会 project stalled）。outputActive=false 表示 PTY 已静默（CLI 被阻塞，
+    // 不是在产出），扫屏判定必须运行——真实阻塞 429 不能被无限抑制。
+    const tracker = createUsageLimitTracker({
+      isRateKindSuppressed: () => false,
+      isOutputActive: () => false,
+    });
+    tracker.beginTurn('');
+    const blocked = tracker.classify(blocked429Screen, 'working');
+    expect(blocked.status).toBe('limited');
+    expect(blocked.usageLimit?.kind).toBe('rate');
+  });
+
+  it('working + outputActive=true 保持抑制（输出进展中 = CLI 自己的输出）', () => {
+    // PTY 活跃（模型正在输出）时屏幕上的 429 文案是业务输出/内部重试，仍抑制。
+    const tracker = createUsageLimitTracker({
+      isRateKindSuppressed: () => false,
+      isOutputActive: () => true,
+    });
+    tracker.beginTurn('');
+    expect(tracker.classify(blocked429Screen, 'working').status).toBe('working');
+  });
+
+  it('未注入 isOutputActive 时保持保守默认（working 一律抑制）', () => {
+    // 纯单测/无输出活动信号的调用方保持既有行为。
+    const tracker = createUsageLimitTracker({ isRateKindSuppressed: () => false });
+    tracker.beginTurn('');
+    expect(tracker.classify(blocked429Screen, 'working').status).toBe('working');
+  });
+
+  it('analyzing + outputActive=false 同样检出', () => {
+    const tracker = createUsageLimitTracker({
+      isRateKindSuppressed: () => false,
+      isOutputActive: () => false,
+    });
+    tracker.beginTurn('');
+    expect(tracker.classify(blocked429Screen, 'analyzing').status).toBe('limited');
+  });
+
+  it('outputActive 门控不影响结构化限流重发', () => {
+    // 结构化限流是权威信号，重发不受 outputActive 影响（P1#1 的粘性保护）。
+    const tracker = createUsageLimitTracker({
+      isRateKindSuppressed: () => true,
+      isOutputActive: () => true,
+    });
+    tracker.beginTurn('');
+    tracker.noteStructuredLimit(structuredLimit());
+    expect(tracker.classify('output', 'working').status).toBe('limited');
+  });
+});

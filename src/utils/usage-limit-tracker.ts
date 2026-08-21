@@ -21,10 +21,31 @@ export interface UsageLimitTracker<S extends string = string> {
   classify(content: string, status: S): { status: S | 'limited'; usageLimit?: CliUsageLimitState };
   detectedThisTurn(seq: number): boolean;
   noteStructuredLimit(state: CliUsageLimitState): void;
+  /**
+   * A turn completed successfully (a harvested bridge final_output is being
+   * emitted). Clears the structured-limit latch so a stale limit is not
+   * re-emitted on the next classify(). Mirrors the daemon's final_output
+   * self-heal (worker-pool clears ds.usageLimit on a real harvested answer):
+   * in an adopted session the user can recover from a structured rate limit
+   * in their own terminal without triggering beginTurn(), so without this the
+   * latch would re-pin the card / Dashboard after the daemon already cleared.
+   */
+  noteTurnCompleted(): void;
 }
 
 export function createUsageLimitTracker<S extends string = string>(opts: {
   isRateKindSuppressed: () => boolean;
+  /**
+   * Whether the CLI is demonstrably producing output (PTY activity within the
+   * caller's freshness window). The screen-scan active-work gate only
+   * suppresses the verdict while this returns true: a `working` status alone
+   * does not prove output is progressing (it is the default projection
+   * whenever promptReady === false), so a non-structured CLI blocked at a
+   * rate-limit error screen that never renders its ready prompt would
+   * otherwise be suppressed forever. Omit to keep the conservative
+   * suppress-on-working behavior (used by pure unit tests).
+   */
+  isOutputActive?: () => boolean;
 }): UsageLimitTracker<S> {
   let turnSeq = 0;
   let detectedTurn: number | undefined;
@@ -67,8 +88,15 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
       // model answer / tool output quoting a business 429) or a transient retry
       // it is handling internally — never a live block, which would park the
       // CLI at an error/prompt screen (idle/stalled). Suppressing here is the
-      // primary fix for the "CLI 还在跑却提示限额已达" false reports.
-      const detected = detectScreenUsageLimit(content, status, undefined, { suppressRateKind: opts.isRateKindSuppressed() });
+      // primary fix for the "CLI 还在跑却提示限额已达" false reports. The
+      // isOutputActive hint refines the gate: `working` alone does not prove
+      // output is progressing, so a parked error screen on a non-structured
+      // CLI is still detected (see cli-usage-limit.detectScreenUsageLimit).
+      const outputActive = opts.isOutputActive?.();
+      const detected = detectScreenUsageLimit(content, status, undefined, {
+        suppressRateKind: opts.isRateKindSuppressed(),
+        ...(outputActive !== undefined ? { outputActive } : {}),
+      });
       if (!detected.limited) {
         // Re-emit an authoritative structured limit recorded this turn so a
         // genuinely blocked CLI keeps its card (see activeStructured).
@@ -100,6 +128,16 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
       suppressedRetryReadyKey = undefined;
       detectedTurn = turnSeq;
       activeStructured = { seq: turnSeq, state };
+    },
+    // A successfully harvested turn (bridge final_output) is definitive
+    // evidence the CLI recovered from any structured limit that parked it.
+    // Drop the latch so the next classify() does not re-emit the stale limit
+    // — the daemon's final_output handler already cleared ds.usageLimit for
+    // the same recovery, and a re-emit would re-pin the card / Dashboard.
+    // detectedTurn is intentionally left as a historical fact (it self-clears
+    // on the next beginTurn).
+    noteTurnCompleted(): void {
+      activeStructured = undefined;
     },
   };
 }

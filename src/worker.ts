@@ -3972,12 +3972,28 @@ function structuredRateLimitAuthoritative(): boolean {
   return isStructuredRateLimitAuthoritative(cliAdapter);
 }
 
+/**
+ * PTY-quiescence window for the usage-limit active-work gate. A `working`
+ * status alone does not prove output is progressing (it is the default
+ * projection whenever promptReady === false), so the screen-scan suppression
+ * only applies while PTY output is this fresh. A non-structured CLI blocked at
+ * a rate/quota error screen that never renders its ready prompt goes silent
+ * past this window and is correctly detected instead of being suppressed
+ * forever. Aligns with the StuckDetector's PTY-quiescence threshold.
+ */
+const USAGE_LIMIT_OUTPUT_ACTIVE_WINDOW_MS = 15_000;
+
+function isOutputActivelyProgressing(): boolean {
+  return Date.now() - lastPtyActivityAtMs < USAGE_LIMIT_OUTPUT_ACTIVE_WINDOW_MS;
+}
+
 // Per-turn usage-limit state machine (extracted to utils/usage-limit-tracker
 // for unit testing). The structured-limit stickiness it owns is load-bearing:
 // a one-shot transcript emit must survive the daemon's working-frame self-heal
 // while the CLI stays genuinely blocked.
 const usageLimitTracker = createUsageLimitTracker<RuntimeScreenStatus>({
   isRateKindSuppressed: structuredRateLimitAuthoritative,
+  isOutputActive: isOutputActivelyProgressing,
 });
 
 function currentUsageLimitSnapshot(): string {
@@ -5611,6 +5627,11 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
         const rawUserText = userEv ? extractTurnStartText(userEv) : '';
         const fields = formatLocalTurnFields(rawUserText, postText);
         if (!fields) continue;
+        // A harvested answer proves the CLI recovered from any structured
+        // limit that parked it — mirror the daemon's final_output self-heal
+        // (worker-pool clears ds.usageLimit there) by dropping the tracker's
+        // re-emit latch so the next classify() does not re-pin the card.
+        usageLimitTracker.noteTurnCompleted();
         send({
           type: 'final_output',
           content: fields.content,
@@ -5625,6 +5646,7 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
       // Headless local turn — see formatHeadlessLocalTurnContent for context.
       const headlessContent = formatHeadlessLocalTurnContent(postText);
       if (!headlessContent) continue;
+      usageLimitTracker.noteTurnCompleted();
       send({
         type: 'final_output',
         content: headlessContent,
@@ -5643,6 +5665,7 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
     const deliveredText = turn.restoredFromJournal
       ? `${t('worker.bridge_restored_turn_notice')}\n\n${postText}`
       : postText;
+    usageLimitTracker.noteTurnCompleted();
     send({
       type: 'final_output',
       content: deliveredText,
@@ -7131,6 +7154,9 @@ function emitReadyCodexTurns(): void {
       // Lark's per-message limit; daemon owns the card chrome.
       const fields = formatLocalTurnFields(turn.userText ?? '', postContent);
       if (!fields) continue;
+      // Harvested answer → drop the structured-limit re-emit latch (mirrors
+      // the daemon's final_output self-heal; see emitReadyTurns).
+      usageLimitTracker.noteTurnCompleted();
       send({
         type: 'final_output',
         ...(sourceHermesSessionId ? { sourceHermesSessionId } : {}),
@@ -7143,6 +7169,7 @@ function emitReadyCodexTurns(): void {
       });
       continue;
     }
+    usageLimitTracker.noteTurnCompleted();
     send({
       type: 'final_output',
       ...(sourceHermesSessionId ? { sourceHermesSessionId } : {}),

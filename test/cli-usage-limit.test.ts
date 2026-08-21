@@ -379,4 +379,31 @@ describe('detectScreenUsageLimit — runtime-status gate (误报根治)', () => 
     );
     expect(usage.limited).toBe(true);
   });
+
+  it('working + outputActive=false still detects a blocking 429 (non-structured CLI parked at error screen)', () => {
+    // A non-structured CLI (codex/grok/traex/pi) whose rate-limit error screen
+    // does not render its configured ready prompt never transitions the idle
+    // detector to idle, so the projected status stays `working` forever (only
+    // Codex App projects `stalled`). `working` alone does not prove output is
+    // progressing — with outputActive=false (PTY quiescent) the gate must not
+    // suppress, or a genuine blocking 429 is hidden indefinitely and the limit
+    // card / backoff path never runs.
+    const result = detectScreenUsageLimit(business429Screen, 'working', now, { outputActive: false });
+    expect(result.limited).toBe(true);
+    if (!result.limited) return;
+    expect(result.kind).toBe('rate');
+    expect(result.retryLabel).toBe('5-10 min');
+  });
+
+  it('working + outputActive=true keeps suppressing (output progressing = CLI own output)', () => {
+    expect(detectScreenUsageLimit(business429Screen, 'working', now, { outputActive: true }).limited).toBe(false);
+  });
+
+  it('analyzing + outputActive=false also detects', () => {
+    expect(detectScreenUsageLimit(business429Screen, 'analyzing', now, { outputActive: false }).limited).toBe(true);
+  });
+
+  it('omitting outputActive keeps the conservative suppress-on-working default', () => {
+    expect(detectScreenUsageLimit(business429Screen, 'working', now).limited).toBe(false);
+  });
 });
