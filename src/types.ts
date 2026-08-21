@@ -43,6 +43,12 @@ export interface VcMeetingImTurnOrigin {
   replyTargetSenderOpenId?: string;
 }
 
+export interface TrustedCaller {
+  requestUserOpenId?: string;
+  requestUserUnionId?: string;
+  requestLarkAppId?: string;
+}
+
 export interface VcMeetingConsumerProfileFilter {
   /** The first slice supports activity-type filtering only. */
   activityTypes?: VcMeetingActivityType[];
@@ -217,6 +223,9 @@ export interface Session {
   /** Informational origin label for UI/debugging, not a trusted audit identity. */
   titleSource?: 'initial' | 'user' | 'agent' | 'cli' | 'dashboard' | 'system';
   status: 'active' | 'closed';
+  /** Crash-safe bounded recovery state for an ordinary Claude/Lark logical
+   * turn. Timer ownership is runtime-only; this record re-arms it on restore. */
+  ordinaryTurnRecovery?: import('./services/ordinary-turn-recovery.js').OrdinaryTurnRecoveryState;
   /** Dashboard 看板视图的手动放置：列 id（backlog/todo/in_progress/in_review/done）。
    *  未设置时前端按运行状态推导默认列；一旦用户拖拽过就以此为准。 */
   kanbanColumn?: string;
@@ -305,6 +314,11 @@ export interface Session {
   pid?: number;
   workingDir?: string;
   webPort?: number;
+  /** Agent-registered local Web preview for this session. The daemon accepts
+   * only a reachable literal loopback target through the session-scoped CLI
+   * capability. Browser APIs/SSE replace this internal target with a
+   * same-origin path and never expose its host/port. */
+  previewTarget?: import('./core/session-preview.js').SessionPreviewTarget;
   /** riff：最近一个任务 id（follow-up 血缘锚点）。持久化后 daemon 重启的下一条
    *  消息仍走 task-follow-up 延续沙箱与上下文，而非冷启新任务。 */
   riffParentTaskId?: string;
@@ -478,6 +492,8 @@ export interface Session {
    *  (rather than a fresh POST) after daemon restart. */
   streamCardId?: string;
   streamCardNonce?: string;
+  /** Stable visible destination of the persisted live streaming card. */
+  streamCardReplyTargetKey?: string;
   /** Legacy field kept for migrating sessions persisted before displayMode was added. */
   streamExpanded?: boolean;
   /** Card body display mode — 'hidden' | 'screenshot'. */
@@ -543,13 +559,23 @@ export interface Session {
   cliPathOverride?: string;
   /** Optional wrapper launcher frozen at creation, e.g. `ttadk codex` or `aiden x claude`. */
   wrapperCli?: string;
-  /** Optional model frozen at creation so historical sessions resume with their original model. */
+  /**
+   * The model this session was last LAUNCHED with — a record, not the launch
+   * source of truth. Sessions used to freeze the bot's model here at creation,
+   * which made a long-running session ignore the model configured in the
+   * dashboard forever; the model is now resolved from the live bot config on
+   * every spawn (see resolveSessionLaunchModel) and stamped back here.
+   *
+   * Only ever READ when the session is pinned to a CLI the bot no longer runs
+   * (rule 3), where the live model belongs to a different CLI — never while the
+   * live config applies, which is what keeps a config change effective.
+   */
   model?: string;
   /** Optional codex reasoning effort frozen at creation (per-turn API override).
    *  Only meaningful for codex/codex-app; injected as model_reasoning_effort at spawn. */
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   /**
-   * True once `cliId`/`cliPathOverride`/`wrapperCli`/`model` have been frozen for
+   * True once `cliId`/`cliPathOverride`/`wrapperCli` have been frozen for
    * this session (see `sessionAgentConfig`). Gates the one-time freeze so it runs
    * exactly once — on a fresh start, or on the first resume of a session created
    * before these fields existed (back-filling the still-missing ones from the live
@@ -573,6 +599,23 @@ export interface Session {
    * is pinned.
    */
   mojoIdentity?: MojoSessionIdentity;
+  /**
+   * mojo backend only. Marks an identity frozen by a build whose double-unset
+   * default is HOST execution. An identity without this flag and without an
+   * explicit `localDaemon` key was frozen when double-unset still meant the
+   * cloud sandbox — resuming it under the new default would silently flip the
+   * session cloud→host, the exact transition the freeze exists to prevent, so
+   * sessionMojoConfig pins those legacy rows to `localDaemon: false` instead.
+   */
+  mojoIdentityHostDefault?: boolean;
+  /**
+   * mojo backend only. Queues the user-visible "this session is pinned to the
+   * legacy sandbox behaviour — close and reopen" notice (see the localDaemon
+   * pin in sessionMojoConfig). Same tri-state protocol as
+   * mojoQuarantineNoticePending: `true` = queued, `false` = delivered,
+   * `undefined` = never queued.
+   */
+  mojoLegacyPinNoticePending?: boolean;
   /**
    * mojo backend only. A remote session id that can no longer be trusted: it was
    * created before `mojoIdentity` existed, so nothing records WHICH control plane
@@ -924,6 +967,7 @@ export interface CodexAppGenerationCommit {
 export interface CliTurnPayload {
   content: string;
   codexAppInput?: CodexAppTurnInput;
+  trustedCaller?: TrustedCaller;
   /** Frozen steer authorization (codex-app ordered pre-final steer). Computed
    * ONCE by the daemon at admission (real human interactive turn only) and COPIED
    * verbatim into every opening/queued/fork/restore path — never re-inferred
@@ -963,8 +1007,13 @@ export interface PendingRepoSetup {
 
 /** Messages sent from Daemon to Worker */
 type DaemonToWorkerBase =
-  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliRuntime?: import('./adapters/cli/runtime.js').CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; turnTimeoutMs?: number; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; disableCliBypass?: boolean; codexRpcInput?: boolean; startupCommands?: string[]; env?: Record<string, string>; sandbox?: boolean; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig | MojoConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; resume?: boolean; forkSession?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; apiOnly?: boolean; loadedBotsConfigPath?: string; loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; atMostOnce?: boolean; codexAppDispatchId?: string; codexAppSteerable?: true; codexAppRecoveredDispatches?: CodexAppDispatchLedgerEntry[]; codexAppGenerationCommits?: CodexAppGenerationCommit[]; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string }
-  | { type: 'message'; content: string; codexAppInput?: CodexAppTurnInput; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; atMostOnce?: true; mojoLivePatch?: MojoLivePatch }
+  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliRuntime?: import('./adapters/cli/runtime.js').CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; turnTimeoutMs?: number; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; disableCliBypass?: boolean; codexRpcInput?: boolean; startupCommands?: string[]; env?: Record<string, string>; sandbox?: boolean; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig | MojoConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; resume?: boolean; forkSession?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; apiOnly?: boolean; loadedBotsConfigPath?: string; loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; atMostOnce?: boolean; codexAppDispatchId?: string; codexAppSteerable?: true; codexAppRecoveredDispatches?: CodexAppDispatchLedgerEntry[]; codexAppGenerationCommits?: CodexAppGenerationCommit[]; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string }
+  /** `model` rides along on every turn for the SAME reason the restart IPC carries
+   *  it: the crash-loop park recovery respawns the CLI from inside the worker on
+   *  the next message, with no restart IPC to refresh the snapshot. Same
+   *  three-state contract (undefined = not carried → keep snapshot; null = launch
+   *  with no model). It never affects the CLI already running. */
+  | { type: 'message'; content: string; codexAppInput?: CodexAppTurnInput; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null }
   | { type: 'codex_app_dispatch_persisted'; requestId: string; ok: boolean; error?: string }
   /** Literal slash-command passthrough. `followUpContent` rides along so the
    *  worker enqueues it strictly AFTER the slash command's Enter — two separate
@@ -1001,7 +1050,7 @@ type DaemonToWorkerBase =
    *  /restart 真正生效（否则 live-worker restart 一直用 fork 时刻的旧快照）。
    *  三分态：undefined = 不携带（旧 daemon / 兜底，worker 保持快照不动）；
    *  null = 明确清空（dashboard 清除了 env，worker 移除快照）。 */
-  | { type: 'restart'; reason?: 'operator' | 'cli_crash'; attemptId?: string; updateWorkingDir?: string; env?: Record<string, string> | null; mojoLivePatch?: MojoLivePatch }
+  | { type: 'restart'; reason?: 'operator' | 'cli_crash'; attemptId?: string; updateWorkingDir?: string; env?: Record<string, string> | null; mojoLivePatch?: MojoLivePatch; model?: string | null }
   /** Lease watchdog fencing: only the exact still-running durable attempt may
    * tear down/restart the CLI. A late command after terminal/current-turn
    * advance is ignored worker-side. */
@@ -1064,6 +1113,9 @@ export type WorkerToDaemon =
        * backend intentionally has no raw-terminal Web UI capability. */
       port: number;
       token: string;
+      /** PER-BOOT random read capability (P1-5): card links minted from it die
+       * with this worker generation, and the dashboard view-link API replaces
+       * it with a short-lived auth-bound grant instead of handing it out. */
       viewToken?: string;
       spawnCommand?: string;
       replyAlreadySent?: boolean;
@@ -1236,6 +1288,9 @@ export type WorkerToDaemon =
        *  message was posted (silent/suppressed turns also complete). */
       status: 'completed' | 'failed' | 'cancelled' | 'ambiguous';
       errorCode?: string;
+      /** Provider-neutral recovery hint. Only an explicit true authorizes the
+       * daemon's bounded ordinary-turn continuation policy. */
+      retryable?: boolean;
       /** Positive silence evidence. Only set to 'nothing_to_send' when the
        *  worker's bridge gate deliberately suppressed this turn as genuine
        *  silence (the model terminated with a bare nothing-to-send sentinel and

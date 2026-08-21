@@ -12,7 +12,7 @@ import * as sessionStore from '../services/session-store.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
@@ -42,6 +42,7 @@ import type { BotConfig } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { sameRuntimeIdentity, type CliRuntimeConfig, type CliRuntimeSnapshot } from '../adapters/cli/runtime.js';
 import { dashboardEventBus } from './dashboard-events.js';
+import { clearSessionPreviewTarget } from './session-preview-registry.js';
 import { composeRowFromActive, composeRowFromPersistedActive } from './dashboard-rows.js';
 import {
   composeSpawnCodexAppContext,
@@ -209,6 +210,38 @@ async function resumeRestoredPendingRepoSetup(
     forkWorker(ds, input, { resume: false, turnId: setup.turnId });
   }
   logger.info(`[${ds.session.sessionId.substring(0, 8)}] Resumed durable pending repo opening without selectable projects`);
+}
+
+/**
+ * Drop a persisted `previewTarget` that belonged to the previous worker
+ * generation, before this restore pass rebuilds a DaemonSession from the row.
+ *
+ * `previewTarget` is the literal loopback (host, port) an agent registered with
+ * `botmux preview <port>`; it is routing state for the worker that was live at
+ * registration time, not a durable property of the conversation. Restore always
+ * opens a NEW generation — every row here is rebuilt with `worker: null`, and
+ * killStalePids has just reaped the previous run's CLI processes — so whatever
+ * served that port is gone and the OS may hand the number to any unrelated
+ * local service. The preview proxy dials a registered target by host/port
+ * alone, so carrying one across the restart can proxy a user's preview into
+ * someone else's local server. Applies to adopt rows too: a surviving adopted
+ * CLI is no proof that its dev server survived, and re-registering costs one
+ * command inside the session.
+ *
+ * Cleanup only — registration (`POST /api/sessions/:id/preview`, which probes
+ * reachability first) and the proxy are untouched; the session simply
+ * re-registers. A failed save is logged and swallowed: the in-memory row this
+ * pass registers is already clear (so nothing dials the stale target), and the
+ * next successful save converges the file.
+ */
+function clearRestoredPreviewTarget(session: Session): void {
+  // P1-13：与 worker 换代 / suspend / exit / close 走同一个收口（清字段 + 落盘 +
+  // 广播 `preview: null`），restore 只是「代次边界」的又一种形态，不该有第二份实现。
+  if (!clearSessionPreviewTarget(session, 'restore opens a new worker generation')) return;
+  logger.debug(
+    `[${session.sessionId.substring(0, 8)}] Dropped preview target registered by the previous worker `
+    + `generation; the session must re-register with \`botmux preview <port>\``,
+  );
 }
 
 function quarantineUnregisteredRestoreSession(session: Session, reason: string): void {
@@ -703,7 +736,7 @@ function renderChatContextBlock(chatContext?: ChatContext): string {
 
 /**
  * Render a `<sender>` tag for prompt injection. Caller resolves the sender
- * (open_id + type + optional name) via `resolveSender(...)` in identity-cache.
+ * (open_id + type + optional name/email) via `resolveSender(...)` in identity-cache.
  * Returns empty string when no sender data is available so the prompt stays
  * clean for synthetic flows (scheduled tasks, no-op spawns).
  */
@@ -711,6 +744,7 @@ export function renderSenderTag(sender?: ResolvedSender): string {
   if (!sender || !sender.openId) return '';
   const attrs: string[] = [`type="${xmlEscape(sender.type)}"`, `open_id="${xmlEscape(sender.openId)}"`];
   if (sender.name) attrs.push(`name="${xmlEscape(sender.name)}"`);
+  if (sender.email) attrs.push(`email="${xmlEscape(sender.email)}"`);
   return `<sender ${attrs.join(' ')} />`;
 }
 
@@ -1627,6 +1661,7 @@ export function persistStreamCardState(ds: DaemonSession): void {
   if (
     s.streamCardId === cardId &&
     s.streamCardNonce === ds.streamCardNonce &&
+    s.streamCardReplyTargetKey === ds.streamCardReplyTargetKey &&
     s.displayMode === ds.displayMode &&
     s.currentImageKey === ds.currentImageKey &&
     s.currentTurnTitle === ds.currentTurnTitle &&
@@ -1639,6 +1674,7 @@ export function persistStreamCardState(ds: DaemonSession): void {
   ) return;
   s.streamCardId = cardId;
   s.streamCardNonce = ds.streamCardNonce;
+  s.streamCardReplyTargetKey = ds.streamCardReplyTargetKey;
   s.displayMode = ds.displayMode;
   s.currentImageKey = ds.currentImageKey;
   s.currentTurnTitle = ds.currentTurnTitle;
@@ -1847,6 +1883,12 @@ export async function restoreActiveSessions(
       logger.debug(`[${session.sessionId.substring(0, 8)}] Already registered by live runtime during restore; skipping snapshot row`);
       continue;
     }
+    // New worker generation ⇒ no registered preview port. Runs before every
+    // branch below (adopt / queued / ordinary / close / quarantine — including
+    // the mojo journal reconciliation right after, which has its own `continue`
+    // paths) so no rebuilt DaemonSession or announced row, and no row persisted
+    // by a quarantine/recovered close, can carry the old target.
+    clearRestoredPreviewTarget(session);
     // Freeze the mojo control plane BEFORE this row becomes visible in the active
     // map. The dispatcher is already live during restore, so a row registered
     // first could be woken — or `/close`d — while still reading live bot config,
@@ -2074,6 +2116,7 @@ export async function restoreActiveSessions(
           adoptedFrom: adopted,
           streamCardId: session.streamCardId,
           streamCardNonce: session.streamCardNonce,
+          streamCardReplyTargetKey: session.streamCardReplyTargetKey,
           displayMode: session.displayMode === 'screenshot' || session.displayMode === 'hidden'
             ? session.displayMode
             : (session.streamExpanded ? 'screenshot' : 'hidden'),
@@ -2278,6 +2321,7 @@ export async function restoreActiveSessions(
       // letting the next update create a new card.
       streamCardId: session.streamCardId,
       streamCardNonce: session.streamCardNonce,
+      streamCardReplyTargetKey: session.streamCardReplyTargetKey,
       displayMode: session.displayMode ?? (session.streamExpanded ? 'screenshot' : 'hidden'),
       currentImageKey: session.currentImageKey,
       currentTurnTitle: session.currentTurnTitle,
@@ -2480,6 +2524,13 @@ export async function restoreActiveSessions(
       );
       continue;
     }
+  }
+
+  // Re-arm persisted semantic-recovery timers only after the whole restore
+  // pass has registered collision winners. A zero-delay overdue backoff must
+  // not wake while a later row is still competing for the same route.
+  for (const ds of restoredByThisInvocation) {
+    if (stillOwnsRestoreRegistration(ds)) ensureOrdinaryTurnRecoveryAttached(ds);
   }
 
   // Persistent backends: auto-fork workers for sessions whose backing session
@@ -3027,6 +3078,7 @@ export async function resumeSession(
     ownerOpenId: session.ownerOpenId,
     streamCardId: session.streamCardId,
     streamCardNonce: session.streamCardNonce,
+    streamCardReplyTargetKey: session.streamCardReplyTargetKey,
     displayMode: session.displayMode ?? (session.streamExpanded ? 'screenshot' : 'hidden'),
     currentImageKey: session.currentImageKey,
     currentTurnTitle: session.currentTurnTitle,

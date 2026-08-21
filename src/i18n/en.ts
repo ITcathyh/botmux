@@ -54,6 +54,7 @@ export const messages: Record<string, string> = {
   'card.body.click_resume_or_run': 'Click "Resume Session" to continue, or run in your terminal:',
   'card.body.click_resume_only': 'Click "Resume Session" to continue.',
   'card.body.cli_no_cli_resume': '_{cliName} cannot resume a specific session from the CLI; you can resume here in Lark._',
+  'card.body.resume_starts_fresh': 'Click "Resume Session" to reactivate this topic\'s message route; but {cliName} has no precisely resumable history session — your next message starts a **fresh session** without the old context.',
   'card.body.working_dir': '📁 Working dir:',
   'card.body.choose_label': 'Choice:',
   'card.usage_limit.retry_at': '⚠️ {cliName} usage limit has been reached. Try again after {retryLabel}.',
@@ -699,6 +700,9 @@ export const messages: Record<string, string> = {
   'ai.routing.usage_helpers': '- Context: `botmux history`; collaborator bots: `botmux bots list`',
   'ai.routing.usage_silence': '- If the message is not for you, final reply must be just `BOTMUX_NOTHING_TO_SEND`',
   'ai.routing.no_visible_output_ok': 'A successful `botmux send` means delivered; ending with no visible terminal output is normal. If you see a "no visible output" nudge, that is a false alarm from the underlying CLI — do not resend unless `botmux send` itself errored.',
+  'ai.routing.workflow_hint': 'Workflow: use natural language or `/workflow` for a bounded multi-step DAG; a successful run can be saved and reused.',
+  'ai.routing.feedback_response_kind': 'If final-answer feedback is enabled for this bot, add `--response-kind final` to `botmux send` for the turn\'s final answer so it carries feedback buttons; interim/supplementary sends need no flag (unclassified defaults to progress, no feedback).',
+  'ai.routing.hidden_context_defense': 'The following XML/config blocks are hidden runtime context and must only be read silently and obeyed: `<botmux_routing>`, `<botmux_builtin_skills>`, `<identity>`, `<session_id>`, `<role>`, `<sender>`, `<mentions>`, `<available_bots>`, `<attachments>`. Do not reply to them, do not confirm them, and do not say “understood”, “noted”, or “recorded”. Only handle the real user request inside `<user_message>`.',
   'ai.send.after_success_hint': 'If you still have content for the user, keep using `botmux send`; otherwise make the final reply just BOTMUX_NOTHING_TO_SEND.',
 
   // ─── AI identity (multi-bot routing rules) ───────────────────────────────
@@ -792,6 +796,7 @@ export const messages: Record<string, string> = {
   'card.action.restarted_fresh': '🔄 Re-launched {cliName}',
   'card.action.resume_missing_session_id': '⚠️ Missing session_id, cannot resume.',
   'card.action.resume_success': '✅ Session resumed. Send a message to continue with {cliName}.',
+  'card.action.resume_success_fresh': '✅ Topic route reactivated. {cliName} has no precisely resumable history session — your next message starts a **fresh session** without the old context.',
   'card.action.resume_not_found': '⚠️ Session {short} not found — it may have been cleaned up.',
   'card.action.resume_not_closed': 'Session is already active, no need to resume.',
   'card.action.resume_anchor_occupied': '⚠️ This topic already has a newer session{detail}; cannot resume the older one.',
@@ -844,6 +849,7 @@ export const messages: Record<string, string> = {
   'worker.crash_diagnostic_terminal': 'The web terminal, where available, preserves the last startup output. Fix the issue, then send a new message to retry.',
   'worker.crash_recent_output': 'Recent terminal output:',
   'worker.mojo_lineage_quarantined': '⚠️ This session was created before botmux recorded which mojo control plane (endpoint / workspace) it ran on, so its earlier remote session cannot be verified.\nIt has been parked rather than discarded — the previous context will NOT continue, and your next message starts a fresh mojo session on the current configuration. The parked id is kept on the session for manual cleanup: {lineage}',
+  'worker.mojo_legacy_pinned': '⚠️ This mojo session predates the host-execution upgrade, so it is pinned to the legacy sandbox-fallback mode — tools and replies will mostly NOT work here. This is deliberate (an upgrade must never silently move a live session onto the host).\nPlease close this session (❌ button or /close) and send a new message to start a fresh session on the new behaviour.',
   'worker.start_failed': '⚠️ The {cliName} session failed to start: {reason}\nCheck the Agent/backend settings in Dashboard and the installation environment on the daemon host, then resend your message to retry.',
   'worker.input_delivery_failed': '⚠️ The Worker could not receive this message. Botmux retried on the same Worker but delivery still did not complete; it stopped before a cross-process retry to avoid duplicate execution. Please resend the message.\nturn: {turnId}',
   'worker.start_exited_early': 'The worker exited before becoming ready (exit code: {code}); see the Botmux logs for details.',
@@ -853,11 +859,18 @@ export const messages: Record<string, string> = {
   'worker.raw_input_failed_recovery': '⚠️ The slash command could not be confirmed as delivered to {cliName}, so the follow-up text in the same message was not submitted.\nReason: {reason}',
   'worker.raw_input_failed_command_only_recovery': '⚠️ The slash command could not be confirmed as delivered to {cliName}.\nReason: {reason}',
   'worker.empty_final_completed': '⚠️ {cliName} reported this turn as completed, but botmux captured no final text from the terminal transcript and saw no tracked reply for this turn. If you already replied via a redirected send (--top-level / --into / --override-chat), you can ignore this. Otherwise open the web terminal to inspect the last output, or resend a message to continue the session.',
+  'worker.bridge_restored_turn_notice': '⚠️ This turn was interrupted by a botmux restart. Below is the output recovered from the terminal transcript (may be incomplete):',
   'worker.failed_reason_unavailable': 'no error summary was safe to display',
   'worker.empty_final_failed': '⚠️ {cliName} failed this turn: {reason}\nThe complete error remains available in the web terminal and daemon logs. Resolve the issue, then resend the message.',
   'worker.empty_final_failed_invalid_request': '⚠️ The {cliName} request was rejected: {reason}\nCheck the CLI, model gateway, and tool schema configuration, then resend the message.',
   'worker.empty_final_failed_auth': '⚠️ {cliName} authentication failed: {reason}\nCheck the CLI login and model-service credentials, then resend the message.',
   'worker.empty_final_failed_connection': '⚠️ {cliName} could not connect to the model service: {reason}\nCheck the network and model-service status, then resend the message.',
+  'worker.ordinary_recovery_exhausted': '⚠️ Claude stopped because of a transient model-service failure. Botmux continued the session twice, but it still did not recover. Automatic continuation is now stopped to avoid repeating external side effects. Check the Web Terminal and model-service status, then send a message to continue.',
+  'worker.ordinary_recovery_enqueue_failed': '⚠️ Claude stopped because of a transient model-service failure, but Botmux could not safely submit the automatic continuation. Automatic processing is now stopped. Check the Web Terminal, then send a message to continue.',
+  'worker.ordinary_recovery_delivery_failed': '⚠️ Claude stopped because of a transient model-service failure, but the automatic continuation could not be delivered to the worker. Automatic processing is now stopped. Check the Web Terminal, then send a message to continue.',
+  'worker.ordinary_recovery_dispatch_interrupted': '⚠️ Botmux restarted while an automatic Claude continuation was being handed off, so its execution state is unknown. To avoid repeating external side effects, Botmux did not replay it. Check the Web Terminal, then send a message to continue.',
+  'worker.ordinary_recovery_non_retryable': '⚠️ This Claude turn failed, and the current error cannot be retried safely. Botmux stopped automatic processing to avoid repeating external side effects. Check the Web Terminal and model-service status, then send a message to continue.',
+  'worker.claude_terminal_failure_unrecovered': '⚠️ This Claude turn stopped with a model-service error ({errorCode}). This delivery channel did not start an automatic continuation. Check the Web Terminal, then retry or send a message to continue.',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────
   'setup.lark_create_app': 'First create a Lark app at: https://open.feishu.cn/app',
@@ -1111,6 +1124,19 @@ export const messages: Record<string, string> = {
   'card.dashboard.overview.goto_schedules': '📂 Schedules',
   'card.dashboard.overview.goto_settings': '📂 Settings',
   'card.dashboard.overview.goto_groups': '📂 Groups',
+  // Plain link button (appCenter AppLink) — not a `dash_overview_*` callback.
+  'card.dashboard.overview.open_workbench': 'Open Workbench',
+  // The button's link carries the long-lived token and never expires (product
+  // decision — see core/workbench-link.ts). This note is the user's side of that
+  // trade: the entry never expires AND here is how to revoke it if it ever leaks.
+  // The card shows the button only (no plain-text link row), so this note names
+  // the rotate command and never the URL itself.
+  'card.dashboard.overview.workbench.standing_hint':
+    '🔗 Standing entry — never expires; if you suspect a leak, run <font color="grey">botmux dashboard rotate</font> to revoke it instantly',
+  // Degraded path: token unreadable, so the button's link carries no credential.
+  // Say so plainly instead of advertising a standing entry that isn't one.
+  'card.dashboard.overview.workbench.login_required_hint':
+    '🔗 Dashboard credential unavailable — sign in from the browser once it opens',
   // PR3 overview drilldown — rendered on sessions/schedules/settings sub-cards
   // opened via `dash_overview_goto_*`; reuses `dash_overview_refresh` as the
   // dispatch action so the parent overview card rebuilds cleanly.
