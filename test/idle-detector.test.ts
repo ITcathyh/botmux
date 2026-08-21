@@ -23,6 +23,7 @@ function makeCli(opts: {
   busyPattern?: RegExp;
   idleToBusyPattern?: RegExp;
   staticBusyPattern?: RegExp;
+  staticBusyClearPattern?: RegExp;
   readyPattern?: RegExp;
 } = {}): CliAdapter {
   return {
@@ -34,6 +35,7 @@ function makeCli(opts: {
     busyPattern: opts.busyPattern,
     idleToBusyPattern: opts.idleToBusyPattern,
     staticBusyPattern: opts.staticBusyPattern,
+    staticBusyClearPattern: opts.staticBusyClearPattern,
     readyPattern: opts.readyPattern,
     systemHints: [],
     altScreen: false,
@@ -475,6 +477,7 @@ describe('IdleDetector: static capacity-queue pre-idle latch', () => {
     // depend on traex's exact string table.
     const detector = new IdleDetector(makeCli({
       staticBusyPattern: /(?:^|[\n\r])[ \t]*QUEUED/i,
+      staticBusyClearPattern: /PROMPT>/,
       readyPattern: /PROMPT>/,
     }));
     const idleCb = vi.fn();
@@ -492,6 +495,58 @@ describe('IdleDetector: static capacity-queue pre-idle latch', () => {
     detector.feed('PROMPT> ');
     vi.advanceTimersByTime(5_500);
     expect(idleCb).toHaveBeenCalledTimes(2);
+    detector.dispose();
+  });
+
+  it('chunk-invariant: queue line and status bar in separate deltas do not clear the latch', () => {
+    // ZMX captures history at ~50ms tail debounce / 250ms hot poll; adjacent
+    // prefix snapshots each emitData(delta). A queue line in one capture and
+    // the `\d+% left` status bar in the next must NOT clear the latch — the
+    // broad readyPattern matches the status bar, so only explicit composer
+    // evidence (staticBusyClearPattern) may clear it.
+    const detector = new IdleDetector(traexAdapter);
+    const idleCb = vi.fn();
+    detector.onIdle(idleCb);
+
+    // Chunk 1: queue line only (no status bar yet).
+    detector.feed('\x1b[2KQueued for capacity');
+    expect(idleCb).not.toHaveBeenCalled();
+
+    // Chunk 2: status bar in a separate delta. The old code cleared the
+    // latch here because readyPattern matches `\d+% left`.
+    detector.feed('\nContext 100% left');
+    vi.advanceTimersByTime(10_000);
+    expect(idleCb).not.toHaveBeenCalled();
+
+    // Real composer redraw clears the latch and idle fires.
+    detector.feed('\x1b[2K› Ask TraeCode CLI to do anything\nContext 100% left');
+    vi.advanceTimersByTime(2_500);
+    expect(idleCb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('chunk-invariant: queue marker split across chunks is detected via rolling tail', () => {
+    // The queue text itself can be split across PTY chunks ("Queued for cap"
+    // + "acity"). The latch must scan the rolling outputTail, not just the
+    // current chunk, to detect the full marker.
+    const detector = new IdleDetector(traexAdapter);
+    const idleCb = vi.fn();
+    detector.onIdle(idleCb);
+
+    // Chunk 1: first half of the queue marker (no match yet).
+    detector.feed('\x1b[2KQueued for cap');
+    expect(idleCb).not.toHaveBeenCalled();
+
+    // Chunk 2: second half + status bar. The rolling tail now contains the
+    // full "Queued for capacity" string — the latch must fire.
+    detector.feed('acity\nContext 100% left');
+    vi.advanceTimersByTime(10_000);
+    expect(idleCb).not.toHaveBeenCalled();
+
+    // Real composer redraw clears the latch and idle fires.
+    detector.feed('\x1b[2K› Ask TraeCode CLI to do anything\nContext 100% left');
+    vi.advanceTimersByTime(2_500);
+    expect(idleCb).toHaveBeenCalledTimes(1);
     detector.dispose();
   });
 });

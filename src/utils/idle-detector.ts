@@ -22,19 +22,22 @@ export class IdleDetector {
   private completionPattern: RegExp | undefined;
   private idleToBusyPattern: RegExp | undefined;
   private staticBusyPattern: RegExp | undefined;
+  private staticBusyClearPattern: RegExp | undefined;
   private busyTransitionArmed = false;
   private readyPattern: RegExp | undefined;
   private readySeen = false;
-  /** Pre-idle latch for static busy screens (capacity queue). Set from a PTY
-   *  chunk carrying explicit static-busy evidence; suppresses screen-derived
-   *  idle until a chunk with readyPattern evidence but no static-busy marker
-   *  redraws. See CliAdapter.staticBusyPattern. */
+  /** Pre-idle latch for static busy screens (capacity queue). Set from PTY
+   *  chunks carrying explicit static-busy evidence (scanned across chunks
+   *  via the rolling tail); suppresses screen-derived idle until a chunk
+   *  with explicit composer evidence (staticBusyClearPattern) redraws.
+   *  See CliAdapter.staticBusyPattern / staticBusyClearPattern. */
   private staticBusyLatch = false;
 
   constructor(cli: CliAdapter) {
     this.completionPattern = cli.completionPattern;
     this.idleToBusyPattern = cli.idleToBusyPattern;
     this.staticBusyPattern = cli.staticBusyPattern;
+    this.staticBusyClearPattern = cli.staticBusyClearPattern;
     this.readyPattern = cli.readyPattern;
   }
 
@@ -107,18 +110,24 @@ export class IdleDetector {
       this.readySeen = true;
     }
 
-    // Pre-idle static-busy latch (capacity-queue screens). Decided from the
-    // CURRENT chunk only: the queue text and the queue screen's `100% left`
-    // status bar both linger in outputTail, so tail matching could never
-    // clear the latch and a stale tail ready marker would clear it mid-queue.
-    // A chunk carrying the static-busy marker means the latest redraw still
-    // shows the queue; a chunk carrying fresh ready evidence without it means
-    // the composer is back.
+    // Pre-idle static-busy latch (capacity-queue screens).
+    // SET: scan both the current chunk AND the rolling tail — the queue
+    //  marker can be split across chunks ("Queued for cap" + "acity"), and
+    //  the tail already holds the full text by the time the second chunk
+    //  arrives (consistent with idleToBusy/completionPattern split-chunk
+    //  handling).
+    // CLEAR: explicit composer evidence (staticBusyClearPattern) in the
+    //  CURRENT chunk takes priority — the tail may still carry residual
+    //  queue text from a previous chunk, but a fresh composer redraw means
+    //  the queue is gone. The broad readyPattern includes `\d+% left`
+    //  (status bar), which the queue screen itself carries — using it to
+    //  clear would re-open the false-idle bug when queue and status bar
+    //  arrive in separate chunks.
     if (this.staticBusyPattern) {
-      if (this.staticBusyPattern.test(stripped)) {
-        this.staticBusyLatch = true;
-      } else if (this.readyPattern?.test(stripped)) {
+      if (this.staticBusyClearPattern?.test(stripped)) {
         this.staticBusyLatch = false;
+      } else if (this.staticBusyPattern.test(stripped) || this.staticBusyPattern.test(this.outputTail)) {
+        this.staticBusyLatch = true;
       }
     }
 

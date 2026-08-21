@@ -364,6 +364,14 @@ export interface CliAdapter {
    *  the latch — it is authoritative independently of the screen observer. */
   readonly staticBusyPattern?: RegExp;
 
+  /** Opt-in CLEAR pattern for the pre-idle static-busy latch. Matches the
+   *  real composer prompt (e.g. line-start ›/❯) so the latch can clear when
+   *  the queue screen redraws into the composer. Must NOT match the status
+   *  bar (e.g. `\d+% left`) — the queue screen itself carries a status bar,
+   *  so the broad readyPattern can never clear the latch. Only tested against
+   *  the CURRENT chunk (fresh composer evidence), not the rolling tail. */
+  readonly staticBusyClearPattern?: RegExp;
+
   /** Ready marker regex — matches when the CLI's input prompt is rendered and
    *  functional.  When set, the idle detector suppresses quiescence-based idle
    *  until this pattern appears in the PTY output.  Checked every cycle (reset

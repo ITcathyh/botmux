@@ -458,6 +458,12 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // viewport probe is forbidden from mutating state. See the
     // TRAEX_STATIC_BUSY_PATTERN comment.
     staticBusyPattern: TRAEX_STATIC_BUSY_PATTERN,
+    // Clear the static-busy latch only on real composer evidence (line-start
+    // ›/❯, excluding numbered selector rows). The broad readyPattern also
+    // matches `\d+% left` (status bar), which the queue screen itself
+    // carries — using it to clear the latch would re-open the ZMX false-idle
+    // bug when queue and status bar arrive in separate chunks.
+    staticBusyClearPattern: /(?:^|[\n\r])\s*[›❯](?!\s*\d+\.)/,
     // TRAE has shipped both the Codex-style `›` prompt and the Claude-style
     // `❯` prompt; v0.200.7 also renders a "Context 100% left" status bar.
     // Startup advisory / picker screens also use `❯ 1.` as a menu cursor, so
