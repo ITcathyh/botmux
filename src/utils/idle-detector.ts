@@ -117,16 +117,23 @@ export class IdleDetector {
     //  arrives (consistent with idleToBusy/completionPattern split-chunk
     //  handling).
     // CLEAR: explicit composer evidence (staticBusyClearPattern) in the
-    //  CURRENT chunk takes priority — the tail may still carry residual
-    //  queue text from a previous chunk, but a fresh composer redraw means
-    //  the queue is gone. The broad readyPattern includes `\d+% left`
-    //  (status bar), which the queue screen itself carries — using it to
-    //  clear would re-open the false-idle bug when queue and status bar
-    //  arrive in separate chunks.
+    //  CURRENT chunk. The broad readyPattern includes `\d+% left` (status
+    //  bar), which the queue screen itself carries — using it to clear
+    //  would re-open the false-idle bug when queue and status bar arrive
+    //  in separate chunks.
+    // ORDER: within a single chunk, whichever evidence appears LAST wins —
+    //  a submitted user message (`› text`) followed by a fresh queue line
+    //  must NOT clear the latch (the queue is fresher), while a queue line
+    //  followed by a real composer redraw must clear it.
     if (this.staticBusyPattern) {
-      if (this.staticBusyClearPattern?.test(stripped)) {
+      const clearIdx = this.staticBusyClearPattern
+        ? lastMatchIndex(this.staticBusyClearPattern, stripped)
+        : -1;
+      const staticChunkIdx = lastMatchIndex(this.staticBusyPattern, stripped);
+      const staticTailIdx = lastMatchIndex(this.staticBusyPattern, this.outputTail);
+      if (clearIdx >= 0 && clearIdx > staticChunkIdx) {
         this.staticBusyLatch = false;
-      } else if (this.staticBusyPattern.test(stripped) || this.staticBusyPattern.test(this.outputTail)) {
+      } else if (staticTailIdx >= 0) {
         this.staticBusyLatch = true;
       }
     }
@@ -245,4 +252,17 @@ export class IdleDetector {
       .replace(/\x1b\[(\d*)C/g, (_m, n) => ' '.repeat(Number(n) || 1))
       .replace(/\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[()][0-9A-B]|\x1b\[[\?]?[0-9;]*[hlmsuJ]/g, '');
   }
+}
+
+/** Find the LAST match index of a regex in a string, or -1. Handles
+ *  non-global regexes by cloning with the g flag. */
+function lastMatchIndex(re: RegExp, s: string): number {
+  const g = new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g');
+  let last = -1;
+  let m: RegExpExecArray | null;
+  while ((m = g.exec(s)) !== null) {
+    last = m.index;
+    if (g.lastIndex === m.index) g.lastIndex++;
+  }
+  return last;
 }

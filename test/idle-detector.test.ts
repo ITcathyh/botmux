@@ -549,6 +549,39 @@ describe('IdleDetector: static capacity-queue pre-idle latch', () => {
     expect(idleCb).toHaveBeenCalledTimes(1);
     detector.dispose();
   });
+
+  it('chunk-internal freshness: submitted user line before fresh queue does not clear latch', () => {
+    // ZMX prefix snapshots merge new history into one delta. A submitted
+    // user message (`› text`) followed by a fresh queue line in the SAME
+    // chunk must NOT clear the latch — the queue is fresher evidence.
+    const detector = new IdleDetector(traexAdapter);
+    const idleCb = vi.fn();
+    detector.onIdle(idleCb);
+
+    detector.feed('› 请修复这个问题\nQueued for capacity\nContext 100% left');
+    vi.advanceTimersByTime(10_000);
+    expect(idleCb).not.toHaveBeenCalled();
+
+    // Real composer (placeholder text, not a submitted user line) clears.
+    detector.feed('\x1b[2K› Ask TraeCode CLI to do anything\nContext 100% left');
+    vi.advanceTimersByTime(2_500);
+    expect(idleCb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('chunk-internal freshness: queue before composer in same chunk clears latch', () => {
+    // The inverse: a queue line followed by a real composer redraw in the
+    // same chunk means the queue is gone — the latch must clear and idle
+    // must fire after quiescence.
+    const detector = new IdleDetector(traexAdapter);
+    const idleCb = vi.fn();
+    detector.onIdle(idleCb);
+
+    detector.feed('Queued for capacity\nContext 100% left\n› Ask TraeCode CLI to do anything');
+    vi.advanceTimersByTime(2_500);
+    expect(idleCb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
 });
 
 // ─── Completion pattern matching ──────────────────────────────────────────

@@ -357,11 +357,12 @@ export interface CliAdapter {
    *  mutation — this consumes raw PTY evidence inside IdleDetector, so it also
    *  holds on backends where screen capture must not mutate state (ZMX):
    *  while latched, screen-derived idle is suppressed until a PTY chunk with
-   *  readyPattern evidence but WITHOUT this marker arrives (the queue screen
-   *  itself matches readyPattern's status-bar arm, so readyPattern alone can
-   *  never clear it). The latch is set/cleared from the current chunk only;
-   *  reset() rebases it. External structured completion (fireIdle) bypasses
-   *  the latch — it is authoritative independently of the screen observer. */
+   *  explicit composer evidence (staticBusyClearPattern) redraws AFTER the
+   *  last queue marker. The latch is set from the rolling outputTail (queue
+   *  markers can be split across chunks); clear is decided by the LAST
+   *  static/clear evidence position within the current chunk. reset() rebases
+   *  it. External structured completion (fireIdle) bypasses the latch — it is
+   *  authoritative independently of the screen observer. */
   readonly staticBusyPattern?: RegExp;
 
   /** Opt-in CLEAR pattern for the pre-idle static-busy latch. Matches the
