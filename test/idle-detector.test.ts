@@ -582,6 +582,78 @@ describe('IdleDetector: static capacity-queue pre-idle latch', () => {
     expect(idleCb).toHaveBeenCalledTimes(1);
     detector.dispose();
   });
+
+  it('stale-tail: composer clear followed by status-only redraw does not re-latch', () => {
+    // After a composer redraw clears the latch, a subsequent status-bar-only
+    // chunk (no composer, no fresh queue) must NOT re-set the latch from
+    // stale queue text lingering in the rolling tail. ZMX hot-poll makes
+    // composer→status-redraw a common sequence. The status-only chunk
+    // arrives BEFORE quiescence fires (isIdle still false), so the stale
+    // tail is still present.
+    const detector = new IdleDetector(traexAdapter);
+    const idleCb = vi.fn();
+    detector.onIdle(idleCb);
+
+    // Queue screen latches.
+    detector.feed('Queued for capacity\nContext 100% left');
+    vi.advanceTimersByTime(5_000);
+    expect(idleCb).not.toHaveBeenCalled();
+
+    // Composer redraw clears the latch. Do NOT advance timers yet — the
+    // stale tail is still present.
+    detector.feed('\x1b[2K› Ask TraeCode CLI to do anything');
+
+    // Status-bar-only redraw: tail still has old queue text, but it must
+    // not re-latch (stale position < clear position).
+    detector.feed('\x1b[2K100% left');
+    vi.advanceTimersByTime(5_000);
+    // Idle fires: the latch was not re-set by the stale tail.
+    expect(idleCb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('stale-tail: composer+status same chunk followed by status-only redraw does not re-latch', () => {
+    // Real-world shape: the composer line itself carries the status bar,
+    // followed by a pure status-bar redraw — all before quiescence fires.
+    const detector = new IdleDetector(traexAdapter);
+    const idleCb = vi.fn();
+    detector.onIdle(idleCb);
+
+    detector.feed('Queued for capacity\n100% left');
+    vi.advanceTimersByTime(5_000);
+    expect(idleCb).not.toHaveBeenCalled();
+
+    // Composer + status in the same chunk — clear wins (composer is after
+    // queue in the chunk).
+    detector.feed('› Ask TraeCode CLI to do anything   100% left');
+
+    // Pure status redraw must not re-latch from stale tail.
+    detector.feed('100% left');
+    vi.advanceTimersByTime(5_000);
+    expect(idleCb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('stale-tail: fresh queue after clear re-latches (position > clear pos)', () => {
+    // Control: a genuinely new queue screen AFTER the clear must re-latch.
+    // The new queue arrives after idle fired (isIdle=true), so feed()
+    // resets the tail and clear position — the new queue is fresh.
+    const detector = new IdleDetector(traexAdapter);
+    const idleCb = vi.fn();
+    detector.onIdle(idleCb);
+
+    detector.feed('Queued for capacity\nContext 100% left');
+    detector.feed('\x1b[2K› Ask TraeCode CLI to do anything');
+    vi.advanceTimersByTime(2_500);
+    expect(idleCb).toHaveBeenCalledTimes(1);
+
+    // New queue screen — fresh evidence after the clear.
+    detector.feed('\x1b[2KQueued for capacity\nContext 100% left');
+    vi.advanceTimersByTime(10_000);
+    // Latch held: idle does NOT fire again.
+    expect(idleCb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
 });
 
 // ─── Completion pattern matching ──────────────────────────────────────────

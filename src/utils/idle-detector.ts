@@ -32,6 +32,10 @@ export class IdleDetector {
    *  with explicit composer evidence (staticBusyClearPattern) redraws.
    *  See CliAdapter.staticBusyPattern / staticBusyClearPattern. */
   private staticBusyLatch = false;
+  /** Tail position of the last composer clear evidence. Queue evidence in
+   *  the tail at or before this position is stale (from before the clear)
+   *  and must not re-set the latch. -1 = no clear recorded. */
+  private staticBusyClearTailPos = -1;
 
   constructor(cli: CliAdapter) {
     this.completionPattern = cli.completionPattern;
@@ -77,6 +81,7 @@ export class IdleDetector {
       this.isIdle = false;
       this.outputTail = '';
       this.readySeen = false;
+      this.staticBusyClearTailPos = -1;
       this.lastSpinnerAt = Date.now();
     }
 
@@ -125,6 +130,9 @@ export class IdleDetector {
     //  a submitted user message (`› text`) followed by a fresh queue line
     //  must NOT clear the latch (the queue is fresher), while a queue line
     //  followed by a real composer redraw must clear it.
+    // STALE-TAIL: after a clear, queue text lingering in the tail must not
+    //  re-set the latch. Record the clear position in the tail; only queue
+    //  evidence AFTER that position is fresh enough to set.
     if (this.staticBusyPattern) {
       const clearIdx = this.staticBusyClearPattern
         ? lastMatchIndex(this.staticBusyClearPattern, stripped)
@@ -133,7 +141,13 @@ export class IdleDetector {
       const staticTailIdx = lastMatchIndex(this.staticBusyPattern, this.outputTail);
       if (clearIdx >= 0 && clearIdx > staticChunkIdx) {
         this.staticBusyLatch = false;
-      } else if (staticTailIdx >= 0) {
+        // Record where the clear landed in the tail so stale queue text
+        // before it doesn't re-set the latch on the next chunk.
+        const chunkStart = this.outputTail.length - stripped.length;
+        this.staticBusyClearTailPos = chunkStart >= 0
+          ? chunkStart + clearIdx
+          : this.outputTail.length;
+      } else if (staticTailIdx >= 0 && staticTailIdx > this.staticBusyClearTailPos) {
         this.staticBusyLatch = true;
       }
     }
@@ -173,6 +187,7 @@ export class IdleDetector {
     this.outputTail = '';
     this.readySeen = false;
     this.staticBusyLatch = false;
+    this.staticBusyClearTailPos = -1;
     this.lastSpinnerAt = Date.now();
     this.clearTimer();
   }
@@ -189,6 +204,7 @@ export class IdleDetector {
     this.outputTail = '';
     this.readySeen = false;
     this.staticBusyLatch = false;
+    this.staticBusyClearTailPos = -1;
     this.lastSpinnerAt = 0;
     this.clearTimer();
   }
@@ -209,6 +225,7 @@ export class IdleDetector {
     this.busyCallback = null;
     this.busyTransitionArmed = false;
     this.staticBusyLatch = false;
+    this.staticBusyClearTailPos = -1;
   }
 
   private quiescenceCheck(): void {
