@@ -660,22 +660,25 @@ describe('IdleDetector: static capacity-queue pre-idle latch', () => {
     // the tail window slides (drops from head). The clear position must
     // shift left too — otherwise a fresh queue landing at a low index in
     // the new window is falsely treated as stale (position < clearPos).
+    // Do NOT advance timers between clear and fresh queue: an idle fire
+    // would reset clearPos via the isIdle path, making the test pass
+    // without exercising the slide-decrement.
     const detector = new IdleDetector(traexAdapter);
     const idleCb = vi.fn();
     detector.onIdle(idleCb);
 
-    // Queue + clear, with enough filler to push the clear to a high index.
+    // Queue + filler + composer clear, all before any timer advance.
     detector.feed('Queued for capacity\n100% left');
     detector.feed('z'.repeat(471) + '\n');
     detector.feed('\n› Ask TraeCode CLI to do anything');
-    vi.advanceTimersByTime(2_500);
-    expect(idleCb).toHaveBeenCalledTimes(1);
 
     // Fresh queue lands at a LOW index in the new tail window (after the
     // slide). It must re-latch despite the old high clearPos.
     detector.feed('\nQueued for capacity\n' + 't'.repeat(430));
     vi.advanceTimersByTime(10_000);
-    expect(idleCb).toHaveBeenCalledTimes(1); // latch held, no new idle
+    // Latch held: idle does NOT fire. Without the slide-decrement, the
+    // stale clearPos would suppress the latch and idle would fire.
+    expect(idleCb).not.toHaveBeenCalled();
     detector.dispose();
   });
 });
