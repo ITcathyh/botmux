@@ -86,7 +86,14 @@ export class IdleDetector {
     }
 
     const stripped = this.stripAnsi(data);
-    this.outputTail = (this.outputTail + stripped).slice(-500);
+    // Shift the clear position left when the tail window drops characters
+    // from the head, so it stays relative to the current window.
+    const combined = this.outputTail + stripped;
+    const dropped = Math.max(0, combined.length - 500);
+    this.outputTail = combined.slice(-500);
+    if (this.staticBusyClearTailPos >= 0) {
+      this.staticBusyClearTailPos = Math.max(-1, this.staticBusyClearTailPos - dropped);
+    }
 
     // Only an explicitly opted-in CLI marker may turn a previously reported
     // idle cycle back into busy. Plain PTY activity — and legacy busyPattern
