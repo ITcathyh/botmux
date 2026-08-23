@@ -5491,6 +5491,8 @@ async function readCardUsageSnapshotForSend(
       // (parity with the daemon reader and the ledger/dashboard consumers).
       larkAppId: larkAppId ?? session.larkAppId,
       fresh: true,
+      // 定价覆盖：从 bot 配置解析，未配置时 undefined（costCny 缺省）。
+      pricing: larkAppId ? resolvePricingForCli(larkAppId) : undefined,
     });
   } catch {
     return { context: null, tokens: null };
@@ -7212,7 +7214,8 @@ import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from './servi
 import { normalizeFeedbackPolicy } from './services/feedback-policy.js';
 import { applyInlineMentions } from './im/lark/inline-mentions.js';
 import { renderBrandTemplate } from './im/lark/brand-template.js';
-import { effectiveDefaultWorkingDir, loadBotConfigs, resolveBrandLabel, resolveUsageDisplay } from './bot-registry.js';
+import { effectiveDefaultWorkingDir, loadBotConfigs, resolveBrandLabel, resolveUsageDisplay, getBot } from './bot-registry.js';
+import { DEFAULT_USD_CNY, type ResolvedModelPricing } from './services/model-pricing.js';
 import { config } from './config.js';
 import { getSessionUsageSnapshot } from './core/cost-calculator.js';
 import {
@@ -7567,6 +7570,17 @@ async function registerSelfFromCredFile(): Promise<void> {
  *  `loadBotConfigs()` 重载会把沙箱残留的 stale bots.json（可能是同 appId 的旧
  *  secret）覆盖到注册表上——每次本地重载后必须把 env bot 重新注册回去压轴。 */
 let envPinnedRiffBot: import('./bot-registry.js').BotConfig | null = null;
+
+/** 从 bot 配置解析定价（bots.json pricing 块 → 内置表）。未配置时返回 undefined。 */
+function resolvePricingForCli(larkAppId: string): ResolvedModelPricing | undefined {
+  const bot = getBot(larkAppId);
+  const pricing = bot?.config?.pricing;
+  if (!pricing) return undefined;
+  return {
+    usdCny: pricing.usdCny ?? DEFAULT_USD_CNY,
+    overrides: pricing,
+  };
+}
 
 function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { session: SessionData; botConfig: import('./bot-registry.js').BotConfig } | null {
   const appId = process.env.BOTMUX_LARK_APP_ID;

@@ -100,6 +100,7 @@ import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { recordQuarantinedLauncherEnvKeys } from './mojo-launcher-env-quarantine.js';
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
 import { getBot, getAllBots, getOwnerOpenId, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
+import { DEFAULT_USD_CNY, type ResolvedModelPricing } from '../services/model-pricing.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
@@ -112,6 +113,18 @@ const DAEMON_BOOT_ID = randomUUID();
 const restartCoordinator = new RestartCoordinator();
 const lifecycleRetiringWorkers = new WeakMap<DaemonSession, Set<ChildProcess>>();
 const transferRetiringWorkers = new WeakSet<ChildProcess>();
+
+/** 从 bot 配置解析定价（bots.json pricing 块 → 内置表）。未配置时返回 undefined。 */
+function resolvePricingForBot(larkAppId?: string): ResolvedModelPricing | undefined {
+  if (!larkAppId) return undefined;
+  const bot = getBot(larkAppId);
+  const pricing = bot?.config?.pricing;
+  if (!pricing) return undefined;
+  return {
+    usdCny: pricing.usdCny ?? DEFAULT_USD_CNY,
+    overrides: pricing,
+  };
+}
 
 /** 在完整 Worker 模块加载前接住首条 IPC，避免冷启动耗时被误判为投递失败。 */
 function workerForkExecArgv(): string[] {
@@ -280,6 +293,8 @@ export function getDaemonSessionUsageSnapshot(
       // card refreshes on every status tick and rides the reader's reparse
       // throttle instead (fresh:false) to stay off the disk.
       fresh: opts?.fresh ?? true,
+      // 定价覆盖：从 bot 配置解析，未配置时 undefined（costCny 缺省）。
+      pricing: resolvePricingForBot(ds.larkAppId ?? ds.session.larkAppId),
     });
   } catch (error) {
     logger.warn(
