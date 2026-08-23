@@ -13,6 +13,10 @@ import {
 import { logger } from './utils/logger.js';
 import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 import type { VoiceConfig } from './services/voice/types.js';
+import type { PricingOverrides } from './services/model-pricing.js';
+import type { BudgetConfig } from './services/budget-tracker.js';
+import { normalizePricingOverrides } from './services/model-pricing.js';
+import { parseBudgetConfig } from './services/budget-tracker.js';
 import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
 import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
 import { normalizeStartupCommandList } from './core/startup-commands.js';
@@ -1973,6 +1977,16 @@ export interface BotConfig {
    * cards render the "🔊 语音总结" button. See services/voice/types.ts.
    */
   voice?: VoiceConfig;
+  /**
+   * Per-bot pricing overrides for cost estimation. Merged over the built-in
+   * model price table. See services/model-pricing.ts.
+   */
+  pricing?: PricingOverrides;
+  /**
+   * Per-bot monthly budget config. When set, the daemon tracks spend and
+   * alerts/blocks at thresholds. See services/budget-tracker.ts.
+   */
+  budget?: BudgetConfig;
 }
 
 export interface BotState {
