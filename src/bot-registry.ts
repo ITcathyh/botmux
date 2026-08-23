@@ -3355,7 +3355,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       contentTriggers,
       voice,
       pricing,
-      budget,
+      budget: budget ?? undefined,
     });
   }
 

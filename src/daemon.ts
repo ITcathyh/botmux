@@ -21497,7 +21497,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           sendUserMessage(record.larkAppId, ownerOpenId, formatBudgetAlert(alert), 'text')
             .catch(err => logger.warn(`[budget] failed to send alert to owner: ${err}`));
         }
-        logger.warn(`[budget] ${record.larkAppId} alert: ${alert.kind} spent=${alert.spentCny} budget=${alert.monthlyCny}`);
+        logger.warn(`[budget] ${record.larkAppId} alert: spent=${alert.spentCny} budget=${alert.monthlyCny} (${alert.percent}%)`);
       }
     } catch (err) {
       logger.warn(`[budget] sink error: ${err}`);
