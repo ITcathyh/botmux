@@ -3127,6 +3127,14 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       }
     }
 
+    // pricing：per-bot 定价覆盖。normalizePricingOverrides 做宽松校验，
+    // 非法项丢弃，全空返回 undefined。
+    const pricing = normalizePricingOverrides(entry.pricing);
+
+    // budget：per-bot 月度预算。parseBudgetConfig 做宽松校验，
+    // 非法/缺字段返回 null。
+    const budget = parseBudgetConfig(entry.budget);
+
     configs.push({
       larkAppId: entry.larkAppId,
       // apiOnly bots may omit the secret (never used — no Feishu connection);
@@ -3332,6 +3340,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       summaryMemoryPath,
       contentTriggers,
       voice,
+      pricing,
+      budget,
     });
   }
 
