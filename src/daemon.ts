@@ -99,6 +99,9 @@ import { migrateOverloadAlertAtStartup } from './services/overload-alert-migrati
 import * as messageQueue from './services/message-queue.js';
 import { emitHookEvent, emitHookEventLocal, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
+import { setUsageLedgerPricingResolver, setUsageLedgerRecordSink } from './services/usage-ledger.js';
+import { trackBudgetSpend, formatBudgetAlert } from './services/budget-tracker.js';
+import { DEFAULT_USD_CNY } from './services/model-pricing.js';
 import { createImgNumberer, extractPostAtParticipants, messageMentionsBot, parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
 import { resolveInboundAudio } from './im/lark/audio-transcribe.js';
 import { expandMergeForward } from './im/lark/merge-forward.js';
@@ -21466,6 +21469,40 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   if (tmuxEnvScrub.failed.length > 0) {
     logger.warn(`[tmux] failed to scrub server-global env key(s): ${tmuxEnvScrub.failed.join(', ')}`);
   }
+
+  // ─── 成本/预算接线 ─────────────────────────────────────────────────────
+  // pricingResolver：把 larkAppId 解析成 bot 的定价配置（bots.json pricing 块
+  // → 内置表）。recordSink：每条正 delta 记录落盘后，累计到预算跟踪器，
+  // 超阈值时私聊 bot owner 告警。sink 内异常被 catch，绝不影响 ledger 主路径。
+  setUsageLedgerPricingResolver((larkAppId) => {
+    if (!larkAppId) return undefined;
+    const bot = getBot(larkAppId);
+    const pricing = bot?.config?.pricing;
+    if (!pricing) return undefined;
+    return {
+      usdCny: pricing.usdCny ?? DEFAULT_USD_CNY,
+      overrides: pricing,
+    };
+  });
+  setUsageLedgerRecordSink((record) => {
+    if (!record.larkAppId || !record.costCny || record.costCny <= 0) return;
+    try {
+      const bot = getBot(record.larkAppId);
+      const budget = bot?.config?.budget;
+      if (!budget) return;
+      const alert = trackBudgetSpend(record.larkAppId, record.costCny, { budget });
+      if (alert) {
+        const ownerOpenId = bot?.config?.ownerOpenId;
+        if (ownerOpenId) {
+          sendUserMessage(record.larkAppId, ownerOpenId, formatBudgetAlert(alert), 'text')
+            .catch(err => logger.warn(`[budget] failed to send alert to owner: ${err}`));
+        }
+        logger.warn(`[budget] ${record.larkAppId} alert: ${alert.kind} spent=${alert.spentCny} budget=${alert.monthlyCny}`);
+      }
+    } catch (err) {
+      logger.warn(`[budget] sink error: ${err}`);
+    }
+  });
 
   // Issue Board 领取的「激活」入口。
   //
