@@ -909,8 +909,10 @@ async function handleScheduleCommand(
       chatType: ds?.chatType === 'p2p' ? 'p2p' : 'topic_group',
       larkAppId,
       // Stamp the creator so the task's scheduled turns can authenticate
-      // workflow commands as them (scheduled-turn-provenance). The daemon
-      // re-checks the creator is still allowed at every run mutation.
+      // workflow commands as them (scheduled-turn-provenance). On the
+      // sandboxed relay path the daemon re-checks the creator is still
+      // allowed at every run mutation; the default non-sandbox route does
+      // not re-check membership.
       ownerOpenId: senderOpenId,
       deliver: 'origin',
       silent,

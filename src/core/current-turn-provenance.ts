@@ -133,10 +133,11 @@ export function resolveCurrentTurnProvenance(
   // Daemon-initiated scheduled turn (`schedule:<taskId>:<uuid>`): no human
   // inbound message exists, so quoteTargetId/lastCallerOpenId were never set
   // for this turn. Authenticate via the task binding + owner gate instead of
-  // the generation join. The live owner-allowed check is enforced daemon-side
-  // (session-relay) — the sandboxed CLI cannot read bots.json, and the daemon
-  // re-checks before every run mutation, the only path that can
-  // start/cancel/retry a run.
+  // the generation join. The live owner-allowed check is enforced on the
+  // sandboxed relay path (session-relay): the sandboxed CLI cannot read
+  // bots.json, and the daemon re-checks before every run mutation there.
+  // The default non-sandboxed signed-envelope route does not re-check
+  // membership — see scheduled-turn-provenance for the exact boundary.
   if (parseScheduledTurnId(marker.turnId)) {
     const auth = authorizeScheduledTurn({
       turnId: marker.turnId,

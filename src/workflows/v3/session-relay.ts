@@ -97,9 +97,12 @@ export function authorizeV3SessionRunMutationRequest(input: {
   /**
    * Live owner gate for scheduled turns: must return true iff the task's
    * creator (ownerOpenId) is still authorized for the bot. The daemon injects
-   * its resolvedAllowedUsers membership check, so a creator removed from the
-   * bot loses workflow authority immediately. Injected rather than imported to
-   * keep this module free of the daemon's bot-registry dependency.
+   * its resolvedAllowedUsers membership check, so on THIS relay path a
+   * creator removed from the bot loses workflow authority at the next
+   * mutation. The default non-sandbox signed-envelope route never reaches
+   * this relay and does not re-check membership (see
+   * scheduled-turn-provenance). Injected rather than imported to keep this
+   * module free of the daemon's bot-registry dependency.
    */
   isScheduleOwnerAllowed?: (larkAppId: string, ownerOpenId: string) => boolean;
 }): V3SessionRelayDecision {
@@ -162,9 +165,11 @@ export function authorizeV3SessionRunMutationRequest(input: {
   // Daemon-initiated scheduled turn (`schedule:<taskId>:<uuid>`): no human
   // inbound message exists, so the session row carries no
   // quoteTargetId/lastCallerOpenId for this turn. Authenticate via the task
-  // binding + the LIVE owner gate — a creator removed from the bot's
-  // resolvedAllowedUsers loses workflow authority immediately. The tuple's
-  // callerOpenId is the task's creator, never anything the request chooses.
+  // binding + the LIVE owner gate — on this relay path a creator removed
+  // from the bot's resolvedAllowedUsers is rejected here (the default
+  // non-sandbox signed-envelope route does not reach this path; see
+  // scheduled-turn-provenance). The tuple's callerOpenId is the task's
+  // creator, never anything the request chooses.
   let callerOpenId: string;
   if (liveTurnId && parseScheduledTurnId(liveTurnId)) {
     if (!input.sessionDataDir) {
