@@ -10873,15 +10873,25 @@ function setupWorkerHandlers(
         // skip card output entirely — so without a fresh message here the owner
         // never learns the CLI is blocked (the turn just stalls). Fire on the
         // working/other→limited edge, AFTER the managed/silent fence above but
-        // BEFORE the card-off / recovery early-breaks below, once per limit
-        // episode: the latch is keyed on usageLimitStateKey and reset by
-        // clearUsageLimitState (self-heal / turn end), so the same episode's
-        // repeated limited ticks stay quiet while the next episode notifies
-        // again.
+        // BEFORE the card-off early-break below (card-off sessions must still
+        // get this ping), once per limit episode: the latch is keyed on
+        // usageLimitStateKey and reset by clearUsageLimitState (self-heal /
+        // turn end), so the same episode's repeated limited ticks stay quiet
+        // while the next episode notifies again.
+        //
+        // Recovery-window exclusion: usageLimit is in-memory. When the CLI got
+        // limited WHILE the daemon was down (common for tmux/adopt restores),
+        // restore has no usageLimit to seed lastScreenStatus='limited' from,
+        // so the first post-restart limited tick is a false (empty→limited)
+        // edge. The in-memory latch also died with the old process, so without
+        // this guard the restart-silence contract would be broken by one @owner
+        // ping. The owner already got the private recovery DM summary; hold the
+        // ping until a real user turn clears suppressRecoveryCard.
         if (
           ds.lastScreenStatus === 'limited'
           && prevStatus !== 'limited'
           && ds.usageLimit
+          && !ds.suppressRecoveryCard
           && ds.rateLimitNotifiedKey !== usageLimitStateKey(ds.usageLimit)
         ) {
           ds.rateLimitNotifiedKey = usageLimitStateKey(ds.usageLimit);

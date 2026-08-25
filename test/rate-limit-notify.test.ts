@@ -402,4 +402,34 @@ describe('rate-limit proactive notification', () => {
     expect(mocks.addReaction).toHaveBeenCalledWith(APP_CARD_OFF, 'om_a', 'DONE');
     expect(ds.pendingAckReactions).toEqual([]);
   });
+
+  it('回归：重启静默窗口内的「假边沿」不发限流通知、不写 latch（CLI 在 daemon 宕机期间被限流）', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    setupPool(sessionReply);
+    const worker = makeFakeWorker();
+    // 模拟 tmux/adopt restore：usageLimit 未持久化 → lastScreenStatus 留空，
+    // 首个 limited 帧是 empty→limited 的假边沿；此时仍处重启静默窗口。
+    const ds = makeDs({ worker, workerPort: 9999, suppressRecoveryCard: true });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    const limit = rateLimitState();
+    worker.emit('message', { type: 'screen_update', content: '429', status: 'limited', usageLimit: limit });
+    await flush();
+
+    // 不发通知（owner 已收到重启恢复 DM 摘要），也不写 latch。
+    expect(textReplies(sessionReply)).toHaveLength(0);
+    expect(ds.rateLimitNotifiedKey).toBeUndefined();
+
+    // 首个真人 turn 清掉静默窗口后，真正的 limited 边沿仍能正常通知——
+    // 闸门挂在 suppressRecoveryCard 上，不是永久静音。
+    ds.suppressRecoveryCard = false;
+    ds.lastScreenStatus = 'working';
+    worker.emit('message', { type: 'screen_update', content: '429', status: 'limited', usageLimit: limit });
+    await flush();
+
+    const texts = textReplies(sessionReply);
+    expect(texts).toHaveLength(1);
+    expect(texts[0]).toContain(`<at id=${OWNER}>`);
+    expect(ds.rateLimitNotifiedKey).toBe(usageLimitStateKey(limit));
+  });
 });
