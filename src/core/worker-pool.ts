@@ -11281,6 +11281,21 @@ function setupWorkerHandlers(
     dispatchAttempt?: number,
   ): Promise<void> => {
     if (startupState.failureNotified) return;
+    // Restart recovery (daemon restart batch-restore): stay silent in the chat.
+    // Without this guard every restored session whose worker fails to start
+    // posts a "会话启动失败" card into its own topic — a broadcast storm during
+    // bulk restore. The failure still lands in the daemon log below; the owner
+    // gets the recovery DM summary instead, and the next real user turn clears
+    // suppressRecoveryCard (rememberLastCliInput) so later failures notify
+    // normally. Do NOT set failureNotified here: a later generation failing
+    // after the flag clears must still surface.
+    if (ds.suppressRecoveryCard) {
+      logger.warn(
+        `[${t}] Startup failure notification suppressed by suppressRecoveryCard `
+        + `(session recovery mode) sid=${ds.session.sessionId}: ${reason}`,
+      );
+      return;
+    }
     startupState.failureNotified = true;
     emitSessionLifecycleHook(ds, 'session.requires_attention', {
       reason: 'worker_start_failed',
