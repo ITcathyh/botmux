@@ -205,6 +205,25 @@ export interface MessageListenerConfig {
     /** V1 only supports top-level group messages. */
     scope?: 'top_level';
   };
+  /**
+   * Optional daemon-side keyword/regex pre-filter. Absent or all-empty = match
+   * every message (legacy behavior). When configured, a message matches the
+   * listener ONLY when its text satisfies the policy, so non-matching messages
+   * never wake the Agent. Keywords are case-insensitive substrings; regexes
+   * honor `regexCaseSensitive` (default insensitive) and each pattern is capped
+   * at 500 chars (longer patterns never match). `matchMode` 'any' (default)
+   * matches when at least one keyword OR regex hits; 'all' requires every
+   * keyword AND every regex to hit.
+   *
+   * bots.json example:
+   * `{"messageListeners":{"oc_xxx":{"enabled":true,"prompt":"...","contentPolicy":{"includeKeywords":["报错","500"],"matchMode":"any"}}}}`
+   */
+  contentPolicy?: {
+    includeKeywords?: string[];
+    includeRegex?: string[];
+    regexCaseSensitive?: boolean;
+    matchMode?: 'any' | 'all';
+  };
   replyPolicy?: {
     /** V1 always replies under the triggering message. */
     mode?: 'thread';
@@ -1035,6 +1054,25 @@ function normalizeMessageListenerConfig(raw: unknown, botIndex: number, chatId: 
   if (includeMsgTypes) messagePolicy.includeMsgTypes = includeMsgTypes;
   messagePolicy.scope = 'top_level';
 
+  const contentRaw = entry.contentPolicy && typeof entry.contentPolicy === 'object' && !Array.isArray(entry.contentPolicy)
+    ? entry.contentPolicy as Record<string, unknown>
+    : undefined;
+  let contentPolicy: MessageListenerConfig['contentPolicy'];
+  if (contentRaw) {
+    const includeKeywords = normalizeMessageListenerStringList(contentRaw.includeKeywords);
+    const includeRegex = normalizeMessageListenerStringList(contentRaw.includeRegex);
+    // Only persist non-default flags; an all-empty policy is dropped entirely
+    // (matchesContentPolicy treats absent/empty as match-all).
+    if (includeKeywords || includeRegex) {
+      contentPolicy = {
+        ...(includeKeywords ? { includeKeywords } : {}),
+        ...(includeRegex ? { includeRegex } : {}),
+        ...(contentRaw.regexCaseSensitive === true ? { regexCaseSensitive: true } : {}),
+        ...(contentRaw.matchMode === 'all' ? { matchMode: 'all' as const } : {}),
+      };
+    }
+  }
+
   return {
     enabled,
     ...(normalizeNonEmptyString(entry.name) ? { name: normalizeNonEmptyString(entry.name) } : {}),
@@ -1043,6 +1081,7 @@ function normalizeMessageListenerConfig(raw: unknown, botIndex: number, chatId: 
     prompt: prompt ?? '',
     ...(Object.keys(senderPolicy).length > 0 ? { senderPolicy } : {}),
     ...(Object.keys(messagePolicy).length > 0 ? { messagePolicy } : {}),
+    ...(contentPolicy ? { contentPolicy } : {}),
     replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
   };
 }

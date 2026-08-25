@@ -1,5 +1,6 @@
 import { getBot, type MessageListenerConfig } from '../bot-registry.js';
 import { rmwBotEntry } from './config-store.js';
+import { MAX_CONTENT_POLICY_REGEX_LENGTH } from './message-listener.js';
 
 export type MessageListenerUpdate = {
   enabled: boolean;
@@ -9,6 +10,7 @@ export type MessageListenerUpdate = {
   prompt: string;
   senderPolicy?: MessageListenerConfig['senderPolicy'];
   messagePolicy?: MessageListenerConfig['messagePolicy'];
+  contentPolicy?: MessageListenerConfig['contentPolicy'];
 };
 
 function stringList(raw: unknown): string[] | undefined {
@@ -77,6 +79,26 @@ export function sanitizeMessageListenerUpdate(raw: unknown): MessageListenerUpda
   const includeMsgTypes = stringList(rawMessage.includeMsgTypes);
   if (includeMsgTypes) messagePolicy.includeMsgTypes = includeMsgTypes;
 
+  const rawContent = entry.contentPolicy && typeof entry.contentPolicy === 'object' && !Array.isArray(entry.contentPolicy)
+    ? entry.contentPolicy as Record<string, unknown>
+    : undefined;
+  let contentPolicy: MessageListenerConfig['contentPolicy'];
+  if (rawContent) {
+    const includeKeywords = stringList(rawContent.includeKeywords);
+    // Drop over-long patterns here too: the runtime length cap is the
+    // authoritative ReDoS guard, but persisting a pattern that can never match
+    // would only confuse the next editor load.
+    const includeRegex = stringList(rawContent.includeRegex)?.filter(pattern => pattern.length <= MAX_CONTENT_POLICY_REGEX_LENGTH);
+    if (includeKeywords || includeRegex) {
+      contentPolicy = {
+        ...(includeKeywords ? { includeKeywords } : {}),
+        ...(includeRegex ? { includeRegex } : {}),
+        ...(rawContent.regexCaseSensitive === true ? { regexCaseSensitive: true } : {}),
+        ...(rawContent.matchMode === 'all' ? { matchMode: 'all' as const } : {}),
+      };
+    }
+  }
+
   return {
     enabled,
     ...(name ? { name } : {}),
@@ -85,6 +107,7 @@ export function sanitizeMessageListenerUpdate(raw: unknown): MessageListenerUpda
     prompt,
     ...(Object.keys(senderPolicy).length > 0 ? { senderPolicy } : {}),
     messagePolicy,
+    ...(contentPolicy ? { contentPolicy } : {}),
   };
 }
 
@@ -134,6 +157,7 @@ export function messageListenerConfigFromUpdate(patch: MessageListenerUpdate): M
     prompt: patch.prompt,
     ...(patch.senderPolicy && Object.keys(patch.senderPolicy).length > 0 ? { senderPolicy: patch.senderPolicy } : {}),
     ...(patch.messagePolicy ? { messagePolicy: { ...patch.messagePolicy, scope: 'top_level' } } : { messagePolicy: { scope: 'top_level' } }),
+    ...(patch.contentPolicy ? { contentPolicy: patch.contentPolicy } : {}),
     replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
   };
 }
