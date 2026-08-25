@@ -2046,8 +2046,13 @@ async function notifyP2pAccessDenied(
   if (!owner) return;
   if (shouldThrottleNotice(`owner-dm:${larkAppId}:${owner}`, OWNER_DM_THROTTLE_MS)) return;
   // 与授权卡同口径：mentions/observed 花名册在 p2p 场景不可用，直接 best-effort
-  // getUserProfile 取名，失败回落缩略 open_id（ou_xxx…xxxx）。
-  const profileName = (await getUserProfile(larkAppId, senderOpenId).catch(() => null))?.name;
+  // getUserProfile 取名，失败回落缩略 open_id（ou_xxx…xxxx）。contact API 挂起
+  // 时不得阻塞消息分发关键路径——5s 超时后按无名处理（与 daemon.ts 的
+  // notifyAllowedUsersResolveFailure 同一纪律：untimed SDK 路径不 await）。
+  const profileName = await Promise.race([
+    getUserProfile(larkAppId, senderOpenId).catch(() => null),
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), 5_000)),
+  ]).then((p) => p?.name);
   const shortRequester = `${senderOpenId.slice(0, 10)}…${senderOpenId.slice(-4)}`;
   const who = profileName ? `${profileName}（${shortRequester}）` : shortRequester;
   void dmAdmin(
