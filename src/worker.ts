@@ -8806,11 +8806,17 @@ function handleVisibleStartupInteraction(data: string): boolean {
 
   trustHandled = true;
   log('Trust dialog detected, auto-accepting...');
-  if (backend && 'sendSpecialKeys' in backend) {
-    (backend as any).sendSpecialKeys('Enter');
-  } else {
-    backend?.write('\r');
-  }
+  // Codex 0.149 的按键处理器在信任框渲染的瞬间尚未就绪，同步发出的 Enter 会
+  // 落进死输入队列被静默丢弃（上游 openai/codex#39487）：确认从未提交，直到
+  // ~20s 后 submit_unconfirmed 兜底。延迟一个短 tick 再发，让按键处理器就绪；
+  // trustHandled 已同步置位，后续 chunk 重复命中同一文案不会重入。
+  setTimeout(() => {
+    if (backend && 'sendSpecialKeys' in backend) {
+      (backend as any).sendSpecialKeys('Enter');
+    } else {
+      backend?.write('\r');
+    }
+  }, 400);
   return true;
 }
 
