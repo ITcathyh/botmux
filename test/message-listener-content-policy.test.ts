@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
 import {
-  MAX_CONTENT_POLICY_REGEX_LENGTH,
   evaluateMessageListener,
   matchesContentPolicy,
   previewMessageListenerMatches,
@@ -48,8 +47,6 @@ describe('matchesContentPolicy', () => {
     expect(matchesContentPolicy('任意文本', undefined)).toBe(true);
     expect(matchesContentPolicy('任意文本', {})).toBe(true);
     expect(matchesContentPolicy('任意文本', { includeKeywords: [] })).toBe(true);
-    expect(matchesContentPolicy('任意文本', { includeRegex: [] })).toBe(true);
-    expect(matchesContentPolicy('任意文本', { includeKeywords: [], includeRegex: [] })).toBe(true);
   });
 
   it('matches keywords case-insensitively as substrings (Chinese-friendly)', () => {
@@ -60,37 +57,14 @@ describe('matchesContentPolicy', () => {
     expect(matchesContentPolicy('出报错了', { includeKeywords: ['报错'] })).toBe(true);
   });
 
-  it('matches regexes case-insensitively by default', () => {
-    expect(matchesContentPolicy('ERROR 500', { includeRegex: ['error\\s+\\d+'] })).toBe(true);
-    expect(matchesContentPolicy('error 500', { includeRegex: ['ERROR\\s+\\d+'] })).toBe(true);
-    expect(matchesContentPolicy('ok', { includeRegex: ['\\d+'] })).toBe(false);
-  });
-
-  it('honors regexCaseSensitive for regexes while keywords stay case-insensitive', () => {
-    expect(matchesContentPolicy('ERROR 500', { includeRegex: ['error'], regexCaseSensitive: true })).toBe(false);
-    expect(matchesContentPolicy('ERROR 500', { includeRegex: ['ERROR'], regexCaseSensitive: true })).toBe(true);
-    // Keywords are always case-insensitive regardless of the regex flag.
-    expect(matchesContentPolicy('ERROR 500', { includeKeywords: ['error'], regexCaseSensitive: true })).toBe(true);
-  });
-
-  it('any mode (default): one keyword or one regex hit is enough', () => {
+  it('any mode (default): one keyword hit is enough', () => {
     expect(matchesContentPolicy('ERROR 500', { includeKeywords: ['不存在', '500'], matchMode: 'any' })).toBe(true);
-    expect(matchesContentPolicy('ERROR 500', { includeRegex: ['nope', '\\d+'], matchMode: 'any' })).toBe(true);
-    expect(matchesContentPolicy('ERROR 500', {
-      includeKeywords: ['不存在'],
-      includeRegex: ['\\d+'],
-      matchMode: 'any',
-    })).toBe(true);
-    expect(matchesContentPolicy('plain text', {
-      includeKeywords: ['nope'],
-      includeRegex: ['\\d+'],
-      matchMode: 'any',
-    })).toBe(false);
+    expect(matchesContentPolicy('plain text', { includeKeywords: ['nope', 'nada'], matchMode: 'any' })).toBe(false);
     // Default mode is 'any' when omitted.
     expect(matchesContentPolicy('ERROR 500', { includeKeywords: ['不存在', '500'] })).toBe(true);
   });
 
-  it('all mode: every keyword AND every regex must hit', () => {
+  it('all mode: every keyword must hit', () => {
     expect(matchesContentPolicy('ERROR 500', {
       includeKeywords: ['error', '500'],
       matchMode: 'all',
@@ -99,49 +73,21 @@ describe('matchesContentPolicy', () => {
       includeKeywords: ['error', '不存在'],
       matchMode: 'all',
     })).toBe(false);
-    expect(matchesContentPolicy('ERROR 500', {
-      includeRegex: ['error', '\\d+'],
-      matchMode: 'all',
-    })).toBe(true);
-    expect(matchesContentPolicy('ERROR 500', {
-      includeRegex: ['error', 'nope'],
-      matchMode: 'all',
-    })).toBe(false);
-    // Both groups AND-ed: all keywords AND all regexes.
-    expect(matchesContentPolicy('ERROR 500', {
-      includeKeywords: ['error'],
-      includeRegex: ['\\d+'],
-      matchMode: 'all',
-    })).toBe(true);
-    expect(matchesContentPolicy('ERROR 500', {
-      includeKeywords: ['error'],
-      includeRegex: ['nope'],
-      matchMode: 'all',
-    })).toBe(false);
-    // An empty regex group is vacuously satisfied in all mode.
-    expect(matchesContentPolicy('ERROR 500', {
-      includeKeywords: ['error'],
-      includeRegex: [],
-      matchMode: 'all',
-    })).toBe(true);
   });
 
-  it('treats invalid regex as non-matching without throwing', () => {
-    expect(() => matchesContentPolicy('text', { includeRegex: ['[unterminated'] })).not.toThrow();
-    expect(matchesContentPolicy('text', { includeRegex: ['[unterminated'] })).toBe(false);
-    // One invalid pattern must not poison a valid sibling in any mode.
-    expect(matchesContentPolicy('ERROR 500', { includeRegex: ['[unterminated', '\\d+'], matchMode: 'any' })).toBe(true);
-    expect(matchesContentPolicy('ERROR 500', { includeRegex: ['[unterminated', '\\d+'], matchMode: 'all' })).toBe(false);
-  });
-
-  it('treats over-long regex (>500 chars) as non-matching', () => {
-    const longPattern = 'a'.repeat(MAX_CONTENT_POLICY_REGEX_LENGTH + 1);
-    expect(longPattern.length).toBeGreaterThan(MAX_CONTENT_POLICY_REGEX_LENGTH);
-    expect(matchesContentPolicy('aaa', { includeRegex: [longPattern] })).toBe(false);
-    // A 500-char pattern is still evaluated (250 optional 'a's match anything).
-    const atLimit = 'a?'.repeat(MAX_CONTENT_POLICY_REGEX_LENGTH / 2);
-    expect(atLimit.length).toBe(MAX_CONTENT_POLICY_REGEX_LENGTH);
-    expect(matchesContentPolicy('aaa', { includeRegex: [atLimit] })).toBe(true);
+  it('V1 安全回归：regex 元字符按字面子串处理，对攻击文本不回溯、不挂起', () => {
+    // `(a+)+$` 作为 JS 正则是典型 catastrophic-backtracking payload（~30 字符
+    // 即可冻结主事件循环十几秒）。V1 只做子串匹配：它必须被当作普通字符串，
+    // 对纯 a 序列不命中，且对超长输入立即返回。
+    const evilLooking = '(a+)+$';
+    expect(matchesContentPolicy('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!!', { includeKeywords: [evilLooking] })).toBe(false);
+    // 字面出现时才命中（证明没有被当成正则，也没有被简单「忽略」）。
+    expect(matchesContentPolicy('pattern is (a+)+$ here', { includeKeywords: [evilLooking] })).toBe(true);
+    const huge = 'a'.repeat(100_000) + '!';
+    const started = Date.now();
+    expect(matchesContentPolicy(huge, { includeKeywords: [evilLooking] })).toBe(false);
+    // 线性子串搜索：100KB 远低于 100ms；若退化成指数回溯会直接超时。
+    expect(Date.now() - started).toBeLessThan(1_000);
   });
 });
 
@@ -155,14 +101,9 @@ describe('evaluateMessageListener contentPolicy integration', () => {
     expect(evaluate(listenerConfig({ includeKeywords: ['磁盘满'] }))).toBeUndefined();
   });
 
-  it('does not match when the regex policy misses', () => {
-    expect(evaluate(listenerConfig({ includeRegex: ['timeout'] }))).toBeUndefined();
-  });
-
-  it('applies matchMode all across keywords and regexes', () => {
+  it('applies matchMode all across keywords', () => {
     expect(evaluate(listenerConfig({
       includeKeywords: ['告警', '500'],
-      includeRegex: ['ERROR'],
       matchMode: 'all',
     }))).toBeDefined();
     expect(evaluate(listenerConfig({
@@ -174,7 +115,7 @@ describe('evaluateMessageListener contentPolicy integration', () => {
   it('keeps matching every message when contentPolicy is absent (legacy default)', () => {
     expect(evaluate(listenerConfig(undefined))).toBeDefined();
     expect(evaluate(listenerConfig(null))).toBeDefined();
-    expect(evaluate(listenerConfig({ includeKeywords: [], includeRegex: [] }))).toBeDefined();
+    expect(evaluate(listenerConfig({ includeKeywords: [] }))).toBeDefined();
   });
 
   it('does not affect the @-mention path: mentioned messages never go through the listener', () => {

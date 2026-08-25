@@ -59,15 +59,14 @@ export interface MessageListenerData {
     scope?: 'top_level';
   };
   /**
-   * Optional daemon-side keyword/regex pre-filter. Absent or all-empty = match
-   * every message. Keywords are case-insensitive substrings; regexes honor
-   * regexCaseSensitive (default insensitive). matchMode 'any' (default) needs
-   * one keyword/regex to hit; 'all' needs every keyword and regex to hit.
+   * Optional daemon-side keyword pre-filter. Absent or all-empty = match every
+   * message. Keywords are case-insensitive substrings. matchMode 'any'
+   * (default) needs one keyword to hit; 'all' needs every keyword to hit.
+   * V1 is keyword-only: regexes are not evaluated on the daemon main loop
+   * (catastrophic-backtracking DoS risk).
    */
   contentPolicy?: {
     includeKeywords?: string[];
-    includeRegex?: string[];
-    regexCaseSensitive?: boolean;
     matchMode?: 'any' | 'all';
   };
 }

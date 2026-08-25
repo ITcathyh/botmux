@@ -206,22 +206,25 @@ export interface MessageListenerConfig {
     scope?: 'top_level';
   };
   /**
-   * Optional daemon-side keyword/regex pre-filter. Absent or all-empty = match
-   * every message (legacy behavior). When configured, a message matches the
-   * listener ONLY when its text satisfies the policy, so non-matching messages
-   * never wake the Agent. Keywords are case-insensitive substrings; regexes
-   * honor `regexCaseSensitive` (default insensitive) and each pattern is capped
-   * at 500 chars (longer patterns never match). `matchMode` 'any' (default)
-   * matches when at least one keyword OR regex hits; 'all' requires every
-   * keyword AND every regex to hit.
+   * Optional daemon-side keyword pre-filter. Absent or all-empty = match every
+   * message (legacy behavior). When configured, a message matches the listener
+   * ONLY when its text satisfies the policy, so non-matching messages never
+   * wake the Agent. Keywords are case-insensitive substrings (linear-time
+   * `String.includes`, safe against attacker-controlled message text).
+   * `matchMode` 'any' (default) matches when at least one keyword hits; 'all'
+   * requires every keyword to hit.
+   *
+   * V1 intentionally does NOT support regexes: the policy is evaluated on the
+   * daemon main event loop for every inbound/backfilled message, and a user-
+   * authored JS regex with catastrophic backtracking (e.g. `(a+)+$`, 6 chars)
+   * freezes the whole multi-bot daemon for tens of seconds on a ~30-char
+   * message. A regex mode can return later behind a linear-time engine (RE2).
    *
    * bots.json example:
    * `{"messageListeners":{"oc_xxx":{"enabled":true,"prompt":"...","contentPolicy":{"includeKeywords":["报错","500"],"matchMode":"any"}}}}`
    */
   contentPolicy?: {
     includeKeywords?: string[];
-    includeRegex?: string[];
-    regexCaseSensitive?: boolean;
     matchMode?: 'any' | 'all';
   };
   replyPolicy?: {
@@ -1060,14 +1063,13 @@ function normalizeMessageListenerConfig(raw: unknown, botIndex: number, chatId: 
   let contentPolicy: MessageListenerConfig['contentPolicy'];
   if (contentRaw) {
     const includeKeywords = normalizeMessageListenerStringList(contentRaw.includeKeywords);
-    const includeRegex = normalizeMessageListenerStringList(contentRaw.includeRegex);
-    // Only persist non-default flags; an all-empty policy is dropped entirely
-    // (matchesContentPolicy treats absent/empty as match-all).
-    if (includeKeywords || includeRegex) {
+    // V1 is keyword-substring only (see the contentPolicy type doc for why no
+    // regexes on the daemon main loop). Only persist non-default flags; an
+    // all-empty policy is dropped entirely (matchesContentPolicy treats
+    // absent/empty as match-all).
+    if (includeKeywords) {
       contentPolicy = {
-        ...(includeKeywords ? { includeKeywords } : {}),
-        ...(includeRegex ? { includeRegex } : {}),
-        ...(contentRaw.regexCaseSensitive === true ? { regexCaseSensitive: true } : {}),
+        includeKeywords,
         ...(contentRaw.matchMode === 'all' ? { matchMode: 'all' as const } : {}),
       };
     }

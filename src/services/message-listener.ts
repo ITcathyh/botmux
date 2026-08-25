@@ -217,50 +217,38 @@ function msgTypeAllowed(listener: MessageListenerConfig, msgType: string): boole
   return include.includes(msgType);
 }
 
-/**
- * Per-pattern length cap for contentPolicy regexes: a ReDoS guard applied at
- * match time (config normalization also drops over-long patterns, but direct
- * bots.json edits bypass normalization, so the runtime check is authoritative).
- */
-export const MAX_CONTENT_POLICY_REGEX_LENGTH = 500;
-
 export type MessageListenerContentPolicy = NonNullable<MessageListenerConfig['contentPolicy']>;
 
 /**
- * Pure keyword/regex pre-filter for listener messages. SHARED by every leg
- * that feeds evaluateMessageListener (realtime delivery, polled backfill,
- * dashboard preview) so they can never diverge on content matching.
+ * Pure keyword pre-filter for listener messages. SHARED by every leg that
+ * feeds evaluateMessageListener (realtime delivery, polled backfill, dashboard
+ * preview) so they can never diverge on content matching.
  *
- * - Absent policy, or one with no keywords and no regexes → match everything
- *   (legacy behavior: every non-mention text message woke the Agent).
+ * - Absent policy, or one with no keywords → match everything (legacy
+ *   behavior: every non-mention text message woke the Agent).
  * - Keywords: case-insensitive substring match (Chinese-friendly; both sides
- *   lowercased, plain `includes`).
- * - Regexes: each pattern is compiled per call; patterns longer than
- *   MAX_CONTENT_POLICY_REGEX_LENGTH never match; an invalid pattern is caught,
- *   logged and treated as non-matching (never throws).
- * - matchMode 'any' (default): at least one keyword OR regex hits.
- * - matchMode 'all': every keyword AND every regex must hit.
+ *   lowercased, plain `includes`). Substring search is linear-time, so an
+ *   attacker-controlled group message cannot stall the daemon main loop.
+ * - matchMode 'any' (default): at least one keyword hits.
+ * - matchMode 'all': every keyword must hit.
+ *
+ * V1 deliberately has NO regex support: a JS regex with catastrophic
+ * backtracking (e.g. the 6-char `(a+)+$`) runs on the daemon's main event
+ * loop for every inbound AND backfilled message, so a ~30-char payload lying
+ * in listener-group history could freeze this single-daemon, multi-bot
+ * process for tens of seconds every poll round. A pattern-length cap does not
+ * bound backtracking. Regex can return later behind a linear-time engine.
  */
 export function matchesContentPolicy(text: string, policy: MessageListenerContentPolicy | undefined): boolean {
   if (!policy) return true;
   const keywords = (policy.includeKeywords ?? []).filter(keyword => keyword.length > 0);
-  const regexes = (policy.includeRegex ?? []).filter(pattern => pattern.length > 0);
-  if (keywords.length === 0 && regexes.length === 0) return true;
+  if (keywords.length === 0) return true;
   const haystack = text.toLowerCase();
   const keywordHits = (keyword: string): boolean => haystack.includes(keyword.toLowerCase());
-  const regexHits = (pattern: string): boolean => {
-    if (pattern.length > MAX_CONTENT_POLICY_REGEX_LENGTH) return false;
-    try {
-      return new RegExp(pattern, policy.regexCaseSensitive === true ? '' : 'i').test(text);
-    } catch (err) {
-      logger.warn(`[message-listener] contentPolicy invalid regex ignored: ${err instanceof Error ? err.message : String(err)}`);
-      return false;
-    }
-  };
   if (policy.matchMode === 'all') {
-    return keywords.every(keywordHits) && regexes.every(regexHits);
+    return keywords.every(keywordHits);
   }
-  return keywords.some(keywordHits) || regexes.some(regexHits);
+  return keywords.some(keywordHits);
 }
 
 export function findMessageListenerForChat(bot: BotState, chatId: string): MessageListenerConfig | undefined {

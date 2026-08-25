@@ -1,6 +1,5 @@
 import { getBot, type MessageListenerConfig } from '../bot-registry.js';
 import { rmwBotEntry } from './config-store.js';
-import { MAX_CONTENT_POLICY_REGEX_LENGTH } from './message-listener.js';
 
 export type MessageListenerUpdate = {
   enabled: boolean;
@@ -85,15 +84,11 @@ export function sanitizeMessageListenerUpdate(raw: unknown): MessageListenerUpda
   let contentPolicy: MessageListenerConfig['contentPolicy'];
   if (rawContent) {
     const includeKeywords = stringList(rawContent.includeKeywords);
-    // Drop over-long patterns here too: the runtime length cap is the
-    // authoritative ReDoS guard, but persisting a pattern that can never match
-    // would only confuse the next editor load.
-    const includeRegex = stringList(rawContent.includeRegex)?.filter(pattern => pattern.length <= MAX_CONTENT_POLICY_REGEX_LENGTH);
-    if (includeKeywords || includeRegex) {
+    // V1 is keyword-substring only (no regexes on the daemon main loop — see
+    // the contentPolicy type doc in bot-registry).
+    if (includeKeywords) {
       contentPolicy = {
-        ...(includeKeywords ? { includeKeywords } : {}),
-        ...(includeRegex ? { includeRegex } : {}),
-        ...(rawContent.regexCaseSensitive === true ? { regexCaseSensitive: true } : {}),
+        includeKeywords,
         ...(rawContent.matchMode === 'all' ? { matchMode: 'all' as const } : {}),
       };
     }

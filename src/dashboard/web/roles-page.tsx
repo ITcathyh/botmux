@@ -84,13 +84,9 @@ type Translator = ReturnType<typeof useT>;
 
 const LISTENER_MESSAGE_TYPES = ['text', 'post', 'image', 'interactive'] as const;
 
-/** Keywords accept comma (ASCII/CJK) or newline separators; regexes are line-based. */
+/** Keywords accept comma (ASCII/CJK) or newline separators. */
 function parseListenerKeywords(text: string): string[] {
   return [...new Set(text.split(/[,，\n]/).map(part => part.trim()).filter(Boolean))];
-}
-
-function parseListenerRegexes(text: string): string[] {
-  return [...new Set(text.split(/\n/).map(part => part.trim()).filter(Boolean))];
 }
 
 function sameStringList(a: readonly string[], b: readonly string[]): boolean {
@@ -153,8 +149,6 @@ function cloneListener(listener: MessageListenerData | null | undefined): Messag
     ...(listener?.contentPolicy ? {
       contentPolicy: {
         ...(listener.contentPolicy.includeKeywords ? { includeKeywords: [...listener.contentPolicy.includeKeywords] } : {}),
-        ...(listener.contentPolicy.includeRegex ? { includeRegex: [...listener.contentPolicy.includeRegex] } : {}),
-        ...(listener.contentPolicy.regexCaseSensitive !== undefined ? { regexCaseSensitive: listener.contentPolicy.regexCaseSensitive } : {}),
         ...(listener.contentPolicy.matchMode ? { matchMode: listener.contentPolicy.matchMode } : {}),
       },
     } : {}),
@@ -714,19 +708,15 @@ function RolesPage(props: { tab: RolesTab }) {
     const includeMsgTypes = [...new Set(messagePolicy.includeMsgTypes ?? [])].filter(Boolean);
     // Content pre-filter: only persist non-default values; an all-empty policy
     // is omitted so the listener keeps matching every message (legacy default).
-    // Regexes over 500 chars are dropped client-side — the runtime cap makes
-    // them never match, so persisting one would only look broken on reload.
+    // V1 is keyword-substring only (no regexes — see the contentPolicy type
+    // doc in bot-registry for the daemon-main-loop DoS rationale).
     const contentPolicy = (() => {
       const raw = editingListener.contentPolicy;
       if (!raw) return undefined;
       const includeKeywords = [...new Set((raw.includeKeywords ?? []).map(value => value.trim()).filter(Boolean))];
-      const includeRegex = [...new Set((raw.includeRegex ?? []).map(value => value.trim()).filter(Boolean))]
-        .filter(pattern => pattern.length <= 500);
-      if (includeKeywords.length === 0 && includeRegex.length === 0) return undefined;
+      if (includeKeywords.length === 0) return undefined;
       return {
-        ...(includeKeywords.length > 0 ? { includeKeywords } : {}),
-        ...(includeRegex.length > 0 ? { includeRegex } : {}),
-        ...(raw.regexCaseSensitive === true ? { regexCaseSensitive: true as const } : {}),
+        includeKeywords,
         ...(raw.matchMode === 'all' ? { matchMode: 'all' as const } : {}),
       };
     })();
@@ -1568,14 +1558,12 @@ function MessageListenerEditor(props: {
   const [targetTab, setTargetTab] = useState<ListenerTargetTab>('members');
   const [targetQuery, setTargetQuery] = useState('');
   const [selectedTargetIds, setSelectedTargetIds] = useState<Set<string>>(() => new Set());
-  // Keyword/regex inputs are free text (comma/newline separated); keep the raw
-  // text local so typing is not disrupted, and re-sync from the persisted lists
-  // only when a DIFFERENT listener loads. During normal typing the parsed lists
-  // equal what we just patched upward, so the inequality check never resets.
+  // Keyword input is free text (comma/newline separated); keep the raw text
+  // local so typing is not disrupted, and re-sync from the persisted list only
+  // when a DIFFERENT listener loads. During normal typing the parsed list
+  // equals what we just patched upward, so the inequality check never resets.
   const [keywordsText, setKeywordsText] = useState(() => (listener.contentPolicy?.includeKeywords ?? []).join('\n'));
-  const [regexText, setRegexText] = useState(() => (listener.contentPolicy?.includeRegex ?? []).join('\n'));
   const policyKeywords = listener.contentPolicy?.includeKeywords ?? [];
-  const policyRegexes = listener.contentPolicy?.includeRegex ?? [];
   useEffect(() => {
     if (!sameStringList(parseListenerKeywords(keywordsText), policyKeywords)) {
       setKeywordsText(policyKeywords.join('\n'));
@@ -1583,13 +1571,6 @@ function MessageListenerEditor(props: {
     // Sync is keyed on the persisted list identity only.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [policyKeywords]);
-  useEffect(() => {
-    if (!sameStringList(parseListenerRegexes(regexText), policyRegexes)) {
-      setRegexText(policyRegexes.join('\n'));
-    }
-    // Sync is keyed on the persisted list identity only.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [policyRegexes]);
   const senderTypes = new Set(listener.senderPolicy?.includeSenderTypes ?? []);
   const msgTypes = new Set(listener.messagePolicy?.includeMsgTypes ?? []);
   const senderMode: 'include_only' | 'all_except_excluded' =
@@ -1775,41 +1756,19 @@ function MessageListenerEditor(props: {
       </div>
       <div className="roles-listener-content-policy">
         <div className="roles-field-label">{tr('roles.listenerContentPolicy')}</div>
-        <div className="roles-listener-grid">
-          <label className="roles-listener-field">
-            <span className="roles-field-label">{tr('roles.listenerKeywords')}</span>
-            <textarea
-              rows={2}
-              value={keywordsText}
-              placeholder={tr('roles.listenerKeywordsPlaceholder')}
-              onChange={ev => {
-                setKeywordsText(ev.currentTarget.value);
-                props.onContentPolicyPatch({ includeKeywords: parseListenerKeywords(ev.currentTarget.value) });
-              }}
-            />
-          </label>
-          <label className="roles-listener-field">
-            <span className="roles-field-label">{tr('roles.listenerRegex')}</span>
-            <textarea
-              rows={2}
-              value={regexText}
-              placeholder={tr('roles.listenerRegexPlaceholder')}
-              onChange={ev => {
-                setRegexText(ev.currentTarget.value);
-                props.onContentPolicyPatch({ includeRegex: parseListenerRegexes(ev.currentTarget.value) });
-              }}
-            />
-          </label>
-        </div>
+        <label className="roles-listener-field">
+          <span className="roles-field-label">{tr('roles.listenerKeywords')}</span>
+          <textarea
+            rows={2}
+            value={keywordsText}
+            placeholder={tr('roles.listenerKeywordsPlaceholder')}
+            onChange={ev => {
+              setKeywordsText(ev.currentTarget.value);
+              props.onContentPolicyPatch({ includeKeywords: parseListenerKeywords(ev.currentTarget.value) });
+            }}
+          />
+        </label>
         <div className="roles-listener-policy-row">
-          <label className="roles-listener-checkbox">
-            <input
-              type="checkbox"
-              checked={listener.contentPolicy?.regexCaseSensitive === true}
-              onChange={ev => props.onContentPolicyPatch({ regexCaseSensitive: ev.currentTarget.checked })}
-            />
-            <span>{tr('roles.listenerRegexCaseSensitive')}</span>
-          </label>
           <label className="roles-listener-field" style={{ minWidth: 180 }}>
             <span className="roles-field-label">{tr('roles.listenerMatchMode')}</span>
             <select
