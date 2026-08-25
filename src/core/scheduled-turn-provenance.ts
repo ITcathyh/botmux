@@ -20,8 +20,12 @@
  *      (session-relay) injects the live resolvedAllowedUsers check, so a
  *      creator removed from the bot loses workflow authority immediately. The
  *      sandboxed CLI cannot read bots.json and injects a pass-through; the
- *      daemon re-checks before every mutation, which is the only path that can
- *      actually start/cancel/retry a run.
+ *      daemon re-checks before every mutation on the relay path. Note: the
+ *      signed-envelope route (non-sandboxed CLIs with .dashboard-secret)
+ *      verifies the shared secret but does not re-check owner membership —
+ *      a removed creator's scheduled task can still start/cancel/retry runs
+ *      in that configuration. This is a known limitation, not a regression:
+ *      scheduled tasks themselves (prompt execution) never checked owner.
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
