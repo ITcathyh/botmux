@@ -879,6 +879,13 @@ export interface ScheduledTask {
   creatorChatId?: string;
   creatorRootMessageId?: string;
   creatorLarkAppId?: string;
+  /** Creator's Lark open_id captured at creation time. Daemon-initiated
+   *  scheduled turns (`schedule:<taskId>:<uuid>`) authenticate workflow
+   *  commands as this identity; the daemon re-checks it is still in the
+   *  bot's resolvedAllowedUsers at every run mutation. Absent for legacy
+   *  tasks and CLI-created tasks without a resolvable creator — those keep
+   *  the historical behavior (scheduled turns cannot run Saved Workflows). */
+  ownerOpenId?: string;
   enabled: boolean;
   createdAt: string;
   lastRunAt?: string;
