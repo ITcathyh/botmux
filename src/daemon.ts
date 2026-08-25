@@ -64,6 +64,7 @@ import {
   getBot,
   getAllBots,
   getOwnerOpenId,
+  getDashboardAdminOpenIds,
   findOncallChat,
   effectiveDefaultWorkingDir,
   effectiveBotDisplayName,
@@ -5991,6 +5992,12 @@ for (const sessionRelayMutation of V3_SESSION_RUN_MUTATIONS) {
           : undefined,
         selfLarkAppId: selfV3LarkAppId,
         baseDir: v3DefaultBaseDir(),
+        sessionDataDir: config.session.dataDir,
+        // Live owner gate for scheduled turns: the task creator must still be
+        // in the bot's resolvedAllowedUsers, so removing a creator revokes
+        // their scheduled tasks' workflow authority immediately.
+        isScheduleOwnerAllowed: (larkAppId, ownerOpenId) =>
+          getDashboardAdminOpenIds(larkAppId).includes(ownerOpenId),
       });
       if (!decision.ok) {
         return jsonRes(res, decision.status, {
