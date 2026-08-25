@@ -35,6 +35,8 @@ function installGlobals(backend: unknown): void {
   g.lastInitConfig = {};
   g.log = () => {};
   g.backend = backend;
+  // 围栏变量：延迟 Enter 回调校验 respawn 代际，eval 上下文需注入
+  g.cliSpawnGeneration = 0;
   const patternMatch = workerSource.match(/const TRUST_DIALOG_PATTERN = (\/[^;]+\/);/);
   if (!patternMatch) throw new Error('TRUST_DIALOG_PATTERN not found in worker.ts');
   // eslint-disable-next-line no-new-func
@@ -123,6 +125,19 @@ describe('trust dialog Enter deferral (Codex 0.149 key-handler race)', () => {
     expect(handler('ordinary startup output')).toBe(false);
     vi.advanceTimersByTime(1_000);
     expect(sendSpecialKeys).not.toHaveBeenCalled();
+  });
+
+  it('does not fire the deferred Enter after a respawn (generation fence)', () => {
+    const sendSpecialKeys = vi.fn();
+    installGlobals({ sendSpecialKeys });
+    const handler = extractTrustHandler();
+
+    handler('Yes, continue');
+    // 400ms 窗口内发生 respawn（cliSpawnGeneration 递增 + backend 替换）
+    (globalThis as Record<string, unknown>).cliSpawnGeneration = 1;
+    (globalThis as Record<string, unknown>).backend = { sendSpecialKeys: vi.fn() };
+    vi.advanceTimersByTime(1_000);
+    expect(sendSpecialKeys, '旧 timer 不得向新会话 backend 发 Enter').not.toHaveBeenCalled();
   });
 
   it('keeps the 400ms deferral in the production trust branch', () => {

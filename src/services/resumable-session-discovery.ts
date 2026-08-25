@@ -347,9 +347,11 @@ export async function discoverClaudeFamilySessions(
  *  `# AGENTS.md instructions for …` injection (which may share the message with
  *  `<environment_context>` via multiple input_text blocks). */
 const SYNTHETIC_PREAMBLE_PATTERNS: readonly RegExp[] = [
-  /<environment_context\b/,
-  /<recommended_plugins\b/,
-  /<permissions\b/,
+  // 锚定行首：合成 preamble 总是独立条目或以 tag 开头；不锚定会误杀散文中
+  // 提及这些标签的真实 prompt（如「<environment_context> 是什么意思」）。
+  /^<environment_context\b/,
+  /^<recommended_plugins\b/,
+  /^<permissions\b/,
 ];
 
 function isSyntheticPreamble(text: string): boolean {
@@ -416,6 +418,11 @@ async function parseRolloutTranscript(
       if (isSyntheticPreamble(text)) return; // startup preamble, not a user turn
       if (isBotmuxInjected(text)) { acc.botmux = true; return true; } // botmux-origin → drop
       if (!acc.fallbackTitle) acc.fallbackTitle = truncateTitle(text);
+      // 新格式（>=0.147）rollout 没有 event_msg/user_message，acc.title 永远
+      // 为空：不含 fallbackTitle 会扫满 MAX_HEAD_LINES_PER_FILE。首个真实用户
+      // 回合即定 origin（与 legacy 路径「id+cwd+title 齐即停扫」一致）；混合
+      // 格式文件中 legacy 条目按时间序在前，acc.title 会先命中早退，不受影响。
+      if (acc.id && acc.cwd && acc.fallbackTitle) return true;
     }
     return Boolean(acc.id && acc.cwd && acc.title);
   });

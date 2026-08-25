@@ -478,6 +478,17 @@ describe('discoverRolloutSessions (codex / traex)', () => {
     expect(out.find((s) => s.cliSessionId === 'perms-sid')?.title).toBe('the real prompt after permissions');
   });
 
+  // 散文中提及 preamble 标签不是合成 preamble——锚定行首避免误杀真实 prompt。
+  it('does not skip a real prompt that mentions preamble tags in prose', async () => {
+    writeRollout('2026/08/14', 'rollout-prose-tags.jsonl', [
+      { type: 'session_meta', payload: { id: 'prose-sid', cwd: '/root/s' } },
+      { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'what does <environment_context> mean in codex rollouts? also <permissions> docs' }] } },
+    ]);
+    const out = await discoverRolloutSessions(sessionsRoot, 10);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ cliSessionId: 'prose-sid', title: 'what does <environment_context> mean in codex rollouts? also <permissions> docs' });
+  });
+
   // A new-format rollout whose first real user turn carries botmux's injected
   // wrapper is botmux-origin and must be dropped — skipping the message and
   // taking a later turn would leak botmux sessions into the /adopt picker.
