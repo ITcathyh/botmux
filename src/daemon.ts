@@ -299,6 +299,7 @@ import { claimInitialUserTurn, isInitialUserTurnPending, releaseInitialUserTurn 
 import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './core/session-create.js';
 import { fillNativeTopicId } from './core/native-topic-id.js';
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
+import { botmuxVersion } from './utils/install-info.js';
 import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, isSubstituteTurn, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import {
@@ -4041,6 +4042,10 @@ interface DaemonDescriptor {
    * never sees them; empty if the bot has no allowlist configured.
    */
   resolvedAllowedUsers: string[];
+  /** botmux version of this daemon process (from package.json). Absent for
+   * daemons started by older builds; lets `botmux status` detect a CLI↔daemon
+   * version mismatch after an npm upgrade. */
+  version?: string;
 }
 
 function writeDaemonDescriptor(d: DaemonDescriptor): void {
@@ -21864,6 +21869,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // email/on_ forms; emitting only ou_ avoids a startup race where the dashboard
     // briefly sees an unusable on_/email (the resolution below rewrites this field).
     resolvedAllowedUsers: getBot(cfg.larkAppId).resolvedAllowedUsers.filter(u => u.startsWith('ou_')),
+    version: botmuxVersion(),
   };
   // Expose the live descriptor module-level so the deferred allowedUsers resolve
   // retry can republish healed open_ids coherently (see republishResolvedAllowedUsers).
