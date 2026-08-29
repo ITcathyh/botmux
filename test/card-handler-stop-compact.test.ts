@@ -93,6 +93,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   getDaemonStreamingCardUsageSnapshot: vi.fn(() => undefined),
   withActiveSessionKeyLock: vi.fn(async (_map: any, _key: string, action: () => any) => action()),
   buildStreamingCardJson: vi.fn(),
+  silentIdleCardFlag: vi.fn(() => false),
 }));
 
 vi.mock('../src/core/session-manager.js', () => ({
