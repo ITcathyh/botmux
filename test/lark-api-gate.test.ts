@@ -342,6 +342,40 @@ describe('executeWithLarkGate — circuit breaker', () => {
     await expect(executeWithLarkGate('app-c3', 'op', failFn)).rejects.toBeInstanceOf(LarkCircuitOpenError);
     expect(failFn).toHaveBeenCalledTimes(4); // 3 initial + 1 probe
   });
+
+  // 熔断器只对瞬态错误（429/5xx/网络）计数。确定性错误重试无意义，也不该
+  // 拉闸——否则一个参数写错的调用方会把整个 app 的写操作快速失败掉，连带
+  // 拖垮其它会话的卡片更新。断言用 fn 调用次数：跳闸后第 N 次不会到达 fn。
+  it('never opens the circuit on deterministic errors (well past the threshold)', async () => {
+    const fn = vi.fn().mockRejectedValue(axiosError(400));
+    const CALLS = 10; // threshold=3 → 若确定性错误计数，第 4 次就会快速失败
+    for (let i = 0; i < CALLS; i++) {
+      const err = await executeWithLarkGate('app-deterministic', 'op', fn).catch((e: unknown) => e);
+      expect(err, `call ${i + 1} must surface the raw 400, not a circuit fast-fail`)
+        .not.toBeInstanceOf(LarkCircuitOpenError);
+    }
+    // 每一次都真正到达了 fn ⇒ 电路始终闭合。
+    expect(fn).toHaveBeenCalledTimes(CALLS);
+  });
+
+  // 同一个 app 上确定性错误不得污染真实瞬态失败的计数：先打一批 400，
+  // 再打 threshold 次 5xx，跳闸必须恰好由 5xx 触发（而不是被 400 提前拉闸，
+  // 也不是被 400 垫高后提早跳）。
+  it('counts only transient failures toward the threshold on a mixed stream', async () => {
+    const deterministic = vi.fn().mockRejectedValue(axiosError(403));
+    for (let i = 0; i < 5; i++) {
+      await expect(executeWithLarkGate('app-mixed', 'op', deterministic)).rejects.toThrow('status code 403');
+    }
+    const transient = vi.fn().mockRejectedValue(axiosError(503));
+    // threshold=3：前 3 次瞬态失败到达 fn 并跳闸。
+    for (let i = 0; i < 3; i++) {
+      await expect(executeWithLarkGate('app-mixed', 'op', transient)).rejects.toThrow('status code 503');
+    }
+    expect(transient).toHaveBeenCalledTimes(3);
+    // 第 4 次才快速失败。
+    await expect(executeWithLarkGate('app-mixed', 'op', transient)).rejects.toBeInstanceOf(LarkCircuitOpenError);
+    expect(transient).toHaveBeenCalledTimes(3); // 未再到达 fn
+  });
 });
 
 // ─── Abort signal ─────────────────────────────────────────────────────────────
