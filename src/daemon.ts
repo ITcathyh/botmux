@@ -101,7 +101,7 @@ import { emitHookEvent, emitHookEventLocal, HOOK_EVENTS, type HookEvent } from '
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
 import { setUsageLedgerPricingResolver, setUsageLedgerRecordSink } from './services/usage-ledger.js';
 import { trackBudgetSpend, formatBudgetAlert } from './services/budget-tracker.js';
-import { DEFAULT_USD_CNY } from './services/model-pricing.js';
+import { resolvePricingConfig } from './services/model-pricing.js';
 import { createImgNumberer, extractPostAtParticipants, messageMentionsBot, parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
 import { resolveInboundAudio } from './im/lark/audio-transcribe.js';
 import { expandMergeForward } from './im/lark/merge-forward.js';
@@ -21476,13 +21476,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // 超阈值时私聊 bot owner 告警。sink 内异常被 catch，绝不影响 ledger 主路径。
   setUsageLedgerPricingResolver((larkAppId) => {
     if (!larkAppId) return undefined;
-    const bot = getBot(larkAppId);
-    const pricing = bot?.config?.pricing;
-    if (!pricing) return undefined;
-    return {
-      usdCny: pricing.usdCny ?? DEFAULT_USD_CNY,
-      overrides: pricing,
-    };
+    return resolvePricingConfig(getBot(larkAppId)?.config?.pricing);
   });
   setUsageLedgerRecordSink((record) => {
     if (!record.larkAppId || !record.costCny || record.costCny <= 0) return;

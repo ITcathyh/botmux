@@ -46,6 +46,23 @@ export interface TokenUsagePricingInput {
 export const DEFAULT_USD_CNY = 7.2;
 
 /**
+ * 把一个 bot 的 `pricing` 块（已经过 normalizePricingOverrides）提升为一次
+ * 定价解析结果：填上汇率默认值。未配置 pricing 时返回 undefined，调用方据此
+ * 省略金额字段（fail-closed，绝不猜价）。
+ *
+ * 这里刻意只接 pricing 对象、不接 larkAppId——本模块是纯函数模块，不能 import
+ * bot-registry（会污染 cost-calculator / usage-ledger / 单测的依赖图）。各调用方
+ * 自己做 `getBot(larkAppId).config.pricing` 查表，再把结果喂进来。
+ */
+export function resolvePricingConfig(pricing?: PricingOverrides): ResolvedModelPricing | undefined {
+  if (!pricing) return undefined;
+  return {
+    usdCny: pricing.usdCny ?? DEFAULT_USD_CNY,
+    overrides: pricing,
+  };
+}
+
+/**
  * 内置价格表，键用模型族前缀（resolveModelPrice 做精确 + 最长前缀匹配）。
  * 每项为 [input, output, cacheRead?, cacheWrite?]，单位 USD/1M token；
  * cacheWrite 缺省 = input。

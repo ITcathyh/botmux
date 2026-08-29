@@ -7215,7 +7215,7 @@ import { normalizeFeedbackPolicy } from './services/feedback-policy.js';
 import { applyInlineMentions } from './im/lark/inline-mentions.js';
 import { renderBrandTemplate } from './im/lark/brand-template.js';
 import { effectiveDefaultWorkingDir, loadBotConfigs, resolveBrandLabel, resolveUsageDisplay, getBot } from './bot-registry.js';
-import { DEFAULT_USD_CNY, type ResolvedModelPricing } from './services/model-pricing.js';
+import { resolvePricingConfig, type ResolvedModelPricing } from './services/model-pricing.js';
 import { config } from './config.js';
 import { getSessionUsageSnapshot } from './core/cost-calculator.js';
 import {
@@ -7573,13 +7573,7 @@ let envPinnedRiffBot: import('./bot-registry.js').BotConfig | null = null;
 
 /** 从 bot 配置解析定价（bots.json pricing 块 → 内置表）。未配置时返回 undefined。 */
 function resolvePricingForCli(larkAppId: string): ResolvedModelPricing | undefined {
-  const bot = getBot(larkAppId);
-  const pricing = bot?.config?.pricing;
-  if (!pricing) return undefined;
-  return {
-    usdCny: pricing.usdCny ?? DEFAULT_USD_CNY,
-    overrides: pricing,
-  };
+  return resolvePricingConfig(getBot(larkAppId)?.config?.pricing);
 }
 
 function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { session: SessionData; botConfig: import('./bot-registry.js').BotConfig } | null {
