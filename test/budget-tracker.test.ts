@@ -239,7 +239,26 @@ describe('formatBudgetAlert', () => {
     });
     expect(msg).toContain('🚫');
     expect(msg).toContain('¥105.00 / ¥100.00');
-    expect(msg).toContain('新任务将被拒绝');
+    // 必须说明「不会自动拒绝」并给出人工动作：hardStop 只有判定原语，
+    // 没有任何 turn 准入路径调用 isBudgetHardStopped。
+    expect(msg).toContain('不会自动拒绝新任务');
+    expect(msg).toContain('请人工关注');
+  });
+
+  // 防回归：hardStop 真接入准入路径之前，文案不得承诺拦截。owner 以为
+  // 已被自动保护而停止人工关注，比不发告警更糟。真落地拦截时连同
+  // isBudgetHardStopped 的调用点一起改这条断言。
+  it('never promises rejection while hardStop enforcement is unwired', () => {
+    for (const hardStop of [true, false]) {
+      for (const threshold of [80, 100]) {
+        const msg = formatBudgetAlert({
+          larkAppId: 'cli_a', month: '2026-08', spentCny: 105, monthlyCny: 100,
+          percent: 105, threshold, hardStop,
+        });
+        expect(msg, `hardStop=${hardStop} threshold=${threshold}`).not.toContain('新任务将被拒绝');
+        expect(msg, `hardStop=${hardStop} threshold=${threshold}`).not.toContain('自动恢复');
+      }
+    }
   });
 
   it('renders the threshold message for regular alerts', () => {
@@ -250,5 +269,76 @@ describe('formatBudgetAlert', () => {
     expect(msg).toContain('⚠️');
     expect(msg).toContain('越过 80% 告警线');
     expect(msg).toContain('¥85.00 / ¥100.00');
+  });
+});
+
+// ─── ledger sink → tracker → owner alert (the daemon's wiring, end to end) ────
+// daemon 的 setUsageLedgerRecordSink 回调把每条正 delta ledger 记录喂进
+// trackBudgetSpend，超阈值时把 formatBudgetAlert 的文案私聊 owner。这里复刻
+// 那段 glue（同样的守卫顺序），确保「记录落盘 → 累加 → 告警文案」这条链不会
+// 在任何一环静默断掉——之前整条链没有任何测试。
+
+describe('record sink → trackBudgetSpend → formatBudgetAlert (daemon wiring)', () => {
+  /** 复刻 daemon.ts 的 sink 回调：守卫 + 累加 + 生成告警文案。 */
+  function daemonSink(
+    record: { larkAppId?: string; costCny?: number },
+    cfg: BudgetConfig | undefined,
+    now: Date,
+  ): string | null {
+    if (!record.larkAppId || !record.costCny || record.costCny <= 0) return null;
+    if (!cfg) return null;
+    const alert = trackBudgetSpend(record.larkAppId, record.costCny, {
+      now, ledgerDir: dir, budget: cfg,
+    });
+    return alert ? formatBudgetAlert(alert) : null;
+  }
+
+  it('accumulates across records and alerts once when a threshold is crossed', () => {
+    const cfg = budget({ monthlyCny: 100, alertThresholdPercent: [80] });
+    // 三条记录累加到 85 → 越过 80% 告警线，只在跨线那条上告警。
+    expect(daemonSink({ larkAppId: 'cli_a', costCny: 40 }, cfg, AUG)).toBeNull();
+    expect(daemonSink({ larkAppId: 'cli_a', costCny: 30 }, cfg, AUG)).toBeNull();
+    const msg = daemonSink({ larkAppId: 'cli_a', costCny: 15 }, cfg, AUG);
+    expect(msg).toContain('⚠️');
+    expect(msg).toContain('¥85.00 / ¥100.00');
+    // 同阈值不重复告警。
+    expect(daemonSink({ larkAppId: 'cli_a', costCny: 1 }, cfg, AUG)).toBeNull();
+    expect(readState(dir).spentCny).toBeCloseTo(86, 6);
+  });
+
+  it('skips records the daemon guards out (no appId / no cost / non-positive)', () => {
+    const cfg = budget({ monthlyCny: 10, alertThresholdPercent: [1] });
+    expect(daemonSink({ costCny: 100 }, cfg, AUG)).toBeNull();          // 无 larkAppId
+    expect(daemonSink({ larkAppId: 'cli_a' }, cfg, AUG)).toBeNull();     // 无 costCny（未定价）
+    expect(daemonSink({ larkAppId: 'cli_a', costCny: 0 }, cfg, AUG)).toBeNull();
+    expect(daemonSink({ larkAppId: 'cli_a', costCny: -5 }, cfg, AUG)).toBeNull();
+    // 一条都没记账 → 状态文件根本没被创建。
+    expect(existsSync(stateFile(dir))).toBe(false);
+  });
+
+  it('does nothing when the bot has no budget configured', () => {
+    expect(daemonSink({ larkAppId: 'cli_a', costCny: 999 }, undefined, AUG)).toBeNull();
+    expect(existsSync(stateFile(dir))).toBe(false);
+  });
+
+  it('keeps per-bot spend isolated', () => {
+    const cfg = budget({ monthlyCny: 100, alertThresholdPercent: [80] });
+    daemonSink({ larkAppId: 'cli_a', costCny: 90 }, cfg, AUG);
+    // cli_b 自己的账本是空的 → 同样金额也只算它自己的第一笔。
+    const msgB = daemonSink({ larkAppId: 'cli_b', costCny: 85 }, cfg, AUG);
+    expect(msgB).toContain('¥85.00 / ¥100.00');
+    expect(readState(dir, 'cli_a').spentCny).toBeCloseTo(90, 6);
+    expect(readState(dir, 'cli_b').spentCny).toBeCloseTo(85, 6);
+  });
+
+  it('the exhausted alert it emits never promises rejection (hardStop unwired)', () => {
+    const cfg = budget({ monthlyCny: 100, alertThresholdPercent: [80], hardStop: true });
+    const msg = daemonSink({ larkAppId: 'cli_a', costCny: 120 }, cfg, AUG);
+    // hardStop 隐含 100% 线 → 走「已用尽」分支，但必须说实话。
+    expect(msg).toContain('🚫');
+    expect(msg).toContain('不会自动拒绝新任务');
+    expect(msg).not.toContain('新任务将被拒绝');
+    // 而且确实没有任何拦截发生：判定原语此刻为 true，却无人调用它。
+    expect(isBudgetHardStopped('cli_a', { now: AUG, ledgerDir: dir, budget: cfg })).toBe(true);
   });
 });

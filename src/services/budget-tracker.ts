@@ -317,7 +317,13 @@ export function getBudgetStatus(larkAppId: string, opts?: BudgetTrackerOpts): Bu
 }
 
 /** Whether new turns should be refused for this bot this month. Fails OPEN:
- *  any error (unreadable state, bad config) returns false. */
+ *  any error (unreadable state, bad config) returns false.
+ *
+ *  ⚠️ 判定原语已就绪但**尚未接入任何 turn 准入路径**——目前没有调用方，
+ *  所以 `hardStop: true` 只影响告警口径（隐含 100% 阈值），不会真的拦下
+ *  任务。要落地拦截需在 daemon 的入站入口（handleNewTopicAdmitted /
+ *  handleThreadReplyAdmitted）调用本函数并回复用户；那是全 bot 共用的最热
+ *  路径，属独立改动。改动时请同步 formatBudgetAlert 的文案口径。 */
 export function isBudgetHardStopped(larkAppId: string, opts?: BudgetTrackerOpts): boolean {
   try {
     if (!larkAppId || typeof larkAppId !== 'string') return false;
@@ -341,13 +347,18 @@ function formatThreshold(v: number): string {
   return String(Math.round(v * 100) / 100);
 }
 
-/** Plain-text alert body for the owner DM. */
+/** Plain-text alert body for the owner DM.
+ *
+ *  ⚠️ 文案不得承诺「拒绝新任务」：hardStop 目前只有判定原语
+ *  （isBudgetHardStopped），没有任何 turn 准入路径调用它，所以配了
+ *  hardStop 也不会真的拦下任何任务。承诺拦截会让 owner 以为已被保护
+ *  而不再人工关注（比不告警更糟）。真接入准入路径后再改回强口径。 */
 export function formatBudgetAlert(alert: BudgetAlert): string {
   const spent = formatMoney(alert.spentCny);
   const budget = formatMoney(alert.monthlyCny);
   const percent = Math.round(alert.percent);
   if (alert.hardStop && alert.threshold >= 100) {
-    return `🚫 月度预算已用尽：本月已用 ¥${spent} / ¥${budget}（${percent}%），新任务将被拒绝，下月 1 日自动恢复。`;
+    return `🚫 月度预算已用尽：本月已用 ¥${spent} / ¥${budget}（${percent}%）。请人工关注并按需暂停会话——当前版本不会自动拒绝新任务。下月 1 日预算重置。`;
   }
   return `⚠️ 月度预算告警：本月已用 ¥${spent} / ¥${budget}（${percent}%），越过 ${formatThreshold(alert.threshold)}% 告警线。`;
 }
