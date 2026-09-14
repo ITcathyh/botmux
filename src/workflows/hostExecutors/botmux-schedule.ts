@@ -71,7 +71,7 @@ const ScheduleInputSchema = z.object({
   chatType: z.enum(['group', 'p2p']).optional(),
   rootMessageId: z.string().optional(),
   scope: z.enum(['thread', 'chat']).optional(),
-  executionPosition: z.enum(['top-level', 'topic', 'new-topic']).optional(),
+  executionPosition: z.enum(['top-level', 'topic', 'new-topic', 'task']).optional(),
   topicTitle: z.string().max(200).optional(),
   larkAppId: z.string().optional(),
   ownerOpenId: z.string().optional(),
@@ -150,6 +150,13 @@ export const botmuxScheduleExecutor: SideEffectingExecutor<ScheduleInput, Schedu
         ok: false,
         errorCode: 'HOST_SCHEDULE_TOPIC_ROOT_REQUIRED',
         message: 'topic execution requires rootMessageId',
+      };
+    }
+    if (input.executionPosition === 'task' && input.rootMessageId) {
+      return {
+        ok: false,
+        errorCode: 'HOST_SCHEDULE_TASK_ROOT_FORBIDDEN',
+        message: 'task execution runs in its own session and must not carry rootMessageId',
       };
     }
     if (input.followActive === true && input.executionPosition !== 'topic') {

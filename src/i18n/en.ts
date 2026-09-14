@@ -1630,4 +1630,10 @@ export const messages: Record<string, string> = {
   'cot.tool.result_done': '✓ Done',
   'cot.thinking_placeholder': 'Thinking…',
   'cot.interrupted': '⚠️ Interrupted by a service restart — this turn\'s thinking never finished',
+  // ─── schedulePos: scheduled-task dedicated-topic execution position (opt-in per-task isolation) ─────
+  'schedulePos.positionNote': 'Execution position: a topic dedicated to this task (created automatically on the first fire; every later fire of this task continues inside that same topic, while different tasks stay isolated from each other; single-group schedules only)',
+  'schedulePos.cardDeliveryTask': 'dedicated topic (this task only)',
+  'schedulePos.cardBtnUseTaskTopic': 'Use dedicated topic',
+  'schedulePos.cardAlreadyTask': 'Already running in this task\'s dedicated topic',
+  'schedulePos.cardTaskMultiChatUnsupported': 'A dedicated topic is only available for single-group schedules',
 };

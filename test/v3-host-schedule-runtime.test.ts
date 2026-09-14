@@ -380,3 +380,36 @@ describe('v3 botmux-schedule host ownerOpenId chain (binding resolution + execut
     expect((persisted[taskId] as Record<string, unknown>).ownerOpenId).toBeUndefined();
   });
 });
+
+describe('v3 botmux-schedule task-position guards', () => {
+  function validate(input: Record<string, unknown>) {
+    const registry = createDefaultHostExecutorRegistry();
+    const registered = registry.get('botmux-schedule')!;
+    const parsed = registered.parseInput({
+      name: 'Task topic',
+      schedule: '30m',
+      prompt: 'Run in the per-task topic',
+      workingDir: '/workspace/project',
+      chatId: 'oc_task',
+      chatType: 'group',
+      executionPosition: 'task',
+      ...input,
+    });
+    return registered.executor.validateBeforeIntent(parsed, Date.parse('2026-03-01T00:00:00Z'));
+  }
+
+  it('rejects a task-position node that carries an externally supplied rootMessageId', () => {
+    // The per-task topic root is minted by the daemon on first fire and written
+    // back to the store; accepting an authored root would let a workflow plant
+    // its session inside an arbitrary existing topic.
+    const result = validate({ rootMessageId: 'om_authored_root' });
+    expect(result).toMatchObject({
+      ok: false,
+      errorCode: 'HOST_SCHEDULE_TASK_ROOT_FORBIDDEN',
+    });
+  });
+
+  it('accepts a rootless task-position node (the only authored shape)', () => {
+    expect(validate({})).toEqual({ ok: true });
+  });
+});

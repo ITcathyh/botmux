@@ -315,7 +315,7 @@ function migrate(raw: any): ScheduledTask | null {
   }
 
   const executionPosition: ScheduleExecutionPosition | undefined =
-    raw.executionPosition === 'top-level' || raw.executionPosition === 'topic' || raw.executionPosition === 'new-topic'
+    raw.executionPosition === 'top-level' || raw.executionPosition === 'topic' || raw.executionPosition === 'new-topic' || raw.executionPosition === 'task'
       ? raw.executionPosition
       : raw.deliver === 'new-topic'
         ? 'new-topic'

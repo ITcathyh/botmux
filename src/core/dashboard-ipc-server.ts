@@ -4137,7 +4137,8 @@ ipcRoute('POST', '/api/schedules/:id/pause',  (_req, res, p) => jsonRes(res, 200
 ipcRoute('POST', '/api/schedules/:id/resume', (_req, res, p) => jsonRes(res, 200, scheduler.setEnabled(p.id, true)));
 // Backward-compatible route used by Lark cards and cached dashboard clients.
 // Modern callers send an exact target; body-less legacy callers keep the
-// historical toggle behavior, now cycling topic → top-level → fresh topic.
+// historical toggle behavior, now cycling topic → top-level → fresh topic →
+// dedicated task topic.
 ipcRoute('POST', '/api/schedules/:id/delivery', async (req, res, p) => {
   let body: unknown;
   try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json' }); }
@@ -4149,7 +4150,7 @@ ipcRoute('POST', '/api/schedules/:id/delivery', async (req, res, p) => {
     ? (body as Record<string, unknown>).executionPosition
     : undefined;
   if (requested !== undefined) {
-    if (requested !== 'top-level' && requested !== 'topic' && requested !== 'new-topic') {
+    if (requested !== 'top-level' && requested !== 'topic' && requested !== 'new-topic' && requested !== 'task') {
       return jsonRes(res, 400, { ok: false, error: 'invalid_execution_position', field: 'executionPosition' });
     }
     const result = updateTaskWithOptionalPrecondition(
@@ -4210,7 +4211,7 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
   }
   let executionPosition: ScheduleExecutionPosition = 'top-level';
   if (b.executionPosition !== undefined) {
-    if (b.executionPosition !== 'top-level' && b.executionPosition !== 'topic' && b.executionPosition !== 'new-topic') {
+    if (b.executionPosition !== 'top-level' && b.executionPosition !== 'topic' && b.executionPosition !== 'new-topic' && b.executionPosition !== 'task') {
       return jsonRes(res, 400, { ok: false, error: 'invalid_execution_position', field: 'executionPosition' });
     }
     executionPosition = b.executionPosition;
@@ -4247,8 +4248,20 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
       field: 'chatIds',
     });
   }
+  if (executionPosition === 'task' && chatIds.length > 1) {
+    return jsonRes(res, 400, {
+      ok: false,
+      error: 'multiple_chats_task_unsupported',
+      field: 'chatIds',
+    });
+  }
   if (executionPosition === 'topic' && !rootMessageId) {
     return jsonRes(res, 400, { ok: false, error: 'topic_root_required', field: 'rootMessageId' });
+  }
+  // The dedicated task topic is materialised lazily on first fire; a client-
+  // supplied root would only adopt a foreign topic into the task session.
+  if (executionPosition === 'task' && rootMessageId) {
+    return jsonRes(res, 400, { ok: false, error: 'task_root_not_user_settable', field: 'rootMessageId' });
   }
   // Note: bot↔chat membership is intentionally NOT validated here.
   // listChatBotMembers returns [] both when the API is unavailable and when
@@ -4269,7 +4282,7 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
       // root is dropped so it can never pull execution back into the topic the
       // schedule was created from (e.g. an adopted one).
       rootMessageId: executionPosition === 'topic' ? (rootMessageId || undefined) : undefined,
-      scope: executionPosition === 'topic' ? 'thread' : 'chat',
+      scope: executionPosition === 'topic' || executionPosition === 'task' ? 'thread' : 'chat',
       executionPosition,
       topicTitle: topicTitle || undefined,
       chatType: 'group',
@@ -4347,7 +4360,7 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
     updates.deliver = b.deliver;
   }
   if (b.executionPosition !== undefined) {
-    if (b.executionPosition !== 'top-level' && b.executionPosition !== 'topic' && b.executionPosition !== 'new-topic') {
+    if (b.executionPosition !== 'top-level' && b.executionPosition !== 'topic' && b.executionPosition !== 'new-topic' && b.executionPosition !== 'task') {
       return jsonRes(res, 400, { ok: false, error: 'invalid_execution_position', field: 'executionPosition' });
     }
     updates.executionPosition = b.executionPosition;

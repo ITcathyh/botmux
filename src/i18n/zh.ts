@@ -1632,4 +1632,10 @@ export const messages: Record<string, string> = {
   'cot.tool.result_done': '✓ 已完成',
   'cot.thinking_placeholder': '思考中…',
   'cot.interrupted': '⚠️ 服务重启，本轮思考已中断',
+  // ─── schedulePos: 定时任务「本任务专属话题」执行位置（opt-in 任务级隔离） ─────
+  'schedulePos.positionNote': '执行位置：本任务专属话题（首次触发时自动创建；同一任务之后每次触发都在该话题内继续，不同任务各自独立、互不串扰；仅支持单个群聊）',
+  'schedulePos.cardDeliveryTask': '专属话题（本任务独立）',
+  'schedulePos.cardBtnUseTaskTopic': '改为专属话题',
+  'schedulePos.cardAlreadyTask': '已在本任务的专属话题中执行',
+  'schedulePos.cardTaskMultiChatUnsupported': '专属话题仅支持单个群聊的定时任务',
 };

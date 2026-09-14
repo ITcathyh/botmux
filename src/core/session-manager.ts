@@ -9,6 +9,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { expandHome, validateWorkingDir } from './working-dir.js';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
+import * as scheduleStore from '../services/schedule-store.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
@@ -2667,6 +2668,21 @@ export async function restoreActiveSessions(
       session.replyThreadAliases = aliases;
       session.rootMessageId = binding.rootMessageId;
       ds.replyThreadAliases = aliases;
+      // A materialized task-position run is promoted to an ordinary thread
+      // session before registration: write the root back onto the task, clear
+      // the deferred marker and flip scope so setActiveSessionSafe below
+      // registers at the real om_ key (sessionAnchorId reads the cleared
+      // marker + thread scope) instead of the stable virtual slot.
+      if (binding.routingAnchor.startsWith('schedule-task:')) {
+        scheduleStore.updateTask(
+          session.deferredScheduleRun.taskId,
+          { rootMessageId: binding.rootMessageId },
+          larkAppId,
+        );
+        session.scope = 'thread';
+        ds.scope = 'thread';
+        session.deferredScheduleRun = undefined;
+      }
       sessionStore.updateSession(session);
     }
     // Literal pending-repo passthroughs have an empty init prompt and therefore
@@ -3398,6 +3414,7 @@ export function resolveScheduledTaskScope(
   task: Pick<ScheduledTask, 'executionPosition' | 'scope' | 'rootMessageId' | 'deliver'>,
 ): 'thread' | 'chat' {
   if (task.executionPosition === 'topic' && task.rootMessageId) return 'thread';
+  if (task.executionPosition === 'task') return task.rootMessageId ? 'thread' : 'chat';
   if (task.executionPosition === 'top-level' || task.executionPosition === 'new-topic') return 'chat';
   if (task.deliver === 'new-topic') return 'chat';
   if (task.scope === 'chat') return 'chat';
@@ -3406,8 +3423,12 @@ export function resolveScheduledTaskScope(
 
 export function resolveScheduledTaskExecutionPosition(
   task: Pick<ScheduledTask, 'executionPosition' | 'scope' | 'rootMessageId' | 'deliver'>,
-): 'top-level' | 'topic' | 'new-topic' {
+): 'top-level' | 'topic' | 'new-topic' | 'task' {
   if (task.executionPosition === 'new-topic') return 'new-topic';
+  // A materialized task-position run is an ordinary retained thread: resolve
+  // it to 'topic' so the existing thread branch owns every later fire. The
+  // rootless first fire keeps 'task' and goes through the dedicated branch.
+  if (task.executionPosition === 'task') return task.rootMessageId ? 'topic' : 'task';
   if (task.executionPosition === 'topic' && task.rootMessageId) return 'topic';
   if (task.executionPosition === 'top-level') return 'top-level';
   if (task.deliver === 'new-topic') return 'new-topic';
@@ -3553,6 +3574,45 @@ export async function executeScheduledTask(
       // silent fresh topic has no real root yet (deferred until the first
       // `botmux send`), so it is not recorded and the next fire re-resolves.
       if (followActiveFreshTopic) recordFollowActiveFreshTopic(taskBeforeFollowActive, anchor);
+    }
+  } else if (executionPosition === 'task') {
+    // Dedicated per-task topic, first fire: the task has no materialized root
+    // yet (a materialized run resolves to position 'topic' above).
+    if (silent) {
+      // Stable virtual anchor shared by every fire of THIS task — unlike
+      // new-topic's per-run `schedule-run:<id>:<turn>` anchor, a second fire
+      // before materialization lands in this same slot and continues the
+      // hidden session. The visible Lark root stays deferred until the first
+      // botmux send; no seed message and no banner are posted.
+      anchor = `schedule-task:${task.id}`;
+      isContinuation = !!activeSessions.get(sessionKey(anchor, larkAppId));
+    } else {
+      if (task.creatorRootMessageId && task.creatorChatId !== task.chatId) {
+        const creatorAppId = task.creatorLarkAppId ?? larkAppId;
+        buildScheduledTargetNotice({
+          kind: 'chat',
+          taskName: task.name,
+          targetAppId: larkAppId,
+          targetChatId: task.chatId,
+          targetBrand: bot.config.brand,
+          locale: localeForBot(creatorAppId),
+        }).then(content => replyMessage(
+          creatorAppId,
+          task.creatorRootMessageId!,
+          content,
+          'text',
+          true,
+        )).catch((err: any) => {
+          logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
+        });
+      }
+      const topicSeed = task.topicTitle?.trim()
+        || t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId));
+      anchor = await sendMessage(larkAppId, task.chatId, topicSeed);
+      // Write the root straight into the task row (store call, not the
+      // scheduler wrapper/event bus): every later fire resolves to this exact
+      // thread and resumes the session created below.
+      scheduleStore.updateTask(task.id, { rootMessageId: anchor }, larkAppId);
     }
   } else if (scope === 'chat') {
     // Explicit task choice: chat scope always starts at the group top level.
@@ -3703,6 +3763,32 @@ export async function executeScheduledTask(
     // let the scheduled prompt overtake (or replace) the opening prompt that
     // owns the reservation.
     const existing = activeSessions.get(key);
+    if (!existing
+      && executionPosition === 'task'
+      && anchor.startsWith('schedule-task:')) {
+      // A rootless first-fire snapshot can race the materialization settlement
+      // of the PREVIOUS fire: promotion (task-root writeback + live-map move to
+      // the om_ slot) commits under THIS virtual-key lock, so reaching the
+      // create path with no virtual owner while the store already carries a root
+      // means this task's session now lives at the real topic slot. Re-enter
+      // routing there instead of opening a second hidden session — its later
+      // materialization would overwrite the task root and split the task's
+      // history. Lock order stays virtual→real, identical to the promotion
+      // helper, so no lock-order inversion is possible.
+      const promotedRoot = scheduleStore.getTask(task.id, larkAppId)?.rootMessageId?.trim();
+      if (promotedRoot) {
+        logger.info(
+          `[scheduler] Task "${task.name}" (${task.id}) first fire raced topic materialization; `
+          + `resuming at the promoted root ${promotedRoot.slice(0, 12)}`,
+        );
+        return executeScheduledTask(
+          { ...task, rootMessageId: promotedRoot },
+          activeSessions,
+          refreshCliVersion,
+          additionalPrompt,
+        );
+      }
+    }
     if (existing) {
       const reservedState = existing.pendingRepo
         ? 'pending_repo'
@@ -3754,6 +3840,14 @@ export async function executeScheduledTask(
         }
         markSessionActivity(existing);
         ensureSessionWhiteboard(existing);
+        if (existing.session.deferredScheduleRun
+          && existing.session.deferredScheduleRun.routingAnchor.startsWith('schedule-task:')) {
+          // A task-position hidden session re-fired before materialization
+          // keeps its stable virtual anchor; hand materialization ownership to
+          // the new turn (the first `botmux send` validates turn equality).
+          existing.session.deferredScheduleRun.turnId = scheduledTurnId;
+          sessionStore.updateSession(existing.session);
+        }
         if (sharedTopicRootId) {
           beginReplyTargetTurn(existing, sharedTopicRootId, scheduledTurnId);
           sessionStore.updateSession(existing.session);
@@ -3825,7 +3919,8 @@ export async function executeScheduledTask(
     // chatId-as-seed for audit (sessionAnchorId() returns chatId via scope). If a
     // formerly chat-scope task was redirected into a converted topic chat, promote
     // the runtime session to thread-scope so follow-up replies stay in-thread.
-    const deferredFreshTopic = executionPosition === 'new-topic' && silent;
+    const deferredFreshTopic = silent
+      && (executionPosition === 'new-topic' || executionPosition === 'task');
     const runtimeScope: 'thread' | 'chat' = deferredFreshTopic
       ? 'chat'
       : scope === 'chat' && anchor !== task.chatId ? 'thread' : scope;
