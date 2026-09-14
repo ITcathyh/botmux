@@ -2921,6 +2921,13 @@ const zh = {
   'workbench.standingLink.copied': '已复制',
   'workbench.standingLink.copyFailed': '复制失败，请手动选中',
   'workbench.standingLink.note': '收藏到浏览器书签长期使用；怀疑泄漏时 rotate 可立即作废。',
+
+  // ─── 定时任务：本任务专属话题（executionPosition: 'task'）─────────────────
+  'schedulePos.webTaskLabel': '本任务专属话题',
+  'schedulePos.webTaskHint': '首次触发时自动创建专属话题；同一任务之后每次触发都在该话题内继续，不同任务各自独立、互不串扰；仅支持单个群聊。',
+  'schedulePos.webTaskMultiChatUnsupported': '专属话题仅支持单个群聊的定时任务',
+  'schedulePos.webTaskTitle': '专属话题标题（可选）',
+  'schedulePos.webTaskTitleHelp': '作为该专属话题的首条消息；话题在首次触发时创建，之后每次触发都在此话题内继续。',
 } satisfies DashboardMessages;
 
 const en: Record<keyof typeof zh, string> = {
@@ -5835,6 +5842,13 @@ const en: Record<keyof typeof zh, string> = {
   'workbench.standingLink.copied': 'Copied',
   'workbench.standingLink.copyFailed': 'Copy failed — select it manually',
   'workbench.standingLink.note': 'Keep it as a browser bookmark for the long run; if you suspect it leaked, `botmux dashboard rotate` kills it instantly.',
+
+  // ── Scheduled tasks: dedicated per-task topic (executionPosition: 'task') ──
+  'schedulePos.webTaskLabel': 'Dedicated topic for this task',
+  'schedulePos.webTaskHint': "A dedicated topic is created automatically on the first run; every later run continues inside that same topic. Different tasks stay isolated from each other. Available for single-group schedules only.",
+  'schedulePos.webTaskMultiChatUnsupported': 'A dedicated topic is only available for single-group schedules',
+  'schedulePos.webTaskTitle': 'Dedicated topic title (optional)',
+  'schedulePos.webTaskTitleHelp': "Sent as the first message of the dedicated topic; the topic is created on the first run and every later run continues inside it.",
 };
 
 const dictionaries: Record<DashboardLocale, DashboardMessages> = { zh, en };

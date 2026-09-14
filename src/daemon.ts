@@ -3290,6 +3290,70 @@ function reconcileDeferredTopicBinding(ds: DaemonSession): string | undefined {
 
 const deferredScheduleSettleTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
+/**
+ * Promote a materialized task-position (`executionPosition:'task'`) silent run
+ * from its stable virtual slot (`schedule-task:<taskId>`) to the real om_ topic
+ * slot, and write the materialized root back onto the task row so every later
+ * fire resolves to this thread.
+ *
+ * The whole transition — guards, task writeback, scope flip and map move — runs
+ * under BOTH key locks in virtual→real order with an identity CAS. If this
+ * session no longer owns the virtual slot, or the real slot was taken meanwhile,
+ * NOTHING is mutated: no root writeback, the deferred marker survives, scope
+ * stays chat and this session keeps its virtual registration. The om_ root is a
+ * message this session itself just published, so a real-slot occupant is
+ * theoretically impossible; logging and keeping state beats silently
+ * overwriting a competing session.
+ */
+async function promoteMaterializedTaskPositionSession(
+  sessions: Map<string, DaemonSession>,
+  ds: DaemonSession,
+  rootMessageId: string,
+): Promise<'promoted' | 'not_task_position' | 'virtual_lost' | 'real_key_occupied'> {
+  const run = ds.session.deferredScheduleRun;
+  if (!run || !run.routingAnchor.startsWith('schedule-task:')) {
+    return 'not_task_position';
+  }
+  const larkAppId = ds.larkAppId;
+  const virtualKey = sessionKey(run.routingAnchor, larkAppId);
+  const realKey = sessionKey(rootMessageId, larkAppId);
+  return withActiveSessionKeyLock(sessions, virtualKey, async () =>
+    withActiveSessionKeyLock(sessions, realKey, () => {
+      if (sessions.get(virtualKey) !== ds) {
+        logger.error(
+          `[scheduler] Task-position promotion lost virtual slot ${virtualKey} `
+          + `session=${ds.session.sessionId.slice(0, 8)}; state and live map left unchanged`,
+        );
+        return 'virtual_lost' as const;
+      }
+      const occupant = sessions.get(realKey);
+      if (occupant && occupant !== ds) {
+        logger.error(
+          `[scheduler] Task-position real slot already occupied by `
+          + `${occupant.session.sessionId.slice(0, 8)} while promoting `
+          + `${ds.session.sessionId.slice(0, 8)}; state and live map left unchanged`,
+        );
+        return 'real_key_occupied' as const;
+      }
+      // Guards passed — commit the durable/session state first, then move the
+      // live registration. reconcileDeferredTopicBinding already set
+      // rootMessageId + aliases on the session.
+      scheduleStore.updateTask(run.taskId, { rootMessageId }, larkAppId);
+      ds.session.deferredScheduleRun = undefined;
+      ds.session.scope = 'thread';
+      ds.scope = 'thread';
+      sessionStore.updateSession(ds.session);
+      sessions.delete(virtualKey);
+      sessions.set(realKey, ds);
+      logger.info(
+        `[scheduler] Task-position session promoted virtual=${virtualKey} real=${realKey} `
+        + `session=${ds.session.sessionId.slice(0, 8)}`,
+      );
+      return 'promoted' as const;
+    }),
+  );
+}
+
 function scheduleDeferredScheduleSettlement(
   ds: DaemonSession,
   context: { turnId: string; source: 'terminal' | 'idle' },
@@ -3325,6 +3389,21 @@ function scheduleDeferredScheduleSettlement(
         logger.info(
           `[scheduler] Deferred topic materialized session=${sessionId.slice(0, 8)} root=${result.rootMessageId.slice(0, 12)}`,
         );
+        // Task-position runs own a stable per-task slot: promote the session to
+        // the real topic key and persist the root on the task. new-topic runs
+        // keep their per-run virtual anchor (already aliased by reconcile).
+        if (ds.session.deferredScheduleRun?.routingAnchor.startsWith('schedule-task:')) {
+          void promoteMaterializedTaskPositionSession(
+            activeSessions,
+            ds,
+            result.rootMessageId,
+          ).catch((err) => {
+            logger.warn(
+              `[scheduler] Task-position promotion failed session=${sessionId.slice(0, 8)}: `
+              + `${err instanceof Error ? err.message : String(err)}`,
+            );
+          });
+        }
         return;
       }
       if (result.action === 'close_refused') {
@@ -3866,6 +3945,7 @@ async function sessionReply(
 // composition it relies on. See test/reply-target-fallback.test.ts.
 export const __testOnly_sessionReply = sessionReply;
 export const __testOnly_activeSessions = activeSessions;
+export const __testOnly_promoteMaterializedTaskPositionSession = promoteMaterializedTaskPositionSession;
 export const __testOnly_scheduleRestoredStreamingCardPinRecovery = scheduleRestoredStreamingCardPinRecovery;
 export const __testOnly_restoreSessionsAndScheduleStartupRecovery = restoreSessionsAndScheduleStartupRecovery;
 

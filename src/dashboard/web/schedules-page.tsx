@@ -497,11 +497,12 @@ export function filterSchedules(rows: ScheduleRow[], filters: ScheduleFilters): 
     });
 }
 
-type SchedulePlacement = 'chat' | 'thread' | 'new-topic' | 'local';
+type SchedulePlacement = 'chat' | 'thread' | 'new-topic' | 'task' | 'local';
 
 export function scheduleExecutionPlacement(s: ScheduleRow): SchedulePlacement {
   if (s.deliver === 'local') return 'local';
   if (s.executionPosition === 'new-topic') return 'new-topic';
+  if (s.executionPosition === 'task') return s.rootMessageId ? 'thread' : 'task';
   if (s.executionPosition === 'topic') return s.rootMessageId ? 'thread' : 'chat';
   if (s.executionPosition === 'top-level') return 'chat';
   if (s.deliver === 'new-topic') return 'new-topic';
@@ -513,6 +514,7 @@ function placementLabel(s: ScheduleRow, tr: ReturnType<typeof useT>): string {
   const placement = scheduleExecutionPlacement(s);
   if (placement === 'local') return tr('schedules.deliveryLocal');
   if (placement === 'new-topic') return tr('schedules.deliveryNewTopic');
+  if (placement === 'task') return tr('schedulePos.webTaskLabel');
   return placement === 'thread'
     ? tr('schedules.deliveryThread')
     : tr('schedules.deliveryTopLevel');
@@ -1410,7 +1412,7 @@ function SchedulesPage() {
     preconditionScript?: string | null;
     preconditionFilePath?: string;
     silent: boolean;
-    executionPosition: 'top-level' | 'topic' | 'new-topic';
+    executionPosition: 'top-level' | 'topic' | 'new-topic' | 'task';
     rootMessageId: string;
     topicTitle: string;
     updateExecutionPosition: boolean;
@@ -1441,7 +1443,10 @@ function SchedulesPage() {
               : {}),
             ...(data.updateExecutionPosition ? {
               executionPosition: data.executionPosition,
-              rootMessageId: data.rootMessageId,
+              // A dedicated task topic owns its root lazily at first fire;
+              // sending the form's retained root would be 400 and could only
+              // adopt a foreign topic into the task.
+              ...(data.executionPosition === 'task' ? {} : { rootMessageId: data.rootMessageId }),
               topicTitle: data.topicTitle,
               chatIds: data.chatIds,
             } : {}),
@@ -1465,7 +1470,7 @@ function SchedulesPage() {
               ? { preconditionFilePath: data.preconditionFilePath }
               : {}),
             executionPosition: data.executionPosition,
-            rootMessageId: data.rootMessageId,
+            ...(data.executionPosition === 'task' ? {} : { rootMessageId: data.rootMessageId }),
             topicTitle: data.topicTitle,
             chatIds: data.chatIds,
             larkAppId: data.larkAppId,
@@ -1481,7 +1486,9 @@ function SchedulesPage() {
       if (!r.ok || body.ok === false) {
         throw new Error(body?.error === 'too_many_target_chats'
           ? tr('schedules.form.errTooManyChats', { limit: MAX_SCHEDULE_TARGET_CHATS })
-          : body?.error ?? `HTTP ${r.status}`);
+          : body?.error === 'multiple_chats_task_unsupported'
+            ? tr('schedulePos.webTaskMultiChatUnsupported')
+            : body?.error ?? `HTTP ${r.status}`);
       }
       setFormOpen(false);
       toast(
@@ -1665,7 +1672,7 @@ interface ScheduleFormData {
   preconditionScript?: string | null;
   preconditionFilePath?: string;
   silent: boolean;
-  executionPosition: 'top-level' | 'topic' | 'new-topic';
+  executionPosition: 'top-level' | 'topic' | 'new-topic' | 'task';
   rootMessageId: string;
   topicTitle: string;
   updateExecutionPosition: boolean;
@@ -1715,13 +1722,16 @@ export function ScheduleFormModal(props: {
   const [silent, setSilent] = useState(editing?.silent === true);
   const [model, setModel] = useState(editing?.model ?? '');
   const [reasoningEffort, setReasoningEffort] = useState<string>(editing?.reasoningEffort ?? '');
-  const [executionPosition, setExecutionPosition] = useState<'top-level' | 'topic' | 'new-topic'>(
+  const [executionPosition, setExecutionPosition] = useState<'top-level' | 'topic' | 'new-topic' | 'task'>(
     editing && scheduleExecutionPlacement(editing) === 'thread'
       ? 'topic'
-      : editing && scheduleExecutionPlacement(editing) === 'new-topic' ? 'new-topic' : 'top-level',
+      : editing && scheduleExecutionPlacement(editing) === 'task'
+        ? 'task'
+        : editing && scheduleExecutionPlacement(editing) === 'new-topic' ? 'new-topic' : 'top-level',
   );
   const initialChatIds = scheduleTargetChatIds(editing);
-  const initialTopicChatId = editing && scheduleExecutionPlacement(editing) === 'thread'
+  const initialTopicChatId = editing
+    && (scheduleExecutionPlacement(editing) === 'thread' || scheduleExecutionPlacement(editing) === 'task')
     ? initialChatIds[0] ?? ''
     : '';
   const [rootMessageId, setRootMessageId] = useState(editing?.rootMessageId ?? '');
@@ -1871,6 +1881,9 @@ export function ScheduleFormModal(props: {
   const topicChatCountInvalid = !localDelivery
     && executionPosition === 'topic'
     && chatIds.length > 1;
+  const taskChatCountInvalid = !localDelivery
+    && executionPosition === 'task'
+    && chatIds.length > 1;
   const rootMissing = touched
     && !localDelivery
     && executionPosition === 'topic'
@@ -2014,7 +2027,7 @@ export function ScheduleFormModal(props: {
   }
 
   function toggleChat(chatId: string, checked: boolean): void {
-    if (checked && executionPosition === 'topic') {
+    if (checked && (executionPosition === 'topic' || executionPosition === 'task')) {
       updateChatSelection([chatId]);
       return;
     }
@@ -2023,7 +2036,7 @@ export function ScheduleFormModal(props: {
       : chatIds.filter(value => value !== chatId));
   }
 
-  function updateExecutionPosition(next: 'top-level' | 'topic' | 'new-topic'): void {
+  function updateExecutionPosition(next: 'top-level' | 'topic' | 'new-topic' | 'task'): void {
     setExecutionPosition(next);
     if (
       next === 'topic'
@@ -2032,6 +2045,8 @@ export function ScheduleFormModal(props: {
     ) {
       setRootMessageId('');
     }
+    // Only per-run fresh topics force silent execution off; a dedicated task
+    // topic is a stable session and may run silently.
     if (next === 'new-topic') setSilent(false);
   }
 
@@ -2046,6 +2061,7 @@ export function ScheduleFormModal(props: {
     if (chatCountInvalid) return;
     if (!localDelivery && executionPosition === 'topic' && chatIds.length !== 1) return;
     if (!localDelivery && executionPosition === 'topic' && !rootMessageId.trim()) return;
+    if (!localDelivery && executionPosition === 'task' && chatIds.length !== 1) return;
     if (!canSubmitSchedule(schedule, editing?.schedule, tr, scheduleTimeZone)) return;
     const precondition = buildSchedulePreconditionFormFields({
       hasExisting: hasExistingPrecondition,
@@ -2443,7 +2459,7 @@ export function ScheduleFormModal(props: {
                 aria-label={tr('schedules.form.chatBinding')}
                 aria-expanded={chatPickerOpen}
                 aria-controls={chatPickerOpen ? 'schedule-chat-picker-panel' : undefined}
-                aria-invalid={chatMissing || topicChatCountInvalid || chatCountInvalid || undefined}
+                aria-invalid={chatMissing || topicChatCountInvalid || taskChatCountInvalid || chatCountInvalid || undefined}
                 aria-describedby={chatCountInvalid ? 'schedule-chat-limit-error' : undefined}
                 title={selectedChatLabels.join('\n')}
                 onClick={() => setChatPickerOpen(value => !value)}
@@ -2498,7 +2514,7 @@ export function ScheduleFormModal(props: {
                     className="schedule-chat-selector"
                     role="group"
                     aria-label={tr('schedules.form.chatBinding')}
-                    aria-invalid={chatMissing || topicChatCountInvalid || chatCountInvalid || undefined}
+                    aria-invalid={chatMissing || topicChatCountInvalid || taskChatCountInvalid || chatCountInvalid || undefined}
                     aria-describedby={chatCountInvalid ? 'schedule-chat-limit-error' : undefined}
                   >
                     {visibleSelectorOptions.length > 0 ? visibleSelectorOptions.map(group => {
@@ -2548,6 +2564,8 @@ export function ScheduleFormModal(props: {
               </small>
             ) : topicChatCountInvalid ? (
               <small className="schedule-form-error-inline">{tr('schedules.form.errTopicSingleChat')}</small>
+            ) : taskChatCountInvalid ? (
+              <small className="schedule-form-error-inline">{tr('schedulePos.webTaskMultiChatUnsupported')}</small>
             ) : null}
           </div>
         ) : null}
@@ -2593,13 +2611,26 @@ export function ScheduleFormModal(props: {
                 />
                 {tr('schedules.deliveryNewTopic')}
               </label>
+              <label title={chatIds.length > 1 ? tr('schedulePos.webTaskMultiChatUnsupported') : undefined}>
+                <input
+                  type="radio"
+                  name="executionPosition"
+                  value="task"
+                  checked={executionPosition === 'task'}
+                  disabled={chatIds.length > 1}
+                  onChange={() => updateExecutionPosition('task')}
+                />
+                {tr('schedulePos.webTaskLabel')}
+              </label>
             </div>
             <small className="schedule-form-help">
               {executionPosition === 'top-level'
                 ? tr('schedules.form.topLevelHelp')
                 : executionPosition === 'topic'
                   ? tr('schedules.form.topicHelp')
-                  : tr('schedules.form.newTopicHelp')}
+                  : executionPosition === 'task'
+                    ? tr('schedulePos.webTaskHint')
+                    : tr('schedules.form.newTopicHelp')}
             </small>
           </div>
         )}
@@ -2633,6 +2664,22 @@ export function ScheduleFormModal(props: {
             />
             <small className="schedule-form-help schedule-form-help-with-count">
               {tr('schedules.form.topicTitleHelp')}
+              <span>{Array.from(topicTitle).length}/200</span>
+            </small>
+          </label>
+        ) : null}
+        {!localDelivery && executionPosition === 'task' ? (
+          <label className="schedule-form-field">
+            <span className="schedule-form-label">{tr('schedulePos.webTaskTitle')}</span>
+            <input
+              type="text"
+              value={topicTitle}
+              onChange={e => setTopicTitle(e.target.value)}
+              placeholder={tr('schedules.form.topicTitlePlaceholder')}
+              maxLength={200}
+            />
+            <small className="schedule-form-help schedule-form-help-with-count">
+              {tr('schedulePos.webTaskTitleHelp')}
               <span>{Array.from(topicTitle).length}/200</span>
             </small>
           </label>
