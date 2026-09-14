@@ -399,6 +399,7 @@ import {
   submitFailureChainKeyOf,
   type SubmitFailureChainKey,
 } from './services/submit-failure-chain.js';
+import { diagnoseSubmitFailure } from './services/submit-failure-diagnosis.js';
 import {
   runAdoptQueuedWriteSequence,
   runAdoptRawInputSequence,
@@ -11110,6 +11111,10 @@ function observeCursorCliSessionId(pid: number, label = 'spawn'): void {
  *  both without being so long that a true failure goes unsurfaced. */
 const SUBMIT_DEFERRED_RECHECK_MS = 20_000;
 const SUBMIT_DEFERRED_RECHECK_MAX_ATTEMPTS = 2;
+/** still_active 只是弱证据（屏幕没有门、但 PTY 刚有活动）：在 20s 弱证据
+ *  重查之外最多再多静默 3 次（约 +60s）。turn 真终态会通过既有 chain 取消
+ *  机制自然终止链，这是保险上限。 */
+const SUBMIT_DIAG_ACTIVE_SILENCE_MAX_EXTRA = 3;
 let unscopedSubmitFailureChainSequence = 0;
 
 /** One live deferred submit-failure recheck chain per (turnId, dispatchAttempt,
@@ -11232,6 +11237,7 @@ function scheduleSubmitFailureNotify(
     cliGeneration: cliGenerationAtSchedule,
   };
   let deferredRecheckAttempts = 0;
+  let activeSilenceExtra = 0;
   log(`writeInput: submit not confirmed after retries — deferred ${SUBMIT_DEFERRED_RECHECK_MS}ms recheck queued. preview="${preview}"`);
   const runDeferredRecheck = async (chainIsCurrent: () => boolean): Promise<void> => {
     const settlement = await settleDeferredSubmitConfirmation(codexBridgeQueue, {
@@ -11302,6 +11308,32 @@ function scheduleSubmitFailureNotify(
         break;
     }
 
+    // 发卡前现场分类（submitDiag）：ZMX 屏幕历史非权威，不读屏；其余用当前
+    // viewport + PTY 活跃度分类。纯判定见 services/submit-failure-diagnosis.ts。
+    let submitDiagnosisScreen = '';
+    if (effectiveBackendType !== 'zmx') {
+      try {
+        submitDiagnosisScreen = backend
+          ? captureBackendScreen(backend)
+          : (lastAnalyzerSnapshot || renderer?.rawSnapshot() || '');
+      } catch { submitDiagnosisScreen = ''; }
+    }
+    const submitDiagnosis = diagnoseSubmitFailure({
+      screenText: submitDiagnosisScreen,
+      lastActivityAtMs: lastPtyActivityAtMs,
+    });
+    if (
+      submitDiagnosis.reason === 'still_active'
+      && activeSilenceExtra < SUBMIT_DIAG_ACTIVE_SILENCE_MAX_EXTRA
+      && chainIsCurrent()
+    ) {
+      activeSilenceExtra += 1;
+      log(`Deferred recheck still sees fresh CLI activity (${submitDiagnosis.evidence}) — silencing submit card once more. preview="${preview}"`);
+      armDeferredRecheck();
+      return;
+    }
+    log(`Submit failure diagnosis: ${submitDiagnosis.reason} (${submitDiagnosis.evidence})${submitDiagnosis.matched ? ` match=${submitDiagnosis.matched}` : ''} preview="${preview}"`);
+
     dropFailedBridgeMark(bridgeTurnId, turnIdentity?.dispatchAttempt);
     redriveRejectedStructuredReady();
     log(`Deferred recheck still missing — notifying user. preview="${preview}"`);
@@ -11313,7 +11345,13 @@ function scheduleSubmitFailureNotify(
         message: t(
           effectiveBackendType === 'zmx'
             ? 'worker.submit_unconfirmed_zmx'
-            : 'worker.submit_unconfirmed',
+            : submitDiagnosis.reason === 'logged_out'
+              ? 'submitDiag.logged_out'
+              : submitDiagnosis.reason === 'interactive_menu'
+                ? 'submitDiag.interactive_menu'
+                : submitDiagnosis.reason === 'draft_parked'
+                  ? 'submitDiag.draft_parked'
+                  : 'worker.submit_unconfirmed',
           {
             cliName: cliName(),
             secs: Math.round(SUBMIT_DEFERRED_RECHECK_MS / 1000),
