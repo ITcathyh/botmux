@@ -811,6 +811,8 @@ function setupBotState(opts?: {
   ownerOpenId?: string;
   /** 原始配置里的 allowedUsers（默认镜像 allowedUsers）。用于构造「配了 owner 但解析为空」的场景。 */
   configAllowedUsers?: string[];
+  /** 内存态黑名单（P1c），默认 []。 */
+  resolvedBlockedUsers?: string[];
   restrictGrantCommands?: boolean;
   regularGroupReplyMode?: 'chat' | 'new-topic' | 'shared' | 'chat-topic';
 	  regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
@@ -867,6 +869,9 @@ function setupBotState(opts?: {
 	    },
     botOpenId: opts && 'botOpenId' in opts ? opts.botOpenId : MY_OPEN_ID,
     resolvedAllowedUsers: opts?.allowedUsers ?? [],
+    // P1c 黑名单字段：假 bot 默认空名单，与 makeBotState 生产默认值对齐；
+    // 缺了它 evaluateTalk/canOperate 的否决腿 .includes 会在 dispatcher 公共路径上抛错。
+    resolvedBlockedUsers: opts?.resolvedBlockedUsers ?? [],
   };
   mockGetBot.mockReturnValue(state);
   return state;
@@ -2964,6 +2969,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedUsers: ['ou_allowed_sibling'] },
       botOpenId: MY_OPEN_ID,
       resolvedAllowedUsers: ['ou_allowed_sibling'],
+      resolvedBlockedUsers: [],
     });
     const event = makeUserMessageEvent({
       senderOpenId: USER_OPEN_ID, // NOT in allowedUsers
@@ -2990,6 +2996,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedChatGroups: ['oc_team'] },
       botOpenId: MY_OPEN_ID,
       resolvedAllowedUsers: [],
+      resolvedBlockedUsers: [],
     });
 
     expect(canTalk(MY_APP_ID, 'oc_team', USER_OPEN_ID)).toBe(true);
@@ -3002,6 +3009,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedChatGroups: ['oc_team'] },
       botOpenId: MY_OPEN_ID,
       resolvedAllowedUsers: [],
+      resolvedBlockedUsers: [],
     });
 
     expect(canTalk(MY_APP_ID, 'oc_other_chat', USER_OPEN_ID)).toBe(false);
@@ -3012,6 +3020,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedChatGroups: ['oc_team'], allowedUsers: ['ou_admin'] },
       botOpenId: MY_OPEN_ID,
       resolvedAllowedUsers: ['ou_admin'],
+      resolvedBlockedUsers: [],
     });
 
     expect(canOperate(MY_APP_ID, 'oc_team', USER_OPEN_ID)).toBe(false);
@@ -3030,6 +3039,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedUsers: ['ou_allowed_human_only'] },
       botOpenId: MY_OPEN_ID,
       resolvedAllowedUsers: ['ou_allowed_human_only'],
+      resolvedBlockedUsers: [],
     });
     const event = makeUserMessageEvent({
       senderOpenId: OTHER_BOT_OPEN_ID,
@@ -6194,6 +6204,7 @@ describe('im.message.receive_v1 — /t force-topic override', () => {
       config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedUsers: ['ou_only_this_user'] },
       botOpenId: MY_OPEN_ID,
       resolvedAllowedUsers: ['ou_only_this_user'],
+      resolvedBlockedUsers: [],
     });
     const event = makeUserMessageEvent({
       senderOpenId: 'ou_random_user',
@@ -6234,6 +6245,7 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic)
       // true), which would route through the single-user relaxation instead and
       // never exercise the branch under test.
       resolvedAllowedUsers: ['ou_someone_else'],
+      resolvedBlockedUsers: [],
     });
   }
 
@@ -7162,6 +7174,7 @@ describe('im.message.receive_v1 — /introduce command', () => {
       config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedUsers: ['ou_some_other_human'] },
       botOpenId: MY_OPEN_ID,
       resolvedAllowedUsers: ['ou_some_other_human'],  // USER_OPEN_ID not in list
+      resolvedBlockedUsers: [],
     });
     const event = makeIntroduceEvent({
       mentions: [
@@ -8449,6 +8462,7 @@ describe('im.message.receive_v1 — botOpenId startup race', () => {
       config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },
       botOpenId: undefined,
       resolvedAllowedUsers: [],
+      resolvedBlockedUsers: [],
     };
     mockGetBot.mockReturnValue(botState);
     // The probe resolves the open_id: token call, then bot-info call.
@@ -8479,6 +8493,7 @@ describe('ensureBotOpenId — dedup', () => {
       config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },
       botOpenId: undefined,
       resolvedAllowedUsers: [],
+      resolvedBlockedUsers: [],
     };
     mockGetBot.mockReturnValue(botState);
     // Each probe = 2 fetches (token + bot-info). Same payload works for both.

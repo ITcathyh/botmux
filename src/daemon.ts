@@ -4491,7 +4491,8 @@ function scheduleAllowedUsersResolveRetry(larkAppId: string, attempt = 1): void 
         // owner can't be revived later.
         writeAllowedUsersCache(larkAppId, applied.map, {
           deleteEntries: definitiveEntriesOf(resolveResult.entryStatus),
-          retainKeys: configured,
+          // 同启动块：sidecar 两侧共用，retainKeys 取并集，不得剪掉 blockedUsers 的缓存。
+          retainKeys: [...new Set([...configured, ...(liveBot.config.blockedUsers ?? [])])],
         });
         republishResolvedAllowedUsers(larkAppId, applied.resolved);
         if (!applied.failed) {
@@ -24330,6 +24331,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // Refresh CLI version per bot's cliId
     refreshCliVersion(cfg);
 
+    // sidecar 同时承载 allowedUsers 与 blockedUsers 的 raw→ou_ 缓存：任一侧
+    // 写缓存时 retainKeys 必须是两侧原始条目的并集，否则一次 allowed 解析写回
+    // 会把 blocked 条目（可能正处于网络失败、只靠缓存存活的状态）剪光，反之亦然。
+    const resolveCacheRetainKeys = [...new Set([
+      ...(bot.config.allowedUsers ?? bot.resolvedAllowedUsers ?? []),
+      ...(bot.config.blockedUsers ?? []),
+    ])];
+
     // Resolve allowed users per bot. Skipped for apiOnly (core-only) bots:
     // their HTTP control-API triggers authenticate via the dashboard token, not
     // allowedUsers, and resolving email/union_id entries would call the Feishu
@@ -24366,7 +24375,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           // Prune definitively-gone entries + keys no longer configured.
           writeAllowedUsersCache(cfg.larkAppId, applied.map, {
             deleteEntries: definitiveEntriesOf(resolveResult.entryStatus),
-            retainKeys: configured,
+            retainKeys: resolveCacheRetainKeys,
           });
           logger.info(`[${cfg.larkAppId}] Resolved allowedUsers: ${bot.resolvedAllowedUsers.join(', ') || '(empty)'}${applied.usedFallback ? ' [some from cache]' : ''}`);
           if (applied.failed && applied.notice) {
@@ -24388,7 +24397,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           bot.resolvedAllowedUsers = applied.resolved;
           bot.rawAllowedUserResolution = applied.map;
           if (applied.usedFallback) {
-            writeAllowedUsersCache(cfg.larkAppId, applied.map, { retainKeys: configured });
+            writeAllowedUsersCache(cfg.larkAppId, applied.map, { retainKeys: resolveCacheRetainKeys });
           }
           const notice = applied.notice
             ?? `Failed to resolve allowedUsers: ${err?.message ?? err}`;
@@ -24406,6 +24415,67 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // will eventually catch up too.
       desc.resolvedAllowedUsers = bot.resolvedAllowedUsers.filter(u => u.startsWith('ou_'));
       try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
+    }
+
+    // Resolve blockedUsers 黑名单（P1c）。复用 allowedUsers 同一套解析器与同一
+    // sidecar（retainKeys 取两侧并集，见 resolveCacheRetainKeys）。与 allowed 块的
+    // 差异是刻意的：黑名单解析降级只会「少否决」（fail-open 方向，不锁人），所以
+    // 不发 owner DM、不排 scheduleAllowedUsersResolveRetry（那条重试只解析
+    // allowedUsers），只 warn；但绝不能因此阻塞启动。literal ou_ 无需网络，预填进
+    // per-entry 缓存，使 client 构造/网络整体抛错时纯 ou_ 黑名单仍生效。
+    // 同 allowed 块：apiOnly bot 跳过（不打飞书 contact API）；不刷 descriptor。
+    if (!cfg.apiOnly && (bot.config.blockedUsers?.length ?? 0) > 0) {
+      const blockedRaw = bot.config.blockedUsers!;
+      const literalOuSeed: Record<string, string> = {};
+      for (const e of blockedRaw) {
+        if (e.startsWith('ou_')) literalOuSeed[e] = e;
+      }
+      const blockedPrevMap: Record<string, string> = {
+        ...literalOuSeed,
+        ...readAllowedUsersCache(cfg.larkAppId),
+      };
+      let blockedApplied: ReturnType<typeof applyAllowedUsersResolve>;
+      if (blockedRaw.some(entryNeedsContactResolve)) {
+        try {
+          const resolveResult = await resolveAllowedUsersWithMap(cfg.larkAppId, blockedRaw);
+          blockedApplied = applyAllowedUsersResolve({
+            rawEntries: blockedRaw,
+            previousResolvedMap: blockedPrevMap,
+            resolveResult,
+          });
+          writeAllowedUsersCache(cfg.larkAppId, blockedApplied.map, {
+            deleteEntries: definitiveEntriesOf(resolveResult.entryStatus),
+            retainKeys: resolveCacheRetainKeys,
+          });
+          if (blockedApplied.usedFallback) {
+            logger.warn(`[${cfg.larkAppId}] blockedUsers resolve degraded: some entries reused from cache. Raw: ${blockedRaw.join(', ')}`);
+          }
+        } catch (err: any) {
+          // 整体抛错 = 瞬时故障：所有需寻址条目按 transient 交给纯合并函数吃缓存；
+          // literal ou_ 经 blockedPrevMap 种子照样恢复。绝不阻塞启动。
+          const throwStatus = new Map<string, EntryResolveStatus>();
+          for (const e of blockedRaw) {
+            if (entryNeedsContactResolve(e)) throwStatus.set(e, 'transient');
+          }
+          blockedApplied = applyAllowedUsersResolve({
+            rawEntries: blockedRaw,
+            previousResolvedMap: blockedPrevMap,
+            resolveResult: { resolved: [], map: new Map(), errored: true, entryStatus: throwStatus },
+          });
+          if (blockedApplied.usedFallback) {
+            writeAllowedUsersCache(cfg.larkAppId, blockedApplied.map, { retainKeys: resolveCacheRetainKeys });
+          }
+          logger.warn(`[${cfg.larkAppId}] blockedUsers resolve failed (cache-only this boot): ${err?.message ?? err}`);
+        }
+      } else {
+        blockedApplied = applyAllowedUsersResolve({
+          rawEntries: blockedRaw,
+          previousResolvedMap: blockedPrevMap,
+          resolveResult: { resolved: [], map: new Map(), entryStatus: new Map() },
+        });
+      }
+      bot.resolvedBlockedUsers = blockedApplied.resolved;
+      logger.info(`[${cfg.larkAppId}] Resolved blockedUsers: ${bot.resolvedBlockedUsers.join(', ') || '(empty)'}`);
     }
 
     checkAllowedChatGroupsConfig(bot);
