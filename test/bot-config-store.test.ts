@@ -917,6 +917,83 @@ describe('bot-config store', () => {
     if (!r.ok) expect(r.reason).toBe('empty_resolved');
   });
 
+  it('setBotBlockedUsers with [] clears disk entry and in-memory resolved list', async () => {
+    const { registry, store } = await loaded({ blockedUsers: ['carol@corp.com'] });
+    registry.getBot('app_default').resolvedBlockedUsers = ['ou_carol'];
+
+    const r = await store.setBotBlockedUsers('app_default', []);
+    expect(r.ok).toBe(true);
+    expect(r).toMatchObject({ ok: true, raw: [], resolved: [] });
+    expect(readConfig().blockedUsers).toBeUndefined();
+    const bot = registry.getBot('app_default');
+    expect(bot.config.blockedUsers).toBeUndefined();
+    expect(bot.resolvedBlockedUsers).toEqual([]);
+  });
+
+  it('setBotBlockedUsers refuses to block a resolved allowedUsers admin', async () => {
+    const { registry, store } = await loaded();
+    // 模拟 daemon 启动期把 email 形态的管理员解析成 ou_ 后的内存态。
+    registry.getBot('app_default').resolvedAllowedUsers = ['ou_owner', 'ou_alice'];
+
+    const r = await store.setBotBlockedUsers('app_default', ['alice@corp.com']);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.reason).toBe('cannot_block_admin');
+      expect(r.conflicting).toEqual(['ou_alice']);
+    }
+    // 绝不落盘 / 不动内存。
+    expect(readConfig().blockedUsers).toBeUndefined();
+    expect(registry.getBot('app_default').resolvedBlockedUsers).toEqual([]);
+  });
+
+  it('setBotBlockedUsers refuses to block the current owner', async () => {
+    const { store } = await loaded();
+    const r = await store.setBotBlockedUsers('app_default', ['ou_owner']);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.reason).toBe('cannot_block_admin');
+      expect(r.conflicting).toEqual(['ou_owner']);
+    }
+  });
+
+  it('setBotBlockedUsers rejects an all-unresolvable list as empty', async () => {
+    const { store } = await loaded();
+    const r = await store.setBotBlockedUsers('app_default', ['garbage']);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('empty_resolved');
+  });
+
+  it('setBotBlockedUsers returns bot_not_registered for an unknown app', async () => {
+    const { store } = await loaded();
+    const r = await store.setBotBlockedUsers('app_missing', ['carol@corp.com']);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('bot_not_registered');
+  });
+
+  it('setBotBlockedUsers persists raw entries, syncs memory, and keeps the shared sidecar union (allowed ∪ blocked)', async () => {
+    const { registry, store } = await loaded();
+    // 先让 sidecar 里有 allowedUsers 的映射（与运行时 set allowedUsers 同路径）。
+    const allow = await store.setBotAllowedUsers('app_default', ['ou_owner'], 'ou_owner');
+    expect(allow.ok).toBe(true);
+
+    const r = await store.setBotBlockedUsers('app_default', ['carol@corp.com', 'on_bob']);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.resolved).toEqual(['ou_carol', 'ou_bob']);
+
+    expect(readConfig().blockedUsers).toEqual(['carol@corp.com', 'on_bob']);
+    const bot = registry.getBot('app_default');
+    expect(bot.config.blockedUsers).toEqual(['carol@corp.com', 'on_bob']);
+    expect(bot.resolvedBlockedUsers).toEqual(['ou_carol', 'ou_bob']);
+
+    // 同一 sidecar：blocked 写入不得把 allowed 的缓存键 prune 掉（retainKeys 取并集）。
+    const sidecar = JSON.parse(readFileSync(join(process.env.SESSION_DATA_DIR!, 'allowed-users-cache-app_default.json'), 'utf-8'));
+    expect(sidecar.map).toMatchObject({
+      ou_owner: 'ou_owner',
+      'carol@corp.com': 'ou_carol',
+      on_bob: 'ou_bob',
+    });
+  });
+
   it('coerceConfigValue parses per kind (bool/enum/cli) and rejects junk', async () => {
     const { store } = await freshModules();
     const boolSpec = store.findConfigField('disableStreamingCard')!;
