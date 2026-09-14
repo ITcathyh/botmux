@@ -104,12 +104,14 @@ import { getDeploymentIdentity } from '../services/deployment-identity.js';
 import { getBotUnionId } from '../services/bot-union-ids-store.js';
 import * as grantPrefsStore from '../services/grant-prefs-store.js';
 import { applyExactChatGrantRequest } from '../services/exact-chat-grant.js';
+import { addAllowedChatGroup, removeAllowedChatGroup } from '../services/grant-store.js';
+import { normalizeGrantDurationOption, normalizeGrantQuotaOption } from '../services/grant-policy.js';
 import { normalizeBotDescriptions } from '../services/bot-description-schema.js';
 import type {
   OpenPlatformDescriptionReadResult,
   OpenPlatformDescriptionUpdateResult,
 } from '../services/open-platform-rename.js';
-import { findConfigField, applyConfigField, coerceConfigValue, setChatFeedbackPolicy } from '../services/bot-config-store.js';
+import { findConfigField, applyConfigField, coerceConfigValue, setChatFeedbackPolicy, setBotBlockedUsers } from '../services/bot-config-store.js';
 import { traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
 import { globalBuiltinSkillInjectionDefault, resolveSkillInjectionSupport } from '../skills/injection-mode.js';
 import { summaryRangeFromBotConfig, updateDashboardSummaryRange } from '../services/summary-range-store.js';
@@ -4539,6 +4541,8 @@ ipcRoute('POST', '/api/grants/chat', async (req, res) => {
     chatId?: unknown;
     subjectOpenIds?: unknown;
     subjectLarkAppIds?: unknown;
+    quota?: unknown;
+    durationMs?: unknown;
   };
   try {
     body = await readJsonBody(req);
@@ -4568,24 +4572,109 @@ ipcRoute('POST', '/api/grants/chat', async (req, res) => {
       message: 'subjectLarkAppIds may only be used with operation=grant',
     });
   }
+  // Optional quota/validity window. Absent keys keep the legacy CLI wire shape
+  // exactly (no quota/expiry written); 'unlimited'/'permanent'/'' normalize to
+  // undefined and are likewise omitted. Illegal option strings are rejected
+  // before the service runs. durationMs is relative; the service computes the
+  // absolute expiresAt to avoid client clock skew.
+  const grantExtras: { quota?: number; durationMs?: number } = {};
+  if (Object.prototype.hasOwnProperty.call(body, 'quota')) {
+    const quota = normalizeGrantQuotaOption(body.quota);
+    if (quota === null) return jsonRes(res, 400, { ok: false, error: 'invalid_quota' });
+    if (quota !== undefined) grantExtras.quota = quota;
+  }
+  if (Object.prototype.hasOwnProperty.call(body, 'durationMs')) {
+    const durationMs = normalizeGrantDurationOption(body.durationMs);
+    if (durationMs === null) return jsonRes(res, 400, { ok: false, error: 'invalid_duration' });
+    if (durationMs !== undefined) grantExtras.durationMs = durationMs;
+  }
   const result = hasSubjectLarkAppIds
     ? await exactChatGrantHandler({
         operation: body.operation,
         receiverLarkAppId: cachedLarkAppId,
         chatId: body.chatId,
         subjectLarkAppIds: body.subjectLarkAppIds,
+        ...grantExtras,
       })
     : await exactChatGrantHandler({
         operation: body.operation,
         receiverLarkAppId: cachedLarkAppId,
         chatId: body.chatId,
         subjectOpenIds: body.subjectOpenIds,
+        ...grantExtras,
       });
   if (!result.ok) {
     const { status, ...responseBody } = result;
     return jsonRes(res, status, responseBody);
   }
   return jsonRes(res, 200, result);
+});
+
+// ─── blockedUsers (talk/operate deny list, P1c) ───────────────────────────
+
+// Read the raw config entries plus the resolved receiver-scoped open_ids.
+// Bare loopback route: the global trusted-host HMAC gate protects it.
+ipcRoute('GET', '/api/blocked-users', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  let bot;
+  try { bot = getBot(cachedLarkAppId); } catch {
+    return jsonRes(res, 404, { ok: false, error: 'bot_not_registered' });
+  }
+  return jsonRes(res, 200, {
+    ok: true,
+    raw: bot.config.blockedUsers ?? [],
+    resolved: bot.resolvedBlockedUsers ?? [],
+  });
+});
+
+// Replace the whole blocklist. Empty array clears it. Owner/admin guards live
+// in setBotBlockedUsers (cannot_block_admin carries the conflicting ou_ list).
+ipcRoute('PUT', '/api/blocked-users', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  let body: { entries?: unknown };
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const entries = body.entries;
+  if (!Array.isArray(entries) || entries.some(entry => typeof entry !== 'string')) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_entries' });
+  }
+  const result = await setBotBlockedUsers(cachedLarkAppId, entries as string[]);
+  if (result.ok) return jsonRes(res, 200, result);
+  if (result.reason === 'cannot_block_admin') {
+    return jsonRes(res, 409, {
+      ok: false,
+      error: 'cannot_block_admin',
+      conflicting: result.conflicting ?? [],
+    });
+  }
+  if (result.reason === 'empty_resolved') {
+    return jsonRes(res, 422, { ok: false, error: 'empty_resolved' });
+  }
+  if (result.reason === 'bot_not_registered') {
+    return jsonRes(res, 404, { ok: false, error: 'bot_not_registered' });
+  }
+  return jsonRes(res, 400, { ok: false, error: result.reason });
+});
+
+// Whole-chat talk grant toggle: allowedChatGroups makes EVERY current member
+// pass canTalk in that chat (talk-only; canOperate is untouched).
+ipcRoute('PUT', '/api/chat-group-grant', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  let body: { chatId?: unknown; granted?: unknown };
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (typeof body.chatId !== 'string' || !isValidRoleChatId(body.chatId)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  }
+  if (typeof body.granted !== 'boolean') {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_granted' });
+  }
+  const result = body.granted
+    ? await addAllowedChatGroup(cachedLarkAppId, body.chatId)
+    : await removeAllowedChatGroup(cachedLarkAppId, body.chatId);
+  if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason });
+  if ('created' in result) return jsonRes(res, 200, { ok: true, created: result.created });
+  return jsonRes(res, 200, { ok: true, removed: result.removed });
 });
 
 // ─── Groups (Phase B) ──────────────────────────────────────────────────────
