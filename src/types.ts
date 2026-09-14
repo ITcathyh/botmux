@@ -1820,4 +1820,8 @@ export type WorkerToDaemon =
        * Absent is derived from `recovery`. See SessionDestroyResult.
        */
       admission?: 'restorable' | 'fenced';
-    };
+    }
+  /** Worker is dying on an uncaught exception/rejection. Best-effort terminal
+   *  diagnostic (sendAndFlush, truncated) so the daemon can surface the real
+   *  crash cause on the card instead of a generic worker-exit message. */
+  | { type: 'worker_fatal'; message: string };
