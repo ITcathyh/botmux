@@ -62,6 +62,7 @@ import {
   tmuxLifecycleInitialDelayMs,
   setStartupTmuxRetrySleepForTests,
 } from '../src/adapters/backend/tmux-pipe-backend.js';
+import { resetTmuxVersionCacheForTests } from '../src/setup/ensure-tmux.js';
 import { bufferSpawnResult } from './helpers/spawn-result.js';
 
 // Startup retries sleep synchronously (Atomics.wait — immune to fake timers);
@@ -125,6 +126,7 @@ beforeEach(() => {
   mockedUnlinkSync.mockReset();
   mockedExecSync.mockReturnValue(Buffer.from('') as any);
   mockedSpawnSync.mockReturnValue(bufferSpawnResult({ status: 0 }));
+  resetTmuxVersionCacheForTests();
 });
 
 describe('TmuxPipeBackend.spawn', () => {
@@ -1256,5 +1258,78 @@ describe('TmuxPipeBackend.onData', () => {
     const joined = received.join('');
     expect(joined).toBe('┌─┐');
     expect(joined).not.toContain('�');
+  });
+});
+describe('TmuxPipeBackend tmux version gating', () => {
+  /** Mock `tmux -V` (via the mocked child_process module shared with
+   *  ensure-tmux) and leave every other execFileSync call succeeding. */
+  function mockTmuxVersion(version: string | null): void {
+    mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
+      if (Array.isArray(args) && args[0] === '-V') {
+        if (version === null) {
+          throw Object.assign(new Error('spawn tmux ENOENT'), { code: 'ENOENT' });
+        }
+        return `${version}\n` as any;
+      }
+      return '' as any;
+    }) as any);
+  }
+
+  it('uses resize-pane on tmux 2.8 (no resize-window subcommand)', () => {
+    mockTmuxVersion('tmux 2.8');
+    const be = new TmuxPipeBackend('bmx-resize-old', { ownsSession: true });
+    be.resize(120, 40);
+    expect(mockedExecFileSync).toHaveBeenCalledWith(
+      'tmux', ['resize-pane', '-t', 'bmx-resize-old', '-x', '120', '-y', '40'], expect.any(Object),
+    );
+  });
+
+  it('uses resize-window on tmux 3.3', () => {
+    mockTmuxVersion('tmux 3.3a');
+    const be = new TmuxPipeBackend('bmx-resize-new', { ownsSession: true });
+    be.resize(120, 40);
+    expect(mockedExecFileSync).toHaveBeenCalledWith(
+      'tmux', ['resize-window', '-t', 'bmx-resize-new', '-x', '120', '-y', '40'], expect.any(Object),
+    );
+  });
+
+  it('keeps resize-window when the version is unknown (legacy behaviour)', () => {
+    mockTmuxVersion(null);
+    const be = new TmuxPipeBackend('bmx-resize-unknown', { ownsSession: true });
+    be.resize(120, 40);
+    expect(mockedExecFileSync).toHaveBeenCalledWith(
+      'tmux', ['resize-window', '-t', 'bmx-resize-unknown', '-x', '120', '-y', '40'], expect.any(Object),
+    );
+  });
+
+  function windowSizeCalls(): string[] {
+    return mockedExecSync.mock.calls
+      .map(c => String(c[0]))
+      .filter(c => c.includes('set-option') && c.includes('window-size largest'));
+  }
+
+  it('skips window-size largest on tmux 3.0', () => {
+    mockTmuxVersion('tmux 3.0');
+    const be = new TmuxPipeBackend('bmx-ws-old', { createSession: true, ownsSession: true });
+    be.spawn('/bin/echo', [], spawnOpts());
+    expect(windowSizeCalls()).toEqual([]);
+    // Other options are still applied.
+    const optionCalls = mockedExecSync.mock.calls.map(c => String(c[0]));
+    expect(optionCalls.some(c => c.includes('status on'))).toBe(true);
+    expect(optionCalls.some(c => c.includes('history-limit 50000'))).toBe(true);
+  });
+
+  it('sets window-size largest on tmux 3.3', () => {
+    mockTmuxVersion('tmux 3.3a');
+    const be = new TmuxPipeBackend('bmx-ws-new', { createSession: true, ownsSession: true });
+    be.spawn('/bin/echo', [], spawnOpts());
+    expect(windowSizeCalls().length).toBe(1);
+  });
+
+  it('tries window-size largest when the version is unknown (legacy behaviour)', () => {
+    mockTmuxVersion(null);
+    const be = new TmuxPipeBackend('bmx-ws-unknown', { createSession: true, ownsSession: true });
+    be.spawn('/bin/echo', [], spawnOpts());
+    expect(windowSizeCalls().length).toBe(1);
   });
 });

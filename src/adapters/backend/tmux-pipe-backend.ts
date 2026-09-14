@@ -30,7 +30,7 @@ import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import type { SessionBackend, SessionProbe, SpawnOpts } from './types.js';
-import { tmuxEnv } from '../../setup/ensure-tmux.js';
+import { tmuxEnv, getTmuxVersionCached, tmuxVersionAtLeast } from '../../setup/ensure-tmux.js';
 import { buildBotmuxEnvAssignments, resolveUserShell, shellWrapperScript, shellCommandArgv, shellKindForPath, TmuxBackend, isTmuxServerLevelErrorText, isExecTimeoutError } from './tmux-backend.js';
 import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
 import { LivenessGate, ADOPT_LIVENESS_MAX_FAILURES } from './liveness-gate.js';
@@ -647,7 +647,16 @@ export class TmuxPipeBackend implements SessionBackend {
     this.cols = cols;
     this.rows = rows;
     if (this.ownsSession) {
-      execFileSync('tmux', ['resize-window', '-t', this.paneTarget, '-x', String(cols), '-y', String(rows)], {
+      // resize-window landed in tmux 2.9; on older builds (2.8) it fails
+      // silently under stdio:'ignore' and the window keeps its spawn size.
+      // resize-pane works on every version and sets the same geometry here
+      // (we own the pane's only window). Unknown version → keep the old
+      // command so behaviour is unchanged where the probe can't answer.
+      const version = getTmuxVersionCached();
+      const subcommand = version !== null && !tmuxVersionAtLeast(version, 2, 9)
+        ? 'resize-pane'
+        : 'resize-window';
+      execFileSync('tmux', [subcommand, '-t', this.paneTarget, '-x', String(cols), '-y', String(rows)], {
         stdio: 'ignore',
         timeout: 5000,
         env: tmuxEnv(),
@@ -1103,7 +1112,13 @@ export class TmuxPipeBackend implements SessionBackend {
       execSync(`tmux set-option -t ${t} mouse on`, { stdio: 'ignore', env, timeout: 5000 });
       execSync(`tmux set-option -s set-clipboard on`, { stdio: 'ignore', env, timeout: 5000 });
       execSync(`tmux set-option -t ${t} history-limit 50000`, { stdio: 'ignore', env, timeout: 5000 });
-      execSync(`tmux set-option -t ${t} window-size largest`, { stdio: 'ignore', env, timeout: 5000 });
+      // window-size largest exists since tmux 3.1; older builds reject the
+      // option (and the shared try/catch would then skip nothing else — the
+      // failing line is the last one). Unknown version: keep trying.
+      const version = getTmuxVersionCached();
+      if (version === null || tmuxVersionAtLeast(version, 3, 1)) {
+        execSync(`tmux set-option -t ${t} window-size largest`, { stdio: 'ignore', env, timeout: 5000 });
+      }
     } catch { /* session may not be ready yet — benign */ }
   }
 

@@ -14007,7 +14007,9 @@ async function spawnCli(
         throw new Error(
           `[read-isolation] refusing to start session ${cfg.sessionId}: `
           + `could not verify existing ${effectiveBackendType} pane `
-          + `(liveness probe: ${paneProbe})`,
+          + `(liveness probe: ${paneProbe})\n\n`
+          + `宿主机 tmux server 当前不可达：探测结果不确定时，botmux 会保持现状，不会清理或重建 pane。`
+          + `请不要执行 kill-server；后端恢复后会自动重新探测，也可稍后重发消息重试。`,
         );
       },
     };
