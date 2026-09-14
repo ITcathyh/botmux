@@ -1036,6 +1036,7 @@ export const messages: Record<string, string> = {
   'worker.input_commit_delayed': '⏳ The Worker received this message, but has not confirmed that it entered the execution queue yet. The machine may be busy; the message can still execute later, so do not resend it.\nturn: {turnId}',
   'worker.input_retired_unconfirmed': '⚠️ The session was deliberately suspended or replaced while this message was in flight, and Botmux could not confirm whether it entered the execution queue. Check the session history first; resend the message only if it did not run.\nturn: {turnId}',
   'worker.start_exited_early': 'The worker exited before becoming ready (exit code: {code}); see the Botmux logs for details.',
+  'workerDiag.recentStderr': 'Recent worker output (may include the failure cause):',
   'worker.tui_submit_failed': '⚠️ The TUI answer could not be confirmed as delivered to {cliName}. The CLI may still be waiting for input; open the local terminal or send a new message to recover.',
   'worker.raw_input_failed': '⚠️ The slash command could not be confirmed as delivered to {cliName}, so the follow-up text in the same message was not submitted. Check the terminal state, then resend.',
   'worker.raw_input_failed_command_only': '⚠️ The slash command could not be confirmed as delivered to {cliName}. Check the terminal state, then resend.',

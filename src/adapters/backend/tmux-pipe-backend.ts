@@ -31,6 +31,7 @@ import { randomBytes } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import type { SessionBackend, SessionProbe, SpawnOpts } from './types.js';
 import { tmuxEnv, getTmuxVersionCached, tmuxVersionAtLeast } from '../../setup/ensure-tmux.js';
+import { stripAnsiForLog, tailChars } from '../../utils/crash-log.js';
 import { buildBotmuxEnvAssignments, resolveUserShell, shellWrapperScript, shellCommandArgv, shellKindForPath, TmuxBackend, isTmuxServerLevelErrorText, isExecTimeoutError } from './tmux-backend.js';
 import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
 import { LivenessGate, ADOPT_LIVENESS_MAX_FAILURES } from './liveness-gate.js';
@@ -81,6 +82,72 @@ function isRetryableStartupTmuxFailure(err: any): boolean {
     return isTmuxServerLevelErrorText((err.stderr?.toString?.() ?? '').trim());
   }
   return true;
+}
+
+/** Evidence about WHY the pane died, collected best-effort after a terminal
+ *  pipe-pane attach failure. All fields null/false when probes are inconclusive
+ *  (server-level outage) — the caller then degrades to the raw error. */
+export interface PipePaneDeathEvidence {
+  paneDead: boolean;
+  paneDeadStatus: string | null;
+  lastScreen: string | null;
+}
+
+const PANE_DEATH_PROBE_TIMEOUT_MS = 1000;
+const PANE_DEATH_SCREEN_TAIL_CHARS = 800;
+
+/** Build the readable startup error for a pane whose CLI process died
+ *  immediately. Pure (no tmux calls) so the wording is unit-testable. */
+export function buildPipePaneStartupError(rawErr: unknown, evidence: PipePaneDeathEvidence): Error {
+  const statusLine = evidence.paneDeadStatus
+    ? `exit status=${evidence.paneDeadStatus}`
+    : '进程已退出（无退出码，可能被信号终止）';
+  const rawFirstLine = (rawErr instanceof Error ? rawErr.message : String(rawErr ?? ''))
+    .split('\n').map(line => line.trim()).find(line => line.length > 0);
+  const lines = [
+    `tmux pane 中的进程启动后立即退出（${statusLine}），这通常是 CLI 本身启动失败，而不是 tmux 未安装。`,
+  ];
+  if (evidence.lastScreen) lines.push(`最后一屏摘要：\n${evidence.lastScreen}`);
+  if (rawFirstLine) lines.push(`原始 pipe-pane 错误：${rawFirstLine}`);
+  return new Error(lines.join('\n'));
+}
+
+/** Best-effort post-mortem after a terminal pipe-pane failure. Runs one
+ *  display-message and one capture-pane, each with a short timeout. Never
+ *  throws and never emits noise: any failure/timeout returns an inconclusive
+ *  evidence ({ paneDead: false }), and the caller keeps the raw error. */
+function collectPipePaneDeathEvidence(paneTarget: string): PipePaneDeathEvidence {
+  let paneDead = false;
+  let paneDeadStatus: string | null = null;
+  try {
+    const out = String(
+      execFileSync(
+        'tmux',
+        ['display-message', '-p', '-t', paneTarget, '#{pane_dead}:#{pane_dead_status}'],
+        { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: PANE_DEATH_PROBE_TIMEOUT_MS, env: tmuxEnv() },
+      ) ?? '',
+    ).trim();
+    const [dead, status] = out.split(':');
+    paneDead = dead === '1';
+    paneDeadStatus = status && status.trim() ? status.trim() : null;
+  } catch {
+    return { paneDead: false, paneDeadStatus: null, lastScreen: null };
+  }
+  let lastScreen: string | null = null;
+  try {
+    const out = String(
+      execFileSync(
+        'tmux',
+        ['capture-pane', '-p', '-t', paneTarget],
+        { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: PANE_DEATH_PROBE_TIMEOUT_MS, env: tmuxEnv() },
+      ) ?? '',
+    );
+    const cleaned = stripAnsiForLog(out);
+    lastScreen = cleaned ? tailChars(cleaned, PANE_DEATH_SCREEN_TAIL_CHARS) : null;
+  } catch {
+    lastScreen = null;
+  }
+  return { paneDead, paneDeadStatus, lastScreen };
 }
 
 /** Convert `\n` to `\r\n` while leaving existing `\r\n` alone. Exported for
@@ -462,7 +529,12 @@ export class TmuxPipeBackend implements SessionBackend {
           // failed spawn and has no handle to clean up.
           this.teardownFifoReader();
           this.fireExit(1, null);
-          throw err;
+          // Best-effort pane post-mortem BEFORE the throw: a pane whose CLI
+          // died instantly is a CLI startup failure, not "tmux missing", and
+          // the raw "Command failed: tmux pipe-pane" card said nothing useful.
+          // An inconclusive probe (server down / timeout) silently keeps err.
+          const evidence = collectPipePaneDeathEvidence(this.paneTarget);
+          throw evidence.paneDead ? buildPipePaneStartupError(err, evidence) : err;
         }
         const detail = (err?.stderr?.toString?.() ?? '').trim() || err?.message || String(err);
         process.stderr.write(

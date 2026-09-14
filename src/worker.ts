@@ -21192,21 +21192,43 @@ process.on('exit', () => {
   teardownSandboxBestEffort();
   stopCodexRpcEngine();
 });
+let workerFatalReported = false;
+/** Best-effort one-shot terminal crash report. The 1s flush timeout means a
+ *  daemon that stopped draining can never delay the fail-closed exit; delivery
+ *  failure is swallowed. Both fatal handlers share this so a rejection that
+ *  immediately causes an exception (or vice versa) reports only once. */
+async function reportWorkerFatal(prefix: string, err: unknown): Promise<void> {
+  if (workerFatalReported) return;
+  workerFatalReported = true;
+  const detail = typeof err === 'object' && err !== null && 'stack' in err && (err as any).stack
+    ? String((err as any).stack)
+    : String(err);
+  const message = `${prefix}: ${detail}`.slice(0, 4096);
+  try {
+    await sendAndFlush({ type: 'worker_fatal', message });
+  } catch { /* best-effort — never delay exit */ }
+}
 process.on('uncaughtException', (err: NodeJS.ErrnoException) => {
   // A broken pipe on stdout/stderr (or any socket) must not tear down a live
   // session — the stdio guard handles those it can; this is the backstop.
   if (isIgnorableStreamError(err)) return;
-  try { log(`Uncaught exception — tearing down sandbox before exit: ${err?.stack ?? err}`); } catch { /* */ }
-  teardownSandboxBestEffort();
-  try { cleanup(); } catch { /* */ }
-  process.exit(1);
+  void (async () => {
+    try { log(`Uncaught exception — tearing down sandbox before exit: ${err?.stack ?? err}`); } catch { /* */ }
+    await reportWorkerFatal('Uncaught exception', err);
+    teardownSandboxBestEffort();
+    try { cleanup(); } catch { /* */ }
+    process.exit(1);
+  })();
 });
 process.on('unhandledRejection', (reason: any) => {
   if (isIgnorableStreamError(reason)) return;
-  try { log(`Unhandled rejection — tearing down sandbox before exit: ${reason?.stack ?? reason}`); } catch { /* */ }
-  teardownSandboxBestEffort();
-  try { cleanup(); } catch { /* */ }
-  process.exit(1);
+  void (async () => {
+    try { log(`Unhandled rejection — tearing down sandbox before exit: ${reason?.stack ?? reason}`); } catch { /* */ }
+    await reportWorkerFatal('Unhandled rejection', reason);
+    teardownSandboxBestEffort();
+    try { cleanup(); } catch { /* */ }
+    process.exit(1);
+  })();
 });
 
 log('Worker started, waiting for init...');

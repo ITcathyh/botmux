@@ -61,6 +61,7 @@ import {
   normaliseCaptureLineEndings,
   tmuxLifecycleInitialDelayMs,
   setStartupTmuxRetrySleepForTests,
+  buildPipePaneStartupError,
 } from '../src/adapters/backend/tmux-pipe-backend.js';
 import { resetTmuxVersionCacheForTests } from '../src/setup/ensure-tmux.js';
 import { bufferSpawnResult } from './helpers/spawn-result.js';
@@ -1260,6 +1261,144 @@ describe('TmuxPipeBackend.onData', () => {
     expect(joined).not.toContain('�');
   });
 });
+
+describe('TmuxPipeBackend pipe-pane death evidence', () => {
+  const isDeadProbe = (args: any) =>
+    Array.isArray(args) && args.includes('display-message')
+    && args.some((a: unknown) => String(a).includes('#{pane_dead}'));
+
+  it('surfaces a readable "CLI died instantly" message with exit status and last screen', () => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      mockedExecSync.mockImplementation(((cmd: any) => {
+        if (String(cmd).includes('pipe-pane')) {
+          throw Object.assign(new Error('Command failed: tmux pipe-pane -O -t 0:2.0'), {
+            status: 1,
+            signal: null,
+            stderr: Buffer.from("can't find pane: 0:2.0"),
+          });
+        }
+        return Buffer.from('') as any;
+      }) as any);
+      mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
+        if (isDeadProbe(args)) return '1:137\n' as any;
+        if (Array.isArray(args) && args.includes('capture-pane')) {
+          return '\x1b[2J$ /usr/local/bin/claude: command not found\r\n' as any;
+        }
+        return '' as any;
+      }) as any);
+
+      const be = new TmuxPipeBackend('0:2.0');
+      const exits: unknown[] = [];
+      be.onExit((code, signal) => exits.push([code, signal]));
+      let thrown: unknown;
+      try {
+        be.spawn('', [], spawnOpts());
+      } catch (err) {
+        thrown = err;
+      }
+
+      expect(thrown).toBeInstanceOf(Error);
+      const message = (thrown as Error).message;
+      expect(message).toContain('启动后立即退出');
+      expect(message).toContain('status=137');
+      expect(message).toContain('最后一屏');
+      expect(message).toContain('command not found');
+      // The raw pipe-pane error's first line is retained.
+      expect(message).toContain('Command failed: tmux pipe-pane');
+      expect(exits).toEqual([[1, null]]);
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it('silently degrades to the raw error when both evidence probes fail (server-level outage)', () => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      mockedExecSync.mockImplementation(((cmd: any) => {
+        if (String(cmd).includes('pipe-pane')) {
+          throw Object.assign(new Error('Command failed: tmux pipe-pane -O -t 0:2.0'), {
+            status: 1,
+            signal: null,
+            stderr: Buffer.from('error connecting to /tmp/tmux-0/default (Connection refused)'),
+          });
+        }
+        return Buffer.from('') as any;
+      }) as any);
+      mockedExecFileSync.mockImplementation(() => {
+        throw Object.assign(new Error('connect failed'), { status: 1, signal: null });
+      });
+
+      const be = new TmuxPipeBackend('0:2.0');
+      let thrown: unknown;
+      try {
+        be.spawn('', [], spawnOpts());
+      } catch (err) {
+        thrown = err;
+      }
+
+      // The raw error is rethrown; the evidence code itself never raises a
+      // second exception or rewrites the message.
+      expect(thrown).toBeInstanceOf(Error);
+      expect((thrown as Error).message).toContain('Command failed: tmux pipe-pane');
+      expect((thrown as Error).message).not.toContain('启动后立即退出');
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it('keeps the raw error when the pane is still alive (pipe-pane failed for another reason)', () => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      mockedExecSync.mockImplementation(((cmd: any) => {
+        if (String(cmd).includes('pipe-pane')) {
+          throw Object.assign(new Error('Command failed: tmux pipe-pane -O -t 0:2.0'), {
+            status: 1,
+            signal: null,
+            stderr: Buffer.from('weird pipe error'),
+          });
+        }
+        return Buffer.from('') as any;
+      }) as any);
+      mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
+        if (isDeadProbe(args)) return '0:\n' as any;
+        return '' as any;
+      }) as any);
+
+      const be = new TmuxPipeBackend('0:2.0');
+      expect(() => be.spawn('', [], spawnOpts())).toThrowError(/Command failed: tmux pipe-pane/);
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+});
+
+describe('buildPipePaneStartupError (pure)', () => {
+  const raw = Object.assign(new Error('Command failed: tmux pipe-pane -O -t x'), {
+    stderr: Buffer.from('boom'),
+  });
+
+  it('renders exit status and screen tail for a dead pane', () => {
+    const err = buildPipePaneStartupError(raw, {
+      paneDead: true,
+      paneDeadStatus: '0',
+      lastScreen: 'fatal: something broke',
+    });
+    expect(err.message).toContain('启动后立即退出');
+    expect(err.message).toContain('exit status=0');
+    expect(err.message).toContain('最后一屏');
+    expect(err.message).toContain('fatal: something broke');
+    expect(err.message).toContain('Command failed: tmux pipe-pane');
+  });
+
+  it('handles a pane killed by signal (no exit status)', () => {
+    const err = buildPipePaneStartupError(raw, { paneDead: true, paneDeadStatus: null, lastScreen: null });
+    expect(err.message).toContain('启动后立即退出');
+    expect(err.message).toContain('信号');
+    expect(err.message).not.toContain('最后一屏');
+  });
+});
+
 describe('TmuxPipeBackend tmux version gating', () => {
   /** Mock `tmux -V` (via the mocked child_process module shared with
    *  ensure-tmux) and leave every other execFileSync call succeeding. */
