@@ -5134,7 +5134,7 @@ describe('GET /api/schedules/:id/logs', () => {
       setLarkAppId(appId);
       setIpcAuthSecret(TEST_IPC_SECRET);
       const task = scheduleStore.createTask({
-        id: 'schedule-run-logs-owned',
+        id: 'schedule_run_logs_owned',
         name: '巡检执行日志',
         schedule: '0 0 * * *',
         parsed: { kind: 'cron', expr: '0 0 * * *', display: '每天 00:00' },
@@ -5244,7 +5244,7 @@ describe('GET /api/schedules/:id/logs', () => {
       setLarkAppId(appId);
       setIpcAuthSecret(TEST_IPC_SECRET);
       const task = scheduleStore.createTask({
-        id: 'schedule-run-logs-owner-check',
+        id: 'schedule_run_logs_owner_check',
         name: '归属校验',
         schedule: '0 0 * * *',
         parsed: { kind: 'cron', expr: '0 0 * * *', display: '每天 00:00' },
@@ -5493,7 +5493,7 @@ describe('schedule target cap', () => {
   it('allows PATCH of an unchanged legacy six-target binding and reduction to five', async () => {
     // Loading or restoring existing rows bypasses the configuration-write cap.
     const legacy = scheduleStore.createTask({
-      id: 'legacy-six-targets',
+      id: 'legacy_six_targets',
       name: 'Legacy target cap fixture',
       schedule: 'every 1h',
       parsed: { kind: 'interval', minutes: 60, display: 'every 1h' },
