@@ -95,6 +95,7 @@ export function buildBotmuxShellHints(locale?: Locale, noTransport?: boolean): s
     t('ai.shell.helpers', undefined, locale),
     t('ai.shell.when_to_send', undefined, locale),
     feedbackResponseKindHint(locale),
+    t('ai.shell.xpi_as_hint', undefined, locale),
     // Experimental anti-resend guidance — opt-in via dashboard Settings
     // (dashboard.noVisibleOutputHint). Default OFF, so the rendered hints match
     // the pre-feature baseline unless an operator flips it on. Live-read here so
@@ -263,6 +264,7 @@ export function buildBotmuxSystemPromptText(opts: {
       prose('ai.routing.usage_helpers'),
       prose('ai.routing.usage_silence'),
       escapeXmlTagLikeTokens(feedbackResponseKindHint(locale)),
+      prose('ai.routing.xpi_as_hint'),
       // Experimental anti-resend guidance — opt-in via dashboard Settings
       // (dashboard.noVisibleOutputHint). Default OFF ⇒ this block is byte-for-byte
       // the pre-feature baseline. Live-read so a toggle applies to the next session.

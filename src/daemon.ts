@@ -367,6 +367,19 @@ import {
   stageCrossPrincipalInterruptionRecord,
 } from './core/cross-principal-interruption-store.js';
 import {
+  crossPrincipalBotClassifyNotice,
+  crossPrincipalBotWaitNotice,
+  crossPrincipalClassificationOptions,
+  crossPrincipalClassificationPrompt,
+  crossPrincipalStagedNotice,
+  crossPrincipalWaitOptions,
+  crossPrincipalWaitPrompt,
+  isCrossPrincipalChoiceOnlyText,
+  parseCrossPrincipalChoiceText,
+  stripCrossPrincipalAsToken,
+  type CrossPrincipalChoice,
+} from './core/cross-principal-choice.js';
+import {
   enqueueXpiSharedCwdTurn,
   finalizeXpiSharedCwdMemberClose,
   reconcileXpiSharedCwdRecovery,
@@ -18387,19 +18400,99 @@ function removeCrossPrincipalRecord(ds: DaemonSession, id: string): void {
 
 function choiceFromAskResult(
   result: Awaited<ReturnType<typeof registerHostAsk>>,
-): 'independent' | 'suggestion' | 'accept' | 'reject' | 'continue_waiting' | undefined {
+): CrossPrincipalChoice | undefined {
   if (result.kind !== 'answered') return undefined;
   const selected = result.answers[0]?.[0];
   if (selected === 'independent' || selected === 'suggestion'
     || selected === 'accept' || selected === 'reject'
     || selected === 'continue_waiting') return selected;
-  const text = result.comment?.trim() ?? '';
-  if (/^独立任务(?:[\s，。,.!！]|$)/i.test(text)) return 'independent';
-  if (/^(?:对\s*A\s*的建议|建议)(?:[\s，。,.!！]|$)/i.test(text)) return 'suggestion';
-  if (/^(?:确认|同意|采纳|执行|是|yes|y|ok|accept)(?:[\s，。,.!！]|$)/i.test(text)) return 'accept';
-  if (/^(?:拒绝|不采纳|否|no|n|reject)(?:[\s，。,.!！]|$)/i.test(text)) return 'reject';
-  if (/^继续等待(?:[\s，。,.!！]|$)/i.test(text)) return 'continue_waiting';
-  return undefined;
+  return parseCrossPrincipalChoiceText(result.comment ?? '', 'any');
+}
+
+function findPendingCrossPrincipalForProposer(
+  ds: DaemonSession,
+  proposer: TrustedCaller,
+): CrossPrincipalInterruption | undefined {
+  return ds.session.crossPrincipalInterruptions?.find(record =>
+    (record.phase === 'awaiting_classification' || record.phase === 'awaiting_owner')
+    && sameTrustedPrincipal(record.proposer, proposer));
+}
+
+function sanitizeCrossPrincipalMessage(
+  message: CrossPrincipalInterruptionMessage,
+): { message: CrossPrincipalInterruptionMessage; choice?: 'independent' | 'suggestion' } {
+  const text = stripCrossPrincipalAsToken(message.text);
+  const prompt = stripCrossPrincipalAsToken(message.userPrompt);
+  return {
+    message: {
+      ...message,
+      text: text.text,
+      userPrompt: prompt.text,
+    },
+    choice: text.choice ?? prompt.choice,
+  };
+}
+
+async function applyCrossPrincipalProposerChoice(
+  ds: DaemonSession,
+  record: CrossPrincipalInterruption,
+  choice: CrossPrincipalChoice,
+): Promise<boolean> {
+  if (record.phase === 'awaiting_classification') {
+    if (choice === 'independent') {
+      record.phase = 'preparing_independent';
+      persistCrossPrincipalQueue(ds);
+      await prepareIndependentCrossPrincipalSession(ds, record);
+      return true;
+    }
+    if (choice === 'suggestion') {
+      markCrossPrincipalSuggestionWaiting(record, Date.now(), CROSS_PRINCIPAL_OWNER_WAIT_MS);
+      persistCrossPrincipalQueue(ds);
+      scheduleCrossPrincipalOwnerWait(ds, record.ownerWaitDeadlineAt!);
+      return true;
+    }
+    return false;
+  }
+  if (record.phase === 'awaiting_owner' && ds.activeInteractiveTurn) {
+    if (choice === 'independent') {
+      record.phase = 'preparing_independent';
+      persistCrossPrincipalQueue(ds);
+      await prepareIndependentCrossPrincipalSession(ds, record);
+      return true;
+    }
+    if (choice === 'suggestion' || choice === 'continue_waiting') {
+      continueCrossPrincipalOwnerWait(record, Date.now(), CROSS_PRINCIPAL_OWNER_WAIT_MS);
+      persistCrossPrincipalQueue(ds);
+      scheduleCrossPrincipalOwnerWait(ds, record.ownerWaitDeadlineAt!);
+      return true;
+    }
+  }
+  return false;
+}
+
+async function trySettleCrossPrincipalProposerChoice(
+  ds: DaemonSession,
+  proposer: TrustedCaller | undefined,
+  text: string,
+  mentions?: LarkMention[],
+): Promise<boolean> {
+  if (!proposer) return false;
+  const record = findPendingCrossPrincipalForProposer(ds, proposer);
+  if (!record) return false;
+  const kind = record.phase === 'awaiting_classification' ? 'classification' : 'wait';
+  // A proposer answering in a group @s the bot, so the inbound body reads
+  // "@<bot> 另开任务". Normalising here (rather than at each call site) keeps
+  // every settle path accepting the same spellings as the host-ask gate; the
+  // `--as` marker sits at the end of the body and is unaffected.
+  const body = stripLeadingMentions(text.trim(), mentions);
+  const tokenChoice = stripCrossPrincipalAsToken(body).choice;
+  const choice = tokenChoice ?? (
+    isCrossPrincipalChoiceOnlyText(body, kind)
+      ? parseCrossPrincipalChoiceText(body, kind)
+      : undefined
+  );
+  if (!choice) return false;
+  return applyCrossPrincipalProposerChoice(ds, record, choice);
 }
 
 async function stageCrossPrincipalInterruption(args: {
@@ -18409,7 +18502,11 @@ async function stageCrossPrincipalInterruption(args: {
   proposer: TrustedCaller;
   message: CrossPrincipalInterruptionMessage;
 }): Promise<boolean> {
-  const { ds, ownerTurnId, owner, proposer, message } = args;
+  const { ds, ownerTurnId, owner, proposer } = args;
+  const { message, choice } = sanitizeCrossPrincipalMessage(args.message);
+  if (await trySettleCrossPrincipalProposerChoice(ds, proposer, args.message.text, args.message.mentions)) {
+    return true;
+  }
   const staged = stageCrossPrincipalInterruptionRecord({
     session: ds.session,
     ownerTurnId,
@@ -18419,15 +18516,37 @@ async function stageCrossPrincipalInterruption(args: {
   });
   if (!staged.inserted) {
     logger.info(`[${tag(ds)}] duplicate cross-principal handoff merged turn=${message.turnId.slice(0, 12)}`);
+    if (choice && await applyCrossPrincipalProposerChoice(ds, staged.record, choice)) {
+      return true;
+    }
     return true;
   }
   // Durable write is the ownership handoff boundary. The worker-pool clears its
   // original delivery record only after this function returns true.
   persistCrossPrincipalQueue(ds);
+  if (choice && await applyCrossPrincipalProposerChoice(ds, staged.record, choice)) {
+    return true;
+  }
+  const loc = localeForBot(ds.larkAppId);
   const proposerOpenId = proposer.requestUserOpenId;
+  if (proposer.senderType === 'bot') {
+    if (proposerOpenId) {
+      void sessionReply(
+        sessionAnchorId(ds),
+        crossPrincipalBotClassifyNotice(proposerOpenId, loc),
+        'text',
+        ds.larkAppId,
+        message.turnId,
+      ).catch(err => logger.warn(`[${tag(ds)}] Failed to acknowledge cross-principal handoff: ${err}`));
+    }
+    staged.record.botClassifyDeadlineAt = Date.now() + CROSS_PRINCIPAL_CONFIRM_TIMEOUT_MS;
+    persistCrossPrincipalQueue(ds);
+    scheduleCrossPrincipalOwnerWait(ds, staged.record.botClassifyDeadlineAt);
+    return true;
+  }
   void sessionReply(
     sessionAnchorId(ds),
-    `${proposerOpenId ? `<at id=${proposerOpenId}></at> ` : ''}消息已安全暂存，不会打断当前任务；请选择“独立任务”或“对当前任务的建议”（机器人也必须明确选择）。`,
+    crossPrincipalStagedNotice(proposerOpenId, loc),
     'text',
     ds.larkAppId,
     message.turnId,
@@ -18882,10 +19001,30 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
       return;
     }
     if (record.phase === 'awaiting_classification') {
+      const loc = localeForBot(ds.larkAppId);
       const proposerId = record.proposer.requestUserOpenId;
       if (!proposerId) {
         removeCrossPrincipalRecord(ds, record.id);
         await notifyCrossPrincipalTerminal(ds, record, '无法确认消息发送者身份，消息未执行；可重新发送。');
+        return;
+      }
+      if (record.proposer.senderType === 'bot') {
+        if (record.botClassifyDeadlineAt && Date.now() >= record.botClassifyDeadlineAt) {
+          removeCrossPrincipalRecord(ds, record.id);
+          await notifyCrossPrincipalTerminal(ds, record, tr('xpi.timeout.unclassified', undefined, loc));
+          return;
+        }
+        if (!record.botClassifyDeadlineAt) {
+          await sessionReply(
+            sessionAnchorId(ds),
+            crossPrincipalBotClassifyNotice(proposerId, loc),
+            'text',
+            ds.larkAppId,
+          );
+          record.botClassifyDeadlineAt = Date.now() + CROSS_PRINCIPAL_CONFIRM_TIMEOUT_MS;
+          persistCrossPrincipalQueue(ds);
+        }
+        scheduleCrossPrincipalOwnerWait(ds, record.botClassifyDeadlineAt);
         return;
       }
       const result = await registerHostAsk({
@@ -18901,31 +19040,17 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
         // proposer can actually see the choice card.
         timeoutMs: CROSS_PRINCIPAL_CONFIRM_TIMEOUT_MS,
         questions: [{
-          prompt: `<at id=${proposerId}></at> 当前有其他成员的任务正在执行。请选择这条消息的处理方式：`,
+          prompt: crossPrincipalClassificationPrompt(proposerId, loc),
           multiSelect: false,
-          options: [
-            { key: 'independent', label: '独立任务' },
-            { key: 'suggestion', label: '对当前任务的建议' },
-          ],
+          options: crossPrincipalClassificationOptions(loc),
         }],
       });
       const choice = choiceFromAskResult(result);
       const current = ds.session.crossPrincipalInterruptions?.find(item => item.id === record.id);
       if (!current) return;
-      if (choice === 'independent') {
-        current.phase = 'preparing_independent';
-        persistCrossPrincipalQueue(ds);
-        await prepareIndependentCrossPrincipalSession(ds, current);
-        return;
-      }
-      if (choice === 'suggestion') {
-        markCrossPrincipalSuggestionWaiting(current, Date.now(), CROSS_PRINCIPAL_OWNER_WAIT_MS);
-        persistCrossPrincipalQueue(ds);
-        scheduleCrossPrincipalOwnerWait(ds, current.ownerWaitDeadlineAt!);
-        return;
-      }
+      if (choice && await applyCrossPrincipalProposerChoice(ds, current, choice)) return;
       removeCrossPrincipalRecord(ds, record.id);
-      await notifyCrossPrincipalTerminal(ds, record, '未选择处理方式，消息未执行；可重新发送或明确发送“独立任务”。');
+      await notifyCrossPrincipalTerminal(ds, record, tr('xpi.timeout.unclassified', undefined, loc));
       return;
     }
 
@@ -18954,6 +19079,24 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
           return;
         }
         const round = record.waitDecisionRound ?? 0;
+        const loc = localeForBot(ds.larkAppId);
+        if (record.proposer.senderType === 'bot') {
+          if ((record.waitDecisionRound ?? 0) > 0) {
+            removeCrossPrincipalRecord(ds, record.id);
+            await notifyCrossPrincipalTerminal(ds, record, tr('xpi.timeout.still_busy', undefined, loc));
+            return;
+          }
+          await sessionReply(
+            sessionAnchorId(ds),
+            crossPrincipalBotWaitNotice(proposerId, loc),
+            'text',
+            ds.larkAppId,
+          );
+          continueCrossPrincipalOwnerWait(record, Date.now(), CROSS_PRINCIPAL_CONFIRM_TIMEOUT_MS);
+          persistCrossPrincipalQueue(ds);
+          scheduleCrossPrincipalOwnerWait(ds, record.ownerWaitDeadlineAt!);
+          return;
+        }
         const waitResult = await registerHostAsk({
           larkAppId: ds.larkAppId,
           chatId: ds.chatId,
@@ -18965,34 +19108,20 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
           chatType: ds.chatType,
           timeoutMs: CROSS_PRINCIPAL_CONFIRM_TIMEOUT_MS,
           questions: [{
-            prompt: `<at id=${proposerId}></at> 原任务仍在执行。请选择继续等待，或改为隔离的独立任务：`,
+            prompt: crossPrincipalWaitPrompt(proposerId, loc),
             multiSelect: false,
-            options: [
-              { key: 'continue_waiting', label: '继续等待' },
-              { key: 'independent', label: '独立任务' },
-            ],
+            options: crossPrincipalWaitOptions(loc),
           }],
         });
         const waitChoice = choiceFromAskResult(waitResult);
         const current = ds.session.crossPrincipalInterruptions?.find(item => item.id === record.id);
         if (!current) return;
-        if (waitChoice === 'continue_waiting') {
-          continueCrossPrincipalOwnerWait(current, Date.now(), CROSS_PRINCIPAL_OWNER_WAIT_MS);
-          persistCrossPrincipalQueue(ds);
-          scheduleCrossPrincipalOwnerWait(ds, current.ownerWaitDeadlineAt!);
-          return;
-        }
-        if (waitChoice === 'independent') {
-          current.phase = 'preparing_independent';
-          persistCrossPrincipalQueue(ds);
-          await prepareIndependentCrossPrincipalSession(ds, current);
-          return;
-        }
+        if (waitChoice && await applyCrossPrincipalProposerChoice(ds, current, waitChoice)) return;
         removeCrossPrincipalRecord(ds, record.id);
         await notifyCrossPrincipalTerminal(
           ds,
           record,
-          '原任务仍在执行，且未选择后续处理；消息未执行。可重新发送，或明确发送“独立任务”。',
+          tr('xpi.timeout.still_busy', undefined, loc),
         );
         return;
       }
@@ -21731,7 +21860,7 @@ async function handleThreadReplyAdmitted(
   const initialCodexAppApplicationContext = vcMeetingApplicationContext(ctx);
   const initialPromptContent = initialCodexAppMessageContext
     + initialCodexAppApplicationContext
-    + parsed.content;
+    + stripCrossPrincipalAsToken(parsed.content).text;
   let promptContent = initialPromptContent;
   let rewrittenCodexAppMessageContext: string | undefined;
   if (!prepared) {
@@ -22213,11 +22342,11 @@ async function handleThreadReplyAdmitted(
     if (pendingAsk) {
       const hostChoiceText = askCandidate.text.trim();
       const hostChoiceAllowsText = pendingAsk.originKind === 'host_cross_principal_classification'
-        ? /^(?:独立任务|对\s*A\s*的建议|建议)$/i.test(hostChoiceText)
+        ? isCrossPrincipalChoiceOnlyText(hostChoiceText, 'classification')
         : pendingAsk.originKind === 'host_cross_principal_wait'
-          ? /^(?:继续等待|独立任务)$/i.test(hostChoiceText)
+          ? isCrossPrincipalChoiceOnlyText(hostChoiceText, 'wait')
         : pendingAsk.originKind === 'host_cross_principal_owner'
-          ? /^(?:采纳并重新执行|不采纳|采纳|同意|拒绝)$/i.test(hostChoiceText)
+          ? isCrossPrincipalChoiceOnlyText(hostChoiceText, 'owner')
           : true;
       // A host-owned cross-principal card is a classification/approval gate,
       // not a blanket "next text answers the ask" prompt.  Arbitrary business
@@ -22253,6 +22382,14 @@ async function handleThreadReplyAdmitted(
   logger.info(`Reply in ${scope}-scope session ${anchor.substring(0, 12)}: ${content.substring(0, 100)} (resources: ${resources.length})`);
 
   let ds = activeSessions.get(sessionKey(anchor, larkAppId));
+  // cmdContent (mention-stripped), matching the host-ask gate below: a raw
+  // "@<bot> 另开任务" is not a choice, so the answer would fall through, the
+  // record would time out, and the notice would ask for the answer just sent.
+  if (ds && threadTrustedCaller
+    && await trySettleCrossPrincipalProposerChoice(ds, threadTrustedCaller, cmdContent, parsed.mentions)) {
+    markIngressAdmitted(ctx);
+    return;
+  }
   if (ds && fillNativeTopicId(ds.session, scope, parsed.threadId)) {
     sessionStore.updateSession(ds.session);
     publishNativeTopicLinkPatch(ds);
