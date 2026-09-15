@@ -576,6 +576,86 @@ describe('executeScheduledTask — task position (dedicated per-task topic)', ()
     });
   });
 
+  it('concurrent rootless non-silent fires seed the topic ONCE and share its session', async () => {
+    // Two run-now clicks admitted from rootless snapshots. Without the
+    // stable per-task serialization each fire sends its own seed: the two om_
+    // anchors take different key locks, both win the registration CAS, and the
+    // task history splits across two sessions. The loser must instead re-read
+    // the winner's writeback and inject into the one session.
+    const active = new Map<string, DaemonSession>();
+    let writtenRoot: string | undefined;
+    scheduleStoreUpdateTaskMock.mockImplementation((
+      _id: string,
+      patch: { rootMessageId?: string },
+    ) => { writtenRoot = patch.rootMessageId; });
+    scheduleStoreGetTaskMock.mockImplementation((id: string, appId: string) => (
+      id === 'task0001' && appId === APP && writtenRoot
+        ? { ...baseTask({ executionPosition: 'task' }), rootMessageId: writtenRoot }
+        : undefined
+    ));
+
+    let seedSeq = 0;
+    let releaseSeed!: () => void;
+    const seedGate = new Promise<void>((resolve) => { releaseSeed = resolve; });
+    sendMessageMock.mockImplementation(async () => {
+      await seedGate;
+      return `om_seed_${++seedSeq}`;
+    });
+    // Model two human-paced run-now clicks: by the time B arrives, A's worker
+    // has finished its spawn handshake (production attaches ds.worker from the
+    // worker init callback, i.e. asynchronously after forkWorker returns).
+    forkWorkerMock.mockImplementation((ds: DaemonSession) => {
+      ds.worker = { killed: false, send: vi.fn() } as any;
+    });
+
+    const first = executeScheduledTask(
+      baseTask({ executionPosition: 'task', chatType: 'group' }),
+      active,
+      refreshCliVersion,
+    );
+    let second: Promise<unknown> | undefined;
+    try {
+      await flush(20);
+      // The delay bites INSIDE the race window: A holds the virtual key while
+      // parked at the seed gate.
+      expect(await settle(first)).toBe('pending');
+      expect(sendMessageMock).toHaveBeenCalledTimes(1);
+
+      second = executeScheduledTask(
+        baseTask({ executionPosition: 'task', chatType: 'group' }),
+        active,
+        refreshCliVersion,
+      );
+      await flush(20);
+      // While the gate is held B is queued on the virtual key — it cannot have
+      // started a second seed of its own.
+      expect(sendMessageMock).toHaveBeenCalledTimes(1);
+
+      releaseSeed();
+      await Promise.all([first, second]);
+
+      expect(sendMessageMock).toHaveBeenCalledTimes(1);
+      const rootWrites = scheduleStoreUpdateTaskMock.mock.calls.filter(c => c[1]?.rootMessageId !== undefined);
+      expect(rootWrites).toEqual([['task0001', { rootMessageId: 'om_seed_1' }, APP]]);
+      expect(active.size).toBe(1);
+      const ds = active.get(sessionKey('om_seed_1', APP));
+      expect(ds).toBeTruthy();
+      expect(ds!.scope).toBe('thread');
+      expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+      // B continued A's session by live injection — no second fork/session.
+      expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
+      expect(sendWorkerInputMock.mock.calls[0][0]).toBe(ds);
+      expect(sendWorkerInputMock.mock.calls[0][2]).toMatch(/^schedule:task0001:/);
+    } finally {
+      releaseSeed();
+      // suite beforeEach only mockClear()s these mocks, so implementations set
+      // here must be restored for later tests.
+      sendMessageMock.mockImplementation(async () => 'om_banner_123');
+      forkWorkerMock.mockReset();
+      await Promise.allSettled([first, second].filter((p): p is Promise<unknown> => !!p));
+    }
+  });
+
   it('a materialized task rides the ordinary thread branch: live injection at its real root, no re-seed/rewrite', async () => {
     const active = new Map<string, DaemonSession>();
     const session: Session = {

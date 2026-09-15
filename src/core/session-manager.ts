@@ -3587,32 +3587,54 @@ export async function executeScheduledTask(
       anchor = `schedule-task:${task.id}`;
       isContinuation = !!activeSessions.get(sessionKey(anchor, larkAppId));
     } else {
-      if (task.creatorRootMessageId && task.creatorChatId !== task.chatId) {
-        const creatorAppId = task.creatorLarkAppId ?? larkAppId;
-        buildScheduledTargetNotice({
-          kind: 'chat',
-          taskName: task.name,
-          targetAppId: larkAppId,
-          targetChatId: task.chatId,
-          targetBrand: bot.config.brand,
-          locale: localeForBot(creatorAppId),
-        }).then(content => replyMessage(
-          creatorAppId,
-          task.creatorRootMessageId!,
-          content,
-          'text',
-          true,
-        )).catch((err: any) => {
-          logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
-        });
-      }
-      const topicSeed = task.topicTitle?.trim()
-        || t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId));
-      anchor = await sendMessage(larkAppId, task.chatId, topicSeed);
-      // Write the root straight into the task row (store call, not the
-      // scheduler wrapper/event bus): every later fire resolves to this exact
-      // thread and resumes the session created below.
-      scheduleStore.updateTask(task.id, { rootMessageId: anchor }, larkAppId);
+      // Two rootless snapshots admitted near-simultaneously (e.g. two run-now
+      // clicks) must not each send a seed: distinct om_ anchors take different
+      // real-key locks below and both win the registration CAS, forking two
+      // sessions that split the task's history. Serialize the recheck / seed /
+      // writeback on the SAME stable per-task key the silent branch uses; the
+      // loser finds the root the winner wrote back and continues that topic.
+      // Lock order is virtual→real here and virtual→real in the promotion
+      // helper, so no lock-order inversion is possible.
+      const firstFire = await withActiveSessionKeyLock(
+        activeSessions,
+        sessionKey(`schedule-task:${task.id}`, larkAppId),
+        async () => {
+          const existingRoot = scheduleStore.getTask(task.id, larkAppId)?.rootMessageId?.trim();
+          if (existingRoot) {
+            return { anchor: existingRoot, rootMessageId: existingRoot, isContinuation: true };
+          }
+          if (task.creatorRootMessageId && task.creatorChatId !== task.chatId) {
+            const creatorAppId = task.creatorLarkAppId ?? larkAppId;
+            buildScheduledTargetNotice({
+              kind: 'chat',
+              taskName: task.name,
+              targetAppId: larkAppId,
+              targetChatId: task.chatId,
+              targetBrand: bot.config.brand,
+              locale: localeForBot(creatorAppId),
+            }).then(content => replyMessage(
+              creatorAppId,
+              task.creatorRootMessageId!,
+              content,
+              'text',
+              true,
+            )).catch((err: any) => {
+              logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
+            });
+          }
+          const topicSeed = task.topicTitle?.trim()
+            || t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId));
+          const seed = await sendMessage(larkAppId, task.chatId, topicSeed);
+          // Write the root straight into the task row (store call, not the
+          // scheduler wrapper/event bus): every later fire resolves to this
+          // exact thread and resumes the session created below.
+          scheduleStore.updateTask(task.id, { rootMessageId: seed }, larkAppId);
+          return { anchor: seed, rootMessageId: seed, isContinuation: false };
+        },
+      );
+      anchor = firstFire.anchor;
+      task = { ...task, rootMessageId: firstFire.rootMessageId };
+      isContinuation = firstFire.isContinuation;
     }
   } else if (scope === 'chat') {
     // Explicit task choice: chat scope always starts at the group top level.

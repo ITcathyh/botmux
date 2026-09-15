@@ -510,6 +510,21 @@ export function scheduleExecutionPlacement(s: ScheduleRow): SchedulePlacement {
   return s.rootMessageId ? 'thread' : 'chat';
 }
 
+/** Initial edit-form position. Storage identity wins over display placement:
+ * a materialized dedicated-task row projects to 'thread', but initializing the
+ * form to 'topic' would make saving any unrelated field PATCH
+ * executionPosition:'topic' and silently downgrade the dedicated task. */
+export function initialScheduleEditPosition(
+  editing: ScheduleRow | null,
+): 'top-level' | 'topic' | 'new-topic' | 'task' {
+  if (editing?.executionPosition === 'task') return 'task';
+  const placement = editing ? scheduleExecutionPlacement(editing) : 'chat';
+  if (placement === 'thread') return 'topic';
+  if (placement === 'task') return 'task';
+  if (placement === 'new-topic') return 'new-topic';
+  return 'top-level';
+}
+
 function placementLabel(s: ScheduleRow, tr: ReturnType<typeof useT>): string {
   const placement = scheduleExecutionPlacement(s);
   if (placement === 'local') return tr('schedules.deliveryLocal');
@@ -1723,11 +1738,7 @@ export function ScheduleFormModal(props: {
   const [model, setModel] = useState(editing?.model ?? '');
   const [reasoningEffort, setReasoningEffort] = useState<string>(editing?.reasoningEffort ?? '');
   const [executionPosition, setExecutionPosition] = useState<'top-level' | 'topic' | 'new-topic' | 'task'>(
-    editing && scheduleExecutionPlacement(editing) === 'thread'
-      ? 'topic'
-      : editing && scheduleExecutionPlacement(editing) === 'task'
-        ? 'task'
-        : editing && scheduleExecutionPlacement(editing) === 'new-topic' ? 'new-topic' : 'top-level',
+    () => initialScheduleEditPosition(editing),
   );
   const initialChatIds = scheduleTargetChatIds(editing);
   const initialTopicChatId = editing

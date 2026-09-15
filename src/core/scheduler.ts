@@ -918,7 +918,21 @@ export function toggleDelivery(id: string): {
   let executionPosition: ScheduleExecutionPosition;
   if (current === 'topic') executionPosition = 'top-level';
   else if (current === 'top-level') executionPosition = 'new-topic';
-  else if (current === 'new-topic') executionPosition = 'task';
+  else if (current === 'new-topic') {
+    // Same multi-chat refusal addTask/updateTask enforce: the dedicated-task
+    // position is single-chat only. The body-less delivery toggle is a legacy
+    // compatibility route and must not persist 'task' for a multi-chat task —
+    // the next fire would run a single-chat dedicated task per target and let
+    // them race on the shared rootMessageId.
+    const targets = scheduleStore.normalizeScheduleChatTargets({
+      chatId: task.chatId,
+      chatIds: task.chatIds ?? null,
+    });
+    if ((targets.chatIds ?? [targets.chatId]).length > 1) {
+      return { ok: false, error: 'multiple_chats_task_unsupported' };
+    }
+    executionPosition = 'task';
+  }
   // A dedicated task parks at top level. The retained root is never reused to
   // cycle back into a topic silently — that was the adopt-topic leak.
   else executionPosition = 'top-level';

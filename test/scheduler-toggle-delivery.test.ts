@@ -117,6 +117,27 @@ describe('scheduler.toggleDelivery', () => {
     expect(publish).toHaveBeenCalledTimes(1);
   });
 
+  it('refuses to toggle a multi-chat fresh-topic task into the dedicated-task position', async () => {
+    // The body-less delivery toggle is a legacy compatibility route; it must
+    // enforce the same single-chat rule addTask/updateTask do. Persisting
+    // 'task' for a multi-chat task would run one dedicated task per target on
+    // the next fire, all racing on a shared rootMessageId.
+    const { toggleDelivery } = await import('../src/core/scheduler.js');
+    const id = seed('origin', {
+      scope: 'chat',
+      executionPosition: 'new-topic',
+      chatId: 'oc_one',
+      chatIds: ['oc_one', 'oc_two'],
+    });
+    expect(toggleDelivery(id)).toEqual({ ok: false, error: 'multiple_chats_task_unsupported' });
+    expect(store.get(id)).toMatchObject({
+      scope: 'chat',
+      executionPosition: 'new-topic',
+      chatIds: ['oc_one', 'oc_two'],
+    });
+    expect(publish).not.toHaveBeenCalled();
+  });
+
   it('parks a rootless dedicated-task task back at group top level', async () => {
     const { toggleDelivery } = await import('../src/core/scheduler.js');
     const id = seed('origin', { scope: 'thread', executionPosition: 'task' });
