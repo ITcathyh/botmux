@@ -113,7 +113,7 @@ import type {
   OpenPlatformDescriptionReadResult,
   OpenPlatformDescriptionUpdateResult,
 } from '../services/open-platform-rename.js';
-import { findConfigField, applyConfigField, coerceConfigValue, setChatFeedbackPolicy, setBotBlockedUsers } from '../services/bot-config-store.js';
+import { findConfigField, applyConfigField, coerceConfigValue, setChatFeedbackPolicy, setBotBlockedUsers, removeBlockedUsers, type SetBlockedUsersResult } from '../services/bot-config-store.js';
 import { traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
 import { globalBuiltinSkillInjectionDefault, resolveSkillInjectionSupport } from '../skills/injection-mode.js';
 import { summaryRangeFromBotConfig, updateDashboardSummaryRange } from '../services/summary-range-store.js';
@@ -4644,16 +4644,30 @@ ipcRoute('GET', '/api/blocked-users', async (_req, res) => {
 
 // Replace the whole blocklist. Empty array clears it. Owner/admin guards live
 // in setBotBlockedUsers (cannot_block_admin carries the conflicting ou_ list).
+// {removeOpenIds} instead unblocks those open_ids by identity, also lifting raw
+// entries written as email/on_/mobile — the row-unblock button uses this route.
 ipcRoute('PUT', '/api/blocked-users', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
-  let body: { entries?: unknown };
+  let body: { entries?: unknown; removeOpenIds?: unknown };
   try { body = await readJsonBody(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
-  const entries = body.entries;
-  if (!Array.isArray(entries) || entries.some(entry => typeof entry !== 'string')) {
-    return jsonRes(res, 400, { ok: false, error: 'invalid_entries' });
+  if (body.entries !== undefined && body.removeOpenIds !== undefined) {
+    return jsonRes(res, 400, { ok: false, error: 'entries_and_removeOpenIds_conflict' });
   }
-  const result = await setBotBlockedUsers(cachedLarkAppId, entries as string[]);
+  const isStringArray = (v: unknown): v is string[] =>
+    Array.isArray(v) && v.every(item => typeof item === 'string');
+  let result: SetBlockedUsersResult;
+  if (body.removeOpenIds !== undefined) {
+    if (!isStringArray(body.removeOpenIds)) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_remove_open_ids' });
+    }
+    result = await removeBlockedUsers(cachedLarkAppId, body.removeOpenIds);
+  } else {
+    if (!isStringArray(body.entries)) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_entries' });
+    }
+    result = await setBotBlockedUsers(cachedLarkAppId, body.entries);
+  }
   if (result.ok) return jsonRes(res, 200, result);
   if (result.reason === 'cannot_block_admin') {
     return jsonRes(res, 409, {

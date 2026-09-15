@@ -1008,6 +1008,74 @@ describe('bot-config store', () => {
     });
   });
 
+  it('removeBlockedUsers lifts email/on_ raw entries that resolve to the target open_id', async () => {
+    const { registry, store } = await loaded({ blockedUsers: ['carol@corp.com', 'on_bob', 'ou_dave'] });
+    registry.getBot('app_default').resolvedBlockedUsers = ['ou_carol', 'ou_bob', 'ou_dave'];
+
+    const r = await store.removeBlockedUsers('app_default', ['ou_carol']);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.raw).toEqual(['on_bob', 'ou_dave']);
+      expect(r.resolved).toEqual(['ou_bob', 'ou_dave']);
+    }
+    expect(readConfig().blockedUsers).toEqual(['on_bob', 'ou_dave']);
+    const bot = registry.getBot('app_default');
+    expect(bot.config.blockedUsers).toEqual(['on_bob', 'ou_dave']);
+    expect(bot.resolvedBlockedUsers).toEqual(['ou_bob', 'ou_dave']);
+  });
+
+  it('removeBlockedUsers keeps non-matching alias entries and is a no-op when nothing maps', async () => {
+    const { registry, store } = await loaded({ blockedUsers: ['carol@corp.com', 'on_bob'] });
+    registry.getBot('app_default').resolvedBlockedUsers = ['ou_carol', 'ou_bob'];
+
+    const r = await store.removeBlockedUsers('app_default', ['ou_someone_else']);
+    expect(r).toMatchObject({ ok: true });
+    if (r.ok) expect(r.raw).toEqual(['carol@corp.com', 'on_bob']);
+    // 无命中：磁盘与内存原样。
+    expect(readConfig().blockedUsers).toEqual(['carol@corp.com', 'on_bob']);
+    expect(registry.getBot('app_default').resolvedBlockedUsers).toEqual(['ou_carol', 'ou_bob']);
+  });
+
+  it('removeBlockedUsers still succeeds when the list carries a definitively unresolvable legacy entry', async () => {
+    // 脏态直写：一个不可能解析的垃圾条目与一个正常邮箱条目并存。全量
+    // setBotBlockedUsers 重解析会以 empty_resolved 拒绝；定向解除不得被它挡住。
+    const { registry, store } = await loaded({ blockedUsers: ['carol@corp.com', 'garbage'] });
+    registry.getBot('app_default').resolvedBlockedUsers = ['ou_carol'];
+
+    const r = await store.removeBlockedUsers('app_default', ['ou_carol']);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      // 垃圾条目证据不足 → 保留；邮箱条目映射命中 → 剔除。
+      expect(r.raw).toEqual(['garbage']);
+      expect(r.resolved).toEqual([]);
+    }
+    expect(readConfig().blockedUsers).toEqual(['garbage']);
+  });
+
+  it('removeBlockedUsers clearing the last entry goes through the clear path', async () => {
+    const { registry, store } = await loaded({ blockedUsers: ['carol@corp.com'] });
+    registry.getBot('app_default').resolvedBlockedUsers = ['ou_carol'];
+
+    const r = await store.removeBlockedUsers('app_default', ['ou_carol']);
+    expect(r).toMatchObject({ ok: true, raw: [], resolved: [] });
+    expect(readConfig().blockedUsers).toBeUndefined();
+    expect(registry.getBot('app_default').config.blockedUsers).toBeUndefined();
+  });
+
+  it('removeBlockedUsers with no targets is an idempotent no-op', async () => {
+    const { store } = await loaded({ blockedUsers: ['carol@corp.com'] });
+    const r = await store.removeBlockedUsers('app_default', []);
+    expect(r).toMatchObject({ ok: true });
+    expect(readConfig().blockedUsers).toEqual(['carol@corp.com']);
+  });
+
+  it('removeBlockedUsers returns bot_not_registered for an unknown app', async () => {
+    const { store } = await loaded();
+    const r = await store.removeBlockedUsers('app_missing', ['ou_carol']);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('bot_not_registered');
+  });
+
   it('coerceConfigValue parses per kind (bool/enum/cli) and rejects junk', async () => {
     const { store } = await freshModules();
     const boolSpec = store.findConfigField('disableStreamingCard')!;

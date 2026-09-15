@@ -48,6 +48,17 @@ function installFetch(state: RouterState): void {
       return jsonResponse(200, { ok: true, ...blocked });
     }
     if (target.endsWith('/blocked-users') && method === 'PUT') {
+      if (parsedBody.removeOpenIds) {
+        // 模拟后端定向解除：按 open_id 从 raw/resolved 中剔除（含别名形态）。
+        const removed = new Set<string>(parsedBody.removeOpenIds);
+        const current = state.blockedByApp[appId] ?? { raw: [], resolved: [] };
+        const next = {
+          raw: current.raw.filter((e: string) => !removed.has(e)),
+          resolved: (current.resolved ?? []).filter((o: string) => !removed.has(o)),
+        };
+        state.blockedByApp[appId] = next;
+        return jsonResponse(200, { ok: true, ...next });
+      }
       state.blockedByApp[appId] = { raw: parsedBody.entries, resolved: parsedBody.entries };
       return jsonResponse(200, { ok: true, raw: parsedBody.entries, resolved: parsedBody.entries });
     }
@@ -293,7 +304,7 @@ describe('MemberAccessSection', () => {
     expect(toast).toHaveBeenCalledWith('blocked.rowBlockOk', expect.any(Object));
   });
 
-  it('unblocks by removing the matching ou_ entry from a fresh raw list', async () => {
+  it('unblocks via the identity-based removeOpenIds route', async () => {
     const state = makeState({
       blockedByApp: { cli_a: { raw: ['ou_u2', 'keep@example.com'], resolved: ['ou_u2'] } },
     });
@@ -309,7 +320,29 @@ describe('MemberAccessSection', () => {
     await settle();
 
     const put = state.calls.filter(c => c.url.endsWith('/blocked-users') && c.method === 'PUT').at(-1);
-    expect(put?.body).toEqual({ entries: ['keep@example.com'] });
+    // 不再由前端按 ou_ 直值过滤 raw：整条解除交给后端按身份反查。
+    expect(put?.body).toEqual({ removeOpenIds: ['ou_u2'] });
+    expect(toast).toHaveBeenCalledWith('blocked.rowUnblockOk', expect.any(Object));
+  });
+
+  it('unblocks a row whose raw entry was written as an email alias (no ou_ literal exists)', async () => {
+    const state = makeState({
+      blockedByApp: { cli_a: { raw: ['bob@example.com'], resolved: ['ou_u2'] } },
+    });
+    installFetch(state);
+    const renderer = renderSection();
+    await open(renderer);
+
+    const unblock = renderer.root.findByProps({ 'data-member-row': 'ou_u2' })
+      .findAllByType('button')
+      .find(b => b.props['data-action'] === 'row-unblock');
+    await act(async () => { unblock!.props.onClick(); });
+    await settle();
+
+    const put = state.calls.filter(c => c.url.endsWith('/blocked-users') && c.method === 'PUT').at(-1);
+    // 旧实现会发 {entries:['bob@example.com']}（过滤不掉，假成功）；现在只发
+    // 身份解除请求，由后端反查 email→ou_ 并剔除别名 raw 条目。
+    expect(put?.body).toEqual({ removeOpenIds: ['ou_u2'] });
     expect(toast).toHaveBeenCalledWith('blocked.rowUnblockOk', expect.any(Object));
   });
 

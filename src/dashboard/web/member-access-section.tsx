@@ -180,33 +180,44 @@ export function MemberAccessSection(props: {
     if (disabled || busy) return;
     setBusy(true);
     try {
-      // 每次操作前 GET 现有原始条目再全量 PUT，避免并发编辑互相覆盖。
-      const current = await loadBlocked(appId);
-      const entries = block
-        ? (current.raw.includes(openId) ? current.raw : [...current.raw, openId])
-        // blockedUsers 的 raw/resolved 不是索引对齐的（解析按类型分桶去重），
-        // 本面板封禁写入的恒为 ou_ 直值，故只按直值精确移除。
-        : current.raw.filter(entry => entry !== openId);
+      if (block) {
+        // 封禁仍走「GET 现有原始条目再全量 PUT」，避免并发编辑互相覆盖。
+        const current = await loadBlocked(appId);
+        const entries = current.raw.includes(openId) ? current.raw : [...current.raw, openId];
+        const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/blocked-users`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ entries }),
+        });
+        await handleBlockedWrite(r, block);
+        return;
+      }
+      // 解除按 open_id 定向：后端会把邮箱 / on_ / 手机形态的别名条目一并
+      // 反查剔除，前端不再依赖 raw 里恰好存在 ou_ 直值。
       const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/blocked-users`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ entries }),
+        body: JSON.stringify({ removeOpenIds: [openId] }),
       });
-      const body = await r.json().catch(() => ({}));
-      if (r.ok && body.ok) {
-        setBlocked({ raw: body.raw ?? entries, resolved: body.resolved ?? [] });
-        toast(block ? tr('blocked.rowBlockOk') : tr('blocked.rowUnblockOk'), { kind: 'success' });
-      } else if (r.status === 409 || body.error === 'cannot_block_admin') {
-        toast(tr('blocked.conflict'), { kind: 'warning' });
-      } else if (r.status === 422 || body.error === 'empty_resolved') {
-        toast(tr('blocked.emptyResolved'), { kind: 'warning' });
-      } else {
-        toast(`${tr('blocked.saveFailed')}: ${body.error ?? r.status}`, { kind: 'error' });
-      }
+      await handleBlockedWrite(r, block);
     } catch (err) {
       toast(`Network error: ${err instanceof Error ? err.message : String(err)}`, { kind: 'error' });
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function handleBlockedWrite(r: Response, block: boolean): Promise<void> {
+    const body = await r.json().catch(() => ({}));
+    if (r.ok && body.ok) {
+      setBlocked({ raw: body.raw ?? [], resolved: body.resolved ?? [] });
+      toast(block ? tr('blocked.rowBlockOk') : tr('blocked.rowUnblockOk'), { kind: 'success' });
+    } else if (r.status === 409 || body.error === 'cannot_block_admin') {
+      toast(tr('blocked.conflict'), { kind: 'warning' });
+    } else if (r.status === 422 || body.error === 'empty_resolved') {
+      toast(tr('blocked.emptyResolved'), { kind: 'warning' });
+    } else {
+      toast(`${tr('blocked.saveFailed')}: ${body.error ?? r.status}`, { kind: 'error' });
     }
   }
 

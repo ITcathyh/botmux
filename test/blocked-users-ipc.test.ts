@@ -22,6 +22,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 vi.mock('../src/services/bot-config-store.js', async importOriginal => ({
   ...await importOriginal<typeof import('../src/services/bot-config-store.js')>(),
   setBotBlockedUsers: vi.fn(),
+  removeBlockedUsers: vi.fn(),
 }));
 
 vi.mock('../src/services/grant-store.js', async importOriginal => ({
@@ -30,7 +31,7 @@ vi.mock('../src/services/grant-store.js', async importOriginal => ({
   removeAllowedChatGroup: vi.fn(),
 }));
 
-import { setBotBlockedUsers } from '../src/services/bot-config-store.js';
+import { setBotBlockedUsers, removeBlockedUsers } from '../src/services/bot-config-store.js';
 import { addAllowedChatGroup, removeAllowedChatGroup } from '../src/services/grant-store.js';
 
 const APP_ID = 'cli_blocked_route';
@@ -204,6 +205,48 @@ describe('PUT /api/blocked-users', () => {
     });
     expect(other.status).toBe(400);
     expect(await other.json()).toMatchObject({ error: 'disk_write_failed' });
+  });
+
+  it('routes {removeOpenIds} to removeBlockedUsers, which also lifts alias entries', async () => {
+    registerBot({ larkAppId: APP_ID, larkAppSecret: '' } as any);
+    vi.mocked(removeBlockedUsers).mockResolvedValue({
+      ok: true,
+      raw: ['on_keep'],
+      resolved: ['ou_keep'],
+    });
+    const port = await start();
+
+    const res = await fetch(`http://127.0.0.1:${port}/api/blocked-users`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ removeOpenIds: ['ou_a'] }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, raw: ['on_keep'], resolved: ['ou_keep'] });
+    expect(removeBlockedUsers).toHaveBeenCalledWith(APP_ID, ['ou_a']);
+    expect(setBotBlockedUsers).not.toHaveBeenCalled();
+  });
+
+  it('400 when entries and removeOpenIds are both present, or removeOpenIds is invalid', async () => {
+    registerBot({ larkAppId: APP_ID, larkAppSecret: '' } as any);
+    const port = await start();
+
+    const both = await fetch(`http://127.0.0.1:${port}/api/blocked-users`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ entries: [], removeOpenIds: [] }),
+    });
+    expect(both.status).toBe(400);
+    expect(await both.json()).toMatchObject({ error: 'entries_and_removeOpenIds_conflict' });
+
+    const invalid = await fetch(`http://127.0.0.1:${port}/api/blocked-users`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ removeOpenIds: 'ou_a' }),
+    });
+    expect(invalid.status).toBe(400);
+    expect(await invalid.json()).toMatchObject({ error: 'invalid_remove_open_ids' });
+    expect(removeBlockedUsers).not.toHaveBeenCalled();
   });
 
   it('503 larkAppId_not_set', async () => {

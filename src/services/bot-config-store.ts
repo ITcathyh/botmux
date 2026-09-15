@@ -14,7 +14,7 @@ import type { BotConfig } from '../bot-registry.js';
 import { getBot, getOwnerOpenId, readBotSkillPolicy } from '../bot-registry.js';
 import { republishResolvedAllowedUsersDescriptor, scheduleAllowedUsersResolveRetryFromMutation } from '../bot-registry.js';
 import { config } from '../config.js';
-import { writeAllowedUsersResolveCache } from '../utils/allowed-users-cache.js';
+import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from '../utils/allowed-users-cache.js';
 import { rmwBotEntry } from './config-store.js';
 import { resolveAllowedUsersWithMap } from '../im/lark/client.js';
 import { CLI_OPTIONS, resolveCliId } from '../setup/bot-config-editor.js';
@@ -561,6 +561,71 @@ export async function setBotBlockedUsers(
   });
   logger.info(`[config:${larkAppId}] blockedUsers updated: ${rawEntries.length} entries, ${resolved.length} resolved`);
   return { ok: true, raw: rawEntries, resolved };
+}
+
+/**
+ * 按 open_id 定向解除黑名单（成员面板单行「解除」专用）。调用方只持有点行
+ * 的 ou_，而 raw 条目可能以邮箱 / on_ / 手机形态写入——只按 ou_ 直值过滤
+ * 会把这些条目留下、接口却回报成功（评审指出的假成功）。
+ *
+ * 对剩余非 ou_ 条目复用同一解析器（降级时再查同一 sidecar 缓存）反查
+ * raw→ou_ 映射：证据表明映射到目标 open_id 的 raw 条目一并剔除；解析不出
+ * （definitive miss，或 transient 且缓存也没有）的条目**原样保留，绝不在证
+ * 据不足时多删**。ou_ 直值直接出列。无命中为幂等 no-op。
+ *
+ * 落盘不回退到 {@link setBotBlockedUsers}：全量重解析会在列表里混有
+ * 历史 definitive-miss 条目时返回 empty_resolved，而本次定向解除已有
+ * 映射证据成立——不能让无关脏条目挡住本次解除。
+ */
+export async function removeBlockedUsers(
+  larkAppId: string,
+  openIds: string[],
+): Promise<SetBlockedUsersResult> {
+  let bot;
+  try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+  const targets = new Set(openIds.filter(id => typeof id === 'string' && id.startsWith('ou_')));
+  const raw = bot.config.blockedUsers ?? [];
+  if (targets.size === 0 || raw.length === 0) {
+    return { ok: true, raw, resolved: bot.resolvedBlockedUsers ?? [] };
+  }
+  // ou_ 直值直接出列；邮箱 / on_ / 手机条目等映射证据。
+  const pending = raw.filter(entry => !targets.has(entry));
+  const unresolved = pending.filter(entry => !entry.startsWith('ou_'));
+  let mapping = new Map<string, string>();
+  if (unresolved.length > 0) {
+    const result = await resolveAllowedUsersWithMap(larkAppId, unresolved);
+    mapping = result.map;
+    if (result.errored) {
+      // contact API 降级时复用写入路径一直维护的 sidecar，避免解除在故障期
+      // 静默 no-op；缓存也没有的条目按证据不足保留。
+      const cached = readAllowedUsersResolveCache(config.session.dataDir, larkAppId);
+      for (const entry of unresolved) {
+        if (!mapping.has(entry) && cached[entry]) mapping.set(entry, cached[entry]);
+      }
+    }
+  }
+  const kept = pending.filter(entry => {
+    if (entry.startsWith('ou_')) return true;
+    const resolvedId = mapping.get(entry);
+    // 只有被证明解析到目标 open_id 的条目才剔除；其余一律保留。
+    return resolvedId === undefined || !targets.has(resolvedId);
+  });
+  if (kept.length === raw.length) {
+    return { ok: true, raw, resolved: bot.resolvedBlockedUsers ?? [] };
+  }
+  if (kept.length === 0) return setBotBlockedUsers(larkAppId, []);
+  const w = await rmwBotEntry<null>(larkAppId, (entry) => {
+    entry.blockedUsers = kept;
+    return { write: true, result: null };
+  });
+  if (!w.ok) return { ok: false, reason: w.reason };
+  bot.config.blockedUsers = kept;
+  // 被剔除的 email/on_ 条目的 ou_ 必在 targets 内（映射命中才剔除），故从
+  // resolved 减去 targets 恰好覆盖直值与别名两种形态。
+  const nextResolved = (bot.resolvedBlockedUsers ?? []).filter(ou => !targets.has(ou));
+  bot.resolvedBlockedUsers = nextResolved;
+  logger.info(`[config:${larkAppId}] blockedUsers unblocked: ${raw.length - kept.length} entries`);
+  return { ok: true, raw: kept, resolved: nextResolved };
 }
 
 export type CoerceResult =
