@@ -10,6 +10,15 @@ import { __testOnly_resetBotRegistry, registerBot } from '../src/bot-registry.js
 
 // Avoid Feishu contact resolution / disk writes: these routes are thin adapters
 // over the service results; service-level coverage lives elsewhere.
+vi.mock('@larksuiteoapi/node-sdk', () => {
+  // registerBot builds a Lark SDK client for any non-apiOnly bot; the test
+  // configs carry an empty placeholder secret, which makes the SDK constructor
+  // throw 7104 on a clean install. These routes never call Feishu, so stub the
+  // Client entirely (same isolation as blocked-users-talk.test.ts).
+  class FakeClient { constructor(public opts: Record<string, unknown>) {} }
+  return { Client: FakeClient };
+});
+
 vi.mock('../src/services/bot-config-store.js', async importOriginal => ({
   ...await importOriginal<typeof import('../src/services/bot-config-store.js')>(),
   setBotBlockedUsers: vi.fn(),
