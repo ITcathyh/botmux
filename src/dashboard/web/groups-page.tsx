@@ -1731,7 +1731,6 @@ export function ManageDialog(props: {
       </fieldset>
 
       <fieldset>
-      <fieldset>
         <legend>{tr('grantAdmin.sectionTitle')}</legend>
         <MemberAccessSection chat={chat} members={inChat} disabled={!available} tr={tr} />
       </fieldset>
@@ -1747,7 +1746,6 @@ export function ManageDialog(props: {
           models={member.defaultModels} disabled={!available}
           onSaved={() => props.onReloadGroups({ force: true })}
         />)}
-      </fieldset>
       </fieldset>
 
       <fieldset>

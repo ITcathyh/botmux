@@ -111,6 +111,27 @@ The group-level setting overrides the dashboard "Bot Config → Regular Group Mo
 - `always`: @ required to get an answer (default); `topic`: replies inside the bot's own topics skip @; `never`: no @ required anywhere in the group; `ambient`: no @ required, but the bot yields when a message explicitly @-mentions someone else.
 - Skipping @ never skips the permission gate, and 8 no-@ exceptions still apply (in-topic replies, substitute triggers, the message listener, and more) — see [Mention Policy](/en/mention-mode) for the full semantics.
 
+## 📑 Chat Tabs
+
+| Command | Description |
+|------|------|
+| `/tabs` / `/tab` / `/tabs list` | List every tab in the current chat and its Tab ID (`/tab` is a compatibility alias) |
+| `/tabs add <url> [name]` | Add a URL tab (owner or authorized operator required) |
+| `/tabs rename <tab_id> <name>` | Rename an editable URL or document tab |
+| `/tabs delete <tab_id>` | Delete an editable URL or document tab |
+| `/tabs sort <tab_id> ...` | Reorder tabs; the command must include every Tab ID returned by `/tabs` |
+
+Built-in Lark tabs are read-only through OpenAPI, though they must still be included when sorting. If the chat only allows its owner and administrators to manage tabs, the bot also needs that chat-level privilege.
+
+AI agents and background scripts should use the CLI instead of sending a slash command into the chat:
+
+```bash
+botmux tabs add "https://example.com/project/releases/2026" \
+  --name "Project release" --json
+```
+
+The CLI resolves the bot and chat from the current `BOTMUX_SESSION_ID`. Use `--session-id` outside the current process tree or `--chat-id` to override the destination. `add` is idempotent by URL: an existing page tab is reused and renamed when needed. This works for merge requests, project boards, release pages, and other automation scenarios. Background callers can also use `botmux tabs list|update|remove|sort`.
+
 ## 🔀 Passthrough to the Underlying CLI
 
 `/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` `/effort` `/fast` — delivered literally to the underlying CLI and handled by its built-in commands.

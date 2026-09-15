@@ -4814,7 +4814,8 @@ function explicitReplyMarkerForTurnWindow(
   if (adoptMode || turn.isLocal || turn.markTimeMs === undefined) return undefined;
   const lower = turn.markTimeMs;
   const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
-  const inWindow = markers.filter(marker => marker.sentAtMs >= lower && marker.sentAtMs < upper);
+  const inWindow = markers.filter(marker => marker.sentAtMs >= lower && marker.sentAtMs < upper
+    && (marker.replyCardResponseKind === undefined || marker.replyCardResponseKind === 'final'));
   return inWindow.at(-1);
 }
 
@@ -16124,6 +16125,9 @@ async function spawnCli(
       env: childEnv as Record<string, string>,
       injectEnv: perBotInjectKeys.length ? perBotInjectEnv : undefined,
       launchShell: lastInitConfig?.launchShell,
+      // spawnBin may now be a launch wrapper (session scope / wrapperCli /
+      // credential sandbox); the Herdr facade still needs the real CLI name.
+      cliBin: cliAdapter.resolvedBin,
     });
   } catch (err) {
     cleanupCodexAppControlBootstrap();
