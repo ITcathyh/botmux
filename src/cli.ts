@@ -10823,7 +10823,11 @@ async function cmdSend(rest: string[]): Promise<void> {
         undefined,
         sendLocale,
       ));
-    } else if (rest.some(tok => tok === '--mention' || tok.startsWith('--mention='))) {
+    } else if (config.crossPrincipalInterruption
+      && rest.some(tok => tok === '--mention' || tok.startsWith('--mention='))) {
+      // Only advertise `--as` while cross-principal isolation is actually
+      // enforced; with the experimental switch off nothing is ever staged, so
+      // the flag would classify nothing.
       console.error(t('xpi.send.as_needed_hint', undefined, sendLocale));
     }
 

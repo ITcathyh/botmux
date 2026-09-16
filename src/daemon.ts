@@ -23077,8 +23077,14 @@ async function handleThreadReplyAdmitted(
   // Daemon-side hint: divert an already-known different principal before IPC.
   // The worker remains authoritative and hands a raced rejection back through
   // onOrdinaryImInputRejected; both paths converge on the same durable record.
+  //
+  // Gated by the experimental XPI switch (default OFF). Off ⇒ fall through to
+  // the existing-owner route below, i.e. deliver the message like any other —
+  // byte-for-byte the pre-#1348 shape. The worker reads the same switch, so a
+  // message that is not diverted here is also not rejected there.
   const activePrincipalTurn = ds.activeInteractiveTurn;
-  if (activePrincipalTurn
+  if (config.crossPrincipalInterruption
+    && activePrincipalTurn
     && threadTrustedCaller
     && !sameTrustedPrincipal(activePrincipalTurn.caller, threadTrustedCaller)
     && !sameTrustedPrincipal(activePrincipalTurn.controller, threadTrustedCaller)) {
@@ -25191,6 +25197,21 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     async onOrdinaryImInputRejected(ds, context) {
       if (!context.rejectedBeforeAdmission
         || context.reason !== 'cross_principal_requires_owner_confirmation') return false;
+      // Experimental XPI switch off ⇒ never stage. Only reachable on a config
+      // TTL skew (the worker still read the switch ON while this daemon reads
+      // it OFF), so staging here would mint exactly the stranded record the
+      // switch exists to prevent. Returning false lets worker-pool retry the
+      // exact turn instead; the worker re-reads the switch on that attempt and
+      // — now agreeing — delivers it. Retries are capped
+      // (ORDINARY_IM_MAX_ATTEMPTS), so a genuinely stuck disagreement surfaces
+      // as a visible delivery failure rather than a silent stranding.
+      if (!config.crossPrincipalInterruption) {
+        logger.warn(
+          `[${tag(ds)}] cross-principal rejection arrived while the XPI switch is off; `
+          + `retrying delivery turn=${context.turnId.slice(0, 12)}`,
+        );
+        return false;
+      }
       const envelope = context.message.type === 'message'
         ? context.message.rerouteEnvelope
         : undefined;
