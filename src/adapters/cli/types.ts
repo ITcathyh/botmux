@@ -493,6 +493,10 @@ export interface CliAdapter {
    * It survives per-turn resets and is retired once per IdleDetector/spawn. */
   readonly startupPendingPattern?: RegExp;
   readonly startupReadyPattern?: RegExp;
+  /** Optional positive initialization evidence from a complete backend history
+   * snapshot. Must reject stale prompts, loading, dialogs, and unsent drafts.
+   * This only releases startup type-ahead; it never proves an idle/turn boundary. */
+  readonly startupReadyFromHistory?: (history: string) => boolean;
 
   /**
    * Longer PTY-silence window used ONLY before this CLI process's FIRST idle

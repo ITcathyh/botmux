@@ -31,7 +31,7 @@ import { persistStreamCardState, rememberLastCliInput } from './session-manager.
 import { spawnWorker, isStandaloneBinary, WORKER_ENTRY_SUBCOMMAND } from './self-spawn.js';
 import { resolveSessionLaunchModel, resolveSessionGroupSettings } from './session-model.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
-import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, type LarkPinRecord } from '../im/lark/client.js';
+import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
 import { isFableModelId, normalizeClaudeModelId } from '../services/claude-transcript.js';
@@ -4273,7 +4273,8 @@ function flushCardPatch(ds: DaemonSession): void {
       patchSucceeded = true;
     })
     .catch(err => {
-      if (err instanceof MessageWithdrawnError) {
+      if (err instanceof MessageWithdrawnError || err instanceof MessageUpdateExpiredError) {
+        const reason = err instanceof MessageUpdateExpiredError ? 'expired' : 'withdrawn';
         // Only clear streamCardId when the withdrawn message is still the
         // active one. With auto-recall a new turn may have advanced
         // ds.streamCardId past `cardId` while this PATCH was in flight (the
@@ -4282,11 +4283,11 @@ function flushCardPatch(ds: DaemonSession): void {
         // forget the live new card and trigger a duplicate POST on the next
         // screen_update.
         if (ds.streamCardId === cardId) {
-          logger.warn(`[${tag(ds)}] Stream card withdrawn, clearing reference`);
+          logger.warn(`[${tag(ds)}] Stream card ${reason}, clearing reference`);
           ds.streamCardId = undefined;
           persistStreamCardState(ds);
         } else {
-          logger.debug(`[${tag(ds)}] Stale card ${cardId.substring(0, 12)} withdrawn (current: ${ds.streamCardId?.substring(0, 12) ?? 'none'})`);
+          logger.debug(`[${tag(ds)}] Stale card ${cardId.substring(0, 12)} ${reason} (current: ${ds.streamCardId?.substring(0, 12) ?? 'none'})`);
         }
         return;
       }
@@ -9056,13 +9057,13 @@ export async function transferSession(
 
 /** Backends whose conversation state is a local, copyable transcript file and
  *  whose CLI exposes a native "fork/branch this session" primitive that botmux
- *  can drive at cold spawn (Claude family / Grok: `--fork-session`; Codex terminal:
- *  `codex fork <id>`). App-server backends (codex-app, or a codex CLI running in
+ *  can drive at cold spawn (Claude family / Grok: `--fork-session`; Codex/TraeX
+ *  terminal: `<cli> fork <id>`). App-server backends (codex-app, or a Codex-family CLI running in
  *  Hybrid RPC mode) keep state in a live app-server process + SQLite and have no
  *  byte-level fork we can reproduce — they are refused. Riff / other pure-remote
  *  backends have no local rollout to fork either. */
 const FORK_CAPABLE_CLI_IDS: ReadonlySet<CliId> = new Set<CliId>([
-  'claude-code', 'seed', 'relay', 'codex', 'grok',
+  'claude-code', 'seed', 'relay', 'codex', 'traex', 'grok',
 ]);
 
 /** True when this session can be byte-level forked via a CLI-native primitive.
@@ -9078,7 +9079,7 @@ export function isForkCapableSession(ds: DaemonSession): boolean {
   // unrelated/empty local session, so refuse rather than claiming a copy was
   // made. A future server-side thread/fork primitive can add an explicit path.
   if (ds.session.existingAppServerEndpoint) return false;
-  // Codex terminal mode is forkable; Codex under Hybrid RPC input is not (the
+  // Codex/TraeX terminal mode is forkable; Hybrid RPC input is not (the
   // thread is an app-server live session, no local rollout to `codex fork`).
   //
   // Read BOTH the live config AND the SPAWN-TIME truth (ds.initConfig): a pane
@@ -9090,7 +9091,8 @@ export function isForkCapableSession(ds: DaemonSession): boolean {
   // and let `/fork` run `codex fork` against a rollout that does not exist.
   // ORing the frozen init flag closes that window (over-refuse, never leak).
   const rpcAtSpawn = ds.initConfig?.codexRpcInput === true;
-  if (cliId === 'codex' && (rpcAtSpawn || botCfg.codexRpcInput === true || config.codexRpcInputDefault)) {
+  if ((cliId === 'codex' || cliId === 'traex')
+    && (rpcAtSpawn || botCfg.codexRpcInput === true || config.codexRpcInputDefault)) {
     return false;
   }
   return true;
