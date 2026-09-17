@@ -5429,7 +5429,7 @@ async function cmdSuspend(): Promise<void> {
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'rename' | 'project',
+  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'rename' | 'project' | 'continuation',
   payload: Record<string, unknown>,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
@@ -5459,6 +5459,68 @@ async function postSessionCliIpc(
   return hostSecret
     ? fetchDaemonIpc(ipcPort, path, init, hostSecret)
     : loopbackFetch(`http://127.0.0.1:${ipcPort}${path}`, init);
+}
+
+async function cmdContinuation(argv: string[]): Promise<void> {
+  const action = argv[0] ?? '';
+  if (!['start', 'await-user', 'cancel'].includes(action)) {
+    console.error('用法: botmux continuation start --readonly [--ttl-minutes N] [--max-continuations N] | await-user | cancel');
+    process.exitCode = 2;
+    return;
+  }
+  const ctx = findAncestorSessionContext();
+  if (!ctx?.sessionId || !ctx.turnId) {
+    console.error('✗ continuation 只能由当前 BotMux 会话的活动轮次调用');
+    process.exitCode = 1;
+    return;
+  }
+  if (action === 'start' && !argv.includes('--readonly')) {
+    console.error('✗ 第一阶段只支持显式 --readonly 的只读长程任务');
+    process.exitCode = 2;
+    return;
+  }
+  const ttlRaw = argValue(argv, '--ttl-minutes');
+  const maxRaw = argValue(argv, '--max-continuations');
+  const ttlMinutes = ttlRaw === undefined ? undefined : Number(ttlRaw);
+  const maxContinuations = maxRaw === undefined ? undefined : Number(maxRaw);
+  if (ttlMinutes !== undefined && (!Number.isFinite(ttlMinutes) || ttlMinutes <= 0)) {
+    console.error('✗ --ttl-minutes 必须是正数');
+    process.exitCode = 2;
+    return;
+  }
+  if (maxContinuations !== undefined
+    && (!Number.isSafeInteger(maxContinuations) || maxContinuations <= 0)) {
+    console.error('✗ --max-continuations 必须是正整数');
+    process.exitCode = 2;
+    return;
+  }
+  let discoveredPort: number | undefined;
+  try { discoveredPort = findDaemon(process.env.BOTMUX_LARK_APP_ID)?.ipcPort; } catch { /* isolated */ }
+  const ipcPort = resolveDaemonIpcPort(discoveredPort, process.env.BOTMUX_DAEMON_IPC_PORT);
+  if (!ipcPort) {
+    console.error('✗ 无法定位当前会话的 daemon');
+    process.exitCode = 1;
+    return;
+  }
+  const response = await postSessionCliIpc(ipcPort, ctx.sessionId, 'continuation', {
+    action,
+    originTurnId: ctx.turnId,
+    ...(ctx.dispatchAttempt !== undefined ? { originDispatchAttempt: ctx.dispatchAttempt } : {}),
+    ...(action === 'start' ? { readonly: true } : {}),
+    ...(ttlMinutes !== undefined ? { ttlMs: Math.round(ttlMinutes * 60_000) } : {}),
+    ...(maxContinuations !== undefined ? { maxContinuations } : {}),
+  });
+  const body = await response.json().catch(() => ({})) as {
+    ok?: boolean;
+    error?: string;
+    state?: { leaseId?: string; status?: string; expiresAt?: number; maxContinuations?: number };
+  };
+  if (!response.ok || !body.ok) {
+    console.error(`✗ continuation 被拒绝: ${body.error ?? `HTTP ${response.status}`}`);
+    process.exitCode = 1;
+    return;
+  }
+  console.log(JSON.stringify({ ok: true, ...body.state }));
 }
 
 /** `botmux preview <port>` registers a reachable loopback Web service for the
@@ -6530,6 +6592,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
                    脱离进程树）；换代/关闭后需重新注册，远端 sandbox 后端不支持
   tabs list|add|update|remove|sort
                    查看和管理当前飞书群标签页；add 按 URL 幂等，适合后台自动化调用
+  continuation start --readonly
+                   （实验性）为当前 TraeX 普通会话显式开启一次只读长程任务续跑；
+                   可加 --ttl-minutes N / --max-continuations N，另有 await-user / cancel
   autostart enable     注册开机自启（macOS launchd / Linux user systemd / Windows Task Scheduler，无需 sudo）
   autostart disable    注销开机自启
   autostart status     查看自启状态
@@ -6672,8 +6737,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
                                        普通群项目控制面与置顶进度卡（详见 \`botmux project --help\`）
 
 新建飞书群:
-  create-group --bot <name> [--bot ...] [--name "群名"]
-                                       用指定 bot 起新群；详见 \`botmux create-group --help\`
+  create-group --bot <name> [--bot ...] [--name "群名"] [--chat-mode group|topic]
+                                       用指定 bot 起新群（--chat-mode topic 建话题群）；详见 \`botmux create-group --help\`
 
 精确群对话授权（talk-only）:
   grant chat --bot <receiver> --chat-id <oc_...> --subject-bot <larkAppId>
@@ -9575,6 +9640,7 @@ async function cmdSend(rest: string[]): Promise<void> {
           const marker: Record<string, unknown> = {
             sentAtMs,
             messageId,
+            responseKind: effectiveResponseKind,
             ...(originTurnId ? { turnId: originTurnId } : {}),
             ...(originDispatchAttempt !== undefined ? { dispatchAttempt: originDispatchAttempt } : {}),
           };
@@ -9657,6 +9723,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         const marker: Record<string, unknown> = {
           sentAtMs: Date.now(),
           messageId: `doc:${exactDocTarget.commentId}`,
+          responseKind: effectiveResponseKind,
           ...(originTurnId ? { turnId: originTurnId } : {}),
           ...(originDispatchAttempt !== undefined ? { dispatchAttempt: originDispatchAttempt } : {}),
           contentLength: content.length,
@@ -10126,6 +10193,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       const marker: Record<string, unknown> = {
         sentAtMs,
         messageId,
+        responseKind: effectiveResponseKind,
         ...(originTurnId ? { turnId: originTurnId } : {}),
         ...(originDispatchAttempt !== undefined ? { dispatchAttempt: originDispatchAttempt } : {}),
         ...(unifiedReplyUsed ? { replyCardResponseKind: effectiveResponseKind } : {}),
@@ -12226,6 +12294,7 @@ botmux create-group — 用一组机器人新建飞书群
 
 用法:
   botmux create-group --bot <name|larkAppId> [--bot ...] [--name "群名"]
+                      [--chat-mode group|topic]
                       [--working-dir <path>]
                       [--kickoff-bot <open_id> --kickoff-prompt "文本"]
                       [--json-status]
@@ -12236,6 +12305,10 @@ botmux create-group — 用一组机器人新建飞书群
                   bots.json 中第一个。重名 → 取 bots.json 中第一个匹配，stderr 打 warning。
                   重复 ref → 自动去重保留首次顺序。
   --name <群名>   可选；不传则用飞书默认无名群。
+  --chat-mode <group|topic>
+                 可选；建群时的群形态，仅在建群那一刻生效且之后不可通过接口更改。
+                 topic = 话题群（每条顶层消息自成一个话题）；group = 普通群（默认）。
+                 不传则不带 chat_mode，沿用飞书默认普通群。
   --working-dir <path>
                  可选；创建成功后，把新群为所有成功入群的 bot 绑定到该目录（等价于逐个 /oncall bind），
                  下次在群里开新话题时直接使用该目录，跳过仓库选择卡片。也可写作 --cwd / --dir。
@@ -12252,7 +12325,8 @@ botmux create-group — 用一组机器人新建飞书群
   用途：把「同团队、已 opt-in」的**别人机器上的** agent（用 bots list --scope team 发现到的 appId）
   和它们各自的 owner 一起拉进一个平台代建的聚焦新群，全程 machine-auth。
   正因为发起人在别人 bot 进群前 @不到它，这条只认 appId、不依赖任何飞书 @，天然绕开视角问题。
-  --agent 至少一个、可多次、按 appId 去重。团队模式忽略 --bot/--kickoff/--working-dir（那些是本机建群用的）。
+  --agent 至少一个、可多次、按 appId 去重。团队模式忽略 --bot/--chat-mode/--kickoff/--working-dir
+  （那些是本机建群用的）。
   未传 --team：本机唯一团队则自动用它，多个要求显式指定。
   （往**已存在**的团队群补人是独立命令：botmux bots invite --chat <chatId> --team X --agent ...）
 
@@ -12300,6 +12374,7 @@ botmux create-group — 用一组机器人新建飞书群
 
   const botRefs = argValues(rest, '--bot');
   const name = argValue(rest, '--name');
+  const chatModeArg = argValue(rest, '--chat-mode');
   const workingDirArg = argValue(rest, '--working-dir', '--cwd', '--dir');
   const kickoffBot = argValue(rest, '--kickoff-bot');
   const kickoffPrompt = argValue(rest, '--kickoff-prompt');
@@ -12348,9 +12423,17 @@ botmux create-group — 用一组机器人新建飞书群
   const {
     resolveBotRefs,
     resolveKickoff,
+    resolveChatMode,
     createGroupCompletionStatus,
     shouldWriteCreateGroupCompletionStatus,
   } = await import('./cli/create-group-resolver.js');
+
+  const resolvedChatMode = resolveChatMode(chatModeArg);
+  if (!resolvedChatMode.ok) {
+    console.error(resolvedChatMode.error);
+    process.exit(1);
+  }
+
   const resolved = resolveBotRefs(
     botRefs,
     botConfigs,
@@ -12418,6 +12501,7 @@ botmux create-group — 用一组机器人新建飞书群
       creatorLarkAppId,
       larkAppIds: resolved.larkAppIds,
       name: name?.trim() || undefined,
+      chatMode: resolvedChatMode.chatMode,
       userOpenIds: targetOpenId ? [targetOpenId] : [],
       transferOwnerTo: targetOpenId,
       notifyOwnerOpenId: targetOpenId,
@@ -13504,8 +13588,21 @@ async function cmdNativeSubagentRuntimeHook(): Promise<void> {
       });
       return;
     }
-    const data = JSON.parse(raw) as { ok?: unknown; invalidPolicy?: unknown; policy?: unknown };
+    const data = JSON.parse(raw) as { ok?: unknown; invalidPolicy?: unknown; deny?: unknown; reason?: unknown; policy?: unknown };
     if (data.ok !== true) return;
+    if (data.deny === true) {
+      nativeSubagentDiagnostic('daemon denied spawn for read-only continuation');
+      await writeNativeSubagentHookDirective({
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason: typeof data.reason === 'string'
+            ? data.reason
+            : 'Read-only continuation forbids subagents',
+        },
+      });
+      return;
+    }
     if (data.invalidPolicy === true) {
       nativeSubagentDiagnostic('daemon rejected invalid stored policy; allowing spawn');
       return;
@@ -15324,6 +15421,7 @@ switch (command) {
   }
   case 'term-link': await cmdTermLink(process.argv.slice(3)); break;
   case 'preview': await cmdPreview(process.argv.slice(3)); break;
+  case 'continuation': await cmdContinuation(process.argv.slice(3)); break;
   case 'schedule': await cmdSchedule(process.argv[3] ?? '', process.argv.slice(4)); break;
   case 'ask': {
     // `botmux ask buttons --options ...` → sub='buttons', rest=['--options', ...]
