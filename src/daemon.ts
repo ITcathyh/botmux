@@ -25852,16 +25852,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     liveSessionCapSweepPending = true;
     void (async () => {
       try {
-        const maxLiveWorkers = getBot(cfg.larkAppId).config.maxLiveWorkers;
+        const liveBotConfig = getBot(cfg.larkAppId).config;
+        const maxLiveWorkers = liveBotConfig.maxLiveWorkers;
+        const idleTtlMs = typeof liveBotConfig.idleSuspendMinutes === 'number'
+          && liveBotConfig.idleSuspendMinutes > 0
+          ? liveBotConfig.idleSuspendMinutes * 60_000
+          : undefined;
         const suspended = await sweepIdleWorkersAfterTurnDrain(
           cfg.larkAppId,
           activeSessions,
-          { maxLiveWorkers },
+          { maxLiveWorkers, idleTtlMs },
         );
         if (suspended.length > 0) {
+          const ttlCount = suspended.filter(entry => entry.reason === 'idle_ttl').length;
           logger.info(
-            `[idle-worker-sweeper] suspended ${suspended.length} session(s) over per-bot cap `
-            + `${maxLiveWorkers ?? DEFAULT_MAX_LIVE_WORKERS} source=${source}`,
+            `[idle-worker-sweeper] suspended ${suspended.length} session(s) `
+            + `[idle_ttl=${ttlCount}, live_worker_cap=${suspended.length - ttlCount}; `
+            + `cap-limit=${maxLiveWorkers ?? DEFAULT_MAX_LIVE_WORKERS}] source=${source}`,
           );
         }
       } catch (err) {

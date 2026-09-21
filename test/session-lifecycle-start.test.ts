@@ -37,10 +37,14 @@ vi.mock('../src/core/self-spawn.js', async (importOriginal) => {
   };
 });
 
-vi.mock('../src/core/worker-budget.js', () => ({
-  checkWorkerAdmission: (...args: unknown[]) => checkWorkerAdmissionMock(...args),
-  formatMemoryBytes: (bytes: number) => `${(bytes / 1024 ** 3).toFixed(1)} GiB`,
-}));
+vi.mock('../src/core/worker-budget.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/core/worker-budget.js')>();
+  return {
+    ...actual,
+    checkWorkerAdmission: (...args: unknown[]) => checkWorkerAdmissionMock(...args),
+    formatMemoryBytes: actual.formatMemoryBytes,
+  };
+});
 
 vi.mock('../src/im/lark/client.js', () => {
   class MessageWithdrawnError extends Error {
@@ -223,6 +227,7 @@ import {
   readManagedOriginCapability,
 } from '../src/core/managed-origin-capability.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { activeSessionKey } from '../src/core/types.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { getBot } from '../src/bot-registry.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
@@ -305,6 +310,7 @@ beforeEach(() => {
     reasons: [],
     pressure: { totalMemoryBytes: 32 * 1024 ** 3, warnings: [] },
     policy: {
+      memoryAdmissionEnabled: true,
       minAvailableMemoryBytes: 8 * 1024 ** 3,
       maxMemoryFullAvg10: 20,
       minAvailableMemorySource: 'default',
@@ -435,6 +441,254 @@ describe('host memory pressure worker admission', () => {
       setActiveSessionsRegistry(undefined);
       resetDeviceIsolationActivationForTest();
     }
+  });
+
+  // Marginal band (memory-only rejection within 10% of the reserve): the fork
+  // is synchronously deferred, idle workers are reclaimed, and after a short
+  // wait admission is re-checked exactly once. These tests pin the forkWorker
+  // glue: prompt preservation, coalescing, generation guard, rejection and the
+  // device-freeze re-entry interaction.
+  const marginalDecision = {
+    allowed: false,
+    reasons: ['available memory 7.5 GiB is below the reserved 8.0 GiB'],
+    pressure: {
+      totalMemoryBytes: 32 * 1024 ** 3,
+      availableMemoryBytes: 7.5 * 1024 ** 3,
+      warnings: [],
+    },
+    policy: {
+      memoryAdmissionEnabled: true,
+      minAvailableMemoryBytes: 8 * 1024 ** 3,
+      maxMemoryFullAvg10: 20,
+      minAvailableMemorySource: 'default',
+      maxMemoryFullAvg10Source: 'default',
+    },
+  };
+
+  it('reclaims, retries once after the wait, and re-forks with the original prompt', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    checkWorkerAdmissionMock.mockReturnValueOnce(marginalDecision as any);
+    const ds = makeDs();
+    const registry = new Map<string, DaemonSession>([[activeSessionKey(ds), ds]]);
+    setActiveSessionsRegistry(registry);
+    const admissions: string[] = [];
+
+    expect(forkWorker(ds, 'marginal prompt', 'om_marginal', {
+      onAdmission: admission => admissions.push(admission),
+    })).toBe(true);
+    expect(admissions).toEqual(['deferred']);
+    expect(forkMock).not.toHaveBeenCalled();
+
+    // Let the reclaim (mutation gate + candidate scan) settle, then pass the
+    // 2s re-check wait. The second admission read resolves allowed.
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(forkMock).toHaveBeenCalledTimes(1);
+    expect(admissions).toEqual(['deferred', 'accepted']);
+    expect(sessionReply).not.toHaveBeenCalled();
+
+    const worker = forkMock.mock.results[0]!.value;
+    worker.emit('message', { type: 'worker_ipc_ready' });
+    expect(vi.mocked(worker.send).mock.calls.at(-1)?.[0]).toMatchObject({
+      type: 'init',
+      prompt: 'marginal prompt',
+      turnId: 'om_marginal',
+    });
+  });
+
+  it('coalesces two concurrent marginal forks: one spawn, second input routed into it', async () => {
+    vi.useFakeTimers();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    // Both synchronous forks read marginal (the retry re-check is the third
+    // read and resolves allowed via the default mock); they must coalesce.
+    checkWorkerAdmissionMock.mockReturnValueOnce(marginalDecision as any);
+    checkWorkerAdmissionMock.mockReturnValueOnce(marginalDecision as any);
+    const ds = makeDs();
+    setActiveSessionsRegistry(new Map<string, DaemonSession>([[activeSessionKey(ds), ds]]));
+    const admissions: string[] = [];
+    const onAdmission = (admission: string) => admissions.push(admission);
+
+    expect(forkWorker(ds, 'first prompt', 'om_first', { onAdmission })).toBe(true);
+    expect(forkWorker(ds, 'second prompt', 'om_second', { onAdmission })).toBe(true);
+    expect(forkMock).not.toHaveBeenCalled();
+
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(forkMock).toHaveBeenCalledTimes(1);
+    expect(admissions).toEqual(['deferred', 'deferred', 'accepted', 'accepted']);
+    // Coalescing means exactly ONE re-check: the two synchronous fork reads +
+    // one retry re-read + one recursive fork read = 4 admission evaluations.
+    expect(checkWorkerAdmissionMock.mock.calls).toHaveLength(4);
+
+    const worker = forkMock.mock.results[0]!.value;
+    worker.emit('message', { type: 'worker_ipc_ready' });
+    const sent = vi.mocked(worker.send).mock.calls.map(call => call[0]);
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: 'init',
+      prompt: 'first prompt',
+      turnId: 'om_first',
+    }));
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: 'message',
+      content: 'second prompt',
+    }));
+  });
+
+  it('stays silent when the session is superseded while the rescue is waiting', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    const registry = new Map<string, DaemonSession>([[activeSessionKey(ds), ds]]);
+    setActiveSessionsRegistry(registry);
+    const replacement = makeDs();
+    let swapped = false;
+    checkWorkerAdmissionMock
+      .mockReturnValueOnce(marginalDecision as any)
+      // The re-check runs AFTER the wait: swap the registry entry then.
+      .mockImplementationOnce(() => {
+        swapped = true;
+        registry.set(activeSessionKey(ds), replacement);
+        return {
+          allowed: true,
+          reasons: [],
+          pressure: { totalMemoryBytes: 32 * 1024 ** 3, warnings: [] },
+          policy: {
+            minAvailableMemoryBytes: 8 * 1024 ** 3,
+            maxMemoryFullAvg10: 20,
+            minAvailableMemorySource: 'default',
+            maxMemoryFullAvg10Source: 'default',
+          },
+        };
+      });
+    const admissions: string[] = [];
+
+    forkWorker(ds, 'superseded prompt', 'om_old', {
+      onAdmission: admission => admissions.push(admission),
+    });
+
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(admissions).toEqual(['deferred']);
+    // The guard runs DURING the re-check, not via an unrelated early return:
+    // the swap side effect proves the retry actually reached its re-read.
+    expect(swapped).toBe(true);
+  });
+
+  it('rejects with the blocked notice when the single re-check is still marginal', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_blocked');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    checkWorkerAdmissionMock.mockReturnValueOnce(marginalDecision as any);
+    const ds = makeDs();
+    setActiveSessionsRegistry(new Map<string, DaemonSession>([[activeSessionKey(ds), ds]]));
+    const admissions: string[] = [];
+
+    expect(forkWorker(ds, 'still blocked', 'om_blocked_turn', {
+      onAdmission: admission => admissions.push(admission),
+    })).toBe(true);
+    expect(admissions).toEqual(['deferred']);
+
+    // The re-check still reads marginal.
+    checkWorkerAdmissionMock.mockReturnValueOnce(marginalDecision as any);
+
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(admissions).toEqual(['deferred', 'rejected']);
+    // Fork read + exactly one re-check read; the rejection came from the retry,
+    // not from reclassifying the synchronous decision as hard.
+    expect(checkWorkerAdmissionMock.mock.calls).toHaveLength(2);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringMatching(/memory pressure.*retry/i),
+      'text',
+      'app_test',
+      'om_blocked_turn',
+      undefined,
+    );
+  });
+
+  it('queues behind a device freeze activated during the wait and forks after release', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    checkWorkerAdmissionMock.mockReturnValueOnce(marginalDecision as any);
+    const ds = makeDs();
+    setActiveSessionsRegistry(new Map<string, DaemonSession>([[activeSessionKey(ds), ds]]));
+
+    // The caller-level flag ("reject now so my caller retries") is present on
+    // the first call but must NOT survive into the asynchronous re-entry: once
+    // the turn was accepted it can only be preserved by the freeze replay.
+    expect(forkWorker(ds, 'freeze racing prompt', 'om_freeze_race', {
+      deferDuringDeviceIsolation: false,
+    })).toBe(true);
+    expect(forkMock).not.toHaveBeenCalled();
+
+    await Promise.resolve();
+    resetDeviceIsolationActivationForTest();
+    acquireDeviceIsolationFreeze({
+      nonce: 'n'.repeat(32),
+      inventoryGeneration: 'g1',
+      leaseIdFactory: () => 'lease-marginal',
+    });
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    // Re-check passed, but the freeze activated during the wait queues the
+    // re-entrant fork instead of dropping it.
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(sessionReply).not.toHaveBeenCalled();
+
+    // Freeze release replays the deferred spawn on the next setImmediate tick.
+    // Switch back to real timers FIRST: under fake timers that tick is queued
+    // by Sinon and discarded when the fake clock is torn down.
+    vi.useRealTimers();
+    releaseDeviceIsolationFreeze({ nonce: 'n'.repeat(32), leaseId: 'lease-marginal' });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(forkMock).toHaveBeenCalledTimes(1);
+
+    const worker = forkMock.mock.results[0]!.value;
+    worker.emit('message', { type: 'worker_ipc_ready' });
+    expect(vi.mocked(worker.send).mock.calls.at(-1)?.[0]).toMatchObject({
+      type: 'init',
+      prompt: 'freeze racing prompt',
+      turnId: 'om_freeze_race',
+    });
+    resetDeviceIsolationActivationForTest();
   });
 });
 
