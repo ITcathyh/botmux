@@ -2833,6 +2833,7 @@ async function configuredBotDefaultsRecoveryRows(
           displayName: bot.displayName ?? null,
           larkBotName: persistedNames.get(bot.larkAppId) ?? null,
           quotaFallbackBot: rawEntry?.quotaFallbackBot,
+          autoInviteOwnerOnGroupAdd: rawEntry?.autoInviteOwnerOnGroupAdd,
         });
         return {
           ...payload,
