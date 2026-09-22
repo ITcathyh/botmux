@@ -273,6 +273,7 @@ import {
   dshRuntimeForSession,
   recordTurnExplicitMention,
   pruneSteerFanoutState,
+  ensureAutomaticTaskContinuationLease,
 } from './core/worker-pool.js';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
 import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler } from './core/dashboard-ipc-server.js';
@@ -559,7 +560,7 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
   try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
-import { isBotMentioned, getGroupStats, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, getGroupStats, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
 import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, normalizeDocNativeWatchSubscription, putDocSubscription, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
@@ -3730,8 +3731,9 @@ export async function noteTurnReceived(
 }
 
 /**
- * Publish the acting CLI identity for one turn, and tell the sender when they
- * need to authorize.
+ * Publish the acting CLI identity for one turn. A missing bytedcli identity
+ * also prepares a direct device-login link inside the wrapper refusal, so the
+ * agent can surface it only if that tool is actually invoked.
  *
  * The sender comes from the daemon's own per-turn record (`replyTargets`, via
  * {@link pickTurnReplyTarget}), falling back to the session's last caller. Both
@@ -3786,10 +3788,10 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
   // refused) it stayed silent.
   //
   // The refusal already carries this. The wrapper prints, on stderr, which tool
-  // was refused and which command authorizes it — at the moment of the refusal,
-  // for that tool only, every time it happens. That is strictly better
-  // information than a guess made a second earlier, so the guess is gone rather
-  // than being made narrower.
+  // was refused and how to authorize it — including a direct ByteCloud login
+  // link when bytedcli can start one automatically — at the moment of the
+  // refusal, for that tool only. That is strictly better information than a
+  // pre-turn guess, so the chat notice stays absent.
 }
 
 async function sessionReply(
@@ -6632,6 +6634,7 @@ for (const sessionRelayMutation of V3_SESSION_RUN_MUTATIONS) {
           if (!hasAllowlist) return true;
           return getDashboardAdminOpenIds(larkAppId).includes(ownerOpenId);
         },
+        isScheduledTurnLive: turnId => ds?.scheduledTurnCallers?.has(turnId) === true,
       });
       if (!decision.ok) {
         return jsonRes(res, decision.status, {
@@ -17646,6 +17649,7 @@ function setActiveInteractiveTurn(
     ...(userPrompt?.trim() ? { userPrompt } : {}),
     ...(controller ? { controller } : {}),
   };
+  ensureAutomaticTaskContinuationLease(ds);
 }
 
 type XpiSharedCwdTurnAdmission =
@@ -18784,10 +18788,12 @@ async function stageCrossPrincipalInterruption(args: {
   message: CrossPrincipalInterruptionMessage;
 }): Promise<boolean> {
   const { ds, ownerTurnId, owner, proposer } = args;
+  if (ds.session.status !== 'active') return true;
   const { message, choice } = sanitizeCrossPrincipalMessage(args.message);
   if (await trySettleCrossPrincipalProposerChoice(ds, proposer, args.message.text, args.message.mentions)) {
     return true;
   }
+  if (ds.session.status !== 'active') return true;
   const staged = stageCrossPrincipalInterruptionRecord({
     session: ds.session,
     ownerTurnId,
@@ -18834,6 +18840,7 @@ async function notifyCrossPrincipalProposer(
   text: string,
   discriminator: string,
 ): Promise<boolean> {
+  if (ds.session.status !== 'active') return false;
   if (record.proposer.senderType === 'bot') {
     logger.info(
       `[${tag(ds)}] XPI bot outcome kept on control/audit plane `
@@ -18842,6 +18849,7 @@ async function notifyCrossPrincipalProposer(
     return true;
   }
   const proposer = await resolveXpiHumanOpenId(ds, record.proposer, 'proposer');
+  if (ds.session.status !== 'active') return false;
   if (proposer.status !== 'resolved') {
     logger.warn(
       `[${tag(ds)}] XPI proposer outcome not delivered: identity=${proposer.status} `
@@ -18897,6 +18905,7 @@ async function notifyCrossPrincipalTerminal(
   record: CrossPrincipalInterruption,
   text: string,
 ): Promise<boolean> {
+  if (ds.session.status !== 'active') return false;
   // A bot sender gets protocol/CLI feedback and local audit only. Publishing
   // --as/appId/turn diagnostics into the shared topic is not actionable for a
   // human observer and caused the noisy notices seen in live R10.
@@ -18909,6 +18918,7 @@ async function notifyCrossPrincipalTerminal(
   }
 
   const proposer = await resolveXpiHumanOpenId(ds, record.proposer, 'proposer');
+  if (ds.session.status !== 'active') return false;
   const recipients = proposer.status === 'resolved' ? [proposer.openId] : [];
   const channel: CrossPrincipalInterruptionDeliveryAudit['channel'] =
     ds.scope === 'thread' ? 'topic' : 'group';
@@ -18929,6 +18939,7 @@ async function notifyCrossPrincipalTerminal(
   for (let attempt = 1; attempt <= XPI_TERMINAL_ALERT_MAX_ATTEMPTS; attempt += 1) {
     const delay = XPI_TERMINAL_ALERT_RETRY_DELAYS_MS[attempt - 1] ?? 1_000;
     if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
+    if (ds.session.status !== 'active') return false;
     try {
       const deliveredMessageId = await sessionReply(
         sessionAnchorId(ds),
@@ -18944,6 +18955,7 @@ async function notifyCrossPrincipalTerminal(
       }
       return true;
     } catch (error) {
+      if (ds.session.status !== 'active') return false;
       failures += 1;
       const detail = error instanceof Error ? error.message : String(error);
       recordCrossPrincipalDeliveryAudit(ds, record, 'delivery_failed', channel, attempt, detail);
@@ -18966,6 +18978,7 @@ async function settleCrossPrincipalTerminal(
   record: CrossPrincipalInterruption,
   text: string,
 ): Promise<void> {
+  if (ds.session.status !== 'active') return;
   if (record.phase !== 'terminal_notice_pending') {
     record.phase = 'terminal_notice_pending';
     record.terminalNoticeText = text;
@@ -18992,6 +19005,7 @@ async function settleCrossPrincipalTerminal(
     );
     logger.warn(`[${tag(ds)}] XPI terminal notice cycle failed record=${record.id}: ${detail}`);
   }
+  if (ds.session.status !== 'active') return;
   if (delivered) {
     removeCrossPrincipalRecord(ds, record.id);
     return;
@@ -19024,6 +19038,7 @@ async function notifyCrossPrincipalOwnerLifecycle(
   text: string,
   discriminator: string,
 ): Promise<boolean> {
+  if (ds.session.status !== 'active') return false;
   if (record.owner.senderType === 'bot') {
     logger.info(
       `[${tag(ds)}] XPI owner lifecycle kept on control/audit plane `
@@ -19032,6 +19047,7 @@ async function notifyCrossPrincipalOwnerLifecycle(
     return true;
   }
   const owner = await resolveXpiHumanOpenId(ds, record.owner, 'owner');
+  if (ds.session.status !== 'active') return false;
   if (owner.status !== 'resolved') {
     logger.warn(
       `[${tag(ds)}] XPI owner lifecycle not delivered: identity=${owner.status} `
@@ -19536,6 +19552,8 @@ async function prepareIndependentCrossPrincipalSession(
 
 function scheduleCrossPrincipalOwnerWait(ds: DaemonSession, deadlineAt: number): void {
   clearTimeout(ds.crossPrincipalWaitTimer);
+  ds.crossPrincipalWaitTimer = undefined;
+  if (ds.session.status !== 'active') return;
   const delay = Math.max(1, deadlineAt - Date.now());
   ds.crossPrincipalWaitTimer = setTimeout(() => {
     ds.crossPrincipalWaitTimer = undefined;
@@ -19549,6 +19567,7 @@ async function askCrossPrincipalConfirmation(
   record: CrossPrincipalInterruption,
   input: Parameters<typeof registerHostAsk>[0],
 ): Promise<Awaited<ReturnType<typeof registerHostAsk>> | undefined> {
+  if (ds.session.status !== 'active') return undefined;
   if (record.confirmationRetryAt && record.confirmationRetryAt > Date.now()) {
     scheduleCrossPrincipalOwnerWait(ds, record.confirmationRetryAt);
     return undefined;
@@ -19845,7 +19864,7 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
     // were already durable. Continue only when the head actually changed; a
     // same-head wait/ask must remain parked until its own event fires.
     const next = ds.session.crossPrincipalInterruptions?.[0];
-    if (next && next.id !== record.id) {
+    if (ds.session.status === 'active' && next && next.id !== record.id) {
       queueMicrotask(() => { void driveCrossPrincipalInterruptions(ds); });
     }
   }
@@ -26637,6 +26656,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // bots via vcMeetingAgentConfigActive.
       ensureVcMeetingEventsSubscribed(cfg.larkAppId).catch(err => {
         logger.debug(`[${cfg.larkAppId}] VC event subscription check failed: ${err?.message ?? err}`);
+      });
+      // Ensure im.message.updated_v1 is subscribed so a user can trigger a task
+      // by editing a previously-un-@ed message to add the @mention. Check-first
+      // best-effort (cached web session, incremental add); never blocks boot.
+      ensureMessageUpdatedEventSubscribed(cfg.larkAppId).catch(err => {
+        logger.debug(`[${cfg.larkAppId}] message-updated event subscription check failed: ${err?.message ?? err}`);
       });
     }
 

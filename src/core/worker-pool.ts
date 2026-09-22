@@ -99,13 +99,15 @@ import { listDocSubscriptionsForSession, removeDocSubscription } from '../servic
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { ZmxBackend } from '../adapters/backend/zmx-backend.js';
+import { zmxEnv } from '../setup/ensure-zmx.js';
+import type { PersistentBackendTarget } from '../adapters/backend/types.js';
 import { backendSupportsWebTerminal } from '../adapters/backend/capabilities.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
 import {
   isStrongManagedHerdrAgentName,
   managedHerdrAgentName,
 } from '../adapters/backend/session-backend-selector.js';
-import { isRemoteBackendSession, isRemoteBackendType, isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, persistentSessionName, killPersistentBackendTarget, killPersistentSession, managedTargetsForCliChange, probePersistentBackendTarget, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
+import { isRemoteBackendSession, isRemoteBackendType, isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, persistentSessionName, killPersistentBackendTarget, killPersistentSession, managedTargetsForCliChange, probePersistentBackendTarget, resolvePairedSpawnBackendType, resolvePersistentBackendTarget, persistentBackendTargetKey } from './persistent-backend.js';
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { recordQuarantinedLauncherEnvKeys } from './mojo-launcher-env-quarantine.js';
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
@@ -585,6 +587,8 @@ import {
   handleReadonlyTaskContinuationTerminal,
   parseReadonlyContinuationOutput,
   readonlyTaskContinuationHandlesTerminal,
+  readonlyTaskContinuationNeedsRestartAttention,
+  startReadonlyTaskContinuation,
   type ReadonlyTaskContinuationDispatch,
   type ReadonlyTaskContinuationState,
 } from '../services/readonly-task-continuation.js';
@@ -1732,6 +1736,8 @@ export function ensureOrdinaryTurnRecoveryAttached(
 }
 
 function readonlyTaskContinuationEnabled(): boolean {
+  const canonical = process.env.BOTMUX_TASK_CONTINUATION_ENABLED?.trim().toLowerCase();
+  if (canonical) return canonical === 'true';
   return process.env.BOTMUX_READONLY_CONTINUATION_ENABLED?.trim().toLowerCase() === 'true';
 }
 
@@ -1749,6 +1755,88 @@ function readonlyTaskContinuationEligible(
     && larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly });
 }
 
+const OPEN_TASK_CONTINUATION_STATUSES = new Set([
+  'active',
+  'backoff',
+  'dispatching',
+  'delivering',
+  'awaiting_user',
+]);
+
+/**
+ * Arm continuation for the current authenticated ordinary user turn as soon as
+ * both independently-produced proofs exist: daemon admission authority and the
+ * live worker's RPC generation. Either can arrive first on a fresh session, so
+ * callers invoke this helper at both edges.
+ *
+ * The machine-wide flag remains the rollout/kill switch. Per-turn opt-in is not
+ * required: an existing record for this logical turn (including cancelled or
+ * awaiting-user) is never re-armed implicitly, and an open lease for another
+ * turn is never overwritten.
+ */
+export function ensureAutomaticTaskContinuationLease(
+  ds: DaemonSession,
+  botCfg = getBot(ds.larkAppId).config,
+): boolean {
+  if (!readonlyTaskContinuationEligible(ds, botCfg)) return false;
+  const authority = ds.activeInteractiveTurn;
+  if (!authority
+    || !authority.turnId.startsWith('om_')
+    || authority.caller.senderType !== 'user'
+    || authority.caller.requestLarkAppId !== ds.larkAppId
+    || (authority.controller
+      && authority.controller.requestLarkAppId !== ds.larkAppId)) return false;
+  // A lease must be born while the same RPC turn still exposes a live managed
+  // capability. After terminal/revocation, RPC proof alone is only a session
+  // capability and must never retroactively bless a completed turn.
+  const origin = ds.managedTurnOrigin;
+  if (!origin?.capability
+    || origin.turnId !== authority.turnId
+    || origin.dispatchAttempt !== undefined) return false;
+
+  const existing = ds.session.readonlyTaskContinuation;
+  // Preserve every explicit terminal/control decision for this turn. In
+  // particular, a later duplicate RPC-status event must not undo `cancel` or
+  // `await-user`.
+  if (existing?.logicalTurnId === authority.turnId) {
+    return OPEN_TASK_CONTINUATION_STATUSES.has(existing.status);
+  }
+  if (existing && OPEN_TASK_CONTINUATION_STATUSES.has(existing.status)) return false;
+
+  const workerGeneration = ds.workerGeneration;
+  const proof = ds.taskContinuationRpcProof;
+  if (!ds.worker || ds.worker.killed || ds.worker.connected === false
+    || !Number.isSafeInteger(workerGeneration) || (workerGeneration ?? 0) <= 0
+    || ds.session.workerGeneration !== workerGeneration
+    || proof?.workerGeneration !== workerGeneration) return false;
+  if (!ensureReadonlyTaskContinuationAttached(ds, botCfg)) return false;
+
+  try {
+    const state = startReadonlyTaskContinuation(ds.session, {
+      turnId: authority.turnId,
+      workerGeneration: workerGeneration!,
+      authorizationMode: 'inherited',
+      startMode: 'automatic',
+      trustedCaller: authority.caller,
+      ...(authority.controller
+        ? { trustedController: authority.controller }
+        : {}),
+    });
+    return state?.logicalTurnId === authority.turnId
+      && OPEN_TASK_CONTINUATION_STATUSES.has(state.status);
+  } catch (err) {
+    // The user turn is already admitted. A lease persistence failure must not
+    // turn that successful admission into a retry (which could duplicate side
+    // effects); leave continuation fail-closed and keep the original turn live.
+    logger.error(
+      `[${tag(ds)}] Failed to arm automatic task continuation for `
+      + `${authority.turnId.substring(0, 16)}: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return false;
+  }
+}
+
 function readonlyTaskContinuationWarning(
   state: NonNullable<Session['readonlyTaskContinuation']>,
 ): string {
@@ -1756,8 +1844,72 @@ function readonlyTaskContinuationWarning(
     ? '租约已过期'
     : state.status === 'exhausted'
       ? `达到最大续跑次数 ${state.maxContinuations}`
+      : state.lastErrorCode === 'daemon_restart'
+        ? 'BotMux 服务重启，无法确认中断前的操作是否完成'
       : state.lastErrorCode ?? '续跑交接失败';
-  return `⚠️ 只读长程任务自动续跑已停止（${reason}）。请检查过程账本和 Web 终端后，再决定是否继续。`;
+  return `⚠️ 长程任务自动续跑已停止（${reason}）。请检查过程账本和 Web 终端后，再决定是否继续。`;
+}
+
+function handleTaskContinuationCliExit(
+  ds: DaemonSession,
+  workerGeneration: number,
+  turnId: string | undefined,
+  dispatchAttempt: number | undefined,
+): boolean {
+  if (!turnId) return false;
+  const terminal = {
+    turnId,
+    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+    status: 'ambiguous' as const,
+    errorCode: 'cli_exit',
+    workerGeneration,
+  };
+  if (!readonlyTaskContinuationHandlesTerminal(ds.session, terminal)) return false;
+  handleReadonlyTaskContinuationTerminal(ds.session, terminal);
+  return true;
+}
+
+type TaskContinuationWorkerExitRecovery = {
+  leaseId: string;
+  turnId: string;
+  dispatchAttempt?: number;
+  workerGeneration: number;
+  action: 'resume' | 'fail';
+};
+
+/** Decide recovery while the exiting generation is still the live owner. A
+ * Node-worker death proves a PTY execution endpoint is gone. Persistent panes
+ * need an authoritative missing probe; exists/unknown fail closed because the
+ * detached CLI may still be executing the last authorized action. */
+function taskContinuationWorkerExitRecovery(
+  ds: DaemonSession,
+  workerGeneration: number,
+): TaskContinuationWorkerExitRecovery | undefined {
+  const state = ds.session.readonlyTaskContinuation;
+  if (!state || (state.status !== 'active' && state.status !== 'backoff')
+    || state.currentWorkerGeneration !== workerGeneration) return undefined;
+
+  const frozenBackend = ds.initConfig?.backendType ?? ds.session.backendType;
+  let action: TaskContinuationWorkerExitRecovery['action'] = 'fail';
+  if (frozenBackend === 'pty') {
+    action = 'resume';
+  } else {
+    try {
+      const target = persistentBackendTargetForSession(ds);
+      if (target) action = probePersistentBackendTarget(target) === 'missing' ? 'resume' : 'fail';
+    } catch {
+      action = 'fail';
+    }
+  }
+  return {
+    leaseId: state.leaseId,
+    turnId: state.currentTurnId,
+    ...(state.currentDispatchAttempt !== undefined
+      ? { dispatchAttempt: state.currentDispatchAttempt }
+      : {}),
+    workerGeneration,
+    action,
+  };
 }
 
 function deliverReadonlyTaskContinuationPending(
@@ -1851,12 +2003,13 @@ function deliverReadonlyTaskContinuationWarningPending(
   );
 }
 
-/** Attach the opt-in read-only task continuation owner. The machine switch is
+/** Attach the authorization-inheriting task continuation owner. The machine switch is
  * checked both here and before every dispatch; an off switch leaves all normal
  * sessions on their existing path. */
 export function ensureReadonlyTaskContinuationAttached(
   ds: DaemonSession,
   botCfg = getBot(ds.larkAppId).config,
+  options: { activeTurnInterrupted?: boolean } = {},
 ): boolean {
   const current = ds.session.readonlyTaskContinuation;
   // A kill switch stops every new automatic dispatch, but it must not hide a
@@ -1892,7 +2045,7 @@ export function ensureReadonlyTaskContinuationAttached(
     recoverDelivery: state => deliverReadonlyTaskContinuationPending(ds, state),
     canEnqueue: () => {
       const workerGeneration = ds.workerGeneration;
-      const proof = ds.readonlyContinuationRpcProof;
+      const proof = ds.taskContinuationRpcProof;
       return readonlyTaskContinuationEligible(ds)
         && ordinaryTurnRecoveryStillOwnsSession(ds)
         && !!ds.worker
@@ -1909,17 +2062,23 @@ export function ensureReadonlyTaskContinuationAttached(
         return false;
       }
       const workerGeneration = ds.workerGeneration;
-      const proof = ds.readonlyContinuationRpcProof;
+      const proof = ds.taskContinuationRpcProof;
       if (!ds.worker || ds.worker.killed || ds.worker.connected === false
         || ds.workerReady !== true
         || !Number.isSafeInteger(workerGeneration) || (workerGeneration ?? 0) <= 0
         || ds.session.workerGeneration !== workerGeneration
-        || proof?.workerGeneration !== workerGeneration) {
+        || !proof
+        || proof.workerGeneration !== workerGeneration) {
         return false;
       }
       const current = ds.session.readonlyTaskContinuation;
       if (!current || current.currentTurnId !== dispatch.turnId
-        || current.currentDispatchAttempt !== dispatch.dispatchAttempt) return false;
+        || current.currentDispatchAttempt !== dispatch.dispatchAttempt
+        || current.authorizationMode !== 'inherited'
+        || !current.trustedCaller
+        || current.trustedCaller.requestLarkAppId !== ds.larkAppId
+        || (current.trustedController
+          && current.trustedController.requestLarkAppId !== ds.larkAppId)) return false;
       try {
         ds.worker.send({
           type: 'message',
@@ -1927,11 +2086,23 @@ export function ensureReadonlyTaskContinuationAttached(
           turnId: dispatch.turnId,
           dispatchAttempt: dispatch.dispatchAttempt,
           ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds) } : {}),
-          readonlyContinuation: {
+          trustedCaller: current.trustedCaller,
+          ...(current.trustedController
+            ? { trustedController: current.trustedController }
+            : {}),
+          taskContinuation: {
             leaseId: current.leaseId,
-            rpcGeneration: proof!.rpcGeneration,
+            rpcGeneration: proof.rpcGeneration,
+            authorizationMode: 'inherited',
           },
         } satisfies Extract<DaemonToWorker, { type: 'message' }>);
+        ds.activeInteractiveTurn = {
+          turnId: dispatch.turnId,
+          caller: { ...current.trustedCaller },
+          ...(current.trustedController
+            ? { controller: { ...current.trustedController } }
+            : {}),
+        };
         recordAdmittedOrdinaryUserTurn(ds, dispatch.turnId, {
           beginRecovery: false,
           dispatchAttempt: dispatch.dispatchAttempt,
@@ -1939,7 +2110,7 @@ export function ensureReadonlyTaskContinuationAttached(
         return workerGeneration!;
       } catch (err) {
         logger.error(
-          `[${tag(ds)}] Failed to enqueue read-only task continuation `
+          `[${tag(ds)}] Failed to enqueue task continuation `
           + `${dispatch.continuation}: ${err instanceof Error ? err.message : String(err)}`,
         );
         return false;
@@ -1950,7 +2121,7 @@ export function ensureReadonlyTaskContinuationAttached(
       ds.agentAttention = { kind: 'blocked', reason: warning, at: Date.now() };
       publishAttentionPatch(ds);
       emitSessionLifecycleHook(ds, 'session.requires_attention', {
-        reason: 'readonly_task_continuation_stopped',
+        reason: 'task_continuation_stopped',
         errorCode: state.lastErrorCode,
         logicalTurnId: state.logicalTurnId,
       });
@@ -1958,8 +2129,18 @@ export function ensureReadonlyTaskContinuationAttached(
     warn: state => {
       deliverReadonlyTaskContinuationWarningPending(ds, state);
     },
-  });
+  }, options);
   return true;
+}
+
+export function markReadonlyTaskContinuationInterruptedByRestart(
+  ds: DaemonSession,
+  restoredLeaseId: string,
+): boolean {
+  const current = ds.session.readonlyTaskContinuation;
+  if (current?.leaseId !== restoredLeaseId
+    || !readonlyTaskContinuationNeedsRestartAttention(current)) return false;
+  return ensureReadonlyTaskContinuationAttached(ds, undefined, { activeTurnInterrupted: true });
 }
 
 function sessionRuntimeDisplayName(
@@ -4277,25 +4458,29 @@ export async function deliverEphemeralOrReply(
 /**
  * Queue a card PATCH. If no PATCH is in-flight, sends immediately.
  * Otherwise stores the card JSON on `ds.pendingCardJson` (overwriting
- * any previously queued value — only the latest state matters).
+ * any previously queued value — only the latest state matters). Returns
+ * whether the PATCH was accepted for immediate or queued delivery.
  */
-export function scheduleCardPatch(ds: DaemonSession, cardJson: string, turnId?: string): void {
+export function scheduleCardPatch(ds: DaemonSession, cardJson: string, turnId?: string): boolean {
   // Defense-in-depth transport gate: a no-transport session (apiOnly bot or HTTP
   // virtual chat) has no real Feishu card to PATCH. Callers already suppress via
   // managedAuxUiSuppressed, but guarding the flush entry too means a stray direct
   // call can never dial updateMessage on a synthetic id.
-  if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return;
+  if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return false;
   // Bot opted out of the streaming card — never patch one into existence.
   // Turn-exact when the caller has turn context (screen updates): a substitute
   // turn arriving mid-PATCH must not suppress a normal turn's card (or vice
   // versa) just because it overwrote the latest-turn slot.
-  if (streamingCardDisabled(ds, turnId)) return;
+  if (streamingCardDisabled(ds, turnId)) return false;
+  const cardId = ds.streamCardId;
+  if (!cardId || cardId === CARD_POSTING_SENTINEL) return false;
   ds.pendingCardJson = cardJson;
   // Capture the card ID now — by the time flushCardPatch runs, ds.streamCardId
   // may have been overwritten by a new turn's card (CARD_POSTING_SENTINEL).
-  ds.pendingCardId = ds.streamCardId;
-  if (ds.cardPatchInFlight) return;
+  ds.pendingCardId = cardId;
+  if (ds.cardPatchInFlight) return true;
   flushCardPatch(ds);
+  return true;
 }
 
 function flushCardPatch(ds: DaemonSession): void {
@@ -6971,9 +7156,8 @@ function teardownAuthoritativePersistentBackingBeforeCloseImpl(
     || session.status === 'closed'
   ) return;
 
-  killPersistentSession(
-    'zmx',
-    persistentSessionName('zmx', session.sessionId),
+  killPersistentBackendTarget(
+    resolvePersistentBackendTarget('zmx', session.sessionId, session.persistentBackendTarget),
     session.sessionId,
   );
 }
@@ -7298,6 +7482,9 @@ export async function closeSession(
     if (ds) {
       ds.session.status = 'closed';
       ds.session.closedAt = after?.closedAt ?? ds.session.closedAt;
+      ds.session.crossPrincipalInterruptions = undefined;
+      clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
       // 活对象与 store 里的行未必是同一个引用；durable close 只清了后者。
       takeSessionPreviewTarget(ds.session);
       // Sync the parking back from the store's committed row. Only reached after a
@@ -7342,6 +7529,9 @@ export async function closeSession(
     // those continuations from re-forking the closed session after its await.
     ds.session.status = 'closed';
     ds.session.closedAt ??= new Date().toISOString();
+    ds.session.crossPrincipalInterruptions = undefined;
+    clearTimeout(ds.crossPrincipalWaitTimer);
+    ds.crossPrincipalWaitTimer = undefined;
     killedLive = true;
     if (!ds.exitEventEmitted) {
       ds.exitEventEmitted = true;
@@ -8262,9 +8452,14 @@ function acknowledgeOrdinaryImDeliveryReceipt(
   if (!record.received) {
     record.received = true;
     clearOrdinaryImDeliveryTimer(record);
+    // Native Codex now commits after history confirms submission, rather than
+    // on enqueue. Its normal two-second screen settle already exceeds the IPC
+    // receipt budget; keep that budget for transport, not for CLI startup.
+    const commitWaitMs = ds.initConfig?.cliId === 'codex' && !ds.initConfig.codexRpcInput
+      ? 90_000 : ORDINARY_IM_ACK_SETTLEMENT_TIMEOUT_MS;
     record.timer = setTimeout(() => {
       delayOrdinaryImDelivery(record);
-    }, ORDINARY_IM_ACK_SETTLEMENT_TIMEOUT_MS);
+    }, commitWaitMs);
     record.timer.unref?.();
   }
   logger.info(
@@ -9958,7 +10153,7 @@ function recordAdmittedOrdinaryUserTurn(
       cancelReadonlyTaskContinuationForUserInput(ds.session, turnId);
     } catch (err) {
       logger.error(
-        `[${tag(ds)}] Failed to cancel read-only continuation for new user input `
+        `[${tag(ds)}] Failed to cancel task continuation for new user input `
         + `${turnId.substring(0, 16)}: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
@@ -9969,6 +10164,37 @@ function recordAdmittedOrdinaryUserTurn(
     ds.agentAttention = undefined;
     publishAttentionPatch(ds);
   }
+}
+
+/** Freeze the creator carried by a daemon-authenticated scheduled input until
+ * the worker publishes the exact turn's managed capability. This is purposely
+ * narrower than a general TrustedCaller cache: only daemon-minted schedule ids
+ * whose task id and app binding match are admitted. */
+function rememberScheduledTurnCaller(
+  ds: DaemonSession,
+  turnId: string | undefined,
+  caller: TrustedCaller | undefined,
+): void {
+  if (!turnId || !caller || caller.source !== 'schedule_creator') return;
+  const taskId = parseScheduledTurnId(turnId);
+  if (!taskId || caller.taskId !== taskId) return;
+  const task = readScheduledTaskForProvenance(
+    config.session.dataDir, ds.larkAppId, taskId,
+  );
+  const expected = task ? trustedCallerForScheduledTask(task, ds.larkAppId) : undefined;
+  if (!expected
+    || expected.requestLarkAppId !== ds.larkAppId
+    || expected.requestUserOpenId !== caller.requestUserOpenId
+    || expected.requestUserUnionId !== caller.requestUserUnionId
+    || expected.source !== caller.source
+    || expected.taskId !== caller.taskId) return;
+  (ds.scheduledTurnCallers ??= new Map()).set(turnId, { ...expected });
+}
+
+function forgetScheduledTurnCaller(ds: DaemonSession, turnId: string | undefined): void {
+  if (!turnId || !ds.scheduledTurnCallers) return;
+  ds.scheduledTurnCallers.delete(turnId);
+  if (ds.scheduledTurnCallers.size === 0) ds.scheduledTurnCallers = undefined;
 }
 
 /** Send one normal (non-raw) worker turn while applying the per-bot Codex App
@@ -10179,6 +10405,7 @@ export function sendWorkerInput(
     );
     return false;
   }
+  rememberScheduledTurnCaller(ds, effectiveTurnId ?? routingTurnId, opts.trustedCaller);
   {
     const admittedTurnId = effectiveTurnId ?? routingTurnId ?? `admitted-turn-${randomUUID()}`;
     recordAdmittedOrdinaryUserTurn(ds, admittedTurnId, {
@@ -10541,6 +10768,7 @@ export function promoteQueuedActivationTail(
       queuedActivationToken: token,
       ...(vcMeetingImTurnOrigin ? { vcMeetingImTurnOrigin } : {}),
     } as DaemonToWorker);
+    rememberScheduledTurnCaller(ds, head.turnId, exactInput.trustedCaller);
     recordAdmittedOrdinaryUserTurn(ds, head.turnId, {
       beginRecovery: true,
       ...(head.dispatchAttempt !== undefined
@@ -11888,6 +12116,7 @@ export function forkWorker(
 
   ds.worker = worker;
   initializeWorkerIpcBootstrap(worker);
+  rememberScheduledTurnCaller(ds, initAttributionTurnId, initTrustedCaller);
   if (shouldTrackOrdinaryImDelivery(ds, initMsg)) {
     sendOrdinaryImDeliveryTracked(ds, initMsg);
   } else {
@@ -12112,16 +12341,42 @@ function isMeetingDrivenTurn(
 function currentGatewayCallerOpenId(ds: DaemonSession, turnId: string): string | undefined {
   // The daemon owns this per-turn sender map. The worker contributes only the
   // turn id over private IPC; it can never choose which human that id denotes.
-  return pickTurnReplyTarget(ds.session, turnId)?.senderOpenId;
+  const replyTargetCaller = pickTurnReplyTarget(ds.session, turnId)?.senderOpenId;
+  if (replyTargetCaller) return replyTargetCaller;
+  const scheduledCaller = ds.scheduledTurnCallers?.get(turnId);
+  if (scheduledCaller) {
+    // The worker publishes the same turn more than once: first at init, then
+    // again after the CLI PID attestation exists. Keep the exact-turn caller
+    // until terminal/revoke/worker-exit so the second publication cannot
+    // overwrite a correctly-bound origin with an anonymous one.
+    return scheduledCaller.requestUserOpenId;
+  }
+  const continuation = ds.session.readonlyTaskContinuation;
+  return continuation?.authorizationMode === 'inherited'
+    && continuation.currentTurnId === turnId
+    && continuation.trustedCaller?.requestLarkAppId === ds.larkAppId
+    && continuation.trustedCaller.senderType === 'user'
+    ? continuation.trustedCaller.requestUserOpenId
+    : undefined;
 }
 
 function currentTurnProcessIdentities(
   ds: DaemonSession,
   turnId: string | undefined,
 ): string[] | undefined {
-  return turnId && ds.localProcessAttestation?.cliPid
-    ? snapshotProcessIdentities(ds.localProcessAttestation.cliPid)
-    : undefined;
+  if (!turnId || !ds.localProcessAttestation) return undefined;
+  const roots = [
+    ds.localProcessAttestation.cliPid,
+    ds.localProcessAttestation.enginePid,
+  ].filter((pid): pid is number => pid !== undefined);
+  if (roots.length === 0) return undefined;
+  const identities = new Set<string>();
+  for (const root of roots) {
+    const snapshot = snapshotProcessIdentities(root);
+    if (!snapshot) return undefined;
+    for (const identity of snapshot) identities.add(identity);
+  }
+  return [...identities].sort();
 }
 
 function setupWorkerHandlers(
@@ -12141,8 +12396,7 @@ function setupWorkerHandlers(
   ) {
     throw new Error('worker generation reservation changed before IPC setup');
   }
-  ds.readonlyContinuationRpcProof = undefined;
-  ds.readonlyContinuationTurnOrigin = undefined;
+  ds.taskContinuationRpcProof = undefined;
   // Tier authority belongs to this exact worker generation. Start unknown and
   // wait for the new worker's rollout-bound observation; this also clears a
   // Codex badge before a role switch starts a non-Codex worker.
@@ -12494,6 +12748,10 @@ function setupWorkerHandlers(
           credentialIsolated: msg.credentialIsolated,
           ...(msg.cliPid !== undefined ? { cliPid: msg.cliPid } : {}),
           ...(msg.cliProcStart !== undefined ? { cliProcStart: msg.cliProcStart } : {}),
+          ...(msg.enginePid !== undefined ? { enginePid: msg.enginePid } : {}),
+          ...(msg.engineProcStart !== undefined
+            ? { engineProcStart: msg.engineProcStart }
+            : {}),
           ...(ds.workerGeneration !== undefined
             ? { workerGeneration: ds.workerGeneration }
             : {}),
@@ -14011,6 +14269,24 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored claude_exit from stale worker generation`);
           break;
         }
+        // The original opted-in turn has no dispatchAttempt, so worker.ts's
+        // durable-delivery terminal path cannot report its CLI exit. Bind the
+        // exit here to the exact live turn + worker generation. Synthetic
+        // continuation exits may already have emitted the same terminal; the
+        // coordinator's tuple/state check makes this second path a no-op.
+        try {
+          handleTaskContinuationCliExit(
+            ds, workerGeneration, msg.turnId, msg.dispatchAttempt,
+          );
+        } catch (err) {
+          logger.error(
+            `[${t}] Failed to persist task continuation CLI exit for generation ${workerGeneration}: `
+            + `${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        // The app-server died with this CLI lifetime. Do not let a backoff timer
+        // reuse its stale generation proof before the replacement reports one.
+        ds.taskContinuationRpcProof = undefined;
         ds.activeInteractiveTurn = undefined;
         // The live-send capability dies with this backend. Preserve the
         // worker-generation policy capability only while this local worker is
@@ -14456,7 +14732,7 @@ function setupWorkerHandlers(
             );
           } catch (err) {
             logger.error(
-              `[${t}] Failed to persist original-turn business final for read-only continuation `
+              `[${t}] Failed to persist original-turn business final for task continuation `
               + `${msg.turnId.substring(0, 8)}: ${err instanceof Error ? err.message : String(err)}`,
             );
           }
@@ -14513,6 +14789,7 @@ function setupWorkerHandlers(
           );
           break;
         }
+        forgetScheduledTurnCaller(ds, msg.turnId);
         // Defense in depth: the worker sends a token-matched revoke before the
         // terminal IPC, but an older/mixed worker must still lose authority at
         // this exact terminal edge. Tuple-match prevents a late turn N event
@@ -14586,7 +14863,7 @@ function setupWorkerHandlers(
           recoveryHandled ||= readonlyContinuationOwnsTerminal;
         } catch (err) {
           logger.error(
-            `[${t}] Failed to persist read-only task continuation terminal for `
+            `[${t}] Failed to persist task continuation terminal for `
             + `${msg.turnId.substring(0, 8)}: `
             + `${err instanceof Error ? err.message : String(err)}`,
           );
@@ -14900,6 +15177,9 @@ function setupWorkerHandlers(
             break;
           }
         }
+        const callerOpenId = msg.turnId
+          ? currentGatewayCallerOpenId(ds, msg.turnId)
+          : undefined;
         const preexistingProcessIdentities = currentTurnProcessIdentities(ds, msg.turnId);
         ds.managedTurnOrigin = {
           capability: msg.capability,
@@ -14909,18 +15189,12 @@ function setupWorkerHandlers(
           ...(msg.dispatchAttempt !== undefined
             ? { dispatchAttempt: msg.dispatchAttempt }
             : {}),
-          ...((msg.turnId && currentGatewayCallerOpenId(ds, msg.turnId))
-            ? { callerOpenId: currentGatewayCallerOpenId(ds, msg.turnId) }
-            : {}),
+          ...(callerOpenId ? { callerOpenId } : {}),
           ...(preexistingProcessIdentities
             ? { preexistingProcessIdentities }
             : {}),
         };
-        ds.readonlyContinuationTurnOrigin = msg.readonlyContinuation === true
-          && msg.turnId?.startsWith('bmx-readonly-')
-          && msg.dispatchAttempt !== undefined
-          ? { workerGeneration, turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt }
-          : undefined;
+        ensureAutomaticTaskContinuationLease(ds, botCfg);
         break;
       }
 
@@ -14933,6 +15207,7 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Dropped managed_turn_origin_revoked with mismatched sessionId`);
           break;
         }
+        forgetScheduledTurnCaller(ds, msg.turnId);
         // Same-generation exact-turn revocation is positive idle evidence for
         // daemon-side pre-routing. Never let historical caller/session fields
         // keep this optimistic hint alive after the worker released authority.
@@ -14969,11 +15244,6 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored stale policy capability in managed turn origin revoke`);
         }
         if (!revokeLive && !revokePolicy) break;
-        if (ds.readonlyContinuationTurnOrigin?.workerGeneration === workerGeneration
-          && ds.readonlyContinuationTurnOrigin.turnId === msg.turnId
-          && ds.readonlyContinuationTurnOrigin.dispatchAttempt === msg.dispatchAttempt) {
-          ds.readonlyContinuationTurnOrigin = undefined;
-        }
         if (revokeLive) {
           ds.managedTurnOrigin = origin.policyCapability && !revokePolicy
             ? {
@@ -15075,30 +15345,31 @@ function setupWorkerHandlers(
         break;
       }
 
-      case 'readonly_continuation_rpc_status': {
+      case 'task_continuation_rpc_status': {
         if (ds.worker !== worker
           || msg.sessionId !== ds.session.sessionId
           || ds.workerGeneration !== workerGeneration
           || ds.session.workerGeneration !== workerGeneration) {
-          logger.warn(`[${t}] Ignored read-only RPC proof from stale worker generation`);
+          logger.warn(`[${t}] Ignored task continuation RPC status from stale worker generation`);
           break;
         }
-        ds.readonlyContinuationRpcProof = msg.eligible
+        ds.taskContinuationRpcProof = msg.eligible
           ? { workerGeneration, rpcGeneration: msg.rpcGeneration, checkedAt: Date.now() }
           : undefined;
+        if (msg.eligible) ensureAutomaticTaskContinuationLease(ds, botCfg);
         break;
       }
 
       case 'final_output': {
         const continuation = ds.session.readonlyTaskContinuation;
-        const exactReadonlyFinal = continuation
+        const exactContinuationFinal = continuation
           && ['active', 'backoff'].includes(continuation.status)
-          && msg.turnId.startsWith('bmx-readonly-')
+          && msg.turnId.startsWith('bmx-continuation-')
           && msg.dispatchAttempt !== undefined
           && continuation.currentTurnId === msg.turnId
           && continuation.currentDispatchAttempt === msg.dispatchAttempt
           && continuation.currentWorkerGeneration === workerGeneration;
-        if (exactReadonlyFinal) {
+        if (exactContinuationFinal) {
           // MR1 deliberately surfaces failed-turn fallback text before the
           // structured terminal. For a synthetic continuation that text is a
           // transport diagnostic, not the model's strict JSON business result;
@@ -15122,8 +15393,8 @@ function setupWorkerHandlers(
           deliverReadonlyTaskContinuationPending(ds, deliveryState);
           break;
         }
-        if (msg.turnId.startsWith('bmx-readonly-')) {
-          logger.warn(`[${t}] Dropped stale/unbound read-only continuation final_output`);
+        if (msg.turnId.startsWith('bmx-continuation-')) {
+          logger.warn(`[${t}] Dropped stale/unbound task continuation final_output`);
           break;
         }
         const originalContinuation = ds.session.readonlyTaskContinuation;
@@ -15137,7 +15408,7 @@ function setupWorkerHandlers(
             );
           } catch (err) {
             logger.error(
-              `[${t}] Failed to persist original-turn final output for read-only continuation `
+              `[${t}] Failed to persist original-turn final output for task continuation `
               + `${msg.turnId.substring(0, 8)}: ${err instanceof Error ? err.message : String(err)}`,
             );
           }
@@ -15446,6 +15717,15 @@ function setupWorkerHandlers(
   worker.on('exit', (code, signal) => {
     const transferRetirement = transferRetiringWorkers.has(worker);
     const lifecycleRetirement = lifecycleRetiringWorkers.get(ds)?.has(worker) === true;
+    const unexpectedWorkerExit = !transferRetirement
+      && !lifecycleRetirement
+      && !worker.killed
+      && ds.session.status === 'active'
+      && ds.worker === worker
+      && ds.workerGeneration === workerGeneration;
+    const continuationRecovery = unexpectedWorkerExit
+      ? taskContinuationWorkerExitRecovery(ds, workerGeneration)
+      : undefined;
     const preReadyExit = !startupState.ready;
     const suppressDeliveryFailure = transferRetirement
       || lifecycleRetirement
@@ -15524,6 +15804,8 @@ function setupWorkerHandlers(
       ds.workerToken = null;
       ds.workerViewToken = null;
       ds.managedTurnOrigin = undefined;
+      ds.scheduledTurnCallers = undefined;
+      ds.taskContinuationRpcProof = undefined;
       ds.activeInteractiveTurn = undefined;
       if (ds.remoteCloseState) {
         ds.remoteCloseState = { ...ds.remoteCloseState, phase: 'uncertain' };
@@ -15557,6 +15839,33 @@ function setupWorkerHandlers(
       // 进程树，包括那一代注册的 dev server。与代次围栏并进同一次落盘。
       const exitedPreviewTarget = takeSessionPreviewTarget(ds.session);
       sessionStore.updateSession(ds.session);
+      if (continuationRecovery?.action === 'resume') {
+        const terminal = {
+          turnId: continuationRecovery.turnId,
+          ...(continuationRecovery.dispatchAttempt !== undefined
+            ? { dispatchAttempt: continuationRecovery.dispatchAttempt }
+            : {}),
+          status: 'ambiguous' as const,
+          errorCode: 'cli_exit',
+          workerGeneration: continuationRecovery.workerGeneration,
+        };
+        try {
+          handleReadonlyTaskContinuationTerminal(ds.session, terminal);
+        } catch (err) {
+          logger.error(
+            `[${t}] Failed to persist task continuation worker-exit recovery: `
+            + `${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      } else if (continuationRecovery?.action === 'fail') {
+        failReadonlyTaskContinuationVisible(
+          ds.session,
+          continuationRecovery.turnId,
+          continuationRecovery.dispatchAttempt,
+          continuationRecovery.workerGeneration,
+          'continuation_worker_exit_backend_unverified',
+        );
+      }
       if (exitedPreviewTarget !== undefined) publishSessionPreviewCleared(ds.session.sessionId);
       dashboardEventBus.publish({
         type: 'session.update',
@@ -15567,18 +15876,49 @@ function setupWorkerHandlers(
       });
     }
     if (!transferRetirement) {
+      let workerExitReconciled: void | Promise<void> = undefined;
       try {
-        const notified = cb.onWorkerExit?.(ds, {
+        workerExitReconciled = cb.onWorkerExit?.(ds, {
           sessionId: ds.session.sessionId,
           workerGeneration,
           code,
           signal,
         });
-        void Promise.resolve(notified).catch((err: any) => {
+        void Promise.resolve(workerExitReconciled).catch((err: any) => {
           logger.error(`[${t}] Failed to reconcile worker exit generation ${workerGeneration}: ${err.message}`);
         });
       } catch (err: any) {
         logger.error(`[${t}] Failed to reconcile worker exit generation ${workerGeneration}: ${err.message}`);
+      }
+      if (continuationRecovery?.action === 'resume') {
+        const resumeAfterReconcile = (): void => {
+          const state = ds.session.readonlyTaskContinuation;
+          if (state?.leaseId !== continuationRecovery.leaseId
+            || state.status !== 'backoff'
+            || ds.session.status !== 'active'
+            || (ds.worker && !ds.worker.killed)
+            || (activeSessionsRegistry
+              && activeSessionsRegistry.get(activeSessionKey(ds)) !== ds)) return;
+          try {
+            forkWorker(ds, '', { resume: true });
+          } catch (err) {
+            failReadonlyTaskContinuationVisible(
+              ds.session,
+              continuationRecovery.turnId,
+              continuationRecovery.dispatchAttempt,
+              continuationRecovery.workerGeneration,
+              'continuation_worker_restart_failed',
+            );
+            logger.error(
+              `[${t}] Failed to restart worker for task continuation: `
+              + `${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        };
+        void Promise.resolve(workerExitReconciled).then(
+          resumeAfterReconcile,
+          resumeAfterReconcile,
+        );
       }
     } else {
       logger.info(`[${t}] Suppressed external worker-exit effects for routing transfer`);
@@ -16635,7 +16975,7 @@ export function forkAdoptWorker(
   }
   if (!canForkRegisteredSession(ds)) return 'rejected';
   ds.workerReady = false;
-  ds.readonlyContinuationRpcProof = undefined;
+  ds.taskContinuationRpcProof = undefined;
   const cb = requireCallbacks();
   const t = tag(ds);
   const adopted = ds.adoptedFrom;
@@ -17247,6 +17587,12 @@ function cleanupPersistentBackendSessions(
   if (!anyBackend) return;
 
   const backend = backendType === 'tmux' ? TmuxBackend : backendType === 'zmx' ? ZmxBackend : HerdrBackend;
+  const targetForSession = (session: Session): PersistentBackendTarget => backendType === 'zmx'
+    ? resolvePersistentBackendTarget(backendType, session.sessionId, session.persistentBackendTarget)
+    : { backendType, sessionName: backend.sessionName(session.sessionId) };
+  const targetKey = (target: PersistentBackendTarget): string => target.backendType === 'zmx'
+    ? persistentBackendTargetKey(target) : target.sessionName;
+  const sessionTargetKey = (session: Session): string => targetKey(targetForSession(session));
   const multiBot = getAllBots().length > 1;
   const cliIdFile = join(config.session.dataDir, backendType === 'tmux' ? 'last-cli-id' : `last-cli-id-${backendType}`);
   let lastCliId: string | undefined;
@@ -17254,34 +17600,52 @@ function cleanupPersistentBackendSessions(
   const currentCliId = config.daemon.cliId;
   // Codex App sessions with an unsettled dispatch ledger must reconcile before
   // any CLI-change sweep tears their backing pane down.
-  const unsettledNames = new Set(
+  const unsettledTargetKeys = new Set(
     activeSessions_
       .filter(hasProtectedSessionMutationOwnership)
-      .map(session => backend.sessionName(session.sessionId)),
+      .map(sessionTargetKey),
   );
   const belongsToBackend = (session: Session) =>
     session.backendType === backendType ||
     (session.backendType === undefined && backendType === 'tmux');
-  const activeNames = new Set(
+  const activeTargetKeys = new Set(
     [...activeSessions_, ...runtimeSessionRows]
       .filter(belongsToBackend)
-      .map(s => backend.sessionName(s.sessionId)),
+      .map(sessionTargetKey),
   );
-  const runtimeNames = new Set(
-    [...runtimeSessionRows, ...activeSessions_.filter(s => s.cliInstanceBinding)].filter(belongsToBackend).map(s => backend.sessionName(s.sessionId)),
+  const runtimeTargetKeys = new Set(
+    [...runtimeSessionRows, ...activeSessions_.filter(s => s.cliInstanceBinding)].filter(belongsToBackend).map(sessionTargetKey),
   );
   const ownedSessions = [
     ...storedSessions.filter(belongsToBackend),
     ...activeSessions_.filter(belongsToBackend),
   ];
-  const ownedIdsByName = new Map<string, Set<string>>();
+  const ownedIdsByTarget = new Map<string, Set<string>>();
   for (const session of ownedSessions) {
-    const name = backend.sessionName(session.sessionId);
-    const ids = ownedIdsByName.get(name) ?? new Set<string>();
+    const name = sessionTargetKey(session);
+    const ids = ownedIdsByTarget.get(name) ?? new Set<string>();
     ids.add(session.sessionId);
-    ownedIdsByName.set(name, ids);
+    ownedIdsByTarget.set(name, ids);
   }
-  const ownedNames = new Set(ownedIdsByName.keys());
+  const ownedTargetKeys = new Set(ownedIdsByTarget.keys());
+  const listBackingTargets = (): PersistentBackendTarget[] => {
+    if (backendType !== 'zmx') {
+      return backend.listBotmuxSessions().map(sessionName => ({ backendType, sessionName }));
+    }
+    // Enumerate only namespaces represented by this store/runtime. Never scan
+    // arbitrary directories or treat a bmx-* name as ownership authority.
+    const directories = new Set(ownedSessions.concat(runtimeSessionRows.filter(belongsToBackend))
+      .map(session => {
+        const target = targetForSession(session);
+        return target.backendType === 'zmx' ? target.socketDir : undefined;
+      }));
+    return [...directories].flatMap(socketDir => {
+      const names = socketDir === undefined
+        ? ZmxBackend.listBotmuxSessions()
+        : ZmxBackend.listBotmuxSessions(zmxEnv(process.env, socketDir));
+      return names.map(sessionName => ({ backendType: 'zmx' as const, sessionName, socketDir }));
+    });
+  };
   type ExactHerdrTarget = { sessionName: string; agentName: string };
   const exactHerdrTarget = (session: Session): ExactHerdrTarget | undefined => {
     const target = session.persistentBackendTarget;
@@ -17364,14 +17728,15 @@ function cleanupPersistentBackendSessions(
       HerdrBackend.killAgents(sessionName, agentNames);
     }
   };
-  const killOwnedBackendSession = (name: string, exactSessionId?: string): void => {
+  const killOwnedBackendSession = (target: PersistentBackendTarget, exactSessionId?: string): void => {
+    const name = target.sessionName;
     if (backendType !== 'zmx') {
       backend.killSession(name);
       return;
     }
     const candidates = exactSessionId
       ? new Set([exactSessionId])
-      : ownedIdsByName.get(name);
+      : ownedIdsByTarget.get(targetKey(target));
     if (!candidates || candidates.size !== 1) {
       logger.warn(
         `Refusing ambiguous name-only ZMX cleanup for ${name}; ` +
@@ -17380,7 +17745,7 @@ function cleanupPersistentBackendSessions(
       return;
     }
     try {
-      ZmxBackend.killManagedSession(name, [...candidates][0]!);
+      killPersistentBackendTarget(target, [...candidates][0]!);
     } catch (err) {
       logger.warn(`Refusing unsafe ZMX cleanup for ${name}: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -17389,29 +17754,33 @@ function cleanupPersistentBackendSessions(
   if (!multiBot && lastCliId && lastCliId !== currentCliId) {
     logger.info(`CLI_ID changed (${lastCliId} → ${currentCliId}), killing all ${backendType} sessions`);
     // Legacy per-topic hosts are still enumerable by bmx-* name.
-    for (const name of backend.listBotmuxSessions()) {
-      if (unsettledNames.has(name)) {
+    for (const target of listBackingTargets()) {
+      const name = target.sessionName;
+      const key = targetKey(target);
+      if (unsettledTargetKeys.has(key)) {
         logger.warn(`Preserving ${backendType} ${name}: unsettled Codex App dispatch must reconcile first`);
         continue;
       }
       // A dispatcher-created runtime session already runs the current CLI.
       // Never let the stale last-cli marker tear it down during restore.
-      if (runtimeNames.has(name)) continue;
+      if (runtimeTargetKeys.has(key)) continue;
       // ZMX_DIR is a user-wide namespace and bmx-* is deterministic, not an
       // ownership credential. Another checkout/data root can legitimately own
       // a bmx-* daemon, so never kill a name absent from this bot's store/map.
-      if (backendType === 'zmx' && !ownedNames.has(name)) continue;
-      killOwnedBackendSession(name);
+      if (backendType === 'zmx' && !ownedTargetKeys.has(key)) continue;
+      killOwnedBackendSession(target);
     }
     // Machine-wide Herdr agents are not separate bmx-* sessions. Include
     // persisted inactive rows as well as the active restore snapshot so a CLI
     // switch cannot leave an old executable behind.
     killManagedExactHerdrTargets(false);
   } else {
-    for (const name of backend.listBotmuxSessions()) {
-      if (ownedNames.has(name) && !activeNames.has(name)) {
+    for (const target of listBackingTargets()) {
+      const name = target.sessionName;
+      const key = targetKey(target);
+      if (ownedTargetKeys.has(key) && !activeTargetKeys.has(key)) {
         logger.info(`Killing orphaned ${backendType} session: ${name}`);
-        killOwnedBackendSession(name);
+        killOwnedBackendSession(target);
       }
     }
     killManagedExactHerdrTargets(true);
@@ -17438,7 +17807,7 @@ function cleanupPersistentBackendSessions(
             sessionName: target.sessionName,
             agentName: target.agentName,
           }))
-          : runtimeNames.has(target.sessionName);
+          : runtimeTargetKeys.has(targetKey(target));
         if (runtimeOwnsTarget) continue;
         const label = target.backendType === 'herdr' && target.agentName
           ? `${target.sessionName}/${target.agentName}`

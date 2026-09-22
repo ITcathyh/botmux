@@ -1054,6 +1054,8 @@ async function handleManagedOriginAttestation(
         channelId: origin.originChannelId,
         sessionId,
         turnId: liveTurnId,
+        ...(origin.callerOpenId ? { callerOpenId: origin.callerOpenId } : {}),
+        larkAppId: ds.larkAppId,
         ...(origin.dispatchAttempt !== undefined
           ? { dispatchAttempt: origin.dispatchAttempt }
           : {}),
@@ -1093,7 +1095,7 @@ ipcRoute('POST', MANAGED_ORIGIN_ATTEST_ROUTE, async (req, res) => {
 });
 
 ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
-  let body: { sessionId?: unknown };
+  let body: { sessionId?: unknown; expectedScheduledTurnId?: unknown };
   try {
     body = await readBoundedJsonBody(req, 1_024, 1_000);
   } catch (err) {
@@ -1109,6 +1111,10 @@ ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
   const sessionId = typeof body.sessionId === 'string' && body.sessionId.length <= 256
     ? body.sessionId
     : '';
+  const expectedScheduledTurnId = typeof body.expectedScheduledTurnId === 'string'
+    && body.expectedScheduledTurnId.length <= 256
+    ? body.expectedScheduledTurnId
+    : undefined;
   const peer = resolveLoopbackPeerProcesses({
     remoteAddress: req.socket.remoteAddress,
     remotePort: req.socket.remotePort,
@@ -1125,6 +1131,7 @@ ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
     sessionId,
     peer: peer.peer,
     findSession: findActiveBySessionId,
+    ...(expectedScheduledTurnId ? { expectedScheduledTurnId } : {}),
   });
   return result.ok
     ? jsonRes(res, 200, result.document)
@@ -1630,18 +1637,6 @@ ipcRoute('POST', '/api/sessions/:sessionId/native-subagent-runtime', async (req,
     };
   }
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
-  const readonlyOrigin = ds.readonlyContinuationTurnOrigin;
-  if (readonlyOrigin
-    && readonlyOrigin.workerGeneration === ds.workerGeneration
-    && ds.managedTurnOrigin?.turnId === readonlyOrigin.turnId
-    && ds.managedTurnOrigin.dispatchAttempt === readonlyOrigin.dispatchAttempt) {
-    return nativeSubagentRuntimeJsonRes({
-      req, res, sessionId: params.sessionId, status: 200,
-      body: { ok: true, deny: true, reason: 'read-only continuation forbids subagents' },
-      ...responseAuth,
-    });
-  }
-
   let runtimeState;
   try { runtimeState = getBot(ds.larkAppId).nativeSubagentRuntimeState; }
   catch { return jsonRes(res, 404, { ok: false, error: 'bot_not_found' }); }
@@ -2484,13 +2479,13 @@ ipcRoute('POST', '/api/project-groups/:chatId/refresh-card', async (_req, res, p
   }
 });
 
-/** Explicit control plane for one read-only long-running task lease. The
+/** Explicit control plane for one authorization-inheriting long-running task lease. The
  * rotating current-turn capability binds every action to the calling session
  * and turn; the daemon owns all persisted state and timers. */
 ipcRoute('POST', '/api/sessions/:sessionId/continuation', async (req, res, params) => {
   type ContinuationRequestBody = {
     action?: unknown;
-    readonly?: unknown;
+    readonly?: unknown; // accepted as a deprecated compatibility hint
     ttlMs?: unknown;
     maxContinuations?: unknown;
   } & Record<string, unknown>;
@@ -2505,14 +2500,11 @@ ipcRoute('POST', '/api/sessions/:sessionId/continuation', async (req, res, param
     return jsonRes(res, 409, { ok: false, error: 'active_turn_required' });
   }
   if (!ensureReadonlyTaskContinuationAttached(ds)) {
-    return jsonRes(res, 409, { ok: false, error: 'readonly_continuation_unavailable' });
+    return jsonRes(res, 409, { ok: false, error: 'continuation_unavailable' });
   }
   try {
     let state;
     if (body.action === 'start') {
-      if (body.readonly !== true) {
-        return jsonRes(res, 400, { ok: false, error: 'readonly_required' });
-      }
       if (!turnId.startsWith('om_') || ds.managedTurnOrigin?.dispatchAttempt !== undefined) {
         return jsonRes(res, 409, { ok: false, error: 'ordinary_user_turn_required' });
       }
@@ -2527,17 +2519,29 @@ ipcRoute('POST', '/api/sessions/:sessionId/continuation', async (req, res, param
         return jsonRes(res, 400, { ok: false, error: 'invalid_max_continuations' });
       }
       const generation = ds.workerGeneration;
-      const proof = ds.readonlyContinuationRpcProof;
+      const proof = ds.taskContinuationRpcProof;
+      const inheritedAuthority = ds.activeInteractiveTurn;
+      if (!inheritedAuthority || inheritedAuthority.turnId !== turnId
+        || inheritedAuthority.caller.requestLarkAppId !== ds.larkAppId
+        || inheritedAuthority.caller.senderType !== 'user') {
+        return jsonRes(res, 409, { ok: false, error: 'continuation_authority_required' });
+      }
       if (!ds.worker || ds.worker.killed || ds.worker.connected === false
         || ds.workerReady !== true
         || !Number.isSafeInteger(generation) || (generation ?? 0) <= 0
         || ds.session.workerGeneration !== generation
         || proof?.workerGeneration !== generation) {
-        return jsonRes(res, 409, { ok: false, error: 'readonly_rpc_proof_required' });
+        return jsonRes(res, 409, { ok: false, error: 'continuation_rpc_required' });
       }
       state = startReadonlyTaskContinuation(ds.session, {
         turnId,
         workerGeneration: generation!,
+        authorizationMode: 'inherited',
+        startMode: 'explicit',
+        trustedCaller: inheritedAuthority.caller,
+        ...(inheritedAuthority.controller
+          ? { trustedController: inheritedAuthority.controller }
+          : {}),
         ...(typeof body.ttlMs === 'number' ? { ttlMs: body.ttlMs } : {}),
         ...(typeof body.maxContinuations === 'number'
           ? { maxContinuations: body.maxContinuations }
@@ -3493,6 +3497,45 @@ ipcRoute('GET', '/api/sessions/:sessionId/trigger-result', (req, res, params) =>
   jsonRes(res, result.ok ? 200 : 400, result);
 });
 
+ipcRoute('POST', '/api/sessions/:sessionId/trigger-result/supersede', async (req, res, params) => {
+  const session = findOwnedSessionRecord(params.sessionId);
+  if (!session || !cachedLarkAppId || session.larkAppId !== cachedLarkAppId) {
+    return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  }
+  let body: Record<string, unknown>;
+  try { body = await readJsonBody<Record<string, unknown>>(req, 4_096); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const predecessorTriggerId = typeof body.predecessorTriggerId === 'string' ? body.predecessorTriggerId.trim() : '';
+  const successorTriggerId = typeof body.successorTriggerId === 'string' ? body.successorTriggerId.trim() : '';
+  if (!predecessorTriggerId || !successorTriggerId || predecessorTriggerId === successorTriggerId) {
+    return jsonRes(res, 400, { ok: false, error: 'distinct_trigger_ids_required' });
+  }
+  try {
+    const outcome = asyncTriggerStore.supersedePendingTriggerByCompletedSuccessorStrict(
+      params.sessionId,
+      predecessorTriggerId,
+      successorTriggerId,
+      Date.now(),
+      cachedLarkAppId,
+    );
+    if (outcome === 'superseded' || outcome === 'already_superseded') {
+      const results = findActiveBySessionId(params.sessionId)?.asyncTriggerResults;
+      if (results?.get(predecessorTriggerId)?.status === 'pending') results.delete(predecessorTriggerId);
+      return jsonRes(res, 200, {
+        ok: true,
+        state: 'superseded',
+        alreadyTerminal: outcome === 'already_superseded',
+        predecessorTriggerId,
+        successorTriggerId,
+      });
+    }
+    return jsonRes(res, 409, { ok: false, error: outcome, predecessorTriggerId, successorTriggerId });
+  } catch (error) {
+    logger.warn(`[async-trigger] exact supersession failed session=${params.sessionId.slice(0, 8)}: ${error}`);
+    return jsonRes(res, 409, { ok: false, error: 'trigger_supersession_rejected' });
+  }
+});
+
 // 会话 insight：只读解析本会话的 transcript，产出动作 span / 失败聚合 / 规则建议
 // （SafeInsightReport）。底层 services/insight 已做 fail-closed 脱敏投影——raw 命令
 // 与输出永不进结构。detail=summary 只返聚合+建议（/insight 卡片、抽屉概览用）；
@@ -4192,7 +4235,7 @@ export interface ScheduleRow {
   createdAt: string;
   lastRunAt?: string;
   nextRunAt?: string;
-  lastStatus?: 'ok' | 'error' | 'skipped';
+  lastStatus?: 'running' | 'ok' | 'error' | 'skipped';
   lastError?: string;
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
@@ -4666,6 +4709,19 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
   // a clear lastError, which is the pre-existing behavior for CLI-created
   // tasks. Adding a flaky gate here would block valid creates.
   try {
+    const ownerOpenId = getOwnerOpenId(cachedLarkAppId);
+    let ownerUnionId: string | undefined;
+    if (ownerOpenId) {
+      const deploymentOwnerUnionId = getDeploymentIdentity(config.session.dataDir).ownerUnionId;
+      const bot = getBot(cachedLarkAppId);
+      // The deployment identity is tenant-stable, but it is authoritative for
+      // this app only after the live allowlist resolution maps that exact
+      // union_id back to the same open_id selected as owner.
+      if (deploymentOwnerUnionId
+        && bot.rawAllowedUserResolution.get(deploymentOwnerUnionId) === ownerOpenId) {
+        ownerUnionId = deploymentOwnerUnionId;
+      }
+    }
     const task = createTaskWithOptionalPrecondition({
       name,
       schedule,
@@ -4685,7 +4741,8 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
       // Stamp the bot owner as creator: dashboard is local + token-protected,
       // and the daemon re-checks the owner is still allowed at every run
       // mutation (scheduled-turn-provenance).
-      ownerOpenId: getOwnerOpenId(cachedLarkAppId),
+      ownerOpenId,
+      ownerUnionId,
       deliver,
       silent,
       followActive: followActive || undefined,
@@ -6151,13 +6208,14 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     pinStreamingCard: cardPrefs.pinStreamingCard,
     silentTurnReactions: cardPrefs.silentTurnReactions,
     codexAppCleanInput: cardPrefs.codexAppCleanInput,
+    codexBrowser: cardPrefs.codexBrowser,
     writableTerminalLinkInCard: cardPrefs.writableTerminalLinkInCard,
     privateCard: cardPrefs.privateCard,
-    thinkingCard: cardPrefs.thinkingCard,
-    thinkingCardToolResult: cardPrefs.thinkingCardToolResult,
+    cotEnabled: cardPrefs.cotEnabled,
     senderTag: cardPrefs.senderTag,
     overloadAlert: cardPrefs.overloadAlert,
     botToBotSameDir: cardPrefs.botToBotSameDir,
+    autoInviteOwnerOnGroupAdd: cardPrefs.autoInviteOwnerOnGroupAdd,
     autoStartOnGroupJoin: cardPrefs.autoStartOnGroupJoin,
     autoStartOnGroupJoinPrompt: cardPrefs.autoStartOnGroupJoinPrompt,
     autoStartOnGroupJoinSeed: cardPrefs.autoStartOnGroupJoinSeed,
@@ -6286,10 +6344,9 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   let body: {
     usageDisplay?: unknown;
     replyCardMode?: unknown;
-    disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; thinkingCard?: unknown;
-    thinkingCardToolResult?: unknown;
+    disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; cotEnabled?: unknown;
     botToBotSameDir?: unknown;
-    autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnGroupJoinSeed?: unknown; autoStartOnGroupJoinSeedDefault?: unknown; autoStartOnNewTopic?: unknown;
+    autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnGroupJoinSeed?: unknown; autoStartOnGroupJoinSeedDefault?: unknown; autoStartOnNewTopic?: unknown; autoInviteOwnerOnGroupAdd?: unknown;
     groupJoinCommandEnabled?: unknown; groupJoinCommand?: unknown;
     regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown; docSubscribeDefaultMode?: unknown;
     overloadAlert?: unknown; summaryMemory?: unknown; summaryMemoryPath?: unknown;
@@ -6301,10 +6358,9 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   const patch: {
     usageDisplay?: UsageDisplayMode;
     replyCardMode?: import('../services/turn-reply-card.js').ReplyCardMode;
-    disableStreamingCard?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; thinkingCard?: boolean;
-    thinkingCardToolResult?: boolean;
+    disableStreamingCard?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; codexBrowser?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; cotEnabled?: boolean;
     botToBotSameDir?: boolean;
-    autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnGroupJoinSeed?: string; autoStartOnNewTopic?: boolean;
+    autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnGroupJoinSeed?: string; autoStartOnNewTopic?: boolean; autoInviteOwnerOnGroupAdd?: boolean;
     groupJoinCommandEnabled?: boolean; groupJoinCommand?: string;
     regularGroupReplyMode?: ChatReplyMode; regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
     docSubscribeDefaultMode?: 'mention-only' | 'all';
@@ -6327,14 +6383,26 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (typeof body.botToBotSameDir === 'boolean') patch.botToBotSameDir = body.botToBotSameDir;
   if (typeof body.silentTurnReactions === 'boolean') patch.silentTurnReactions = body.silentTurnReactions;
   if (typeof body.codexAppCleanInput === 'boolean') patch.codexAppCleanInput = body.codexAppCleanInput;
+  if (typeof body.codexBrowser === 'boolean') {
+    if (body.codexBrowser) {
+      const config = getBot(cachedLarkAppId).config;
+      if (config.cliId !== 'codex-app') {
+        return jsonRes(res, 400, { ok: false, error: 'codex_browser_requires_codex_app' });
+      }
+      if (config.existingAppServer || config.sandbox === true || config.readIsolation === true) {
+        return jsonRes(res, 409, { ok: false, error: 'codex_browser_config_conflict' });
+      }
+    }
+    patch.codexBrowser = body.codexBrowser;
+  }
   if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
   if (typeof body.privateCard === 'boolean') patch.privateCard = body.privateCard;
-  if (typeof body.thinkingCard === 'boolean') patch.thinkingCard = body.thinkingCard;
-  if (typeof body.thinkingCardToolResult === 'boolean') patch.thinkingCardToolResult = body.thinkingCardToolResult;
+  if (typeof body.cotEnabled === 'boolean') patch.cotEnabled = body.cotEnabled;
   if (typeof body.senderTag === 'boolean') patch.senderTag = body.senderTag;
   if (typeof body.overloadAlert === 'boolean') patch.overloadAlert = body.overloadAlert;
   if (typeof body.summaryMemory === 'boolean') patch.summaryMemory = body.summaryMemory;
   if (typeof body.summaryMemoryPath === 'string') patch.summaryMemoryPath = body.summaryMemoryPath;
+  if (typeof body.autoInviteOwnerOnGroupAdd === 'boolean') patch.autoInviteOwnerOnGroupAdd = body.autoInviteOwnerOnGroupAdd;
   if (typeof body.autoStartOnGroupJoin === 'boolean') patch.autoStartOnGroupJoin = body.autoStartOnGroupJoin;
   if (typeof body.autoStartOnGroupJoinPrompt === 'string') patch.autoStartOnGroupJoinPrompt = body.autoStartOnGroupJoinPrompt;
   if (typeof body.autoStartOnGroupJoinSeed === 'string') {
@@ -6382,7 +6450,11 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (Object.keys(patch).length === 0) return jsonRes(res, 400, { ok: false, error: 'no_valid_fields' });
 
   const r = await cardPrefsStore.updateBotCardPrefs(cachedLarkAppId, patch);
-  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  if (!r.ok) {
+    const status = r.reason === 'codex_browser_config_conflict'
+      || r.reason === 'existing_app_server_sandbox_conflict' ? 409 : 400;
+    return jsonRes(res, status, { ok: false, error: r.reason });
+  }
   jsonRes(res, 200, { ok: true, ...r.prefs });
 });
 
@@ -6924,6 +6996,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     // read-isolation toggle validates at enable time; changing the agent afterwards
     // is the other way a bot could end up configured-but-unenforceable.)
     let readIsolationCleared = false;
+    let codexBrowserCleared = false;
     const r = await rmwBotEntry<{
       error?: 'reasoning_effort_not_supported_by_model' | 'launch_mode_sandbox_conflict';
       nextReasoningEffort?: typeof reasoningEffort;
@@ -6949,6 +7022,10 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
         return { write: false, result: { error: 'reasoning_effort_not_supported_by_model' } };
       }
       entry.cliId = selected.cliId;
+      if (selected.cliId !== 'codex-app' && entry.codexBrowser !== undefined) {
+        delete entry.codexBrowser;
+        codexBrowserCleared = true;
+      }
       if (selected.wrapperCli) entry.wrapperCli = selected.wrapperCli;
       else delete entry.wrapperCli;
       if (selected.cliLaunchMode) entry.cliLaunchMode = selected.cliLaunchMode;
@@ -7069,6 +7146,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     if (!supportsDshRuntime) bot.config.dshRuntime = undefined;
     else if (dshRuntimeFieldPresent) bot.config.dshRuntime = nextDshRuntime;
     if (readIsolationCleared) bot.config.readIsolation = false;
+    if (codexBrowserCleared) bot.config.codexBrowser = undefined;
     if (isRemoteCliId(selected.cliId)) {
       bot.config.backendType = selected.cliId as typeof bot.config.backendType;
     } else if (bot.config.backendType && isRemoteBackendType(bot.config.backendType)) {
@@ -7107,6 +7185,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       readIsolation: bot.config.readIsolation === true,
       readIsolationSupported: readIsolationEnforceableFor(bot.config),
       readIsolationCleared,
+      codexBrowserCleared,
       agentAvailable: availability.available,
       availabilityWarning,
       requiredCommand: availability.command,
@@ -7800,7 +7879,11 @@ ipcRoute('PUT', '/api/bot-sandbox', async (req, res) => {
   // restore; this toggle is intentionally next-session-only and cannot mutate
   // a live pane's profile.
   const r = await sandboxStore.updateBotSandbox(cachedLarkAppId, body.enabled === true);
-  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  if (!r.ok) {
+    const status = r.reason === 'codex_browser_config_conflict'
+      || r.reason === 'existing_app_server_sandbox_conflict' ? 409 : 400;
+    return jsonRes(res, status, { ok: false, error: r.reason });
+  }
   jsonRes(res, 200, { ok: true, sandbox: r.sandbox });
 });
 
@@ -7899,7 +7982,12 @@ ipcRoute('PUT', '/api/bot-read-isolation', async (req, res) => {
           backendType,
           session.sessionId,
         );
-        if (persistentBackend.probePersistentSession(backendType, backingName) !== 'missing') {
+        const probe = backendType === 'zmx'
+          ? persistentBackend.probePersistentBackendTarget(persistentBackend.resolvePersistentBackendTarget(
+            backendType, session.sessionId, session.persistentBackendTarget,
+          ))
+          : persistentBackend.probePersistentSession(backendType, backingName);
+        if (probe !== 'missing') {
           return jsonRes(res, 409, {
             ok: false,
             error: 'read_isolation_teardown_unverified',
@@ -7920,7 +8008,11 @@ ipcRoute('PUT', '/api/bot-read-isolation', async (req, res) => {
     // A crash at any point can only lead to a cold spawn under the old or new
     // durable policy; there is no owned pane to reattach.
     const r = await sandboxStore.updateBotReadIsolation(larkAppId, enable);
-    if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+    if (!r.ok) {
+      const status = r.reason === 'codex_browser_config_conflict'
+        || r.reason === 'existing_app_server_sandbox_conflict' ? 409 : 400;
+      return jsonRes(res, status, { ok: false, error: r.reason });
+    }
     jsonRes(res, 200, {
       ok: true,
       readIsolation: r.readIsolation,

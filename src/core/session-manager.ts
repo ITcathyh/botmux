@@ -13,7 +13,7 @@ import * as scheduleStore from '../services/schedule-store.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
@@ -31,7 +31,8 @@ import {
   persistentSessionName,
   probePersistentBackendTarget,
   probePersistentSession,
-  probePersistentSessions,
+  probePersistentBackendTargets,
+  persistentBackendTargetKey,
   killPersistentBackendTarget,
   killPersistentSession,
   type PersistentBackendType,
@@ -803,7 +804,7 @@ function renderChatContextBlock(chatContext?: ChatContext): string {
 /**
  * Whether this bot injects the `<sender>` tag. Default ON: an unreadable bot
  * (getBot throws for an unknown appId) or an absent key both mean "inject",
- * matching `thinkingCard`'s convention — only an explicit `false` disables, so
+ * matching `cotEnabled`'s convention — only an explicit `false` disables, so
  * a config-read failure can never silently strip per-turn attribution.
  */
 function senderTagEnabled(larkAppId: string): boolean {
@@ -2228,6 +2229,15 @@ export async function restoreActiveSessions(
     // that close failed.
     .filter(s => !quarantinedSessionIds.has(s.sessionId))
     .sort((a, b) => restorePriority(b) - restorePriority(a));
+  // Snapshot the exact leases inherited from the previous daemon before any
+  // restore await lets live ingress mutate a registered session. A lease born
+  // in this boot must never be mislabeled as interrupted by the old process.
+  const interruptedReadonlyContinuationLeaseIds = new Map(active.flatMap(session => {
+    const continuation = session.readonlyTaskContinuation;
+    return continuation?.status === 'active' && continuation.startMode !== 'explicit'
+      ? [[session.sessionId, continuation.leaseId] as const]
+      : [];
+  }));
 
   // LOAD-BEARING ORDER: validate and contain the narrow XPI shared-cwd state
   // before stale-pid sweeping, backend probes, registration, card recovery, or
@@ -3023,7 +3033,11 @@ export async function restoreActiveSessions(
   for (const ds of restoredByThisInvocation) {
     if (!stillOwnsRestoreRegistration(ds)) continue;
     ensureOrdinaryTurnRecoveryAttached(ds);
-    ensureReadonlyTaskContinuationAttached(ds);
+    const restoredLeaseId = interruptedReadonlyContinuationLeaseIds.get(ds.session.sessionId);
+    if (!restoredLeaseId
+      || !markReadonlyTaskContinuationInterruptedByRestart(ds, restoredLeaseId)) {
+      ensureReadonlyTaskContinuationAttached(ds);
+    }
   }
 
   // Persistent backends: auto-fork workers for sessions whose backing session
@@ -3037,7 +3051,6 @@ export async function restoreActiveSessions(
     backendTarget: PersistentBackendTarget;
     backendName: string;
   }> = [];
-  const namesByBackend = new Map<PersistentBackendType, Set<string>>();
   for (const ds of restoredByThisInvocation) {
     // A later restore CAS awaited after this row was registered. During that
     // yield the user may have closed/resumed/replaced it; never carry the stale
@@ -3069,31 +3082,20 @@ export async function restoreActiveSessions(
       ? `${backendTarget.sessionName}/${backendTarget.agentName}`
       : backendTarget.sessionName;
     restoreCandidates.push({ ds, backendType, backendTarget, backendName });
-    // Only session-name-addressable targets can be answered from a batch
-    // snapshot; agent-scoped Herdr rows fall back to their per-target probe.
-    if (backendTarget.backendType === 'herdr' && backendTarget.agentName) continue;
-    const names = namesByBackend.get(backendType) ?? new Set<string>();
-    names.add(backendTarget.sessionName);
-    namesByBackend.set(backendType, names);
   }
-  // ZMX/Zellij can classify every requested name from one control-plane list.
-  // This is both a consistent restore snapshot and avoids an O(N²) ZMX restart
-  // when each per-row probe would otherwise scan every per-session daemon.
-  const probeSnapshots = new Map<PersistentBackendType, ReadonlyMap<string, SessionProbe>>();
-  for (const [backendType, names] of namesByBackend) {
-    probeSnapshots.set(backendType, probePersistentSessions(backendType, names));
-  }
+  const probeSnapshots = probePersistentBackendTargets(restoreCandidates
+    .map(item => item.backendTarget)
+    .filter(target => !(target.backendType === 'herdr' && target.agentName)));
   for (const { ds, backendType, backendTarget, backendName } of restoreCandidates) {
     // An earlier candidate's mismatch close can await document cleanup, so
     // revalidate exact ownership and worker state for every row before any
     // destructive action. A message can wake a later candidate during that
     // await, while its persistent backing is still being created.
     if (!stillOwnsRestoreRegistration(ds) || ds.worker) continue;
-    // Agent-scoped Herdr targets are not addressable by session name, so they
-    // never joined the batch and keep the per-target probe.
+    // Keep agent-scoped Herdr probes at their existing per-row lifecycle point.
     const probe = backendTarget.backendType === 'herdr' && backendTarget.agentName
       ? probePersistentBackendTarget(backendTarget)
-      : probeSnapshots.get(backendType)?.get(backendTarget.sessionName) ?? 'unknown';
+      : probeSnapshots.get(persistentBackendTargetKey(backendTarget)) ?? 'unknown';
     if (probe === 'missing') {
       const tag = ds.session.sessionId.substring(0, 8);
       if (ds.session.queuedActivationPending) {
@@ -4134,6 +4136,14 @@ export async function executeScheduledTask(
     const now = Date.now();
     session.larkAppId = larkAppId;
     session.scope = runtimeScope;
+    if (scheduledTrustedCaller) {
+      // A fresh scheduled session is owned by the authenticated task creator.
+      // Persist both ids so an in-turn `botmux schedule add` can create a child
+      // task with the same tenant-stable identity instead of degrading to an
+      // ownerOpenId-only legacy task.
+      session.ownerOpenId = scheduledTrustedCaller.requestUserOpenId;
+      session.ownerUnionId = scheduledTrustedCaller.requestUserUnionId;
+    }
     if (deferredFreshTopic) {
       session.deferredScheduleRun = {
         taskId: task.id,

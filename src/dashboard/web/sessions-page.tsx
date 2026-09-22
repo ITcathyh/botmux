@@ -22,6 +22,7 @@ import { createPortal } from 'react-dom';
 import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from '../../core/close-residual.js';
 import {
   IDLE_CLEANUP_HOUR_OPTIONS,
+  idleCleanupHoursLabel,
   parseIdleCleanupHours,
   selectCleanupCandidates,
   type IdleCleanupHours,
@@ -204,10 +205,6 @@ type IdleCleanupBarProps = {
 };
 
 type IdleCleanupHoursValue = `${IdleCleanupHours}`;
-
-function idleCleanupHoursLabel(hours: IdleCleanupHours): string {
-  return hours === 168 ? '7d' : `${hours}H`;
-}
 
 const idleCleanupThresholdOptions = IDLE_CLEANUP_HOUR_OPTIONS.map(hours => ({
   value: String(hours) as IdleCleanupHoursValue,
@@ -537,8 +534,8 @@ function CopyButton(props: { value: string }): React.JSX.Element {
     <button
       type="button"
       data-copy={props.value}
-      onClick={() => {
-        void copyText(props.value, t('sessions.copy')).then(didCopy => {
+      onClick={(event) => {
+        void copyText(props.value, t('sessions.copy'), event.currentTarget).then(didCopy => {
           if (!didCopy) return;
           setCopied(true);
           window.setTimeout(() => setCopied(false), 800);
