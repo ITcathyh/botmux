@@ -11287,7 +11287,13 @@ export function forkWorker(
     // then re-check admission exactly once. hard (PSI hit / shortfall beyond
     // the band) keeps the immediate rejection; the escape valve never reaches
     // this block (memoryAdmissionEnabled=false always evaluates allowed).
-    if (tier === 'marginal' && !opts.admissionReclaimAttempt) {
+    // deferDuringDeviceIsolation:false callers rely on the synchronous
+    // rejection to preserve their own retry/durable-redelivery guarantee (the
+    // only such caller is the doc-comment live delivery); the async path would
+    // instead accept the turn first and then fail silently after the wait.
+    if (tier === 'marginal'
+      && !opts.admissionReclaimAttempt
+      && opts.deferDuringDeviceIsolation !== false) {
       logger.info(
         `[${tag(ds)}] Memory admission marginal (${admission.reasons.join('; ')}); `
         + `reclaiming idle workers and re-checking once`,
@@ -11322,6 +11328,7 @@ export function forkWorker(
               ...(initDispatchAttempt !== undefined ? { dispatchAttempt: initDispatchAttempt } : {}),
               ...(initCodexAppSteerable ? { codexAppSteerable: true as const } : {}),
               ...(initTrustedCaller ? { trustedCaller: initTrustedCaller } : {}),
+              ...(initAtMostOnce ? { atMostOnce: true as const } : {}),
             });
             opts.onAdmission?.(routed ? 'accepted' : 'rejected');
           } else {
@@ -11329,23 +11336,14 @@ export function forkWorker(
           }
           return;
         }
-        // Re-enter through the full fork pipeline. Drop a caller-supplied
-        // deferDuringDeviceIsolation:false here: that flag means "reject now so
-        // MY caller can retry", but this re-entry runs after the caller already
-        // accepted the turn (doc-comment provider cursor will not re-deliver);
-        // letting the default freeze-replay path keep the input is the only
-        // non-lossy option.
-        const reentryOpts: ForkWorkerOptions = {
+        // Re-enter through the full fork pipeline. The recursive call has no
+        // throwing caller above it, so surface its rejection with the same
+        // user-visible blocked notice instead of letting the turn vanish.
+        const reentered = forkWorker(ds, promptInput, resumeOrTurnId, {
           ...opts,
           admissionReclaimAttempt: true,
           admissionReclaimedCount: outcome.reclaimed,
-        };
-        delete reentryOpts.deferDuringDeviceIsolation;
-        // Boolean false is reserved for the tail-only quarantine guard. The
-        // recursive call has no throwing caller above it, so surface its
-        // rejection with the same user-visible blocked notice instead of
-        // letting the turn vanish silently.
-        const reentered = forkWorker(ds, promptInput, resumeOrTurnId, reentryOpts);
+        });
         if (!reentered) {
           notifyBlocked(outcome.decision, outcome.reclaimed);
           opts.onAdmission?.('rejected');

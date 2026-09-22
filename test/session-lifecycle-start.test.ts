@@ -533,7 +533,7 @@ describe('host memory pressure worker admission', () => {
     const onAdmission = (admission: string) => admissions.push(admission);
 
     expect(forkWorker(ds, 'first prompt', 'om_first', { onAdmission })).toBe(true);
-    expect(forkWorker(ds, 'second prompt', 'om_second', { onAdmission })).toBe(true);
+    expect(forkWorker(ds, 'second prompt', { turnId: 'om_second', atMostOnce: true }, { onAdmission })).toBe(true);
     expect(forkMock).not.toHaveBeenCalled();
 
     await Promise.resolve();
@@ -556,6 +556,7 @@ describe('host memory pressure worker admission', () => {
     expect(sent).toContainEqual(expect.objectContaining({
       type: 'message',
       content: 'second prompt',
+      atMostOnce: true,
     }));
   });
 
@@ -662,12 +663,9 @@ describe('host memory pressure worker admission', () => {
     const ds = makeDs();
     setActiveSessionsRegistry(new Map<string, DaemonSession>([[activeSessionKey(ds), ds]]));
 
-    // The caller-level flag ("reject now so my caller retries") is present on
-    // the first call but must NOT survive into the asynchronous re-entry: once
-    // the turn was accepted it can only be preserved by the freeze replay.
-    expect(forkWorker(ds, 'freeze racing prompt', 'om_freeze_race', {
-      deferDuringDeviceIsolation: false,
-    })).toBe(true);
+    // A normal fork enters the async reclaim path; a freeze activated DURING
+    // the wait must queue the re-entrant fork and replay it on release.
+    expect(forkWorker(ds, 'freeze racing prompt', 'om_freeze_race')).toBe(true);
     expect(forkMock).not.toHaveBeenCalled();
 
     await Promise.resolve();
@@ -700,6 +698,50 @@ describe('host memory pressure worker admission', () => {
       turnId: 'om_freeze_race',
     });
     resetDeviceIsolationActivationForTest();
+  });
+
+  it('keeps the synchronous rejection for callers opting out of deferral even when marginal', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_blocked');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    checkWorkerAdmissionMock.mockReturnValue(marginalDecision as any);
+    const ds = makeDs();
+    setActiveSessionsRegistry(new Map<string, DaemonSession>([[activeSessionKey(ds), ds]]));
+    const admissions: string[] = [];
+
+    // The doc-comment live delivery passes false: its provider only preserves
+    // the redelivery while the rejection is synchronous, so the marginal band
+    // must not divert it into the async reclaim path.
+    expect(forkWorker(ds, 'doc comment prompt', { turnId: 'om_doc_blocked' }, {
+      deferDuringDeviceIsolation: false,
+      onAdmission: admission => admissions.push(admission),
+    })).toBe(true);
+
+    // Exactly one synchronous admission read, one immediate rejection; no
+    // reclaim wait or re-check is scheduled.
+    expect(checkWorkerAdmissionMock.mock.calls).toHaveLength(1);
+    expect(admissions).toEqual(['rejected']);
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringMatching(/memory pressure.*retry/i),
+      'text',
+      'app_test',
+      'om_doc_blocked',
+      undefined,
+    );
+
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(checkWorkerAdmissionMock.mock.calls).toHaveLength(1);
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(admissions).toEqual(['rejected']);
   });
 });
 
