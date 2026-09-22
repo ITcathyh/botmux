@@ -560,6 +560,50 @@ describe('host memory pressure worker admission', () => {
     }));
   });
 
+  it('keeps a coalesced grouped fork in the leased queue instead of routing without a slot', async () => {
+    vi.useFakeTimers();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    checkWorkerAdmissionMock.mockReturnValueOnce(marginalDecision as any);
+    checkWorkerAdmissionMock.mockReturnValueOnce(marginalDecision as any);
+    const ds = makeDs();
+    ds.session.xpiSharedCwdAdmissionGroupId = 'xpi:coalesce-group';
+    setActiveSessionsRegistry(new Map<string, DaemonSession>([[activeSessionKey(ds), ds]]));
+    const admissions: string[] = [];
+    const onAdmission = (admission: string) => admissions.push(admission);
+
+    const firstOpts: Record<string, unknown> = { onAdmission };
+    const secondOpts: Record<string, unknown> = { onAdmission };
+    forkWorker(ds, 'group first', 'om_group_first', firstOpts);
+    forkWorker(ds, 'group second', { turnId: 'om_group_second', atMostOnce: true }, secondOpts);
+    // Both calls entered the marginal async path; the out-flag is the XPI call
+    // sites' only way to distinguish that deferral from freeze/transfer gates.
+    expect(firstOpts.marginalReclaimScheduled).toBe(true);
+    expect(secondOpts.marginalReclaimScheduled).toBe(true);
+
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    // Leading waiter re-forks (accepted); the coalesced waiter stays deferred:
+    // its daemon call site already persisted it in the XPI queue, which must
+    // perform the single leased dispatch. Routing here would bypass the lease.
+    expect(forkMock).toHaveBeenCalledTimes(1);
+    expect(admissions).toEqual(['deferred', 'deferred', 'accepted', 'deferred']);
+
+    const worker = forkMock.mock.results[0]!.value;
+    worker.emit('message', { type: 'worker_ipc_ready' });
+    const sent = vi.mocked(worker.send).mock.calls.map(call => call[0]);
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: 'init',
+      prompt: 'group first',
+    }));
+    expect(sent.some(message => message.type === 'message' && message.content === 'group second')).toBe(false);
+  });
+
   it('stays silent when the session is superseded while the rescue is waiting', async () => {
     vi.useFakeTimers();
     const sessionReply = vi.fn(async () => 'om_reply');
@@ -717,10 +761,14 @@ describe('host memory pressure worker admission', () => {
     // The doc-comment live delivery passes false: its provider only preserves
     // the redelivery while the rejection is synchronous, so the marginal band
     // must not divert it into the async reclaim path.
-    expect(forkWorker(ds, 'doc comment prompt', { turnId: 'om_doc_blocked' }, {
+    const forkOpts: Record<string, unknown> = {
       deferDuringDeviceIsolation: false,
-      onAdmission: admission => admissions.push(admission),
-    })).toBe(true);
+      onAdmission: (admission: string) => admissions.push(admission),
+    };
+    expect(forkWorker(ds, 'doc comment prompt', { turnId: 'om_doc_blocked' }, forkOpts)).toBe(true);
+    // Opting out skips the marginal block entirely, so the async-path out-flag
+    // must not be set either.
+    expect(forkOpts.marginalReclaimScheduled).toBeUndefined();
 
     // Exactly one synchronous admission read, one immediate rejection; no
     // reclaim wait or re-check is scheduled.
@@ -4235,6 +4283,29 @@ describe('Codex App clean-input feature gate', () => {
     }));
     expect(ds.session.codexAppDispatchLedger?.map(entry => entry.turnId))
       .toEqual(['turn-old', 'turn-next']);
+  });
+
+  it('defers a grouped non-empty double-fork instead of routing it without the lease', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app', codexAppCleanInput: true }));
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    ds.session.cliId = 'codex-app';
+    ds.session.xpiSharedCwdAdmissionGroupId = 'xpi:double-fork-group';
+    ds.session.codexAppDispatchLedger = [
+      { dispatchId: 'old', turnId: 'turn-old', state: 'prepared', content: 'old' },
+    ];
+    const admissions: string[] = [];
+
+    forkWorker(ds, { content: 'next' }, { turnId: 'om_group_follower' }, {
+      onAdmission: admission => admissions.push(admission),
+    });
+
+    // The grouped turn is already owned by the leased journal; routing it into
+    // the live worker would run two group members' CLIs in the same cwd.
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(worker.send).not.toHaveBeenCalled();
+    expect(worker.kill).not.toHaveBeenCalled();
+    expect(admissions).toEqual(['deferred']);
   });
 
   it('stages a non-Codex double-fork behind a tokened activation without live IPC', () => {

@@ -10906,6 +10906,16 @@ export type ForkWorkerOptions = {
    * attempted reclamation in its user notice. Never set from callers.
    */
   admissionReclaimedCount?: number;
+  /**
+   * Internal out-flag, set synchronously when the call entered the marginal
+   * memory band and its single reclaim/re-check re-entry is pending. The
+   * onAdmission value alone cannot identify that path — device-freeze and
+   * transfer-gate deferrals report the same 'deferred', but keep their own
+   * replay, whereas the marginal path only re-enters asynchronously. XPI
+   * group callers use this to decide whether durable queueing replaces their
+   * synchronous-retry path. Never set from callers.
+   */
+  marginalReclaimScheduled?: boolean;
 };
 
 /**
@@ -11230,6 +11240,15 @@ export function forkWorker(
       reportAdmission('deferred');
       return true;
     }
+    // XPI shared-cwd groups: never execute a grouped turn against a live worker
+    // without the group lease. This is the non-coalesced sibling of the
+    // marginal re-entry guard below (e.g. a device-freeze replay landing after
+    // a leased worker already spawned); group call sites persist the turn in
+    // the leased journal before reaching here.
+    if (ds.session.xpiSharedCwdAdmissionGroupId) {
+      reportAdmission('deferred');
+      return true;
+    }
     const routed = sendWorkerInput(ds, promptPayload, initTurnId, {
       ...(initDispatchAttempt !== undefined ? { dispatchAttempt: initDispatchAttempt } : {}),
       // R6-B3: sendWorkerInput reads steer authorization from OPTS (not the
@@ -11298,6 +11317,7 @@ export function forkWorker(
         `[${tag(ds)}] Memory admission marginal (${admission.reasons.join('; ')}); `
         + `reclaiming idle workers and re-checking once`,
       );
+      opts.marginalReclaimScheduled = true;
       reportAdmission('deferred');
       void coalesceMarginalAdmissionRetry(marginalAdmissionRetries, ds, {
         reclaim: async () => {
@@ -11323,6 +11343,19 @@ export function forkWorker(
         // kill-reforking it; an empty wake-up is already satisfied by the
         // leading spawn. The recursive call below reports its own admission.
         if (ds.worker && !ds.worker.killed) {
+          // XPI shared-cwd groups: the grouped fork call sites that participate
+          // in lease serialization (ingress/cross-principal/reserved-opening)
+          // each enqueue the turn durably when its synchronous fork could not
+          // claim a group slot, and driveNext already owns the journal for its
+          // own dispatches. That queue drives the single leased send after the
+          // leading worker finishes. Routing here would execute without the
+          // lease — two group members could then run CLIs in the same cwd — and
+          // the worker-side turn dedupe only covers om_/bmx-recovery- turn ids,
+          // so a non-om_ turn would also run twice.
+          if (ds.session.xpiSharedCwdAdmissionGroupId) {
+            opts.onAdmission?.('deferred');
+            return;
+          }
           if (prompt.length > 0) {
             const routed = sendWorkerInput(ds, promptPayload, initTurnId, {
               ...(initDispatchAttempt !== undefined ? { dispatchAttempt: initDispatchAttempt } : {}),
