@@ -1507,6 +1507,35 @@ describe('repo select card — worktree open', () => {
     expect(sandboxAtFork).toBe(false);                // fork consumed the SAME frozen snapshot
   });
 
+  it('runAutoWorktreeCommit records the degrade verdict on the session (persisted) BEFORE the fork', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
+    const { deps } = makeDeps(ds);
+    vi.mocked(maybeCreateDefaultWorktree).mockImplementationOnce(async (_app, baseDir) => ({ dir: baseDir }));
+    let markerAtFork: unknown;
+    vi.mocked(forkWorker).mockImplementationOnce(((forked: DaemonSession) => {
+      markerAtFork = forked.session.autoWorktreeFallbackDir;
+      return true;
+    }) as any);
+
+    await runAutoWorktreeCommit({
+      ds, anchor: ROOT_ID, larkAppId: APP_ID, baseDir: '/repos/alpha',
+      activeSessions: deps.activeSessions, notify: vi.fn(),
+    });
+
+    expect(markerAtFork).toBe('/repos/alpha');
+    expect(updateSession).toHaveBeenCalledWith(expect.objectContaining({ autoWorktreeFallbackDir: '/repos/alpha' }));
+  });
+
+  it('runAutoWorktreeCommit does NOT mark a session that got a real worktree', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
+    const { deps } = makeDeps(ds);
+    await runAutoWorktreeCommit({
+      ds, anchor: ROOT_ID, larkAppId: APP_ID, baseDir: '/repos/alpha',
+      activeSessions: deps.activeSessions, notify: vi.fn(),
+    });
+    expect(ds.session.autoWorktreeFallbackDir).toBeUndefined();
+  });
+
   it('double click starts ONE background creation and commits once', async () => {
     const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
     const { deps, sessionReply } = makeDeps(ds);

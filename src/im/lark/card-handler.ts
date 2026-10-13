@@ -1077,6 +1077,15 @@ export async function runAutoWorktreeCommit(deps: {
     if (targetSubdir && !existsSync(targetDir)) {
       throw new Error(`worktree 中不存在原工作目录对应的子目录：${targetSubdir}`);
     }
+    if (wt.dir === baseDir) {
+      // The gate DEGRADED to the real default dir. Freeze that verdict on the
+      // session (persisted, before the fork) so the worker can only strengthen
+      // it: a spawn that resolves to the local oncall sandbox in this dir is
+      // refused (autoWorktreeFallbackSandboxError) instead of binding the real
+      // project read-write — e.g. a mojo remote proof voided mid-build.
+      ds.session.autoWorktreeFallbackDir = baseDir;
+      sessionStore.updateSession(ds.session);
+    }
     await runDetachedBotTurnAdmission(larkAppId, () => commitRepoSelection(
       {
         ds, rootId: anchor, larkAppId, operatorOpenId, activeSessions,

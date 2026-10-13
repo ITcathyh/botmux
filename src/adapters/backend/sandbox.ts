@@ -530,6 +530,29 @@ export function resolveLocalSandboxMode(input: {
 }
 
 
+/**
+ * Fork-side half of the auto-worktree fail-closed gate. When the gate let a
+ * session degrade to the real default dir (`fallbackDir`), the worker may only
+ * STRENGTHEN that verdict: if the spawn now resolves to the LOCAL oncall
+ * sandbox (which binds workingDir read-write to the host) in that same dir,
+ * refuse instead of running it there. Closes the TOCTOU between the gate (T0,
+ * before the worktree build) and the fork (T1, after it) for every input the
+ * gate cannot freeze — e.g. a mojo remote proof voided mid-build.
+ * scratch / off are fine: scratch leaves the host untouched.
+ */
+export function autoWorktreeFallbackSandboxError(input: {
+  sandboxMode: SandboxMode;
+  workingDir: string | undefined;
+  fallbackDir: string | undefined;
+}): string | undefined {
+  if (input.sandboxMode !== 'oncall' || !input.fallbackDir || !input.workingDir) return undefined;
+  const canon = (p: string): string => { try { return realpathSync(p); } catch { return resolve(p); } };
+  if (canon(input.workingDir) !== canon(input.fallbackDir)) return undefined;
+  return `auto-worktree fell back to the real default dir ${input.fallbackDir} because no local sandbox applied when it was decided, `
+    + 'but this spawn now resolves to the local oncall file sandbox (workingDir bound read-write to the real project). '
+    + 'Refusing to start; fix the default dir (git repo) or pick a working dir with /repo.';
+}
+
 /** Top-level dirs that are symlinks on usrmerge distros (/bin → usr/bin …) —
  *  replicated inside the tmpfs root so `#!/bin/sh` etc. resolve. */
 const USRMERGE_CANDIDATES = ['/bin', '/sbin', '/lib', '/lib64', '/lib32', '/libx32'] as const;

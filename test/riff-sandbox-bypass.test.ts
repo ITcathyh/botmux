@@ -6,7 +6,8 @@
  * Run:  pnpm vitest run test/riff-sandbox-bypass.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { localSandboxApplies, resolveLocalSandboxMode } from '../src/adapters/backend/sandbox.js';
+import { localSandboxApplies, resolveLocalSandboxMode, autoWorktreeFallbackSandboxError } from '../src/adapters/backend/sandbox.js';
+import { readFileSync } from 'node:fs';
 
 describe('localSandboxApplies', () => {
   it('bypasses the local file sandbox for the riff backend (remote sandbox, no local process)', () => {
@@ -78,6 +79,29 @@ describe('resolveLocalSandboxMode (shared worker ↔ auto-worktree fail-closed r
     expect(resolveLocalSandboxMode({
       backendType: 'mojo', mojoConfig: { cloud: true, env: { X_JWT_TOKEN: 'tok' } }, configSandbox: true,
     })).toBe('off'); // the ONE exempt name
+  });
+});
+
+describe('autoWorktreeFallbackSandboxError (fork may only strengthen the gate verdict)', () => {
+  it('refuses oncall in the dir the gate degraded to', () => {
+    expect(autoWorktreeFallbackSandboxError({ sandboxMode: 'oncall', workingDir: '/repo/x', fallbackDir: '/repo/x' })).toBeTruthy();
+    expect(autoWorktreeFallbackSandboxError({ sandboxMode: 'oncall', workingDir: '/repo/x/', fallbackDir: '/repo/x' })).toBeTruthy();
+  });
+  it('allows off / scratch, other dirs, and sessions without a fallback marker', () => {
+    expect(autoWorktreeFallbackSandboxError({ sandboxMode: 'off', workingDir: '/repo/x', fallbackDir: '/repo/x' })).toBeUndefined();
+    expect(autoWorktreeFallbackSandboxError({ sandboxMode: 'scratch', workingDir: '/repo/x', fallbackDir: '/repo/x' })).toBeUndefined();
+    expect(autoWorktreeFallbackSandboxError({ sandboxMode: 'oncall', workingDir: '/repo/x-wt', fallbackDir: '/repo/x' })).toBeUndefined();
+    expect(autoWorktreeFallbackSandboxError({ sandboxMode: 'oncall', workingDir: '/repo/x', fallbackDir: undefined })).toBeUndefined();
+  });
+  it('is wired: forkWorker forwards the session marker and the worker throws on the resolved sandboxMode', () => {
+    const wp = readFileSync('src/core/worker-pool.ts', 'utf8');
+    expect(wp).toContain('autoWorktreeFallbackDir: ds.session.autoWorktreeFallbackDir,');
+    const w = readFileSync('src/worker.ts', 'utf8');
+    const i = w.indexOf('const sandboxMode = resolveLocalSandboxMode(');
+    const j = w.indexOf('fallbackDir: cfg.autoWorktreeFallbackDir,');
+    expect(i).toBeGreaterThan(0);
+    expect(j).toBeGreaterThan(i);
+    expect(w.slice(j, j + 200)).toContain('if (fallbackError) throw new Error(fallbackError);');
   });
 });
 

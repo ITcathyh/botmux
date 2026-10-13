@@ -356,6 +356,60 @@ describe('maybeCreateDefaultWorktree', () => {
     expect(notices).toHaveLength(1);
   });
 
+  it('snapshot ON / live OFF when ENTERING the gate: the gate refuses on the frozen snapshot', async () => {
+    // Divergence exists BEFORE the gate decides (unlike the flip-in-notify
+    // tests, where the verdict is already computed). A gate that re-read live
+    // config would degrade here; the frozen snapshot must win.
+    const plain = join(tempRoot, 'not-a-repo-snap-on-live-off');
+    mkdirSync(plain);
+    const { mod } = await loadWithBot(plain, true); // live: sandbox OFF
+    await expect(mod.maybeCreateDefaultWorktree('app_wt', plain, {
+      isBotDefaultDir: true, locale: 'zh', sandboxSnapshot: { sandbox: true },
+    })).rejects.toBeInstanceOf(mod.AutoWorktreeFailClosedError);
+  });
+
+  it('snapshot OFF / live ON when ENTERING the gate: the gate degrades on the frozen snapshot', async () => {
+    const plain = join(tempRoot, 'not-a-repo-snap-off-live-on');
+    mkdirSync(plain);
+    const { mod } = await loadWithBot(plain, true, { sandbox: true }); // live: oncall
+    const r = await mod.maybeCreateDefaultWorktree('app_wt', plain, {
+      isBotDefaultDir: true, locale: 'zh', sandboxSnapshot: { sandbox: false },
+    });
+    expect(r.dir).toBe(plain);
+  });
+
+  it('mojo remote proof voided mid-build: the gate degrades at T0, the fork-side guard refuses oncall at T1', async () => {
+    // Reproduction of the reported TOCTOU: mojo{cloud:true} + oncall + non-git
+    // default dir. T0 gate: provably remote → no local sandbox → degrade to the
+    // real dir. Mid-build the mojo block flips to cloud:false. T1 (worker):
+    // resolves to LOCAL oncall in that real dir → must be refused, never run.
+    const plain = join(tempRoot, 'not-a-repo-mojo-flip');
+    mkdirSync(plain);
+    const { registry, mod } = await loadWithBot(plain, true, {
+      cliId: 'mojo', backendType: 'mojo', sandbox: true, mojo: { cloud: true },
+    });
+    const r = await mod.maybeCreateDefaultWorktree('app_wt', plain, {
+      isBotDefaultDir: true, locale: 'zh', sandboxSnapshot: { sandbox: true, cliId: 'mojo' },
+    });
+    expect(r.dir).toBe(plain); // T0: degraded (gate judged remote)
+
+    // Mid-build config edit voids the remote proof.
+    const cfg = registry.getBot('app_wt').config as any;
+    cfg.mojo = { ...cfg.mojo, cloud: false };
+
+    // T1: what the worker resolves (same helpers as worker.ts spawnCli).
+    const { resolveLocalSandboxMode, autoWorktreeFallbackSandboxError } = await import('../src/adapters/backend/sandbox.js');
+    const { buildEffectiveMojoConfig, normalizeMojoConfig } = await import('../src/adapters/backend/mojo-types.js');
+    const v = normalizeMojoConfig(cfg.mojo);
+    const sandboxMode = resolveLocalSandboxMode({
+      backendType: 'mojo',
+      mojoConfig: buildEffectiveMojoConfig(v.ok ? v.value : undefined, {}),
+      configSandbox: true,
+    });
+    expect(sandboxMode).toBe('oncall'); // the escape the guard must stop
+    expect(autoWorktreeFallbackSandboxError({ sandboxMode, workingDir: plain, fallbackDir: plain })).toMatch(/Refusing/);
+  });
+
   it('scratch sandbox does NOT fail closed: the COW overlay keeps the real dir untouched, so it DEGRADES', async () => {
     // scratch (full-root COW overlay / APFS clone) routes every write — cwd
     // included — into a throwaway per-session layer; the host stays unchanged.
