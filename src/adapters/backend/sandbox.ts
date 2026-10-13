@@ -21,6 +21,7 @@
 import { sandboxNetworkLaunch } from '../../core/sandbox-network-launch.js';
 import { networkProxyError, type SandboxNetworkPolicy } from '../../core/sandbox-network-policy.js';
 import { isMojoFullyRemote } from './mojo-types.js';
+import { resolveSandboxMode, type SandboxMode } from '../cli/sandbox-mode.js';
 import { mkdirSync, existsSync, writeFileSync, chmodSync, readdirSync, readFileSync, rmSync, rmdirSync, unlinkSync, statSync, lstatSync, readlinkSync, realpathSync, openSync, fstatSync, readSync, writeSync, closeSync, constants as fsConstants } from 'node:fs';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
@@ -480,6 +481,52 @@ export function localSandboxApplies(
     return !isMojoFullyRemote(remoteExecution);
   }
   return true;
+}
+
+/**
+ * The worker's EFFECTIVE local file-sandbox mode, as ONE shared pure resolver.
+ *
+ * worker.ts resolves `sandboxMode` with this exact call; the auto-worktree
+ * fail-closed gate (services/default-worktree.ts) reuses it so the two can never
+ * drift again — the riff exemption once only existed in the worker (a sandboxed
+ * riff bot then fell back to the real default dir on a worktree failure), and
+ * the mojo backend (#803) repeated the SAME drift for a provably-remote session.
+ *
+ * Shape:
+ *   localSandboxApplies(backend, mojoConfig)
+ *     ? resolveSandboxMode({ configSandbox, readIsolation, envValue })
+ *     : 'off'
+ *
+ * - The REMOTE exemption (riff / remote-runner / provably-remote mojo) wraps the
+ *   WHOLE resolution: a remote backend has no local CLI process, so even
+ *   BOTMUX_SANDBOX=1|scratch must not engage a local sandbox there.
+ * - mojo is NOT exempt by name alone: only a PROVABLY remote mojo session is
+ *   (see localSandboxApplies / isMojoFullyRemote — cloud on, localDaemon off,
+ *   no wrapperCli, no unprovable env). A local mojo session keeps its sandbox.
+ * - There is no no-transport arm: forkWorker does not force-isolate a
+ *   no-transport session (#899 dropped the forced readIsolation).
+ * - Throws exactly where resolveSandboxMode throws (invalid config value or
+ *   BOTMUX_SANDBOX): a typo'd mode must never silently run without isolation.
+ */
+export function resolveLocalSandboxMode(input: {
+  backendType: string;
+  mojoConfig?: {
+    cloud?: boolean;
+    localDaemon?: boolean;
+    wrapperCli?: string;
+    jwtEnv?: string;
+    env?: Record<string, string>;
+  };
+  configSandbox?: unknown;
+  readIsolation?: boolean;
+  envValue?: string | undefined;
+}): SandboxMode {
+  if (!localSandboxApplies(input.backendType, input.mojoConfig)) return 'off';
+  return resolveSandboxMode({
+    configSandbox: input.configSandbox,
+    readIsolation: input.readIsolation === true,
+    envValue: input.envValue,
+  });
 }
 
 
