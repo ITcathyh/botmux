@@ -282,7 +282,6 @@ import {
 } from '../src/core/worker-pool.js';
 import { announceSessionRow } from '../src/core/session-activity.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
-import { getAllBots } from '../src/bot-registry.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
