@@ -230,7 +230,7 @@ describe("worker-pool startup failure × suppressRecoveryCard", () => {
       'text',
       'app_test',
       undefined,
-      undefined,
+      { sourceSessionId: 'sid-recovery-off' },
     );
     expect(logger.warn).not.toHaveBeenCalledWith(
       expect.stringContaining('suppressRecoveryCard'),
@@ -261,7 +261,7 @@ describe("worker-pool startup failure × suppressRecoveryCard", () => {
       'text',
       'app_test',
       undefined,
-      undefined,
+      { sourceSessionId: 'sid-recovery-transient' },
     );
   });
 });

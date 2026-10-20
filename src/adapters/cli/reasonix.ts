@@ -2,11 +2,13 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
 import { delay } from '../../utils/timing.js';
+import { PROCESS_TABLE_MAX_BUFFER } from '../../utils/exec-limits.js';
 
 const LEASE_SUFFIX = '.jsonl.lease.json';
 
@@ -44,10 +46,9 @@ export function isDescendantOf(pid: number, ancestorPid: number): boolean {
     return false;
   }
   try {
-    // 全进程表扫描：显式抬高 maxBuffer，防输出超过 Node 默认 1MiB 时 ENOBUFS。
     const raw = execFileSync('ps', ['-axo', 'pid=,ppid='], {
       encoding: 'utf-8',
-      maxBuffer: 32 * 1024 * 1024,
+      maxBuffer: PROCESS_TABLE_MAX_BUFFER,
     });
     const ppidOf = new Map<number, number>();
     for (const line of raw.split('\n')) {
@@ -214,11 +215,6 @@ export function createReasonixAdapter(pathOverride?: string): CliAdapter {
     // so tmux has no scrollback available for transcript paging.
     altScreen: true,
     skillsDir: '~/.reasonix/skills',
-    modelChoices: [
-      'deepseek-flash/deepseek-v4-flash',
-      'deepseek-pro/deepseek-v4-pro',
-    ],
+    modelChoices: CLI_MODEL_CHOICES['reasonix'],
   };
 }
-
-export const create = createReasonixAdapter;

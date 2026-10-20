@@ -114,13 +114,46 @@ describe('isLoopbackPeer — CIDR', () => {
     expect(isLoopbackPeer('::ffff:192.168.1.2')).toBe(false);
   });
 
-  it('supports a /0 catch-all per family', () => {
+  it('rejects overly broad CIDR prefixes (/0 through /7) as fail-closed items', () => {
+    // /0 matches the whole internet — the local-only guarantee would be gone.
     setEnv('0.0.0.0/0');
-    expect(isLoopbackPeer('8.8.8.8')).toBe(true);
-    expect(isLoopbackPeer('fd00::1')).toBe(false);
-    setEnv('::/0');
-    expect(isLoopbackPeer('fd00::1')).toBe(true);
     expect(isLoopbackPeer('8.8.8.8')).toBe(false);
+    expect(isLoopbackPeer('1.2.3.4')).toBe(false);
+    expect(mockWarn).toHaveBeenCalledTimes(1);
+
+    mockWarn.mockReset();
+    setEnv('::/0');
+    expect(isLoopbackPeer('fd00::1')).toBe(false);
+    expect(isLoopbackPeer('2001:db8::1')).toBe(false);
+    expect(mockWarn).toHaveBeenCalledTimes(1);
+
+    // anything between /1 and /7 is rejected on either family as well
+    mockWarn.mockReset();
+    setEnv('128.0.0.0/1,2.0.0.0/7,fe00::/7');
+    expect(isLoopbackPeer('8.8.8.8')).toBe(false);
+    expect(isLoopbackPeer('2.4.0.1')).toBe(false);
+    expect(isLoopbackPeer('fe80::1')).toBe(false);
+    expect(mockWarn).toHaveBeenCalledTimes(3);
+
+    // defaults never change when bad entries are skipped
+    expect(isLoopbackPeer('127.0.0.1')).toBe(true);
+    expect(isLoopbackPeer('::1')).toBe(true);
+  });
+
+  it('accepts the /8 boundary block on either family', () => {
+    setEnv('10.0.0.0/8');
+    expect(isLoopbackPeer('10.1.2.3')).toBe(true);
+    expect(isLoopbackPeer('11.1.2.3')).toBe(false);
+    setEnv('fd00::/8');
+    expect(isLoopbackPeer('fd00::1')).toBe(true);
+    expect(isLoopbackPeer('fe00::1')).toBe(false);
+  });
+
+  it('skips an overly broad item but keeps sibling entries valid', () => {
+    setEnv('0.0.0.0/0,10.0.0.5');
+    expect(isLoopbackPeer('8.8.8.8')).toBe(false);
+    expect(isLoopbackPeer('10.0.0.5')).toBe(true);
+    expect(isLoopbackPeer('10.0.0.6')).toBe(false);
   });
 });
 

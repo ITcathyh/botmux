@@ -8,11 +8,13 @@
  * discover live peers, no shared in-memory state required.
  *
  * A daemon is considered offline if its heartbeat hasn't been refreshed in
- * the last STALE_MS (90s by default — matches dashboard/registry.ts).
+ * the last DAEMON_HEARTBEAT_STALE_MS (utils/daemon-heartbeat.ts — shared with
+ * dashboard/registry.ts and the session-store occupancy lease TTL).
  */
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveBotmuxDataDir } from '../core/data-dir.js';
+import { DAEMON_HEARTBEAT_STALE_MS } from './daemon-heartbeat.js';
 
 export interface OnlineDaemonInfo {
   larkAppId: string;
@@ -21,16 +23,17 @@ export interface OnlineDaemonInfo {
   bootInstanceId?: string;
   /** Auth protocol advertised atomically with bootInstanceId + ipcPort. */
   workflowIpcProtocol?: string;
+  /** Internal target-authoritative dispatch launch protocol. */
+  dispatchLaunchIpcProtocol?: 'v1';
+  /** Presence-based session-store capability. Copy only; never a write permit. */
+  sessionStoreProtocol?: string;
+  /** Running binary version. Copy only; never compared by size. */
+  botmuxVersion?: string;
   botName?: string;
   cliId?: string;
   pid?: number;
   lastHeartbeat?: number;
-  /** botmux version of the process serving this daemon (from package.json).
-   * Absent for daemons started by older builds. */
-  version?: string;
 }
-
-const STALE_MS = 90_000;
 
 /** `dataDir` lets a caller that already resolved a data dir keep the daemon
  *  probe and its store access on the SAME directory. Omitting it falls back to
@@ -64,20 +67,27 @@ export function resolveDaemonIpcPort(
 }
 
 /** List every daemon whose descriptor file is fresh (heartbeat within STALE_MS). */
-export function listOnlineDaemons(dataDir?: string): OnlineDaemonInfo[] {
+/** `strict`: an unlistable registry dir throws instead of reading as "nobody
+ *  online" — for callers that must not mistake an unreadable registry for an
+ *  empty one. Malformed individual descriptors are skipped either way. */
+export function listOnlineDaemons(dataDir?: string, opts: { strict?: boolean } = {}): OnlineDaemonInfo[] {
   const dir = registryDir(dataDir);
-  if (!existsSync(dir)) return [];
+  // No existsSync pre-check: it also answers false on EACCES, which strict
+  // mode must surface. A registry that was never created (ENOENT) is empty.
   const now = Date.now();
   const out: OnlineDaemonInfo[] = [];
   let names: string[] = [];
-  try { names = readdirSync(dir); } catch { return []; }
+  try { names = readdirSync(dir); } catch (err) {
+    if (opts.strict && (err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    return [];
+  }
   for (const f of names) {
     if (!f.endsWith('.json')) continue;
     try {
       const raw = readFileSync(join(dir, f), 'utf-8');
       const d = JSON.parse(raw) as Partial<OnlineDaemonInfo>;
       if (typeof d.ipcPort !== 'number' || typeof d.larkAppId !== 'string') continue;
-      if (now - (d.lastHeartbeat ?? 0) > STALE_MS) continue;
+      if (now - (d.lastHeartbeat ?? 0) > DAEMON_HEARTBEAT_STALE_MS) continue;
       out.push({
         larkAppId: d.larkAppId,
         ipcPort: d.ipcPort,
@@ -87,11 +97,19 @@ export function listOnlineDaemons(dataDir?: string): OnlineDaemonInfo[] {
         ...(typeof d.workflowIpcProtocol === 'string' && d.workflowIpcProtocol
           ? { workflowIpcProtocol: d.workflowIpcProtocol }
           : {}),
+        ...(d.dispatchLaunchIpcProtocol === 'v1'
+          ? { dispatchLaunchIpcProtocol: d.dispatchLaunchIpcProtocol }
+          : {}),
+        ...(typeof d.sessionStoreProtocol === 'string' && d.sessionStoreProtocol
+          ? { sessionStoreProtocol: d.sessionStoreProtocol }
+          : {}),
+        ...(typeof d.botmuxVersion === 'string' && d.botmuxVersion
+          ? { botmuxVersion: d.botmuxVersion }
+          : {}),
         ...(typeof d.botName === 'string' && d.botName.trim() ? { botName: d.botName.trim() } : {}),
         ...(typeof d.cliId === 'string' && d.cliId.trim() ? { cliId: d.cliId.trim() } : {}),
         pid: d.pid,
         lastHeartbeat: d.lastHeartbeat,
-        ...(typeof d.version === 'string' && d.version.trim() ? { version: d.version.trim() } : {}),
       });
     } catch { /* malformed — skip */ }
   }
@@ -101,30 +119,4 @@ export function listOnlineDaemons(dataDir?: string): OnlineDaemonInfo[] {
 /** Find a specific online daemon by larkAppId. Returns null if offline / not found. */
 export function findOnlineDaemon(larkAppId: string, dataDir?: string): OnlineDaemonInfo | null {
   return listOnlineDaemons(dataDir).find(d => d.larkAppId === larkAppId) ?? null;
-}
-
-/**
- * Compare the running CLI's version against the versions advertised by online
- * daemons. Returns the first mismatching daemon version, or null when every
- * daemon matches or no meaningful comparison is possible.
- *
- * - Daemons started by older builds don't publish a version field — skipped
- *   (backward compat), never treated as a mismatch.
- * - A source checkout reports '0.0.0' (the real version is injected only at
- *   publish time). When the CLI itself runs from a checkout there is nothing
- *   sensible to compare, so the check is skipped entirely rather than emitting
- *   noise against daemons that may also be 0.0.0.
- */
-export function detectDaemonVersionMismatch(
-  cliVersion: string,
-  daemons: OnlineDaemonInfo[],
-): string | null {
-  const cli = cliVersion.trim();
-  if (!cli || cli === '0.0.0') return null;
-  for (const d of daemons) {
-    const daemonVersion = (d.version ?? '').trim();
-    if (!daemonVersion) continue;
-    if (daemonVersion !== cli) return daemonVersion;
-  }
-  return null;
 }

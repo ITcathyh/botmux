@@ -12,6 +12,15 @@
  * Comma-separated IPv4/IPv6 literals or CIDRs. Invalid items are ignored
  * (fail-closed: never throw, never allow) and logged once at parse time.
  *
+ * Security boundary: this list ONLY relaxes the "peer must be local" check.
+ * Every migrated endpoint still requires its existing HMAC signature (fresh
+ * timestamp, unspent nonce, shared secret); a wide entry does not turn any
+ * endpoint into an unauthenticated one. Because the peer check is the outer
+ * ring, absurdly broad blocks are rejected too — a /0 CIDR (or /1–/7) matches
+ * the whole internet and makes the local-only guarantee meaningless, so such
+ * items are ignored like any other invalid entry. Prefer /32 (single host) or
+ * the narrowest LAN block that actually carries the loopback traffic.
+ *
  * The parsed env is cached for the process lifetime — daemon env is immutable
  * after boot; tests reset the cache via __resetLoopbackPeersCacheForTest().
  */
@@ -125,6 +134,16 @@ function parseIp(addr: string): ParsedIp | null {
   return { version: 4, value: ipv4OctetsToBigInt(octets) };
 }
 
+/**
+ * Smallest permitted CIDR prefix on either family. /0 matches the whole
+ * internet and /1–/7 span multiple top-level address blocks; accepting them
+ * would hollow out the local-only check, so they are fail-closed rejected.
+ * /8 is the narrowest sane floor: one traditional class-A block, which is
+ * also the granularity of the big private ranges people actually configure
+ * (`10.0.0.0/8`, IPv6 ULA `fd00::/8`).
+ */
+const MIN_CIDR_PREFIX = 8;
+
 interface CidrEntry {
   version: 4 | 6;
   network: bigint;
@@ -156,6 +175,7 @@ function parseEntry(raw: string): CidrEntry | null {
   if (ip === null) return null;
   const bits = ip.version === 4 ? 32 : 128;
   if (prefix > bits) return null;
+  if (prefix < MIN_CIDR_PREFIX) return null;
   const mask = prefixMask(bits, prefix);
   // Normalize host bits away so e.g. 192.168.1.5/16 behaves like 192.168.0.0/16.
   return { version: ip.version, network: ip.value & mask, mask };
@@ -178,7 +198,8 @@ function parseEnv(raw: string | undefined): CidrEntry[] {
     if (entry === null) {
       // Fail-closed: skip the item, but surface the typo once at startup.
       logger.warn(
-        `[loopback-peers] ignoring invalid BOTMUX_LOOPBACK_PEERS item: ${JSON.stringify(part)}`,
+        `[loopback-peers] ignoring invalid BOTMUX_LOOPBACK_PEERS item ${JSON.stringify(part)} `
+          + '(malformed, or a CIDR wider than /8 — use /32 for a single host)',
       );
       continue;
     }
@@ -207,7 +228,8 @@ function entryMatches(entry: CidrEntry, ip: ParsedIp): boolean {
  *
  * Default semantics (unchanged): `127.0.0.1`, `::1`, and any address ending
  * with `::ffff:127.0.0.1`. Additional peers come from BOTMUX_LOOPBACK_PEERS.
- * Empty/undefined/unparseable addresses are rejected.
+ * Empty/undefined/unparseable addresses are rejected. Note this answers ONLY
+ * the local-peer question: callers must still verify the request's HMAC.
  */
 export function isLoopbackPeer(addr: string | undefined | null): boolean {
   if (!addr) return false;
