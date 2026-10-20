@@ -13,7 +13,8 @@ import {
   normalizeScratchStorage,
   type SandboxMode,
 } from './adapters/cli/sandbox-mode.js';
-import type { BackendType } from './adapters/backend/types.js';
+import type { BackendType, HerdrBackendConfig } from './adapters/backend/types.js';
+import { normalizeHerdrBackendConfig } from './adapters/backend/types.js';
 import { normalizeMojoConfig, type MojoConfig } from './adapters/backend/mojo-types.js';
 import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
 import {
@@ -1771,6 +1772,14 @@ export interface BotConfig {
    * selection, and auth settings for riff's HTTP API.
    */
   riff?: RiffBackendConfig;
+
+  /**
+   * Configuration for the herdr backend. Optional even when `backendType` is
+   * `'herdr'`: default placement uses machine-wide managed 'botmux' host session.
+   * Can target an existing host session (e.g. 'default') and place panes into
+   * specific tabs or workspaces.
+   */
+  herdr?: HerdrBackendConfig;
 
   /**
    * Configuration for the mojo backend (@byted/mojo headless CLI). Optional
@@ -4030,6 +4039,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       readDenyExtraPaths: normalizeStringList(entry.readDenyExtraPaths),
       backendType: entry.backendType,
       riff: entry.riff && typeof entry.riff === 'object' ? entry.riff : undefined,
+      herdr: normalizeHerdrBackendConfig(entry.herdr),
       mojo: entry.mojo && typeof entry.mojo === 'object' ? entry.mojo : undefined,
       // Positive integer only; ≤0 / non-int / absent → undefined (= no cap).
       maxLiveWorkers: typeof entry.maxLiveWorkers === 'number'
