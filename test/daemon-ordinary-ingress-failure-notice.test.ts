@@ -2793,6 +2793,7 @@ describe('durable admission then failing status reply → no resend advice (PR #
     ds.session.queuedActivationPending = true;
     ds.session.queuedActivationInput = '';
     ds.session.queuedActivationTurnId = 'turn-queued-pending-1';
+    mocks.forkWorker.mockImplementationOnce(() => true);
 
     await handleThreadReply(
       makeEventData('om_msg_qp', '继续', anchor),
@@ -2801,8 +2802,8 @@ describe('durable admission then failing status reply → no resend advice (PR #
 
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
     // This branch returns without rememberLastCliInput, so it must clear the
-    // recovery flag itself — otherwise every later async worker death stays
-    // muted and the session is permanently silent.
+    // recovery flag itself once the fork is ACCEPTED — otherwise every later
+    // async worker death stays muted and the session is permanently silent.
     expect(ds.suppressRecoveryCard).toBeUndefined();
   });
 
@@ -2813,6 +2814,7 @@ describe('durable admission then failing status reply → no resend advice (PR #
     ds.session.queued = true;
     ds.session.queuedActivationInput = { content: 'retained opening task' };
     ds.session.queuedActivationTurnId = 'turn-queued-retained-1';
+    mocks.forkWorker.mockImplementationOnce(() => true);
 
     await handleThreadReply(
       makeEventData('om_msg_qr', '继续任务', anchor),
@@ -2821,6 +2823,27 @@ describe('durable admission then failing status reply → no resend advice (PR #
 
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
     expect(ds.suppressRecoveryCard).toBeUndefined();
+  });
+
+  it('queued refork keeps suppressRecoveryCard when forkWorker returns false (rejection leg, same predicate as main refork)', async () => {
+    const anchor = 'om_thread_queued_rejected';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.suppressRecoveryCard = true;
+    ds.session.queuedActivationPending = true;
+    ds.session.queuedActivationInput = '';
+    ds.session.queuedActivationTurnId = 'turn-queued-rejected-1';
+    // false = quarantine / session no longer active non-throwing rejection;
+    // the fork was not accepted, so recovery silence must survive exactly as
+    // on the sync-throw path.
+    mocks.forkWorker.mockImplementationOnce(() => false);
+
+    await handleThreadReply(
+      makeEventData('om_msg_qj', '继续', anchor),
+      makeCtx(anchor, 'om_msg_qj'),
+    );
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.suppressRecoveryCard).toBe(true);
   });
 
   it('queued refork keeps suppressRecoveryCard when forkWorker throws synchronously (clear happens only after acceptance)', async () => {
