@@ -237,7 +237,9 @@ function parseEnv(raw: string | undefined): CidrEntry[] {
       // Fail-closed: skip the item, but surface the typo once at startup.
       logger.warn(
         `[loopback-peers] ignoring invalid BOTMUX_LOOPBACK_PEERS item ${JSON.stringify(part)} `
-          + '(malformed, or a CIDR wider than /8 — use /32 for a single host)',
+          + '(malformed, or too broad: native CIDR /0–/7, or an IPv6 block '
+          + 'covering ::ffff:0:0/96 wider than the v4-equivalent /8 — use /32 '
+          + 'for a single host)',
       );
       continue;
     }
