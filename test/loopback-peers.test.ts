@@ -155,6 +155,42 @@ describe('isLoopbackPeer — CIDR', () => {
     expect(isLoopbackPeer('10.0.0.5')).toBe(true);
     expect(isLoopbackPeer('10.0.0.6')).toBe(false);
   });
+
+  it('rejects IPv6 blocks that re-open the whole IPv4 space via mapped form (dual-stack reports ::ffff:a.b.c.d)', () => {
+    // Dual-stack Node reports an IPv4 peer as ::ffff:8.8.8.8, so an IPv6 entry
+    // covering ::ffff:0:0/96 is a v4 /0 in disguise and must not slip past the
+    // width floor that only checked the native spelling.
+    for (const bad of ['::/0', '::/8', '::/64', '::/80', '::ffff:0:0/96', '::ffff:0:0/100', '::ffff:0:0/103']) {
+      setEnv(bad);
+      expect(isLoopbackPeer('::ffff:8.8.8.8')).toBe(false);
+      expect(isLoopbackPeer('8.8.8.8')).toBe(false);
+    }
+  });
+
+  it('accepts IPv6-mapped entries at the v4-equivalent /8 boundary', () => {
+    // ::ffff:10.0.0.0/104 is 10.0.0.0/8; the peer arrives in mapped form.
+    setEnv('::ffff:10.0.0.0/104');
+    expect(isLoopbackPeer('::ffff:10.1.2.3')).toBe(true);
+    expect(isLoopbackPeer('::ffff:11.1.2.3')).toBe(false);
+    // one step wider than /104 (v4 /7) is rejected
+    setEnv('::ffff:10.0.0.0/103');
+    expect(isLoopbackPeer('::ffff:10.1.2.3')).toBe(false);
+    // a normal /112 mapped block (v4 /16) works
+    setEnv('::ffff:192.168.0.0/112');
+    expect(isLoopbackPeer('::ffff:192.168.5.5')).toBe(true);
+    expect(isLoopbackPeer('::ffff:10.0.0.1')).toBe(false);
+    // a mapped single-host literal is a v4 /32 and stays valid
+    setEnv('::ffff:192.168.1.1');
+    expect(isLoopbackPeer('::ffff:192.168.1.1')).toBe(true);
+    expect(isLoopbackPeer('::ffff:192.168.1.2')).toBe(false);
+  });
+
+  it('still permits ordinary broad-but-bounded IPv6 blocks that do not touch mapped v4', () => {
+    setEnv('fd00::/8,2001:db8::/32');
+    expect(isLoopbackPeer('fd00::1')).toBe(true);
+    expect(isLoopbackPeer('2001:db8::1')).toBe(true);
+    expect(isLoopbackPeer('::ffff:8.8.8.8')).toBe(false);
+  });
 });
 
 describe('isLoopbackPeer — invalid env items are ignored (fail-closed)', () => {

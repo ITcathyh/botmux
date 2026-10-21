@@ -1,11 +1,14 @@
 /**
- * Loopback peer predicate for internal HMAC-authenticated HTTP endpoints.
+ * Loopback peer predicate for internal authenticated HTTP endpoints.
  *
- * Historically three call sites each inlined the same strict literal check
+ * Every call site historically inlined the same strict literal check
  * (`127.0.0.1` / `::1` / `::ffff:127.0.0.1`). On hosts with a customized
  * network stack the kernel can report a loopback TCP peer's address as a LAN
- * IP, which made every internal HMAC request fail with 401. This module keeps
- * the exact same default allow-list and adds an opt-in env extension:
+ * IP, which made every internal request fail at the origin gate. All such
+ * gates now delegate here (dashboard CLI auth, daemon-internal auth,
+ * workflow v3 daemon IPC, migrate-to-chat IPC, dispatch-launch IPC,
+ * native-subagent runtime IPC, current-actor peer resolution). This module
+ * keeps the exact same default allow-list and adds an opt-in env extension:
  *
  *   BOTMUX_LOOPBACK_PEERS=10.0.0.5,192.168.0.0/16,fd00::/8
  *
@@ -13,13 +16,16 @@
  * (fail-closed: never throw, never allow) and logged once at parse time.
  *
  * Security boundary: this list ONLY relaxes the "peer must be local" check.
- * Every migrated endpoint still requires its existing HMAC signature (fresh
- * timestamp, unspent nonce, shared secret); a wide entry does not turn any
- * endpoint into an unauthenticated one. Because the peer check is the outer
- * ring, absurdly broad blocks are rejected too — a /0 CIDR (or /1–/7) matches
- * the whole internet and makes the local-only guarantee meaningless, so such
- * items are ignored like any other invalid entry. Prefer /32 (single host) or
- * the narrowest LAN block that actually carries the loopback traffic.
+ * Every gate still requires its existing proof (HMAC signature with fresh
+ * timestamp + unspent nonce + shared secret, or a local /proc socket-inode
+ * ownership chain); a wide entry does not turn any endpoint into an
+ * unauthenticated one. Because the peer check is the outer ring, absurdly
+ * broad blocks are rejected too — a /0 CIDR (or /1–/7) matches the whole
+ * internet and makes the local-only guarantee meaningless, and on a
+ * dual-stack host an IPv6 block reaching ::ffff:0:0/96 is an IPv4 /0 in
+ * disguise, so both are ignored like any other invalid entry. Prefer /32
+ * (single host) or the narrowest LAN block that actually carries the
+ * loopback traffic.
  *
  * The parsed env is cached for the process lifetime — daemon env is immutable
  * after boot; tests reset the cache via __resetLoopbackPeersCacheForTest().
@@ -141,8 +147,16 @@ function parseIp(addr: string): ParsedIp | null {
  * /8 is the narrowest sane floor: one traditional class-A block, which is
  * also the granularity of the big private ranges people actually configure
  * (`10.0.0.0/8`, IPv6 ULA `fd00::/8`).
+ *
+ * The floor must ALSO be applied to IPv6 entries that reach into the
+ * IPv4-mapped block ::ffff:0:0/96: a dual-stack Node server reports every
+ * IPv4 peer as ::ffff:a.b.c.d, so `::/80` (which contains that whole block)
+ * is `0.0.0.0/0` in disguise and would reopen the entire IPv4 internet.
  */
 const MIN_CIDR_PREFIX = 8;
+
+/** ::ffff:0:0, the top 96 bits of the IPv4-mapped IPv6 range. */
+const IPV4_MAPPED_BLOCK_TOP96 = 0xffffn << 32n;
 
 interface CidrEntry {
   version: 4 | 6;
@@ -178,7 +192,31 @@ function parseEntry(raw: string): CidrEntry | null {
   if (prefix < MIN_CIDR_PREFIX) return null;
   const mask = prefixMask(bits, prefix);
   // Normalize host bits away so e.g. 192.168.1.5/16 behaves like 192.168.0.0/16.
-  return { version: ip.version, network: ip.value & mask, mask };
+  const network = ip.value & mask;
+  if (ip.version === 6 && entryReachesMappedV4(network, prefix)) {
+    // The block covers part/all of ::ffff:0:0/96, and dual-stack reports IPv4
+    // peers in mapped form. Translate to the effective IPv4 prefix
+    // (/96-and-shorter that fully contains the block = v4 /0) and enforce the
+    // same floor, or `::/80` would re-open the whole IPv4 internet.
+    const effectiveV4Prefix = prefix <= 96 ? 0 : prefix - 96;
+    if (effectiveV4Prefix < MIN_CIDR_PREFIX) return null;
+  }
+  return { version: ip.version, network, mask };
+}
+
+/**
+ * Whether an aligned IPv6 CIDR block reaches the IPv4-mapped range
+ * ::ffff:0:0/96 (and therefore matches IPv4 peers on a dual-stack host).
+ *
+ * - prefix ≤ 96: the block fully contains the mapped /96 when the mapped
+ *   block's top 96 bits share the entry's prefix.
+ * - prefix > 96: the (narrower) block lies inside the mapped range.
+ */
+function entryReachesMappedV4(network: bigint, prefix: number): boolean {
+  if (prefix <= 96) {
+    return (IPV4_MAPPED_BLOCK_TOP96 & prefixMask(128, prefix)) === network;
+  }
+  return (network >> 32n) === 0xffffn;
 }
 
 let cachedEntries: CidrEntry[] | null = null;
