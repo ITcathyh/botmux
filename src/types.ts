@@ -92,6 +92,23 @@ export interface TrustedCaller {
    *  happens to hold such a mapping becomes a way for anyone who can make it
    *  speak to borrow that access, with the audit trail pointing at the bot. */
   senderType?: 'user' | 'bot';
+  /**
+   * Host-attested developer for an inbound peer-bot turn. This is deliberately
+   * separate from requestUser*: the immediate caller remains the bot for
+   * routing, allowlists and audit, while a remote runner may explicitly opt in
+   * to the bot owner's human credentials (for example, developer_default).
+   *
+   * The value is present only when the sender was positively identified as a
+   * bot, its union_id matched the authoritative platform team-sync roster, and
+   * the owner was resolved through the receiving Lark app. Message text,
+   * session ownership and last-human state never populate it.
+   */
+  botOwner?: {
+    openId: string;
+    unionId: string;
+    email: string;
+    source: 'platform_team';
+  };
 }
 
 export interface VcMeetingConsumerProfileFilter {
@@ -1205,10 +1222,10 @@ export interface Session {
    */
   autoWorktreeFallbackDir?: string;
   /** Persisted adopt metadata — allows adopt sessions to survive daemon restarts.
-   *  Either tmuxTarget (tmux backend) OR zellijSession+zellijPaneId (zellij). */
+   *  The source-specific tmux, Zellij, Herdr, or Orca identity is set. */
   adoptedFrom?: {
     /** Source backend of the external session. Absent means legacy tmux metadata. */
-    source?: 'tmux' | 'herdr' | 'zellij';
+    source?: 'tmux' | 'herdr' | 'zellij' | 'orca';
     tmuxTarget?: string;
     /** zellij adopt target: session name + pane id (e.g. "terminal_1"). */
     zellijSession?: string;
@@ -1218,6 +1235,17 @@ export interface Session {
     herdrPaneId?: string;
     herdrAgentName?: string;
     herdrTerminalId?: string;
+    orcaTerminalHandle?: string;
+    /** Display snapshot from adoption; the handle remains the stable identity. */
+    orcaTerminalTitle?: string;
+    /** Orca control route; absent = desktop relay for legacy rows. */
+    orcaInstance?: import('./services/orca-cli.js').OrcaInstance;
+    orcaPtyId?: string;
+    orcaIncarnationId?: string;
+    orcaExecutionHostId?: string;
+    orcaWorktreeId?: string;
+    orcaAgentIdentity?: string;
+    orcaPaneSizeVerified?: boolean;
     originalCliPid?: number;
     sessionId?: string;
     cliId?: string;
@@ -1940,7 +1968,10 @@ type DaemonToWorkerBase =
 
 export type DaemonToWorker = DaemonToWorkerBase extends infer Message
   ? Message extends { type: 'init' }
-    ? Omit<Message, 'loadedBotsConfigPath'> & {
+    ? Omit<Message, 'loadedBotsConfigPath' | 'adoptSource'> & {
+        adoptSource?: 'tmux' | 'herdr' | 'zellij' | 'orca';
+        adoptOrcaIdentity?: import('./services/orca-cli.js').OrcaExpectedTerminalIdentity;
+        adoptOrcaSizeVerified?: boolean;
         loadedBotsConfigPath?: string;
         loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance;
         feedback?: import('./services/feedback-policy.js').FeedbackPolicy;
@@ -2164,7 +2195,11 @@ export type WorkerToDaemon =
   /** Worker 已处理 SessionStart 信号并建立 post-hook prompt evidence fence。
    *  daemon 收到后才结束 `botmux session-ready` HTTP 请求。 */
   | { type: 'session_ready_ack'; requestId: string }
-  | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number }
+  | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number;
+      /** The main turn has ended but this many background tasks it launched are
+       *  still running (card: 「主回合已结束 · 后台子任务运行中（N）」). Omitted
+       *  otherwise. Display only — no status decision reads it. */
+      backgroundTasks?: number }
   /** Incremental model thinking (CoT) attributed to an active Lark turn.
    * `entries` is the FULL cumulative list so far (not a delta) — each entry
    * renders as its own node in the native CoT message: thinking paragraphs,

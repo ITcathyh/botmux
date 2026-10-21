@@ -51,6 +51,7 @@ import { closeResidualClause, parseCloseResidual, type ParsedCloseResidual } fro
 import {
   advanceAncestorSessionTurn,
   findAncestorSessionMarkerContext as findLiveAncestorSessionContext,
+  findAuthenticatedAncestorSessionContext,
   resolveSessionContext,
 } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
@@ -3911,13 +3912,15 @@ async function cmdDashboard(args: string[]): Promise<void> {
 // ─── Session helpers ──────────────────────────────────────────────────────────
 
 interface AdoptedFromData {
-  source?: 'tmux' | 'herdr' | 'zellij';
+  source?: 'tmux' | 'herdr' | 'zellij' | 'orca';
   tmuxTarget?: string;
   zellijSession?: string;
   zellijPaneId?: string;
   herdrSessionName?: string;
   herdrTarget?: string;
   herdrPaneId?: string;
+  orcaTerminalHandle?: string;
+  orcaTerminalTitle?: string;
   originalCliPid?: number;
   sessionId?: string;
   cwd?: string;
@@ -4681,6 +4684,9 @@ function adoptedCliPid(s: SessionData): number | undefined {
 function adoptTargetLabel(s: SessionData): string {
   if (!isAdoptedSession(s)) return '';
   const a = s.adoptedFrom;
+  if (a.source === 'orca' || a.orcaTerminalHandle) {
+    return `adopt: orca ${a.orcaTerminalTitle || a.orcaTerminalHandle || '?'}`;
+  }
   if (a.source === 'zellij' || a.zellijPaneId) {
     const target = a.zellijSession && a.zellijPaneId
       ? `${a.zellijSession}/${a.zellijPaneId}`
@@ -4783,8 +4789,8 @@ function sessionBackingInfo(s: SessionData, snapshot?: BackingProbeSnapshot): {
   if (s.backendType === 'pty') {
     return { backendType: 'pty', probe: 'missing', label: 'pty' };
   }
-  if (s.backendType === 'riff' || s.backendType === 'mojo' || s.backendType === 'remote-runner') {
-    // A remote backend runs its agent off-box, not in a local
+  if (s.backendType === 'riff' || s.backendType === 'mojo' || s.backendType === 'remote-runner' || s.backendType === 'orca') {
+    // A remote backend or adopted Orca terminal runs outside a Botmux-owned local
     // multiplexer pane: there is nothing to probe, attach to, or name as a
     // PersistentBackendTarget (sessionPersistentTarget returns undefined for it, by
     // design). Surface a stable label and report the nonexistent local backing as
@@ -4795,7 +4801,11 @@ function sessionBackingInfo(s: SessionData, snapshot?: BackingProbeSnapshot): {
     // narrow the union, and the exhaustiveness guard at the end of this function
     // depends on that narrowing. Adding a remote backend therefore fails to
     // compile here until it is listed — which is how mojo was caught.
-    return { backendType: s.backendType, probe: 'missing', label: s.backendType };
+    return {
+      backendType: s.backendType,
+      probe: 'missing',
+      label: s.backendType === 'orca' ? adoptTargetLabel(s) : s.backendType,
+    };
   }
   if (s.backendType === undefined) {
     // Legacy rows predate backend stamping. Only tmux was externally attachable,
@@ -5803,7 +5813,7 @@ async function cmdSuspend(): Promise<void> {
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'rename' | 'project' | 'continuation' | 'durable-send' | 'turn-delivery' | typeof DEFERRED_TOPIC_CLAIM_ROUTE,
+  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'rename' | 'project' | 'continuation' | 'durable-send' | 'turn-delivery' | typeof DEFERRED_TOPIC_CLAIM_ROUTE | 'chat-manager',
   payload: Record<string, unknown>,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
@@ -5811,7 +5821,7 @@ async function postSessionCliIpc(
   if (!process.env.BOTMUX_SEND_RELAY) {
     try { hostSecret = loadDaemonIpcSecret(); } catch { /* sandboxed/read-isolated: capability fallback below */ }
   }
-  if (!hostSecret) {
+  if (!hostSecret || route === 'chat-manager') {
     const claim = readManagedOriginCapability(
       resolveDataDir(),
       sessionId,
@@ -5822,6 +5832,14 @@ async function postSessionCliIpc(
       requestBody.originCapability = claim.capability;
       if (claim.turnId) requestBody.originTurnId = claim.turnId;
       if (claim.dispatchAttempt !== undefined) requestBody.originDispatchAttempt = claim.dispatchAttempt;
+    }
+    if (!claim && route === 'chat-manager' && !process.env.BOTMUX_SEND_RELAY && !process.env.BOTMUX_ORIGIN_CHANNEL_ID) {
+      const marker = findAuthenticatedAncestorSessionContext(resolveDataDir());
+      if (marker?.sessionId === sessionId && marker.capability) {
+        requestBody.originCapability = marker.capability;
+        requestBody.originTurnId = marker.turnId;
+        requestBody.originDispatchAttempt = marker.dispatchAttempt;
+      }
     }
   }
   const path = `/api/sessions/${encodeURIComponent(sessionId)}/${route}`;
@@ -6070,6 +6088,27 @@ async function cmdChat(argv: string[]): Promise<void> {
   }
   console.error(out);
   process.exitCode = 1;
+}
+
+async function cmdChatManager(argv: string[]): Promise<void> {
+  const action = argv[0];
+  if (argv.length !== 1 || !['set', 'clear', 'status'].includes(action)) {
+    console.error('用法: botmux manager set|clear|status');
+    process.exitCode = 2;
+    return;
+  }
+  const sid = findAncestorSessionContext()?.sessionId;
+  const session = sid ? [...loadSessions().values()].find(item => item.sessionId === sid) : undefined;
+  const daemon = session && findDaemon(session.larkAppId);
+  if (!session || !daemon) {
+    console.error(JSON.stringify({ ok: false, error: session ? 'daemon_offline' : 'missing_session_context' }));
+    process.exitCode = 1;
+    return;
+  }
+  const response = await postSessionCliIpc(daemon.ipcPort, session.sessionId, 'chat-manager', { action });
+  const body: any = await response.json().catch(() => ({ ok: false, error: `HTTP ${response.status}` }));
+  if (response.ok && body?.ok) console.log(JSON.stringify(body));
+  else { console.error(JSON.stringify(body)); process.exitCode = 1; }
 }
 
 const SESSION_RENAME_USAGE = '用法: botmux session rename "<标题>"（只改当前会话；会话自动识别，不接受 --session-id 等参数指定其他会话）';
@@ -7162,6 +7201,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
 
 飞书消息（在 CLI 会话内自动推断 session）:
   chat rename <新群名称>               修改当前会话所在群的名称
+  manager set|clear|status             设置、取消或查看当前群负责人（会话内使用）
        --proactive                    标记为 AI 主动改名（应用 10 分钟防抖）
 ${SEND_HELP_BODY}
   card patch --message-id <om_xxx> (--card-file <path> | --card-json <json>)
@@ -8927,6 +8967,7 @@ import {
 } from './core/completion-proposal.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from './services/feedback-policy-resolver.js';
 import { normalizeFeedbackPolicy } from './services/feedback-policy.js';
+import { materializeFeedbackPolicyForDelivery } from './services/feedback-reviewer-delivery.js';
 import { attachOncallGroupButton, recordOncallGroupDelivery } from './im/lark/oncall-group.js';
 import { applyInlineMentions, applyInlineMentionsToCard } from './im/lark/inline-mentions.js';
 import { renderBrandTemplate } from './im/lark/brand-template.js';
@@ -11612,25 +11653,22 @@ async function cmdSend(rest: string[]): Promise<void> {
   // Freeze email reviewers into this bot's app-scoped open_id NOW, with
   // the bot's own credentials, so the card callback can match network-free
   // against the delivery snapshot. Pure ou_/on_ lists (and requester/everyone)
-  // skip the lookup. If resolution empties a reviewers list, fail closed (no
-  // feedback control) rather than ship a card nobody can click.
+  // skip the lookup. An empty definitive list still renders the control (the
+  // callback rejects every operator); a TRANSIENT resolution failure reuses
+  // the last-known-good cache instead of shipping an empty snapshot, and with
+  // no cache to reuse the control is dropped for this delivery.
   if (feedbackPolicy && effectiveResponseKind === 'final' && feedbackPolicy.audience === 'reviewers') {
     try {
-      const { materializeFeedbackReviewers } = await import('./services/feedback-policy.js');
       const { resolveAllowedUsersWithMap } = await import('./im/lark/client.js');
-      feedbackPolicy = await materializeFeedbackReviewers(feedbackPolicy, async entries => {
-        const { map } = await resolveAllowedUsersWithMap(s.larkAppId!, entries);
-        const resolved = new Map<string, string>();
-        for (const entry of entries) {
-          const id = map.get(entry);
-          if (id && id.startsWith('ou_')) resolved.set(entry, id);
-        }
-        return resolved;
+      feedbackPolicy = await materializeFeedbackPolicyForDelivery({
+        policy: feedbackPolicy,
+        larkAppId: s.larkAppId!,
+        dataDir: config.session.dataDir,
+        resolveAllowedUsersWithMap,
       });
     } catch {
       feedbackPolicy = undefined;
     }
-    if (feedbackPolicy && feedbackPolicy.reviewers.length === 0) feedbackPolicy = undefined;
   }
   const feedbackRequesterSubjectId = replyTargetSenderOpenId ?? s.ownerOpenId;
   const withOncallGroup = (card: string): string => {
@@ -13646,6 +13684,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   --bot <spec>          兼容外部/旧链路；spec = open_id[:名字[:角色]]，不保证本机双向授权
   --brief <text>        子项目简报 / 追加内容；首个语义行写 @steer 可显式调整活跃 Codex App turn
   --brief-file <path>   从文件读取简报
+  --result-delivery <mode>  结果投递：relay（默认）|publish|publish-and-relay
   --steer               在简报前注入通用 @steer 指令；普通 dispatch 默认仍进入 Queue
   --delegate schedule:create
                         请求把当前真人回合的 schedule 创建权限委托给目标 Bot 当前派发 turn（需宿主策略开启）
@@ -13716,6 +13755,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const intoRoot = dispatchArgs.into;
   const standby = dispatchArgs.standby;
   const steer = dispatchArgs.steer;
+  const resultDelivery = dispatchArgs.resultDelivery ?? 'relay';
   const botSpecs = dispatchArgs.bots;
   const botAppSpecs = dispatchArgs.botApps;
   const delegateScheduleCreate = dispatchArgs.delegates?.includes('schedule:create') === true;
@@ -13790,6 +13830,10 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   }
   if (!standby && !brief.trim()) {
     console.error('缺少简报。用 --brief 或 --brief-file 指定（仅 --standby 模式可省略）。');
+    process.exit(1);
+  }
+  if (!['relay', 'publish', 'publish-and-relay'].includes(resultDelivery)) {
+    console.error('--result-delivery 必须是 relay|publish|publish-and-relay。');
     process.exit(1);
   }
   if (steer) brief = withBotSteerDirective(brief);
@@ -13908,6 +13952,12 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     if (!parsedBotApps.some(item => item.appId === targetAppId)) parsedBotApps.push({ appId: targetAppId, role });
   }
 
+  if (resultDelivery !== 'relay' && (standby || botSpecs.length > 0 || parsedBotApps.length === 0
+    || parsedBotApps.some(item => botConfigs.find(cfg => cfg.larkAppId === item.appId)?.promptInjection === 'none'))) {
+    console.error('公开结果投递需要使用 --bot-app 派发实际任务，目标须启用默认提示注入；零注入模式使用自动回传。');
+    process.exit(1);
+  }
+
   let requestedLaunch: { model?: string; reasoningEffort?: CodexReasoningEffort } | undefined;
   let effectiveRuntime: { model: string; reasoningEffort?: CodexReasoningEffort } | undefined;
   if (hasLaunchOverride) {
@@ -13980,6 +14030,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     dispatchRootId,
     exactReportRootEnabled,
     sameTopicSendEnabled,
+    resultDelivery: resultDelivery as 'relay' | 'publish' | 'publish-and-relay',
   });
   let built;
   try {
@@ -14357,7 +14408,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
  */
 async function cmdReport(rest: string[]): Promise<void> {
   if (rest.includes('--help') || rest.includes('-h')) {
-    console.log(`botmux report — 交付回报（issue 待验收 / 交接 Review·进展·结果并保持自然会话位置）
+    console.log(`botmux report — 任务回报（状态同步 / 结果投递并保持自然会话位置）
 
 用法:
   botmux report --content-file <path>
@@ -14365,6 +14416,7 @@ async function cmdReport(rest: string[]): Promise<void> {
   botmux report --into <om_root> --content-file <path>
   botmux report --top-level "子项目X 完成，产出在 …"
   botmux report --dispatch-root <om_seed> "子项目X 完成，产出在 …"
+  botmux report --dispatch-root <om_seed> --delivery publish --content-file <path>
   botmux report "子项目X 完成，产出在 …" --legacy-dispatch
 
 说明:
@@ -14380,8 +14432,7 @@ async function cmdReport(rest: string[]): Promise<void> {
      dispatch 注册表命中时仍回到原主编排会话，并唤醒其已有上下文。
      legacy / 跨机器 dispatch 没有本机注册表时仍回退群顶层，避免在子话题唤醒无上下文会话。
 
-  代码 Review 交接建议明确写出：首次 Review / 复审、MR、本轮改动、验证、风险，
-  以及希望 Reviewer 采取的动作。
+  回报应明确写出任务类型、本轮改动、验证、风险和建议的下一步动作。
 
 选项:
   --content-file <path>  从文件读取回报内容
@@ -14389,6 +14440,9 @@ async function cmdReport(rest: string[]): Promise<void> {
   --top-level            显式发到当前群顶层（覆盖默认落点）
   --dispatch-root <id>   dispatch 注入的精确 seed；优先且不命中时 fail closed
   --recipient-root <id>  仅指定历史收件人来源根消息；校验失败不降级，不代替 --dispatch-root
+  --delivery <mode>      relay（默认，仅回传来源会话）|publish（仅发布到当前派单话题）|
+                         publish-and-relay（发布并回传来源会话）
+  --publish-to <target>  thread（默认，当前派单话题）|chat（当前群顶层）
   --status <状态>        同步子任务状态：pending|in_progress|blocked|completed|failed
   --progress <0-100>     同步子任务完成百分比
   --remaining <text>     同步该子任务待完成内容
@@ -14438,7 +14492,7 @@ async function cmdReport(rest: string[]): Promise<void> {
     process.exit(1);
   }
   const projectStatusRaw = argValue(rest, '--status')?.trim();
-  for (const flag of ['--status', '--progress', '--remaining', '--milestone']) {
+  for (const flag of ['--status', '--progress', '--remaining', '--milestone', '--delivery', '--publish-to']) {
     if (flagPresentButValueMissing(rest, flag)) {
       console.error(`${flag} 需要一个值。`);
       process.exit(1);
@@ -14456,6 +14510,19 @@ async function cmdReport(rest: string[]): Promise<void> {
   }
   const projectRemaining = argValue(rest, '--remaining')?.trim();
   const projectMilestone = argValue(rest, '--milestone')?.trim();
+  const reportDelivery = argValue(rest, '--delivery')?.trim() ?? 'relay';
+  if (!['relay', 'publish', 'publish-and-relay'].includes(reportDelivery)) {
+    console.error('--delivery 必须是 relay|publish|publish-and-relay。');
+    process.exit(1);
+  }
+
+  const publishTo = argValue(rest, '--publish-to');
+  if ((publishTo !== undefined && !['thread', 'chat'].includes(publishTo))
+    || (publishTo !== undefined && reportDelivery === 'relay')
+    || (reportDelivery !== 'relay' && (!explicitDispatchRoot || explicitInto || explicitTopLevel || legacyDispatch))) {
+    console.error('发布模式需要 --dispatch-root；--publish-to 仅支持 thread|chat，不能与 --into、--top-level 或 --legacy-dispatch 混用。');
+    process.exit(1);
+  }
 
   let content = '';
   const contentFile = argValue(rest, '--content-file');
@@ -14650,6 +14717,8 @@ async function cmdReport(rest: string[]): Promise<void> {
           ...(projectProgressRaw !== undefined ? { progress: Number(projectProgressRaw) } : {}),
           ...(projectRemaining ? { remaining: projectRemaining } : {}),
           ...(projectMilestone ? { milestone: projectMilestone } : {}),
+          ...(reportDelivery !== 'relay' ? { delivery: reportDelivery } : {}),
+          ...(publishTo ? { publishTo } : {}),
         },
       });
     } catch (err: any) {
@@ -14662,29 +14731,38 @@ async function cmdReport(rest: string[]): Promise<void> {
       && !explicitDispatchRoot) {
       // Ordinary topic/chat turn, not a registered dispatch.
     } else if (!response.ok || triggerBody?.ok !== true) {
-      console.error(`主编排会话回注失败: ${triggerBody?.error ?? `HTTP ${response.status}`}`);
+      console.error(JSON.stringify({ success: false, error: triggerBody?.error ?? `HTTP ${response.status}`,
+        ...(triggerBody?.publishedMessageId ? { publishedMessageId: triggerBody.publishedMessageId } : {}),
+        ...(triggerBody?.deliveryKey ? { deliveryKey: triggerBody.deliveryKey } : {}),
+      }));
       process.exit(1);
     } else {
       const target = triggerBody.reportTarget;
       console.log(JSON.stringify({
         success: true,
-        delivery: 'orchestrator-session',
-        reportedTo: target?.sessionId,
+        delivery: reportDelivery === 'publish' ? 'lark-message' : 'orchestrator-session',
+        reportedTo: reportDelivery === 'publish' ? triggerBody.publishedMessageId : target?.sessionId,
         viaRegistry: true,
-        recipient: {
+        recipient: reportDelivery === 'publish' ? {
+          kind: 'chat', chatId: s.chatId,
+        } : {
           kind: 'orchestrator-session',
           botAppId: target?.larkAppId,
           sessionId: target?.sessionId,
           ...(reportRecipient ? { openId: reportRecipient } : {}),
         },
         placementSource: 'dispatch-registry',
-        messageTarget: {
+        messageTarget: reportDelivery === 'publish' ? triggerBody.publicationTarget : {
           mode: 'orchestrator-session',
           sessionId: target?.sessionId,
           botAppId: target?.larkAppId,
         },
         triggerId: triggerBody.triggerId,
         projectSynced: triggerBody.projectSynced === true,
+        deliveryMode: reportDelivery,
+        ...(typeof triggerBody.publishedMessageId === 'string'
+          ? { publishedMessageId: triggerBody.publishedMessageId, publicationTarget: triggerBody.publicationTarget }
+          : {}),
       }));
       return;
     }
@@ -14692,7 +14770,7 @@ async function cmdReport(rest: string[]): Promise<void> {
 
   if (!reportRecipient) {
     console.error(
-      '找不到 Review / 回报接收者：本会话没有 creatorOpenId、ownerOpenId 或可用的历史发送者。\n' +
+      '找不到回报接收者：本会话没有 creatorOpenId、ownerOpenId 或可用的历史发送者。\n' +
       '若确需交接，请改用 `botmux send --mention <open_id:名字>` 明确指定接收者。');
     process.exit(1);
   }
@@ -17136,6 +17214,22 @@ function getVersion(): string {
 
 const command = process.argv[2];
 
+if (command === '__orca-relay-local') {
+  const { callLocalOrcaRelay } = await import('./services/orca-local-relay.js');
+  const input = JSON.parse(readFileSync(0, 'utf-8'));
+  if (!Array.isArray(input?.args) || !input.args.every((arg: unknown) => typeof arg === 'string')) throw new Error('Invalid Orca relay arguments');
+  if (!Number.isInteger(input.timeoutMs) || input.timeoutMs <= 0) throw new Error('Invalid Orca relay timeout');
+  if (input.expected && (!['terminalHandle', 'worktreeId', 'agentIdentity'].every(key => typeof input.expected[key] === 'string')
+    || !['ptyId', 'incarnationId', 'executionHostId'].every(key => input.expected[key] === undefined || typeof input.expected[key] === 'string'))) {
+    throw new Error('Invalid Orca relay terminal identity');
+  }
+  const result = await callLocalOrcaRelay(input.args, input.timeoutMs, input.expected);
+  await writeAndFlush(process.stdout, JSON.stringify(result.ok
+    ? { ok: true, result: result.value }
+    : { ok: false, error: { message: result.message } }));
+  process.exit(0);
+}
+
 // Single-file-executable self-hosting: when botmux is a `bun build --compile`
 // binary, it cannot spawn `node dist/index-*.js` (no dist/ on disk). Instead the
 // daemon/core-only/worker/supervisor/dashboard spawners re-exec THIS binary with
@@ -18654,6 +18748,7 @@ switch (command) {
   case 'top-notice': await cmdTopNotice(process.argv.slice(3)); break;
   case 'card':     await cmdCard(process.argv.slice(3)); break;
   case 'chat':     await cmdChat(process.argv.slice(3)); break;
+  case 'manager':  await cmdChatManager(process.argv.slice(3)); break;
   case 'project':  await cmdProject(process.argv.slice(3)); break;
   case 'dispatch': await cmdDispatch(process.argv.slice(3)); break;
   case 'report': await cmdReport(process.argv.slice(3)); break;
