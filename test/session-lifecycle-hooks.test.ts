@@ -794,11 +794,11 @@ describe('worker-pool lifecycle hook integration', () => {
     const ds = makeDs({ worker });
     __testOnly_setupWorkerHandlers(ds, worker);
 
-    // Simulate a file-lock timeout on a huge sessions file (the crash vector:
-    // the daemon has no global uncaughtException trap, so a throwing exit
-    // handler would take down every other session).
+    // Simulate a durable row-persist failure (SQLite busy timeout, disk full).
+    // The crash vector: the daemon has no global uncaughtException trap, so a
+    // throwing exit handler would take down every other session.
     vi.mocked(updateSession).mockImplementationOnce(() => {
-      throw new Error('file-lock timeout waiting for sessions.json.lock');
+      throw new Error('database is locked (SQLITE_BUSY: busy timeout)');
     });
 
     // The emit must NOT throw — the narrow try/catch around the persistence
@@ -816,11 +816,14 @@ describe('worker-pool lifecycle hook integration', () => {
       ds,
       expect.objectContaining({ sessionId: 'sid-lifecycle-test', code: 1 }),
     );
-    // Dashboard exited event and session.exit lifecycle hook still fired once.
-    expect(dashboardEventBus.publish).toHaveBeenCalledTimes(1);
-    expect(dashboardEventBus.publish).toHaveBeenCalledWith(
-      expect.objectContaining({ type: 'session.exited' }),
+    // The dashboard dormant-update and the session.exit lifecycle hook still
+    // fired exactly once: an active row's worker death publishes session.update
+    // (dormant) rather than session.exited (see worker-exit-dashboard-event.ts).
+    const dormantPublishes = dashboardEventBus.publish.mock.calls.filter(
+      ([event]) => (event as { type?: string; body?: { patch?: { status?: string } } })
+        .body?.patch?.status === 'dormant',
     );
+    expect(dormantPublishes).toHaveLength(1);
     expect(emitHookEventMock).toHaveBeenCalledWith(
       'session.exit',
       expect.objectContaining({ sessionId: 'sid-lifecycle-test', reason: 'exit_code_1' }),
