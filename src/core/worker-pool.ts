@@ -12184,8 +12184,7 @@ function setupWorkerHandlers(
       // Carry the frozen init attribution so an abrupt pre-ready exit of a
       // durable VC delivery is fenced to the receipt/lease chain, not replied
       // out-of-band (which could post on a silent delivery).
-      void notifyStartupFailure(reason, startupState.initTurnId, startupState.initDispatchAttempt)
-        .catch(err => logger.error(`[${t}] notifyStartupFailure failed: ${err instanceof Error ? err.message : String(err)}`));
+      void notifyStartupFailure(reason, startupState.initTurnId, startupState.initDispatchAttempt);
     }
     // Clear the current child before notifying durable consumers. A callback
     // may schedule a retry; it must not observe/send to this dead IPC channel.
