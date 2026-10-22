@@ -6,6 +6,7 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { logger } from '../utils/logger.js';
 import type { CliId } from '../adapters/cli/types.js';
+import type { SessionTokenUsageSnapshot } from '../types.js';
 import { findAidenLatestCheckpointByBotmuxSessionId, findAidenLatestCheckpointBySessionId } from '../services/aiden-checkpoints.js';
 import {
   __resetTranscriptResolverCacheForTest,
@@ -13,11 +14,18 @@ import {
   resolveSessionTranscriptPath,
 } from '../services/transcript-resolver.js';
 import { scanJsonlFromFd, scanJsonlFromOffset, type JsonlCursor } from '../services/jsonl-cursor.js';
+import { estimateCostCny, type ResolvedModelPricing } from '../services/model-pricing.js';
 import {
   isMeaningfulQueuedCommand,
   isMeaningfulUserEvent,
   type TranscriptEvent,
 } from '../services/claude-transcript.js';
+import { __resetCodexCompactionCountForTest, readCodexCompactionCount } from '../services/codex-compaction-count.js';
+import { readAntigravityTokenUsage } from '../services/antigravity-usage.js';
+import { readMinimaxUsage } from '../services/minimax-usage.js';
+import { readCursorUsage } from '../services/cursor-usage.js';
+import { cursorConfigDirForBot } from '../services/cursor-paths.js';
+import { config } from '../config.js';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -30,7 +38,7 @@ export interface SessionCost {
   turns: number;
 }
 
-export interface SessionTokenUsage extends SessionCost {
+export interface SessionTokenUsage extends SessionCost, SessionTokenUsageSnapshot {
   in: number;
   out: number;
 }
@@ -50,13 +58,28 @@ export interface SessionContextUsage {
  * is cumulative for the Session; neither value is inferred from the other.
  * `turnTokens` is the delta for the latest user turn (cumulative since the last
  * user message) — small, matches what the CLI's own TUI shows for "this turn",
- * whereas `tokens` is the whole-session cumulative (cache-inclusive, large). */
+ * whereas `tokens` is the whole-session cumulative (cache-inclusive, large).
+ * `costCny` is the cumulative CNY estimate for the whole session (pricing-gated:
+ * absent when no pricing is supplied or the session model is unpriced). */
 export interface SessionUsageSnapshot {
   context: SessionContextUsage | null;
   tokens: SessionTokenUsage | null;
   turnTokens: { in: number; out: number } | null;
   model?: string;
   reasoningEffort?: string;
+  costCny?: number;
+}
+
+/** What `SessionUsageSnapshot.context` was measured from, for `botmux observe`
+ *  (Claude Code and Codex only). Kept out of the snapshot itself so the card
+ *  pipeline keeps seeing exactly the shape it always did. `measuredAtMs` is the
+ *  transcript entry's own timestamp (file mtime only when the entry carries
+ *  none). `compactions` is null when it cannot be counted reliably (e.g. an
+ *  oversized Codex rollout with no incremental cursor yet) — unknown, never 0. */
+export interface SessionContextObservation {
+  measuredAtMs: number;
+  compactions: number | null;
+  source: 'claude-transcript' | 'codex-rollout';
 }
 
 export interface SessionTokenUsageQuery {
@@ -70,6 +93,10 @@ export interface SessionTokenUsageQuery {
   /** Bypass the reparse throttle (stat short-circuit and incremental folding
    *  still apply). Use at low-frequency exact points like ledger/card snapshots. */
   fresh?: boolean;
+  /** Optional pricing for CNY cost estimation. When supplied (and the session
+   *  model is priced), getSessionUsageSnapshot fills `costCny` on the
+   *  cumulative token totals — distinct from the ledger's per-delta cost. */
+  pricing?: ResolvedModelPricing;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -89,6 +116,17 @@ export function getSessionCost(sessionId: string, cwd: string): SessionCost | nu
 
 function num(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+/** Transcript entry `timestamp` (ISO string, or epoch ms) → epoch ms; null when absent/unparseable. */
+function entryTimestampMs(entry: any): number | null {
+  const raw = entry?.timestamp;
+  if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) return raw;
+  if (typeof raw === 'string' && raw) {
+    const ms = Date.parse(raw);
+    if (Number.isFinite(ms) && ms > 0) return ms;
+  }
+  return null;
 }
 
 function firstNonEmptyString(...values: unknown[]): string {
@@ -221,6 +259,12 @@ interface TokenUsageAggregate {
   turns: number;
   latestCodexUsage: SessionTokenUsage | null;
   latestContextUsage: SessionContextUsage | null;
+  /** Epoch ms of the transcript entry `latestContextUsage` came from (null when
+   *  the entry carried no parseable timestamp). Claude Code / Codex only. */
+  latestContextAtMs: number | null;
+  /** `system/compact_boundary` entries seen (Claude Code). Codex compactions are
+   *  counted separately — see services/codex-compaction-count.ts. */
+  compactions: number;
   latestCodexUsageSource: UsageSourceRecord | null;
   latestContextUsageSource: UsageSourceRecord | null;
   modelSource: UsageSourceRecord | null;
@@ -287,6 +331,8 @@ function newTokenUsageAggregate(): TokenUsageAggregate {
     turns: 0,
     latestCodexUsage: null,
     latestContextUsage: null,
+    latestContextAtMs: null,
+    compactions: 0,
     latestCodexUsageSource: null,
     latestContextUsageSource: null,
     modelSource: null,
@@ -299,6 +345,14 @@ function newTokenUsageAggregate(): TokenUsageAggregate {
 /** Claude Code / Seed: one JSONL line per content block; blocks of the same
  *  turn repeat the same message.id and usage snapshot — count once per id. */
 function foldClaudeLine(agg: TokenUsageAggregate, seenMessageIds: Set<string>, entry: any): void {
+  // A compaction leaves exactly one system/compact_boundary marker (the summary
+  // and the post-compact messages are separate lines), so each marker is one
+  // compaction. It does not touch the latest context measurement: the next
+  // assistant message supersedes it.
+  if (entry?.type === 'system' && entry?.subtype === 'compact_boundary') {
+    agg.compactions++;
+    return;
+  }
   // A *real* new prompt starts a new user turn → reset the per-turn delta.
   // Reuse the single source of truth the bridge attribution queue uses
   // (claude-transcript.ts) so "本轮" agrees with what counts as a turn start:
@@ -343,9 +397,11 @@ function foldClaudeLine(agg: TokenUsageAggregate, seenMessageIds: Set<string>, e
   agg.turnInputTokens += num(u.input_tokens) + num(u.cache_creation_input_tokens);
   agg.turnOutputTokens += num(u.output_tokens);
   // Synthetic/empty assistant records around compaction must not erase the
-  // last native context measurement.
-  if (contextTokens > 0) {
+  // last native context measurement. A sidechain (subagent) message carries the
+  // subagent's own prompt size, not the main conversation's.
+  if (contextTokens > 0 && entry.isSidechain !== true) {
     agg.latestContextUsage = { usedTokens: contextTokens };
+    agg.latestContextAtMs = entryTimestampMs(entry);
   }
   if (!agg.model && typeof msg.model === 'string') agg.model = msg.model;
   agg.turns++;
@@ -363,6 +419,7 @@ function foldCodexLine(agg: TokenUsageAggregate, entry: any, getSource: UsageSou
   };
   if (contextUsage) {
     agg.latestContextUsage = contextUsage;
+    agg.latestContextAtMs = entryTimestampMs(entry);
     agg.latestContextUsageSource = sourceForTrackedMetric();
   }
 
@@ -719,6 +776,7 @@ export function __resetSessionUsageCachesForTest(): void {
   usageFileCache.clear();
   warnedOversizedUsageFiles.clear();
   piModelsCache = null;
+  __resetCodexCompactionCountForTest();
   __resetTranscriptResolverCacheForTest();
 }
 
@@ -795,6 +853,8 @@ function aggregateHasAllCodexMetrics(agg: TokenUsageAggregate): boolean {
 interface UsageReadResult {
   agg: TokenUsageAggregate;
   result: SessionTokenUsage | null;
+  /** Resolved transcript the numbers came from (file-backed CLIs only). */
+  transcriptPath?: string;
 }
 
 function ensureUsageFileCacheCapacity(key: string): void {
@@ -964,7 +1024,6 @@ function readCodexTokenAggregateCached(
     };
   };
 
-  let scanned: JsonlCursor;
   let completeBytes: number;
   let previewAgg: TokenUsageAggregate;
   let pendingTailIsInitialResidualLine: boolean;
@@ -977,7 +1036,7 @@ function readCodexTokenAggregateCached(
       usageFileCache.delete(key);
       return null;
     }
-    ({ state, seenMessageIds, scanned, completeBytes, previewAgg, pendingTailIsInitialResidualLine } = win);
+    ({ state, seenMessageIds, completeBytes, previewAgg, pendingTailIsInitialResidualLine } = win);
   } else if (!oversized) {
     baseOffset = 0;
     const win = scanFromWindow(baseOffset, true);
@@ -986,7 +1045,7 @@ function readCodexTokenAggregateCached(
       usageFileCache.delete(key);
       return null;
     }
-    ({ state, seenMessageIds, scanned, completeBytes, previewAgg, pendingTailIsInitialResidualLine } = win);
+    ({ state, seenMessageIds, completeBytes, previewAgg, pendingTailIsInitialResidualLine } = win);
   } else {
     // Oversized cold/bounded read. Fast path: scan the last tail window. Widen
     // ONCE to the back-scan budget and re-scan that whole window when the fast
@@ -1025,7 +1084,7 @@ function readCodexTokenAggregateCached(
         win = widened;
       }
     }
-    ({ state, seenMessageIds, scanned, completeBytes, previewAgg, pendingTailIsInitialResidualLine } = win);
+    ({ state, seenMessageIds, completeBytes, previewAgg, pendingTailIsInitialResidualLine } = win);
   }
 
   const nextOffset = pendingTailIsInitialResidualLine ? baseOffset : baseOffset + completeBytes;
@@ -1302,9 +1361,14 @@ function readSessionUsage(q: SessionTokenUsageQuery): UsageReadResult | null {
     if (!checkpointPath || !existsSync(checkpointPath)) return null;
     return readSessionTokenAggregateCached(checkpointPath, 'aiden', { fresh: q.fresh });
   }
+  if (q.cliId === 'antigravity') {
+    if (!q.cliSessionId) return null;
+    return readAntigravityTokenUsage(q.cliSessionId) as UsageReadResult | null;
+  }
   const resolved = resolveSessionTranscriptPath(q);
   if (!resolved || !existsSync(resolved.path)) return null;
-  const read = readSessionTokenAggregateCached(resolved.path, usageKindForCli(q.cliId), { fresh: q.fresh });
+  const cached = readSessionTokenAggregateCached(resolved.path, usageKindForCli(q.cliId), { fresh: q.fresh });
+  const read = cached ? { ...cached, transcriptPath: resolved.path } : cached;
   if (q.cliId !== 'grok' || !read) return read;
   // signals.json is a small rewritten snapshot beside updates.jsonl. Read it
   // on every card refresh: the append-only JSONL cache may legitimately be
@@ -1356,15 +1420,71 @@ function readSessionUsage(q: SessionTokenUsageQuery): UsageReadResult | null {
   } catch {
     // summary.json is also created lazily; reasoning effort is optional.
   }
-  return { agg, result };
+  return { agg, result, transcriptPath: resolved.path };
 }
 
 export function getSessionTokenUsage(q: SessionTokenUsageQuery): SessionTokenUsage | null {
+  if (q.cliId === 'minimax' || q.cliId === 'cursor') return getSessionUsageSnapshot(q).tokens;
   return readSessionUsage(q)?.result ?? null;
 }
 
+/** Provenance of the latest context measurement for `botmux observe`: only the
+ *  two CLIs whose "latest prompt size" is a native, absolute measurement
+ *  (Claude Code transcript usage, Codex `last_token_usage`). Everything else
+ *  stays unreported rather than guessed. */
+function observeContext(q: SessionTokenUsageQuery, read: UsageReadResult): SessionContextObservation | undefined {
+  const agg = read.agg;
+  if (!agg.latestContextUsage || agg.latestContextUsage.usedTokens <= 0) return undefined;
+  if (q.cliId !== 'claude-code' && q.cliId !== 'codex') return undefined;
+  let measuredAtMs = agg.latestContextAtMs;
+  if (measuredAtMs === null && read.transcriptPath) {
+    // The entry carried no timestamp: the file's last write is the tightest
+    // bound we can prove, and it can only be later than the measurement.
+    try { measuredAtMs = statSync(read.transcriptPath).mtimeMs; } catch { /* unknown */ }
+  }
+  if (measuredAtMs === null || !Number.isFinite(measuredAtMs) || measuredAtMs <= 0) return undefined;
+  if (q.cliId === 'claude-code') {
+    return { measuredAtMs: Math.round(measuredAtMs), compactions: agg.compactions, source: 'claude-transcript' };
+  }
+  const compactions = read.transcriptPath
+    ? readCodexCompactionCount(read.transcriptPath, { maxColdScanBytes: MAX_USAGE_TRANSCRIPT_BYTES })
+    : null;
+  return { measuredAtMs: Math.round(measuredAtMs), compactions, source: 'codex-rollout' };
+}
+
 export function getSessionUsageSnapshot(q: SessionTokenUsageQuery): SessionUsageSnapshot {
+  if (q.cliId === 'cursor') {
+    return readCursorUsage(cursorConfigDirForBot(q.larkAppId), config.session.dataDir,
+      q.sessionId, q.cliSessionId || q.sessionId, q.fresh, q.pricing);
+  }
+  if (q.cliId === 'minimax') {
+    const resolved = resolveSessionTranscriptPath(q);
+    const snapshot = resolved ? readMinimaxUsage(resolved.path, q.cliSessionId || q.sessionId, q.fresh) : null;
+    const costCny = snapshot?.tokens ? estimateCostCny(snapshot.tokens, q.pricing) : null;
+    return { ...(snapshot ?? { context: null, tokens: null, turnTokens: null }),
+      ...(costCny !== null && Number.isFinite(costCny) ? { costCny } : {}) };
+  }
+  return usageSnapshotFromRead(q, readSessionUsage(q));
+}
+
+/** One transcript read feeding BOTH the cumulative token totals and the
+ *  context gauge plus its provenance (`botmux observe` rows). Same file cache
+ *  as getSessionUsageSnapshot, so asking for the extra provenance never costs a
+ *  second scan. CLIs other than Claude Code / Codex get no observation. */
+export function getSessionUsageWithContext(q: SessionTokenUsageQuery): {
+  snapshot: SessionUsageSnapshot;
+  contextObservation?: SessionContextObservation;
+} {
+  if (q.cliId === 'cursor' || q.cliId === 'minimax') return { snapshot: getSessionUsageSnapshot(q) };
   const read = readSessionUsage(q);
+  const contextObservation = read ? observeContext(q, read) : undefined;
+  return {
+    snapshot: usageSnapshotFromRead(q, read),
+    ...(contextObservation ? { contextObservation } : {}),
+  };
+}
+
+function usageSnapshotFromRead(q: SessionTokenUsageQuery, read: UsageReadResult | null): SessionUsageSnapshot {
   const agg = read?.agg;
   // Per-turn delta only for dialects that track it (Claude family). Codex/coco
   // fold to a cumulative-only latestCodexUsage and leave turn counters at 0, so
@@ -1373,6 +1493,9 @@ export function getSessionUsageSnapshot(q: SessionTokenUsageQuery): SessionUsage
     && (agg.turnInputTokens > 0 || agg.turnOutputTokens > 0)
     ? { in: agg.turnInputTokens, out: agg.turnOutputTokens }
     : null;
+  // 累计口径金额（区别于 ledger 的 delta 口径）：无 pricing 或模型未定价时
+  // estimateCostCny 返回 null，字段缺省而非报错。
+  const costCny = read?.result ? estimateCostCny(read.result, q.pricing) : null;
   return {
     context: agg?.latestContextUsage ?? null,
     tokens: read?.result ?? null,
@@ -1382,9 +1505,6 @@ export function getSessionUsageSnapshot(q: SessionTokenUsageQuery): SessionUsage
     // be internal routing codes and intentionally never surface on cards.
     ...(q.cliId === 'grok' && agg?.model ? { model: agg.model } : {}),
     ...(q.cliId === 'grok' && agg?.reasoningEffort ? { reasoningEffort: agg.reasoningEffort } : {}),
+    ...(costCny !== null && Number.isFinite(costCny) ? { costCny } : {}),
   };
-}
-
-export function formatNumber(n: number): string {
-  return n.toLocaleString('en-US');
 }

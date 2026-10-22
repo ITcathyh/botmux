@@ -9,6 +9,37 @@ import {
   WORKBENCH_TERM_STYLES,
   workbenchTermAppearanceMessage,
 } from '../src/dashboard/web/agent-workbench-appearance.js';
+import { WORKBENCH_TERM_WRITE_MESSAGE } from '../src/dashboard/web/agent-workbench-terminal-control.js';
+
+function terminalPageSource(): string {
+  return readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+}
+
+/** 终端页里一个顶格声明的函数（`function name(){` … 顶格的 `}`），原样抠出来跑。 */
+function extractTerminalPageFunction(name: string): string {
+  const source = terminalPageSource();
+  const start = source.indexOf(`\nfunction ${name}(`);
+  expect(start, `worker.ts 里找不到终端页的 ${name}`).toBeGreaterThan(-1);
+  const end = source.indexOf('\n}', start + 1);
+  expect(end, `${name} 没有正常闭合`).toBeGreaterThan(-1);
+  return source.slice(start, end + '\n}'.length);
+}
+
+/** 终端页 `var term=new Terminal({…});` 那一句：注入替身构造函数，拿到它真正传给 xterm 的选项。 */
+function bootTerminalConstructor(width = 1440, autoFontSize: (width: number) => number = () => 14): {
+  options: { theme: Record<string, string>; fontSize: unknown };
+} {
+  const source = terminalPageSource();
+  const start = source.indexOf('var term=new Terminal({');
+  expect(start, 'worker.ts 里找不到终端页的 new Terminal').toBeGreaterThan(-1);
+  const end = source.indexOf('\n});', start);
+  expect(end, 'new Terminal 没有正常闭合').toBeGreaterThan(-1);
+  function Terminal(this: { options: unknown }, options: unknown) { this.options = options; }
+  return new Function(
+    'Terminal', 'isTouch', '_wbAutoFontSize', '_wbTerminalWidth',
+    `${source.slice(start, end + '\n});'.length)}\nreturn term;`,
+  )(Terminal, false, autoFontSize, () => width);
+}
 
 /** 终端画布住在跨文档的 `/s/<sessionId>` iframe 里（src/worker.ts 的内联页面），
  *  父页换 class / 换 CSS 变量都传不进去，配色只能靠 postMessage 递过来。
@@ -17,9 +48,13 @@ import {
  *  所以这里把子页那段监听器原样抠出来跑，喂父页真实构造的载荷，两侧一起验。 */
 function extractTerminalPageListener(): string {
   const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-  const start = source.indexOf('var _WB_THEME_KEYS=');
-  expect(start, 'worker.ts 里找不到终端页的外观监听器').toBeGreaterThan(-1);
-  const anchor = source.indexOf("window.addEventListener('message'", start);
+  // 起点是父页 origin 探针，不是主题键表：监听器现在还兼着「记住父页的 origin，好把
+  // 这条通道的写权限回报上去」，两段代码是同一块 postMessage 管道，抠一半跑不起来。
+  const start = source.indexOf('var _wbParentOrigin=');
+  expect(start, 'worker.ts 里找不到终端页的父页 origin 探针').toBeGreaterThan(-1);
+  const keys = source.indexOf('var _WB_THEME_KEYS=', start);
+  expect(keys, 'worker.ts 里找不到终端页的外观监听器').toBeGreaterThan(-1);
+  const anchor = source.indexOf("window.addEventListener('message'", keys);
   expect(anchor, '监听器没有注册 message 事件').toBeGreaterThan(-1);
   const end = source.indexOf('\n});', anchor);
   expect(end, '监听器没有正常闭合').toBeGreaterThan(-1);
@@ -82,7 +117,7 @@ interface Harness {
   fire: (data: unknown, source?: unknown) => void;
 }
 
-function bootTerminalPage(): Harness {
+function bootTerminalPage(fixedSize = false): Harness {
   const term: TermStub = { options: {} };
   let fits = 0;
   const fit = { fit: () => { fits += 1; } };
@@ -94,8 +129,8 @@ function bootTerminalPage(): Harness {
       if (type === 'message') handlers.push(handler);
     },
   };
-  // 子页那段是浏览器端 ES5 脚本，用 Function 注入它依赖的三个外部符号。
-  new Function('term', 'fit', 'window', extractTerminalPageListener())(term, fit, win);
+  // Inject the browser listener dependencies, including remote grid ownership.
+  new Function('term', 'fit', 'window', 'fixedSize', extractTerminalPageListener())(term, fit, win, fixedSize);
   expect(handlers.length, '监听器没挂上').toBe(1);
   return {
     term,
@@ -108,6 +143,13 @@ function bootTerminalPage(): Harness {
 }
 
 describe('工作台 → 终端 iframe 的外观下发接缝', () => {
+  it('preserves a fixed remote grid when changing terminal appearance', () => {
+    const page = bootTerminalPage(true);
+    page.fire(workbenchTermAppearanceMessage('reader', 'ink'));
+    expect(page.term.options.lineHeight).toBe(WORKBENCH_TERM_LINE_HEIGHTS.reader);
+    expect(page.fitCount()).toBe(0);
+  });
+
   it('父页构造的 8 种载荷（4 皮肤 × 2 风格）子页全部收下，主题逐色落到 xterm', () => {
     for (const skin of WORKBENCH_SKIN_IDS) {
       for (const termStyle of WORKBENCH_TERM_STYLES) {
@@ -125,11 +167,12 @@ describe('工作台 → 终端 iframe 的外观下发接缝', () => {
     }
   });
 
-  it('阅读风走大行距 1.3，经典保持 xterm 默认的 1（「经典 = 原样」）', () => {
-    // 1.3 而不是最初的 1.55：1.55 下单元格高约 24.5px，CLI 底部那块固定 8 行的 chrome
-    // （提示 + 输入框 + 状态条）要吃掉约 196px，一屏四分之一全是 chrome。1.3 仍比经典
-    // 的 1.0 松三成，正文呼吸感还在，chrome 收回约 16%。
-    expect(WORKBENCH_TERM_LINE_HEIGHTS.reader).toBe(1.3);
+  it('阅读风走 1.15 的行距，经典保持 xterm 默认的 1（「经典 = 原样」）', () => {
+    // 1.15 是第三档。最初 1.55：单元格高约 24.5px，CLI 底部那块固定 8 行的 chrome
+    // （提示 + 输入框 + 状态条）要吃掉约 196px，一屏四分之一全是 chrome，所以降到 1.3。
+    // 1.3 对中文密集的 TUI 内容仍偏松（汉字撑满 em 框，行间空隙观感接近隔行），再收到
+    // 1.15 ≈ 18.2px：比经典的 1.0 松一成半，呼吸感在，行与行不再散开。
+    expect(WORKBENCH_TERM_LINE_HEIGHTS.reader).toBe(1.15);
     expect(WORKBENCH_TERM_LINE_HEIGHTS.classic).toBe(1);
 
     const reader = bootTerminalPage();
@@ -141,32 +184,14 @@ describe('工作台 → 终端 iframe 的外观下发接缝', () => {
     expect(classic.term.options.lineHeight).toBe(WORKBENCH_TERM_LINE_HEIGHTS.classic);
   });
 
-  it('终端页那行行距字面量与 WORKBENCH_TERM_LINE_HEIGHTS 同源（改一处必须两处一起改）', () => {
-    // 终端页住在 worker.ts 的模板字符串里、没法 import，所以行距只能是抄过去的字面量。
-    // 上一条已经用真实监听器验过行为；这一条再把源码里那行三元钉死，任何一侧单方面
-    // 改数字（比如只改了 CSS 的 --term-line-height）都会在这里断掉。
-    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-    const found = /term\.options\.lineHeight=_d\.termStyle==='reader'\?([\d.]+):([\d.]+);/.exec(source);
-    expect(found, 'worker.ts 里找不到行距那行三元').not.toBeNull();
-    expect(Number(found?.[1])).toBe(WORKBENCH_TERM_LINE_HEIGHTS.reader);
-    expect(Number(found?.[2])).toBe(WORKBENCH_TERM_LINE_HEIGHTS.classic);
-  });
-
+  // 源码结构护栏(K4)：终端页初始 xterm 主题是 worker.ts 模板字符串里的字面量，import 不进来；
+  // 父页 classic 预设必须与它逐键逐色一致，否则没开阅读风的存量用户一进工作台终端就换色。
+  // 这里执行那句 new Terminal() 取真实选项再比，不钉字面量的写法。
   it('经典风的色值与终端页里写死的那份逐色相同 —— 没开阅读风的用户零变化', () => {
-    // 「经典 = 原本 Botmux 预览的真实终端渲染原样」。终端页 new Terminal() 里那份
-    // 字面量是既有渲染的唯一事实来源；父页的 classic 预设只要漂一个色，
-    // 存量用户一进工作台就会看到终端换色 —— 而这恰恰是 classic 承诺不会发生的事。
-    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-    const start = source.indexOf('var term=new Terminal({');
-    expect(start).toBeGreaterThan(-1);
-    const literal = source.slice(start, source.indexOf('fontSize:', start));
-    for (const [key, value] of Object.entries(WORKBENCH_CLASSIC_TERM_THEME)) {
-      // 键名按原样匹配（xterm 认的是 selectionBackground，大小写写错就不生效），
-      // 色值只比较十六进制本身，不计较大小写。
-      const found = new RegExp(`${key}:'(#[0-9a-fA-F]{3,8})'`).exec(literal);
-      expect(found, `终端页的 theme 字面量里找不到 ${key}`).not.toBeNull();
-      expect(found?.[1].toLowerCase(), `classic ${key}`).toBe(value.toLowerCase());
-    }
+    const lower = (theme: Record<string, string>) => Object.fromEntries(
+      Object.entries(theme).map(([key, value]) => [key, value.toLowerCase()]),
+    );
+    expect(lower(bootTerminalConstructor().options.theme)).toEqual(lower({ ...WORKBENCH_CLASSIC_TERM_THEME }));
   });
 
   it('只认父窗口发来的合法载荷：冒充来源、错类型、脏色值一律丢弃', () => {
@@ -282,40 +307,158 @@ describe('终端页字号按容器宽度自适应', () => {
     }
   });
 
-  it('接进渲染链路：构造函数按容器宽度取字号，尺寸变化先换档再 fit', () => {
-    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-    // ① 初始字号不再是写死的字面量。
-    expect(source).toContain('fontSize:_wbAutoFontSize(_wbTerminalWidth())');
-    expect(source).not.toContain('fontSize:14,fontFamily');
-    // ② resize / 转屏 / 容器改宽这条防抖链路里，先复算字号再 fit——顺序反了算出来
-    //    的是旧字号下的列数。
-    const start = source.indexOf('function onViewportResize(){');
-    expect(start).toBeGreaterThan(-1);
-    const body = source.slice(start, source.indexOf('\n}', start));
-    expect(body.indexOf('_wbApplyAutoFontSize()'))
-      .toBeLessThan(body.indexOf('fit.fit()'));
-    // ③ 三个触发源都接上：窗口 resize、转屏、容器自身尺寸（自包含，嵌入方不用配合）。
-    expect(source).toContain("window.addEventListener('resize',onViewportResize)");
-    expect(source).toContain("window.addEventListener('orientationchange',onViewportResize)");
-    expect(source).toContain('new ResizeObserver(onViewportResize).observe(_wbHost)');
+  it('接进渲染链路：构造函数按容器宽度取字号，尺寸变化防抖合并后先换档再 fit', () => {
+    // ① 初始字号来自字号自适应，而不是写死的 14。
+    expect(bootTerminalConstructor(390, width => (width === 390 ? 10.5 : Number.NaN)).options.fontSize).toBe(10.5);
+
+    // ② resize / 转屏 / 容器改宽这条防抖链路：一串事件只落一次，且先复算字号再 fit——
+    //    顺序反了 fit 出来的是旧字号下的列数。固定网格由远端定行列，不 fit。
+    const run = (fixedSize: boolean) => {
+      const calls: string[] = [];
+      let pending: (() => void) | null = null;
+      const onViewportResize = new Function(
+        'setTimeout', 'clearTimeout', '_wbApplyAutoFontSize', 'fit', 'sendResize', 'fixedSize',
+        `var _rzT=0;${extractTerminalPageFunction('onViewportResize')}\nreturn onViewportResize;`,
+      )(
+        (callback: () => void) => { pending = callback; return 1; },
+        () => { pending = null; },
+        () => { calls.push('font'); return true; },
+        { fit: () => { calls.push('fit'); } },
+        () => { calls.push('send'); },
+        fixedSize,
+      ) as () => void;
+      for (let burst = 0; burst < 3; burst += 1) onViewportResize();
+      expect(calls, '防抖期内什么都不做').toEqual([]);
+      (pending as (() => void) | null)?.();
+      return calls;
+    };
+    expect(run(false)).toEqual(['font', 'fit', 'send']);
+    expect(run(true)).toEqual(['font', 'send']);
   });
 
-  it('只动画布渲染：自适应本身不向后端多发一帧（共享 pty 的列数不被镜像改写）', () => {
-    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-    // 终端是共享 pty 的镜像。字号自适应只能改本页的渲染几何，绝不能自己造一条
-    // resize 帧——那会把桌面端正在看的那个 pty 的列数一起改掉。
-    const start = source.indexOf('function _wbAutoFontSize(width){');
-    const end = source.indexOf('\n}', source.indexOf('function _wbApplyAutoFontSize(){'));
-    const block = source.slice(start, end);
-    expect(block).not.toContain('ws_');
-    expect(block).not.toContain("type:'resize'");
-    // 向后端发 resize 的出口全页只有 sendResize 一处，且带列数/行数去重：
-    // 落在同一网格上的 fit 不会重复外发。
-    expect(source.match(/ws_\.send\(JSON\.stringify\(\{type:'resize'/g)?.length).toBe(1);
-    const sender = source.slice(
-      source.indexOf('function sendResize(){'),
-      source.indexOf('\n}', source.indexOf('function sendResize(){')),
-    );
-    expect(sender).toContain('if(term.cols===_lastC&&term.rows===_lastR)return;');
+  it('只动画布渲染：字号换档后网格没变就不向后端外发 resize（共享 pty 的列数不被镜像改写）', () => {
+    // 终端是共享 pty 的镜像。字号自适应之后的 fit 若落在同一网格上，绝不能再造一条
+    // resize 帧——那会让共享的 zellij/tmux pane 白白重排一次。
+    const term = { cols: 80, rows: 24 };
+    const ws = { readyState: 1, sent: [] as unknown[], send(data: string) { this.sent.push(JSON.parse(data)); } };
+    const sendResize = new Function(
+      'term', 'ws_',
+      `var _lastC=0,_lastR=0;${extractTerminalPageFunction('sendResize')}\nreturn sendResize;`,
+    )(term, ws) as () => void;
+    sendResize();
+    expect(ws.sent).toEqual([{ type: 'resize', cols: 80, rows: 24 }]);
+    sendResize();
+    expect(ws.sent, '同一网格不重复外发').toHaveLength(1);
+    term.cols = 62;
+    sendResize();
+    expect(ws.sent.at(-1)).toEqual({ type: 'resize', cols: 62, rows: 24 });
+    ws.readyState = 3;
+    term.rows = 30;
+    sendResize();
+    expect(ws.sent, '连接没开就不发').toHaveLength(2);
+  });
+});
+
+/**
+ * 反方向的同一条管道：终端 iframe → 工作台的写权限回报。
+ *
+ * 为什么必须单独验：页面自己那份 `hasToken` 来自 HTTP GET，而 WebSocket 升级是**另
+ * 一次**鉴权——iOS WebView 的升级请求不带 Cookie，同一份页面完全可能 HTTP 判可写、
+ * WS 只读。worker 在握手完成时把这条连接的真实结论发下来，页面据此收起输入并上抛给
+ * 嵌入方。抠出来跑，验的是真正会下发的那份代码。
+ */
+describe('终端 iframe → 工作台的写权限回报接缝', () => {
+  interface WriteReporter {
+    set(value: boolean): void;
+    origin(): string | null;
+  }
+
+  function bootWriteReporter(options: {
+    ancestorOrigins?: string[];
+    hasToken?: boolean;
+    platformReadonly?: boolean;
+  } = {}): {
+    reporter: WriteReporter;
+    posted: Array<{ data: unknown; origin: unknown }>;
+    bannerShown(): boolean;
+    fireAppearance(origin: string): void;
+  } {
+    const posted: Array<{ data: unknown; origin: unknown }> = [];
+    const handlers: ((event: unknown) => void)[] = [];
+    const parent = {
+      tag: 'parent-window',
+      postMessage(data: unknown, origin: unknown) { posted.push({ data, origin }); },
+    };
+    const classes = new Set<string>();
+    const banner = {
+      classList: {
+        add: (name: string) => { classes.add(name); },
+        remove: (name: string) => { classes.delete(name); },
+      },
+    };
+    const win = {
+      parent,
+      location: options.ancestorOrigins ? { ancestorOrigins: options.ancestorOrigins } : {},
+      addEventListener(type: string, handler: (event: unknown) => void) {
+        if (type === 'message') handlers.push(handler);
+      },
+    };
+    const documentStub = { getElementById: (id: string) => (id === 'readonly-banner' ? banner : null) };
+    const reporter = new Function(
+      'window', 'document', 'term', 'fit', 'hasToken', 'platformReadonly', 'wsHasWrite',
+      `${extractTerminalPageListener()}
+return {set:_wbSetWsWrite,origin:function(){return _wbParentOrigin}};`,
+    )(
+      win,
+      documentStub,
+      { options: {} },
+      { fit() {} },
+      options.hasToken ?? true,
+      options.platformReadonly ?? false,
+      null,
+    ) as WriteReporter;
+    return {
+      reporter,
+      posted,
+      bannerShown: () => classes.has('show'),
+      fireAppearance(origin: string) {
+        const message = workbenchTermAppearanceMessage('classic', WORKBENCH_SKIN_IDS[0]);
+        for (const handler of handlers) handler({ data: message, source: parent, origin });
+      },
+    };
+  }
+
+  it('WS 判只读 → 上抛 write:false 并亮出只读横幅，目标 origin 取 ancestorOrigins', () => {
+    const harness = bootWriteReporter({ ancestorOrigins: ['https://dash.example'] });
+    expect(harness.reporter.origin()).toBe('https://dash.example');
+    harness.reporter.set(false);
+    // 消息类型取父页面板真正认的那个常量：任何一侧单方面改名，面板都会静默收不到回报。
+    expect(harness.posted).toEqual([{
+      data: { type: WORKBENCH_TERM_WRITE_MESSAGE, write: false },
+      origin: 'https://dash.example',
+    }]);
+    // 页面以为自己可写（hasToken=true），这条连接却只读：横幅必须说出来。
+    expect(harness.bannerShown()).toBe(true);
+    harness.reporter.set(true);
+    expect(harness.posted.at(-1)).toEqual({
+      data: { type: WORKBENCH_TERM_WRITE_MESSAGE, write: true },
+      origin: 'https://dash.example',
+    });
+    expect(harness.bannerShown()).toBe(false);
+  });
+
+  it('拿不到父页 origin 就一个字不发——绝不用星号广播', () => {
+    const harness = bootWriteReporter();
+    expect(harness.reporter.origin()).toBe(null);
+    harness.reporter.set(true);
+    expect(harness.posted).toEqual([]);
+    // 父页发来的外观消息本身就证明了它的 origin（来源已校验是 window.parent），
+    // 靠它补上之后，攒着的结论补发一次。
+    harness.fireAppearance('https://dash.example');
+    expect(harness.reporter.origin()).toBe('https://dash.example');
+    expect(harness.posted).toEqual([{
+      data: { type: WORKBENCH_TERM_WRITE_MESSAGE, write: true },
+      origin: 'https://dash.example',
+    }]);
   });
 });

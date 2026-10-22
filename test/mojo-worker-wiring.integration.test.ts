@@ -12,7 +12,7 @@
  *
  * Run:  pnpm vitest run test/mojo-worker-wiring.integration.test.ts
  */
-import { spawn, type ChildProcess } from 'node:child_process';
+import { type ChildProcess } from 'node:child_process';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -20,6 +20,7 @@ import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
+import { spawnTsScript } from './helpers/ts-runner.js';
 
 interface Invocation {
   argv: string[];
@@ -48,6 +49,7 @@ node -e '
       PER_BOT_TOKEN: process.env.PER_BOT_TOKEN,
       MOJO_BLOCK_ONLY: process.env.MOJO_BLOCK_ONLY,
       BOTMUX_SESSION_ID: process.env.BOTMUX_SESSION_ID,
+      BOTMUX_REPLY_STYLE: process.env.BOTMUX_REPLY_STYLE,
       AGENT_LOCAL_DAEMON: process.env.AGENT_LOCAL_DAEMON,
       X_JWT_TOKEN: process.env.X_JWT_TOKEN,
       WRAPPER_MARK: process.env.WRAPPER_MARK,
@@ -128,7 +130,7 @@ async function runWorker(opts: {
     }]));
 
     const startedAt = Date.now();
-    child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+    child = spawnTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -235,7 +237,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
 `);
       chmodSync(bin, 0o755);
 
-      child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      child = spawnTsScript(resolve('src/worker.ts'), [], {
         cwd: resolve('.'),
         env: {
           ...process.env,
@@ -360,6 +362,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
       init: {
         model: 'gpt-5.5-2026-04-24',
         env: { PER_BOT_TOKEN: 'per-bot-value' },
+        replyStyle: { recipes: false, layout: false, theme: 'minimal' },
         backendConfig: { cloud: true, env: { MOJO_BLOCK_ONLY: 'mojo-block-value' } },
       },
     });
@@ -374,6 +377,11 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
     // Per-bot env and the mojo-specific env block both land in the child.
     expect(invocation.env.PER_BOT_TOKEN).toBe('per-bot-value');
     expect(invocation.env.MOJO_BLOCK_ONLY).toBe('mojo-block-value');
+    expect(JSON.parse(invocation.env.BOTMUX_REPLY_STYLE ?? '')).toEqual({
+      recipes: false,
+      layout: false,
+      theme: 'minimal',
+    });
     // cloud=true (localDaemon unset) is the fully-remote shape — no host daemon.
     expect(invocation.env.AGENT_LOCAL_DAEMON).toBe('0');
   }, 40_000);
@@ -540,8 +548,46 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
 
     expect(finalOutputs(messages), `duplicate reply delivered\n${logs}`).toHaveLength(0);
     expect(logs).toContain('model already called botmux send');
-    // The suppressed turn still tells observers which message WAS the reply.
-    expect(messages.some(m => m.type === 'explicit_reply_observed')).toBe(true);
+    // A legacy marker without an exact turn id may suppress the duplicate
+    // fallback, but it cannot authorize trusted outbound provenance.
+    expect(messages.some(m => m.type === 'explicit_reply_observed')).toBe(false);
+  }, 40_000);
+
+  it('reports every explicit progress and final message for the same turn', async () => {
+    const writeMultipleSendMarkers = `node -e '
+  const fs = require("fs"), p = require("path");
+  const dir = p.join(process.env.SESSION_DATA_DIR, "turn-sends");
+  fs.mkdirSync(dir, { recursive: true });
+  const markerPath = p.join(dir, process.env.BOTMUX_SESSION_ID + ".jsonl");
+  for (const marker of [
+    { messageId: "om_progress", responseKind: "progress" },
+    { messageId: "om_final", responseKind: "final" },
+    { messageId: "om_wrong_turn", responseKind: "final", turnId: "om_other_turn" },
+  ]) fs.appendFileSync(markerPath, JSON.stringify({
+    sentAtMs: Date.now(), turnId: "om_bridge_turn", contentLength: 10, ...marker,
+  }) + "\\n");
+'`;
+    const { messages, logs } = await runWorker({
+      fakeStream: [
+        `echo '{"type":"system","subtype":"init","session_id":"sid-bridge-multi"}'`,
+        writeMultipleSendMarkers,
+        `echo '{"type":"result","status":"ok","result":"已完成","session_id":"sid-bridge-multi","warnings":[]}'`,
+      ].join('\n'),
+      init: { turnId: 'om_bridge_turn' },
+      awaitLog: TURN_SETTLED_LOG,
+    });
+
+    expect(messages.filter(m => m.type === 'explicit_reply_observed')).toEqual([
+      expect.objectContaining({
+        type: 'explicit_reply_observed', turnId: 'om_bridge_turn',
+        messageId: 'om_progress', responseKind: 'progress',
+      }),
+      expect.objectContaining({
+        type: 'explicit_reply_observed', turnId: 'om_bridge_turn',
+        messageId: 'om_final', responseKind: 'final',
+      }),
+    ]);
+    expect(logs).toContain('model already called botmux send');
   }, 40_000);
 
   it('delivers nothing when the answer is the nothing-to-send sentinel', async () => {
@@ -690,7 +736,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
       writeFakeMojo(root);
 
       const errors: string[] = [];
-      child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      child = spawnTsScript(resolve('src/worker.ts'), [], {
         cwd: resolve('.'),
         env: {
           ...process.env,
@@ -770,7 +816,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
       writeFakeMojo(root);
 
       const errors: string[] = [];
-      child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      child = spawnTsScript(resolve('src/worker.ts'), [], {
         cwd: resolve('.'),
         env: {
           ...process.env,
@@ -891,7 +937,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
         writeFakeMojo(root);
 
         const errors: string[] = [];
-        child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+        child = spawnTsScript(resolve('src/worker.ts'), [], {
           cwd: resolve('.'),
           env: {
             ...process.env,
@@ -969,7 +1015,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-clear","war
       chmodSync(bin, 0o755);
 
       let ready = 0;
-      child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      child = spawnTsScript(resolve('src/worker.ts'), [], {
         cwd: resolve('.'),
         env: {
           ...process.env,
@@ -1049,7 +1095,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-clear","war
       writeFakeMojo(root);
 
       const errors: string[] = [];
-      child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      child = spawnTsScript(resolve('src/worker.ts'), [], {
         cwd: resolve('.'),
         env: {
           ...process.env,

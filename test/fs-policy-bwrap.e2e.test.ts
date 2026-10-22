@@ -22,12 +22,16 @@
  * file- vs dir-shaped denies, mode-000 the empty sources, pre-create missing
  * mask mountpoints, then invoke bwrap.
  */
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, rmdirSync, writeFileSync, mkdirSync, chmodSync, realpathSync, existsSync, statSync, lstatSync, readlinkSync } from 'node:fs';
+import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
+import { spawn, spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync, rmdirSync, writeFileSync, mkdirSync, chmodSync, realpathSync, existsSync, statSync, lstatSync, readlinkSync, readFileSync, symlinkSync } from 'node:fs';
+import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 import { tmpdir, homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { buildFsPolicy, compileToBwrap } from '../src/adapters/cli/fs-policy.js';
+import { createOhMyPiAdapter, ompSessionDir } from '../src/adapters/cli/oh-my-pi.js';
+import { sessionSkillManifestPath } from '../src/core/skills/manifest-store.js';
+import { sessionSkillSnapshotRoot, snapshotSessionSkills, type SkillSnapshotTrust } from '../src/core/skills/snapshot.js';
 
 const bwrapUsable = process.platform === 'linux'
   && spawnSync('sh', ['-c', 'command -v bwrap'], { stdio: 'ignore' }).status === 0
@@ -50,7 +54,7 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
   // Build the bwrap argv the SAME way the worker does (deny masks: mode-000
   // empty sources, missing mountpoints pre-created). Returns the created-mask
   // list too so cleanup tests can assert rmdir-if-empty.
-  function build(userPaths: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }, opts: { larkCliLinuxStore?: string; larkTransportEnabled?: boolean; botHome?: string } = {}) {
+  function build(userPaths: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }, opts: { larkCliLinuxStore?: string; larkTransportEnabled?: boolean; botHome?: string; mandatoryReadOnlyPaths?: string[]; sessionOwnedReadonlyRoots?: string[] } = {}) {
     const emptiesDir = join(S, 'sbx/empties');
     const emptyDir = join(S, 'sbx/empty');
     mkdirSync(emptiesDir, { recursive: true });
@@ -66,6 +70,8 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
       userPaths: { readOnly: [join(S, 'ref'), ...(userPaths.readOnly ?? [])], readWrite: userPaths.readWrite, deny: userPaths.deny },
       larkCliLinuxStore: opts.larkCliLinuxStore,
       larkTransportEnabled: opts.larkTransportEnabled,
+      mandatoryReadOnlyPaths: opts.mandatoryReadOnlyPaths,
+      sessionOwnedReadonlyRoots: opts.sessionOwnedReadonlyRoots,
       net: true, writeRegexes: [],
     });
     policy.rules = policy.rules.filter(r => r.access === 'deny' || existsSync(r.path));
@@ -108,7 +114,12 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
     writeFileSync(join(S, 'proj/.env'), 'API_KEY=zzz');
     writeFileSync(join(S, 'ref/doc.md'), 'ref');
   });
-  afterAll(() => { if (S) rmSync(S, { recursive: true, force: true }); });
+  // `build()` chmods the deny-mask sources to 000 (mirroring the worker), and a
+  // 000 DIRECTORY cannot be traversed — so a plain recursive delete throws
+  // `EACCES: permission denied, rm` for any NON-root uid, failing this file in an
+  // unnamed afterAll while every real case is already green. See the helper for
+  // the measurements (root hides it; Node and Bun fail alike).
+  afterAll(() => rmSandboxScratch(S));
 
   it('readWrite: reads AND writes the project', () => {
     const { args } = build({});
@@ -120,6 +131,117 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
     const { args } = build({});
     expect(run(args, `cat ${JSON.stringify(join(S, 'ref/doc.md'))}`).status).toBe(0);
     expect(run(args, `echo x > ${JSON.stringify(join(S, 'ref/hack'))}`).status).not.toBe(0);
+  });
+
+  it('per-session ready-signal trail: OWN file is writable at the kernel level, a sibling trail is not', () => {
+    // The generated dsh-tui wrapper plugin appends its ready-dispatch diagnostics
+    // from INSIDE the sandbox, so the per-session file grant has to hold at the
+    // kernel level, not just in accessForPath. The worker pre-creates the file
+    // (bwrap cannot bind a missing source), which is also why this builds the
+    // policy against an existing file.
+    const own = join(S, 'botmux-home/data/ready-signal/e2e-session.log');
+    const sibling = join(S, 'botmux-home/data/ready-signal/other.log');
+    mkdirSync(dirname(own), { recursive: true });
+    writeFileSync(own, '');
+    writeFileSync(sibling, 'SIBLING-SECRET\n');
+    const { args } = build({});
+    const wrote = run(args, `printf '{"event":"ready-dispatch-attempted"}\\n' >> ${JSON.stringify(own)}`);
+    expect(wrote.status).toBe(0);
+    expect(readFileSync(own, 'utf8')).toContain('ready-dispatch-attempted');
+    // A sibling session's trail is NOT bound: its real content is unreachable from
+    // inside, and an append aimed at it never reaches the host — the sandbox root
+    // is an empty tmpfs, so that redirect can only create a throwaway file in a
+    // sandbox-only parent dir (which is why the exit status alone proves nothing).
+    const read = run(args, `cat ${JSON.stringify(sibling)}`);
+    expect(read.out).not.toContain('SIBLING-SECRET');
+    run(args, `printf 'pwned' >> ${JSON.stringify(sibling)}`);
+    expect(readFileSync(sibling, 'utf8')).toBe('SIBLING-SECRET\n');
+  });
+
+  it('sandbox=true × `botmux skill show` (KERNEL-level): own manifest + own snapshot readable, not writable; sibling session + store unreachable', () => {
+    // The worker grants the session's own manifest as a mandatory read-only FILE
+    // and its skill SNAPSHOT root through sessionOwnedReadonlyRoots. Before the
+    // fix both reads hit an unmounted path (ENOENT) inside bwrap.
+    const dataDir = join(S, 'botmux-home/data');
+    const store = join(S, 'botmux-home/skills/store');
+    for (const [name, body] of [['deploy', 'DEPLOY-BODY'], ['payroll', 'PAYROLL-BODY']]) {
+      mkdirSync(join(store, name), { recursive: true });
+      writeFileSync(join(store, name, 'SKILL.md'), `${body}\n`);
+    }
+    const trust: SkillSnapshotTrust = { storeDir: store, pluginsDir: join(S, 'botmux-home/plugins'), sessionDataDir: dataDir, botsDirs: [join(S, 'botmux-home/bots')], workingDir: join(S, 'proj') };
+    const snap = (sessionId: string, name: string) => snapshotSessionSkills({
+      sessionId, cliId: 'codex', workingDir: join(S, 'proj'), policyMode: 'priority', diagnostics: [],
+      generatedAt: '2026-10-19T00:00:00.000Z',
+      prioritySkills: [{ id: name, name, tags: [], rootDir: join(store, name), entrypoint: 'SKILL.md',
+        source: { type: 'local-copy', originalPath: join(store, name) }, priorityReason: 'bot:include' }],
+    }, { trust, dataDir }).manifest;
+    const own = snap('e2e-session', 'deploy');
+    snap('other-session', 'payroll');
+    const ownManifest = sessionSkillManifestPath('e2e-session', dataDir);
+    const otherManifest = sessionSkillManifestPath('other-session', dataDir);
+    mkdirSync(dirname(ownManifest), { recursive: true });
+    writeFileSync(ownManifest, '{"own":true}\n');
+    writeFileSync(otherManifest, 'OTHER-MANIFEST\n');
+    const ownSnapshot = sessionSkillSnapshotRoot('e2e-session', dataDir);
+    const otherSnapshot = sessionSkillSnapshotRoot('other-session', dataDir);
+    expect(own.prioritySkills[0].rootDir).toBe(join(ownSnapshot, 'deploy'));
+
+    const { args } = build({}, {
+      mandatoryReadOnlyPaths: [ownManifest],
+      sessionOwnedReadonlyRoots: [ownSnapshot],
+    });
+    const manifest = run(args, `cat ${JSON.stringify(ownManifest)}`);
+    expect(manifest.status).toBe(0);
+    expect(manifest.out).toContain('"own":true');
+    const body = run(args, `cat ${JSON.stringify(join(ownSnapshot, 'deploy/SKILL.md'))}`);
+    expect(body.status).toBe(0);
+    expect(body.out).toContain('DEPLOY-BODY');
+
+    for (const [path, secret] of [
+      [otherManifest, 'OTHER-MANIFEST'],
+      [join(otherSnapshot, 'payroll/SKILL.md'), 'PAYROLL-BODY'],
+      [join(store, 'deploy/SKILL.md'), 'DEPLOY-BODY'],
+      [join(store, 'payroll/SKILL.md'), 'PAYROLL-BODY'],
+    ]) {
+      const r = run(args, `cat ${JSON.stringify(path)}`);
+      expect(r.status, path).not.toBe(0);
+      expect(r.out, path).not.toContain(secret);
+    }
+    // Read-only at the kernel: neither the manifest nor the snapshot can be rewritten.
+    run(args, `echo PWNED > ${JSON.stringify(ownManifest)}; echo PWNED > ${JSON.stringify(join(ownSnapshot, 'deploy/SKILL.md'))}`);
+    expect(readFileSync(ownManifest, 'utf8')).toBe('{"own":true}\n');
+    expect(readFileSync(join(ownSnapshot, 'deploy/SKILL.md'), 'utf8')).toBe('DEPLOY-BODY\n');
+  });
+
+  it('a LIVE sandbox keeps reading its skill snapshot while the store copy is deleted and recreated (updateInstalledSkill shape)', async () => {
+    const dataDir = join(S, 'botmux-home/data');
+    const store = join(S, 'botmux-home/skills/store');
+    mkdirSync(join(store, 'live'), { recursive: true });
+    writeFileSync(join(store, 'live', 'SKILL.md'), 'LIVE-V1\n');
+    snapshotSessionSkills({
+      sessionId: 'e2e-session', cliId: 'codex', workingDir: join(S, 'proj'), policyMode: 'priority', diagnostics: [],
+      generatedAt: '2026-10-19T00:00:00.000Z',
+      prioritySkills: [{ id: 'live', name: 'live', tags: [], rootDir: join(store, 'live'), entrypoint: 'SKILL.md',
+        source: { type: 'local-copy', originalPath: join(store, 'live') }, priorityReason: 'bot:include' }],
+    }, { trust: { storeDir: store, pluginsDir: join(S, 'botmux-home/plugins'), sessionDataDir: dataDir, botsDirs: [join(S, 'botmux-home/bots')], workingDir: join(S, 'proj') }, dataDir });
+    const snapshot = sessionSkillSnapshotRoot('e2e-session', dataDir);
+    const go = join(S, 'proj/work/go-live');
+    rmSync(go, { force: true });
+    const { args } = build({}, { sessionOwnedReadonlyRoots: [snapshot] });
+    const child = spawn('bwrap', [...args, '/bin/sh', '-c',
+      `while [ ! -e ${JSON.stringify(go)} ]; do sleep 0.05; done; cat ${JSON.stringify(join(snapshot, 'live/SKILL.md'))}`]);
+    let out = '';
+    child.stdout.on('data', d => { out += d; });
+    child.stderr.on('data', d => { out += d; });
+    // Sandbox is up and bound; now replace the store copy underneath it.
+    await new Promise(r => setTimeout(r, 300));
+    rmSync(join(store, 'live'), { recursive: true, force: true });
+    mkdirSync(join(store, 'live'), { recursive: true });
+    writeFileSync(join(store, 'live', 'SKILL.md'), 'LIVE-V2\n');
+    writeFileSync(go, '');
+    const code = await new Promise<number | null>(r => child.on('close', r));
+    expect(code).toBe(0);
+    expect(out).toContain('LIVE-V1');
   });
 
   it('deny DIR (existing): real content unreadable, and mask empty/unlistable for non-root (root may list but sees nothing real)', () => {
@@ -224,6 +346,70 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
     expect(run(args, `echo x > ${JSON.stringify(join(denied, 'evil'))} && echo WROTE`).out).not.toContain('WROTE');
     expect(existsSync(join(denied, 'evil'))).toBe(false);
     rmSync(denied, { recursive: true, force: true });
+  });
+
+  it('OMP state stays writable while only the current transcript directory is carved through the sessions mask', () => {
+    const realHome = join(S, 'omp-real-home');
+    const linkedHome = join(S, 'omp-linked-home');
+    mkdirSync(realHome);
+    symlinkSync(realHome, linkedHome, 'dir');
+    vi.stubEnv('HOME', linkedHome);
+    try {
+      const agentRoot = join(realpathSync(realHome), '.omp', 'agent');
+      const sessionsRoot = join(agentRoot, 'sessions');
+      const own = ompSessionDir('self');
+      const sibling = join(sessionsRoot, 'botmux/sibling');
+      const legacy = join(sessionsRoot, '-legacy-project');
+      const terminalSessions = join(agentRoot, 'terminal-sessions');
+      const siblingTranscript = join(sibling, 'secret.jsonl');
+      const legacyTranscript = join(legacy, 'legacy.jsonl');
+      const migratedTranscript = join(own, 'migrated.jsonl');
+      const breadcrumb = join(terminalSessions, 'pane');
+      expect(own).toBe(join(sessionsRoot, 'botmux/self'));
+      mkdirSync(own, { recursive: true });
+      mkdirSync(legacy, { recursive: true });
+      writeFileSync(legacyTranscript, 'LEGACY_SECRET');
+      writeFileSync(migratedTranscript, 'MIGRATED_EXACT');
+      const adapterArgs = createOhMyPiAdapter('/usr/bin/omp').buildArgs({ sessionId: 'self', resume: true });
+      expect(adapterArgs[adapterArgs.indexOf('--session-dir') + 1]).toBe(own);
+      expect(adapterArgs[adapterArgs.indexOf('--resume') + 1]).toBe(migratedTranscript);
+
+      mkdirSync(sibling, { recursive: true });
+      mkdirSync(terminalSessions, { recursive: true });
+      writeFileSync(join(agentRoot, 'agent.db'), 'state');
+      writeFileSync(join(agentRoot, 'agent.db-wal'), 'wal');
+      writeFileSync(join(agentRoot, 'config.yml'), 'config');
+      writeFileSync(siblingTranscript, 'SIBLING_SECRET');
+      writeFileSync(breadcrumb, `${join(S, 'proj')}\n${siblingTranscript}\nfresh\n`);
+
+      const { args } = build({
+        readWrite: [agentRoot, own],
+        deny: [sessionsRoot],
+      });
+      expect(args).toContain(own);
+
+      expect(run(args, `printf updated >> ${JSON.stringify(join(agentRoot, 'agent.db'))}`).status).toBe(0);
+      expect(readFileSync(join(agentRoot, 'agent.db'), 'utf8')).toContain('updated');
+      expect(run(args, `cat ${JSON.stringify(migratedTranscript)}`).out).toContain('MIGRATED_EXACT');
+      expect(run(args, `printf own > ${JSON.stringify(join(own, 'new.jsonl'))}`).status).toBe(0);
+      expect(readFileSync(join(own, 'new.jsonl'), 'utf8')).toBe('own');
+
+      const breadcrumbRead = run(args, `cat ${JSON.stringify(breadcrumb)}`);
+      expect(breadcrumbRead.status).toBe(0);
+      expect(breadcrumbRead.out).toContain(siblingTranscript);
+      const siblingRead = run(args, `cat ${JSON.stringify(siblingTranscript)}`);
+      expect(siblingRead.status).not.toBe(0);
+      expect(siblingRead.out).not.toContain('SIBLING_SECRET');
+      const legacyRead = run(args, `cat ${JSON.stringify(legacyTranscript)}`);
+      expect(legacyRead.status).not.toBe(0);
+      expect(legacyRead.out).not.toContain('LEGACY_SECRET');
+
+      const other = join(sessionsRoot, 'botmux/other');
+      expect(run(args, `mkdir ${JSON.stringify(other)}`).status).not.toBe(0);
+      expect(existsSync(other)).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it('deny → allow → deny (4 layers): the DEEPEST deny is masked, secret unreadable+unwritable, middle carve-out still works', () => {

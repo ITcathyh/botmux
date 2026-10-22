@@ -43,6 +43,9 @@ function overflowAllowsScroll(value: string): boolean {
 }
 
 function canScroll(target: HTMLElement, axis: Axis): boolean {
+  // The session table owns its local interactive horizontal overlay. All other
+  // axes/containers retain the original display-only floating scrollbar path.
+  if (axis === 'x' && target.hasAttribute('data-local-horizontal-scrollbar')) return false;
   const style = getComputedStyle(target);
   const overflow = axis === 'y' ? style.overflowY : style.overflowX;
   if (!overflowAllowsScroll(overflow)) return false;
@@ -51,7 +54,9 @@ function canScroll(target: HTMLElement, axis: Axis): boolean {
 }
 
 function isVisible(target: HTMLElement): boolean {
-  if (!target.isConnected || target.closest('[hidden]')) return false;
+  // An overlay that makes the page behind it `inert` (e.g. the Bot config example
+  // drawer) leaves that page unscrollable; its bars must not float over the overlay.
+  if (!target.isConnected || target.closest('[hidden], [inert]')) return false;
   const rect = target.getBoundingClientRect();
   return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 && rect.top < window.innerHeight && rect.left < window.innerWidth;
 }
@@ -249,14 +254,14 @@ export function initFloatingScrollbars(root: HTMLElement): void {
     // in the observed subtree) would re-trigger the observer → a self-sustaining rAF loop.
     for (const record of records) {
       const node = record.target;
-      if (node instanceof Element && node.closest('.floating-scrollbar-layer')) continue;
+      if (node instanceof Element && node.closest('.floating-scrollbar-layer, .session-horizontal-scrollbar')) continue;
       scheduleRescan();
       return;
     }
   });
   mutationObserver.observe(root, {
     attributes: true,
-    attributeFilter: ['class', 'style', 'hidden', 'open'],
+    attributeFilter: ['class', 'style', 'hidden', 'inert', 'open'],
     childList: true,
     subtree: true,
   });

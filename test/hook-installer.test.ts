@@ -126,8 +126,110 @@ describe('installHook — claude-settings', () => {
     const botmuxReady = ss.filter((g) => g.hooks?.some((e: any) => e.command.includes('cli.js') && e.command.trimEnd().endsWith('session-ready')));
     expect(botmuxReady.length).toBe(1);
     expect(botmuxReady[0].hooks[0].command).toBe(readyCmd2);
-    expect(hasInstalledSessionReadyHook(hookInstall)).toBe(false);
+    expect(hasInstalledSessionReadyHook(hookInstall)).toBe(true);
     expect(hasInstalledSessionReadyHook({ ...hookInstall, sessionStartCommand: readyCmd2 })).toBe(true);
+  });
+
+  it('ready preflight recognizes a standalone hook after switching to a Node launch path', () => {
+    mkdirSync(join(tmpDir, '.claude'), { recursive: true });
+    writeFileSync(configPath, JSON.stringify({
+      hooks: {
+        SessionStart: [
+          { hooks: [{ type: 'command', command: '/home/u/.botmux/bin/botmux session-ready' }] },
+        ],
+      },
+    }));
+
+    expect(hasInstalledSessionReadyHook({
+      configPath,
+      format: 'claude-settings',
+      sessionStartCommand: '/usr/bin/node /opt/botmux/dist/cli.js session-ready',
+    })).toBe(true);
+  });
+
+  it.each([
+    '/repo/dist-bin/botmux-linux-x64 session-ready',
+    '/repo/dist-bin/botmux-future-riscv64 session-ready',
+  ])('ready preflight preserves an exact command match: %s', (installedCommand) => {
+    mkdirSync(join(tmpDir, '.claude'), { recursive: true });
+    writeFileSync(configPath, JSON.stringify({
+      hooks: {
+        SessionStart: [
+          { hooks: [{ type: 'command', command: installedCommand }] },
+        ],
+      },
+    }));
+
+    expect(hasInstalledSessionReadyHook({
+      configPath,
+      format: 'claude-settings',
+      sessionStartCommand: installedCommand,
+    })).toBe(true);
+  });
+
+  it.each([
+    '/repo/dist-bin/botmux-linux-x64',
+    '/repo/dist-bin/botmux-linux-arm64',
+    '/repo/dist-bin/botmux-linux-x64-musl',
+    '/repo/dist-bin/botmux-linux-arm64-musl',
+    '/repo/dist-bin/botmux-darwin-x64',
+    '/repo/dist-bin/botmux-darwin-arm64',
+    'C:\\repo\\dist-bin\\botmux-windows-x64',
+    'C:\\repo\\dist-bin\\botmux-windows-x64.exe',
+    'C:\\repo\\dist-bin\\botmux-windows-arm64',
+    'C:\\repo\\dist-bin\\botmux-windows-arm64.exe',
+  ])('识别 dev dist-bin 产物并保持三类 hook 幂等: %s', (first) => {
+    const second = '/opt/botmux/bin/botmux';
+    const firstInstall = {
+      configPath,
+      format: 'claude-settings' as const,
+      sessionStartCommand: `${first} session-ready`,
+      userPromptSubmitCommand: `${first} user-prompt-hook`,
+    };
+    installHook('claude-code', firstInstall, `${first} hook claude-code`);
+    installHook('claude-code', {
+      ...firstInstall,
+      sessionStartCommand: `${second} session-ready`,
+      userPromptSubmitCommand: `${second} user-prompt-hook`,
+    }, `${second} hook claude-code`);
+
+    const hooks = JSON.parse(readFileSync(configPath, 'utf-8')).hooks;
+    for (const event of ['PreToolUse', 'SessionStart', 'UserPromptSubmit']) {
+      expect(hooks[event]).toHaveLength(1);
+      expect(hooks[event][0].hooks).toHaveLength(1);
+      expect(hooks[event][0].hooks[0].command).toContain(second);
+    }
+  });
+
+  it.each([
+    'botmux-helper',
+    'botmux-wrapper',
+    'botmux-linux',
+    'botmux-x64',
+    'botmux-linux-x64-extra',
+    'botmux-linux-x64.exe',
+    'botmux-linux-arm64-musl.exe',
+    'botmux-darwin-arm64.exe',
+    'botmux-darwin-arm64-musl',
+    'botmux-windows-x64-musl',
+    'botmux-windows-arm64-musl.exe',
+  ])('不把第三方同前缀程序 %s 当成 botmux hook', (basename) => {
+    const thirdPartyCommand = `/usr/local/bin/${basename} session-ready`;
+    mkdirSync(join(tmpDir, '.claude'), { recursive: true });
+    writeFileSync(configPath, JSON.stringify({
+      hooks: { SessionStart: [{ hooks: [{ type: 'command', command: thirdPartyCommand }] }] },
+    }));
+
+    const currentBinary = '/repo/dist-bin/botmux-linux-x64';
+    installHook('claude-code', {
+      configPath,
+      format: 'claude-settings',
+      sessionStartCommand: `${currentBinary} session-ready`,
+    }, `${currentBinary} hook claude-code`);
+
+    const commands = JSON.parse(readFileSync(configPath, 'utf-8'))
+      .hooks.SessionStart.flatMap((group: any) => group.hooks.map((entry: any) => entry.command));
+    expect(commands).toContain(thirdPartyCommand);
   });
 
   it('ready preflight fails closed for malformed or unrelated SessionStart config', () => {
@@ -137,6 +239,22 @@ describe('installHook — claude-settings', () => {
         SessionStart: [
           { matcher: 'malformed-without-hooks' },
           { hooks: [{ type: 'command', command: '/usr/bin/unrelated-ready-hook' }] },
+        ],
+      },
+    }));
+    expect(hasInstalledSessionReadyHook({
+      configPath,
+      format: 'claude-settings',
+      sessionStartCommand: '/usr/bin/node /path/to/cli.js session-ready',
+    })).toBe(false);
+  });
+
+  it('ready preflight does not accept a third-party command with the same suffix', () => {
+    mkdirSync(join(tmpDir, '.claude'), { recursive: true });
+    writeFileSync(configPath, JSON.stringify({
+      hooks: {
+        SessionStart: [
+          { hooks: [{ type: 'command', command: '/usr/bin/botmux-helper session-ready' }] },
         ],
       },
     }));
@@ -180,7 +298,7 @@ describe('installHook — claude-settings', () => {
     const botmuxUps = ups.filter((g) => g.hooks?.some((e: any) => e.command.includes('cli.js') && e.command.trimEnd().endsWith('user-prompt-hook')));
     expect(botmuxUps.length).toBe(1);
     expect(botmuxUps[0].hooks[0].command).toBe(promptCmd2);
-    // 结构化识别：换路径后 preflight 仍为 true（与 hasInstalledSessionReadyHook 的精确字符串匹配不同）
+    // 结构化识别：换路径后 preflight 仍为 true。
     expect(hasInstalledPromptHook({ configPath, format: 'claude-settings', userPromptSubmitCommand: promptCmd2 })).toBe(true);
   });
 
@@ -225,6 +343,100 @@ describe('installHook — claude-settings', () => {
     const ups: any[] = settings.hooks?.UserPromptSubmit ?? [];
     expect(ups.some((g) => g.hooks?.some((e: any) => e.command === '/usr/bin/my-own-hook'))).toBe(true);
     expect(ups.some((g) => g.hooks?.some((e: any) => e.command.endsWith('user-prompt-hook')))).toBe(true);
+  });
+
+  it('(i2) 打包二进制命令（不含 cli.js）在重装时被去重，不重复追加', () => {
+    // 编译态单文件二进制写入的命令是打包二进制路径，根本不含 cli.js。
+    // 旧判据 `command.includes('cli.js')` 会把它永远误判为「未安装」，每次叠加一条。
+    const binAsk = '"/opt/botmux/node_modules/botmux-linux-x64/botmux" hook claude-code';
+    const binReady = '"/opt/botmux/node_modules/botmux-linux-x64/botmux" session-ready';
+    const binPrompt = '"/opt/botmux/node_modules/botmux-linux-x64/botmux" user-prompt-hook';
+
+    const hookInstall = {
+      configPath,
+      format: 'claude-settings' as const,
+      sessionStartCommand: binReady,
+      userPromptSubmitCommand: binPrompt,
+    };
+    installHook('claude-code', hookInstall, binAsk);
+    const afterFirst = readFileSync(configPath, 'utf-8');
+
+    // 再装一次（幂等），内容与首次完全一致 → 说明三条去重都认出了二进制命令
+    installHook('claude-code', hookInstall, binAsk);
+    const afterSecond = readFileSync(configPath, 'utf-8');
+    expect(afterSecond).toBe(afterFirst);
+
+    const settings = JSON.parse(afterFirst);
+    const asks: any[] = settings.hooks?.PreToolUse ?? [];
+    const askGroups = asks.filter((g) => g.matcher === 'AskUserQuestion');
+    expect(askGroups.length).toBe(1);
+    expect(askGroups[0].hooks[0].command).toBe(binAsk);
+
+    const ss: any[] = settings.hooks?.SessionStart ?? [];
+    expect(ss).toHaveLength(1);
+    expect(ss[0].hooks[0].command).toBe(binReady);
+
+    const ups: any[] = settings.hooks?.UserPromptSubmit ?? [];
+    expect(ups).toHaveLength(1);
+    expect(ups[0].hooks[0].command).toBe(binPrompt);
+
+    // preflight 也应认出二进制命令
+    expect(hasInstalledPromptHook(hookInstall)).toBe(true);
+  });
+
+  it('(i3) Node cli.js 命令替换旧的打包二进制命令（两种形态互相去重）', () => {
+    // ⚠️ 方向很重要：这里必须 **先装二进制、再装 Node**。
+    // 反过来（先 Node 后二进制）旧判据 `includes('cli.js')` 也能认出被替换的旧条目
+    // （它含 cli.js），那条用例在**未修复的代码上照样绿** —— 测不到本次修复。
+    // 只有本方向能打死旧判据：旧条目是二进制命令、不含 cli.js，旧判据认不出 →
+    // 不删旧的、直接追加 → PreToolUse 变 2 条（实测 master 如此）。
+    const binAsk = '"/opt/botmux/node_modules/botmux-linux-x64/botmux" hook claude-code';
+    const nodeAsk = '/usr/bin/node /path/to/cli.js hook claude-code';
+    // 先装编译态（不含 cli.js）
+    installHook('claude-code', { configPath, format: 'claude-settings' }, binAsk);
+    // 再用 Node 态命令重装，应替换旧的而非叠加
+    installHook('claude-code', { configPath, format: 'claude-settings' }, nodeAsk);
+
+    const settings = JSON.parse(readFileSync(configPath, 'utf-8'));
+    const asks: any[] = settings.hooks?.PreToolUse ?? [];
+    const askGroups = asks.filter((g) => g.matcher === 'AskUserQuestion');
+    expect(askGroups.length).toBe(1);
+    expect(askGroups[0].hooks[0].command).toBe(nodeAsk);
+  });
+
+  it('(i4) 已堆叠的重复条目在一次安装后收敛为单条（存量自愈）', () => {
+    // 线上失效形态不是「装两次多一条」，而是 installHook 在 read-isolation 路径下
+    // **每次冷 spawn 都跑**（worker.ts provisionIsolatedBotHome），编译态盒子每开一个
+    // 会话就 +1、无上限。所以真正要守的性质是：**已经堆坏的 settings.json，装一次就收敛回 1**。
+    // 实测未修复的代码在此场景下不仅不收敛，还会继续叠（5 条 → 6 条）。
+    const bin = '/opt/botmux/node_modules/botmux-linux-x64/botmux';
+    const binAsk = `"${bin}" hook claude-code`;
+    const binReady = `"${bin}" session-ready`;
+    const binPrompt = `"${bin}" user-prompt-hook`;
+
+    // 预置一份已经堆了 5 条重复 botmux 条目的 settings.json（模拟存量机器）
+    const stacked = (cmd: string) => Array.from({ length: 5 }, () => ({ hooks: [{ type: 'command', command: cmd }] }));
+    mkdirSync(join(tmpDir, '.claude'), { recursive: true });
+    writeFileSync(configPath, JSON.stringify({
+      hooks: {
+        PreToolUse: Array.from({ length: 5 }, () => ({ matcher: 'AskUserQuestion', hooks: [{ type: 'command', command: binAsk }] })),
+        SessionStart: stacked(binReady),
+        UserPromptSubmit: stacked(binPrompt),
+      },
+    }, null, 2));
+
+    installHook('claude-code', {
+      configPath,
+      format: 'claude-settings',
+      sessionStartCommand: binReady,
+      userPromptSubmitCommand: binPrompt,
+    }, binAsk);
+
+    const settings = JSON.parse(readFileSync(configPath, 'utf-8'));
+    const askGroups = (settings.hooks?.PreToolUse ?? []).filter((g: any) => g.matcher === 'AskUserQuestion');
+    expect(askGroups).toHaveLength(1);
+    expect(settings.hooks?.SessionStart ?? []).toHaveLength(1);
+    expect(settings.hooks?.UserPromptSubmit ?? []).toHaveLength(1);
   });
 
   it('read-isolation inherits only the global Claude env map and refreshes rotated auth', () => {
@@ -295,6 +507,28 @@ describe('installHook — claude-settings', () => {
     expect(statSync(`${configPath}.botmux-inherited-env.json`).mode & 0o777).toBe(0o600);
   });
 
+  it('credential-source mode excludes auth keys from the inherited env and scrubs stale ones', () => {
+    const globalPath = join(tmpDir, '.claude-global', 'settings.json');
+    mkdirSync(join(tmpDir, '.claude-global'), { recursive: true });
+    mkdirSync(join(tmpDir, '.claude'), { recursive: true });
+    writeFileSync(globalPath, JSON.stringify({
+      env: { ANTHROPIC_API_KEY: 'shared-key', ANTHROPIC_AUTH_TOKEN: 'shared-token', HTTPS_PROXY: 'http://proxy.example' },
+    }));
+    // Previously inherited (before the bot got its own account) + a local one.
+    writeFileSync(configPath, JSON.stringify({ env: { ANTHROPIC_AUTH_TOKEN: 'old-inherited', CLAUDE_CODE_OAUTH_TOKEN: 'local', KEEP: '1' } }));
+    installHook('claude-code', {
+      configPath,
+      format: 'claude-settings' as const,
+      inheritClaudeEnvFrom: globalPath,
+      inheritClaudeEnvExclude: ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN'],
+    }, hookCommand);
+    const settings = JSON.parse(readFileSync(configPath, 'utf-8'));
+    expect(settings.env).toEqual({ KEEP: '1', HTTPS_PROXY: 'http://proxy.example' });
+    // Excluded keys are not recorded as inherited-from-shared.
+    const state = JSON.parse(readFileSync(`${configPath}.botmux-inherited-env.json`, 'utf-8'));
+    expect(state.keys).toEqual(['HTTPS_PROXY']);
+  });
+
   it('(c2) 已有同 hookCommand 的 PreToolUse entry 不会重复追加', () => {
     // 第一次安装
     installHook('claude-code', { configPath, format: 'claude-settings' }, hookCommand);
@@ -343,7 +577,7 @@ describe('installHook — claude-settings', () => {
     expect(askGroups[0].hooks.some((e: any) => e.command === hookCommand)).toBe(true);
   });
 
-  it('(d) 迁移旧 PermissionRequest botmux entry 到 PreToolUse', () => {
+  it('(d) 旧 PermissionRequest botmux entry 收敛为唯一的权限确认桥 entry，并补上 PreToolUse', () => {
     const existing = {
       hooks: {
         PermissionRequest: [
@@ -365,11 +599,24 @@ describe('installHook — claude-settings', () => {
 
     const settings = JSON.parse(readFileSync(configPath, 'utf-8'));
     const permGroups: any[] = settings.hooks?.PermissionRequest ?? [];
-    expect(permGroups.some((g) => g.hooks?.some((e: any) => e.command === hookCommand))).toBe(false);
+    const botmuxPermGroups = permGroups.filter((g) => g.hooks?.some((e: any) => e.command === hookCommand));
+    // 旧的 matcher='*'/timeout 86400 条目被替换成唯一一条：无 matcher、timeout 900
+    expect(botmuxPermGroups).toEqual([{ hooks: [{ type: 'command', command: hookCommand, timeout: 900 }] }]);
     expect(permGroups.some((g) => g.hooks?.some((e: any) => e.command === '/usr/bin/other-permission-hook'))).toBe(true);
 
     const preToolGroups: any[] = settings.hooks?.PreToolUse ?? [];
     expect(preToolGroups.some((g) => g.matcher === 'AskUserQuestion' && g.hooks?.some((e: any) => e.command === hookCommand))).toBe(true);
+  });
+
+  it('(e) 权限确认桥 entry 重复安装保持幂等（只一条，文件内容不变）', () => {
+    installHook('claude-code', { configPath, format: 'claude-settings' }, hookCommand);
+    const first = readFileSync(configPath, 'utf-8');
+    installHook('claude-code', { configPath, format: 'claude-settings' }, hookCommand);
+    expect(readFileSync(configPath, 'utf-8')).toBe(first);
+    const settings = JSON.parse(first);
+    expect(settings.hooks.PermissionRequest).toEqual([
+      { hooks: [{ type: 'command', command: hookCommand, timeout: 900 }] },
+    ]);
   });
 });
 
@@ -541,4 +788,136 @@ describe('cleanupTraexAskHooks', () => {
     expect(() => cleanupTraexAskHooks([configPath])).not.toThrow();
     expect(JSON.parse(readFileSync(configPath, 'utf-8'))).toEqual(existing);
   });
+});
+
+const OPENCODE_PLUGIN_CASES = [
+  { label: 'V1 (opencode-plugin)', cliId: 'opencode', format: 'opencode-plugin' as const },
+  { label: 'V2 (opencode2-plugin)', cliId: 'opencode', format: 'opencode2-plugin' as const },
+];
+
+/**
+ * The generated plugins must not reach a loopback service through the global
+ * `fetch`, and — the part a `toContain` check cannot see — the helper they call
+ * has to actually EXIST in each generated file.
+ *
+ * WHY THIS IS EXECUTED, NOT GREPPED: the helper was first interpolated into the
+ * V2 template only, while BOTH templates had their call switched over. The V1
+ * plugin then died with `ReferenceError: loopbackSafeFetch is not defined` on its
+ * fallback path — and every source-contains assertion stayed green, because the
+ * call site is present in both. "Changed the call, forgot the definition" is the
+ * characteristic generated-template defect, so these tests import the emitted
+ * file and run the function.
+ *
+ * The plugins run inside OpenCode's Bun process, where `fetch` auto-uses
+ * `$http_proxy` and `no_proxy` is literal-match only. For the V2 reply path that
+ * also means the Basic password from the registration file would be handed to the
+ * corporate proxy, not just a failed reply.
+ */
+describe('generated OpenCode plugins — loopback requests bypass the proxy', () => {
+  for (const { label, cliId, format } of OPENCODE_PLUGIN_CASES) {
+    it(`${label}: defines loopbackSafeFetch wherever it is called`, () => {
+      const dir = makeTmpDir();
+      const configPath = join(dir, 'plugin', 'botmux-ask.js');
+      installHook(cliId, { configPath, format }, '/usr/bin/node /x/cli.js hook opencode');
+      const src = readFileSync(configPath, 'utf-8');
+      // A call without a definition is the defect; assert on the PAIR.
+      const calls = (src.match(/loopbackSafeFetch\(/g) ?? []).length;
+      const defs = (src.match(/(?:async\s+)?function\s+loopbackSafeFetch\b/g) ?? []).length;
+      expect(calls).toBeGreaterThan(0);
+      expect(defs).toBe(1);
+      // And it must be built on node:http — that is the whole point.
+      expect(src).toContain("await import(\"node:http\")");
+      expect(src).toContain('isLiteralLoopback');
+    });
+
+    it(`${label}: the emitted helper RUNS and reaches a loopback server directly`, async () => {
+      const dir = makeTmpDir();
+      const configPath = join(dir, 'plugin', 'botmux-ask.js');
+      installHook(cliId, { configPath, format }, '/usr/bin/node /x/cli.js hook opencode');
+      const src = readFileSync(configPath, 'utf-8');
+
+      // Pull just the two helper functions out of the generated file and evaluate
+      // them. Importing the whole plugin would start its OpenCode wiring; this
+      // still executes the REAL emitted text, which is what the guard is about.
+      const from = src.indexOf('function isLiteralLoopback');
+      expect(from).toBeGreaterThan(-1);
+      const to = src.indexOf('\n}', src.indexOf('function loopbackSafeFetch'));
+      expect(to).toBeGreaterThan(from);
+      const helperSrc = src.slice(from, to + 2);
+
+      const { createServer } = await import('node:http');
+      const servers: import('node:http').Server[] = [];
+      try {
+        let direct = 0;
+        const server = createServer((_q, r) => {
+          direct++;
+          r.writeHead(200, { 'content-type': 'application/json' });
+          r.end('{"ok":true}');
+        });
+        servers.push(server);
+        await new Promise<void>(res => server.listen(0, '127.0.0.1', () => res()));
+        const port = (server.address() as { port: number }).port;
+
+        // `new Function` has no dynamic-import callback, so the generated
+        // `await import("node:http")` cannot resolve inside it. Hand the module in
+        // through a local `import` binding instead of rewriting the emitted text —
+        // the body under test stays byte-for-byte what we ship.
+        const nodeHttp = await import('node:http');
+        // eslint-disable-next-line no-new-func
+        const make = new Function('__import', `const _i = __import; ${helperSrc.replace(/await import\("node:http"\)/g, '_i("node:http")')}\nreturn { isLiteralLoopback, loopbackSafeFetch };`);
+        const { isLiteralLoopback, loopbackSafeFetch } = make(
+          (spec: string) => (spec === 'node:http' ? nodeHttp : (() => { throw new Error(`unexpected import ${spec}`); })()),
+        ) as {
+          isLiteralLoopback: (u: string) => boolean;
+          loopbackSafeFetch: (u: string, i?: unknown) => Promise<{ ok: boolean; status: number; text: () => Promise<string> }>;
+        };
+
+        // Classification: loopback vs remote (remote must keep the native fetch).
+        expect(isLiteralLoopback(`http://127.0.0.1:${port}/x`)).toBe(true);
+        expect(isLiteralLoopback('http://localhost:1/x')).toBe(true);
+        expect(isLiteralLoopback('https://api.example.com/x')).toBe(false);
+
+        const res = await loopbackSafeFetch(`http://127.0.0.1:${port}/api/x`, {
+          method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+        });
+        expect(res.ok).toBe(true);
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe('{"ok":true}');
+        expect(direct).toBe(1);
+      } finally {
+        await Promise.all(servers.splice(0).map(s => new Promise<void>(r => s.close(() => r()))));
+      }
+    });
+  }
+});
+
+/**
+ * A hook that dies before reading its stdin (crashes at startup, gets killed)
+ * turns the plugin's pending stdin write into EPIPE. The plugin runs inside
+ * OpenCode's own process, so an unhandled stream error there takes OpenCode down;
+ * the ask must fall back to passthrough instead. Executed rather than grepped for
+ * the reason given above: the guard has to exist in BOTH emitted templates.
+ */
+describe('generated OpenCode plugins — a hook that exits before reading stdin', () => {
+  for (const { label, cliId, format } of OPENCODE_PLUGIN_CASES) {
+    it(`${label}: askBotmux resolves passthrough instead of throwing EPIPE`, async () => {
+      const dir = makeTmpDir();
+      const configPath = join(dir, 'plugin', 'botmux-ask.js');
+      installHook(cliId, { configPath, format }, '/usr/bin/node /x/cli.js hook opencode');
+      const src = readFileSync(configPath, 'utf-8');
+      const from = src.indexOf('function askBotmux');
+      expect(from).toBeGreaterThan(-1);
+      const askSrc = src.slice(from, src.indexOf('\n}', from) + 2);
+
+      const hook = join(dir, 'hook.mjs');
+      writeFileSync(hook, 'process.exit(7);\n');
+      const { spawn } = await import('node:child_process');
+      // eslint-disable-next-line no-new-func
+      const askBotmux = new Function('spawn', 'CMD', 'ARGS', `${askSrc}\nreturn askBotmux;`)(
+        spawn, process.execPath, [hook],
+      ) as (payload: string) => Promise<string>;
+      // Larger than the pipe buffer, so the write is still pending when the hook exits.
+      await expect(askBotmux(JSON.stringify({ text: 'x'.repeat(256 * 1024) }))).resolves.toBe('');
+    });
+  }
 });

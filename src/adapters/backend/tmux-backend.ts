@@ -1,14 +1,14 @@
-import * as pty from 'node-pty';
 import { execSync, execFileSync } from 'node:child_process';
+import { lstatSync, readFileSync } from 'node:fs';
 import { basename } from 'node:path';
-import { randomBytes } from 'node:crypto';
-import type { SessionBackend, SpawnOpts, SessionProbe } from './types.js';
-import { probeTmuxFunctional, scrubTmuxServerGlobalEnv, tmuxEnv } from '../../setup/ensure-tmux.js';
-import { BOTMUX_INJECTED_ENV_KEYS, PROXY_ENV_KEYS, REDACTED_CHILD_ENV_KEYS } from '../../utils/child-env.js';
+import type { SessionProbe } from './types.js';
+import { probeTmuxFunctional, scrubTmuxServerGlobalEnv, tmuxEnv, getTmuxVersionCached, tmuxVersionAtLeast } from '../../setup/ensure-tmux.js';
+import { BOTMUX_INJECTED_ENV_KEYS, CA_BUNDLE_ENV_KEYS, PROXY_ENV_KEYS, REDACTED_CHILD_ENV_KEYS, SESSION_TEMP_ENV_KEYS, WORKFLOW_WORKER_ENV_KEYS } from '../../utils/child-env.js';
 import { sanitizePerBotEnv } from '../../core/per-bot-env.js';
 import { logger } from '../../utils/logger.js';
 import { isExecutable } from '../../utils/executable.js';
-import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
+import { PROCESS_TABLE_MAX_BUFFER } from '../../utils/exec-limits.js';
+import { tmuxCommand, tmuxSocketArgs } from './tmux-socket.js';
 
 /**
  * `unset KEY KEY ...` clause spliced into the shell wrapper before exec. The
@@ -30,40 +30,176 @@ const FISH_PANE_ENV_UNSET_CLAUSE = `set -e ${PANE_ENV_UNSET_KEYS.join(' ')}`;
 let serverGlobalEnvScrubbed = false;
 
 /**
- * TmuxBackend — session backend using tmux for process persistence.
+ * True when a tmux client's stderr reports a CONNECTION-level failure — the
+ * client never got an answer from the shared server, so the error proves
+ * nothing about any particular session/pane:
+ *   - "error connecting to <socket> (Connection refused)" — Linux fails
+ *     unix-socket connect() with an INSTANT clean ECONNREFUSED when the
+ *     server's accept backlog overflows. A busy-but-alive server (stalled a
+ *     couple of seconds under load while hundreds of workers probe it every
+ *     second) mass-produces exactly this error.
+ *   - "error connecting to <socket> (No such file or directory)" — socket file
+ *     missing (server down, or the file was cleaned from /tmp under a live
+ *     server).
+ *   - "lost server" / "server exited unexpectedly" — the connection died
+ *     mid-command.
  *
- * Architecture: pty-under-tmux.
- *   - A node-pty process runs `tmux new-session` or `tmux attach-session`
- *   - All output flows through the pty (onData/onExit work unchanged)
- *   - kill() only detaches (kills the pty viewer), tmux session survives
- *   - destroySession() kills the tmux session (for explicit /close)
+ * Probes must classify these as 'unknown', NEVER as an authoritative
+ * 'missing': on 2026-08-20 a few seconds of backlog overflow on the default
+ * server made every worker's liveness probe read clean-exit "error connecting"
+ * as "pane gone", and the daemon tore down / force-FRESHed dozens of live
+ * sessions across all bots simultaneously.
+ *
+ * Deliberately NOT matched: "no server running on <socket>" — the client did
+ * determine that no server owns the socket, and a not-running server provably
+ * has no sessions, so that one stays an authoritative 'missing'.
+ */
+export function isTmuxServerLevelErrorText(stderrText: string): boolean {
+  return /error connecting to|lost server|server exited unexpectedly/i.test(stderrText);
+}
+
+/**
+ * True when the connection failure is specifically "the socket file does not
+ * exist" (ENOENT on connect). This is still a server-level error (see
+ * {@link isTmuxServerLevelErrorText}) — on its own it cannot tell "no server at
+ * all" from "a live server whose socket was cleaned from /tmp" — but it is the
+ * ONLY shape a cold machine produces: a reboot wipes /tmp (macOS /private/tmp,
+ * Linux tmpfs / boot-time tmpfiles), so before anything has started a server
+ * every probe reads exactly this. A server that merely exited leaves its socket
+ * file behind and reads "no server running" instead.
+ */
+export function isTmuxSocketMissingErrorText(stderrText: string): boolean {
+  return /error connecting to .*\(No such file or directory\)/i.test(stderrText);
+}
+
+/**
+ * Evidence that NO tmux process (server or client) of the current user is
+ * visible. Used ONLY by {@link TmuxBackend.serverAbsentOnColdMachine} to break the
+ * read-isolation cold-start tie; it is a heuristic (a renamed tmux binary or a
+ * server in another PID namespace is invisible to it), so it must never feed
+ * the general probeSession that kill-verify / close / wake paths consume.
+ *
+ * Deliberately coarse and fail-closed:
+ *   - matches ANY tmux process of this uid (any socket, client or server), so a
+ *     live server whose socket was deleted is never missed, whatever its argv
+ *     or proctitle looks like on this platform;
+ *   - returns false (⇒ caller stays 'unknown') whenever `ps` fails, times out,
+ *     prints nothing parseable, or the uid is unavailable.
+ * A concurrent sibling probe's short-lived client can make this false — that
+ * only keeps today's 'unknown', the safe direction.
+ */
+export function noTmuxProcessForCurrentUser(): boolean {
+  // Both real and effective uid: a setuid launcher must not let a server owned
+  // by the other one slip past the comparison.
+  const uids = new Set<number>();
+  if (typeof process.getuid === 'function') uids.add(process.getuid());
+  if (typeof process.geteuid === 'function') uids.add(process.geteuid());
+  if (uids.size === 0) return false;
+  let out: string;
+  try {
+    out = execFileSync('ps', ['-A', '-o', 'uid=,comm='], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 3000,
+      maxBuffer: PROCESS_TABLE_MAX_BUFFER,
+    });
+  } catch {
+    return false;
+  }
+  if (typeof out !== 'string') return false;
+  let rows = 0;
+  for (const line of out.split('\n')) {
+    const m = /^\s*(\d+)\s+(.+?)\s*$/.exec(line);
+    if (!m) continue;
+    rows++;
+    if (!uids.has(Number(m[1]))) continue;
+    // Prefix, not equality: on Linux tmux renames its threads via
+    // prctl(PR_SET_NAME) ("tmux: server", "tmux: client"); macOS keeps "tmux"
+    // (or the full path). Over-matching only keeps 'unknown'.
+    if (basename(m[2]!).startsWith('tmux')) return false;
+  }
+  // `ps -A` always lists at least this process itself; zero parseable rows
+  // means the output format is not what we expect — no evidence either way.
+  return rows > 0;
+}
+
+/**
+ * True when a thrown exec*Sync error represents the caller's own `timeout`
+ * deadline firing — regardless of the exit-status shape Node attached.
+ *
+ * Node reports a spawnSync timeout as `error.code === 'ETIMEDOUT'` while ALSO
+ * reporting whatever the child managed to do around the kill. Normally the
+ * child dies from the kill signal (`status: null, signal: 'SIGTERM'`), but
+ * under heavy load the client can complete and exit cleanly in the same window
+ * the deadline fires — the throw then carries `status: 0/1, signal: null` PLUS
+ * the ETIMEDOUT error. 2026-08-23: exactly that shape escaped every
+ * "clean numeric exit ⇒ the server answered deterministically" classifier
+ * during a post-outage mass cold-restart (261 sessions rebuilt in ~40s after
+ * the shared server died): `new-session` had actually succeeded server-side,
+ * but the launch was classified as a deterministic rejection, not retried, and
+ * the worker died user-visibly ("会话启动失败: spawnSync tmux ETIMEDOUT").
+ *
+ * A deadline is NEVER an authoritative server answer. Every tmux classifier
+ * must check this BEFORE any status-shape branch.
+ */
+export function isExecTimeoutError(err: unknown): boolean {
+  return (err as NodeJS.ErrnoException | null | undefined)?.code === 'ETIMEDOUT';
+}
+
+/**
+ * Linux reports ENOENT both on a first boot and after a live server's socket
+ * was unlinked. Only the identity preflight may use this extra cold-start
+ * evidence: an unlinked live socket still owns its pathname in /proc/net/unix.
+ * Liveness/restore probes keep their conservative `unknown` classification.
+ */
+function coldLinuxTmuxEvidence(err: unknown): 'absent' | 'appeared' | null {
+  if (process.platform !== 'linux' || isExecTimeoutError(err)) return null;
+  const failure = err as { status?: number; signal?: string | null; stderr?: Buffer | string } | null;
+  if (failure?.status !== 1 || failure.signal) return null;
+  const match = /^error connecting to (\/[^\r\n]+) \(No such file or directory\)$/.exec(String(failure.stderr ?? '').trim());
+  if (!match) return null;
+  const socketPath = match[1];
+  const pathIsMissing = (): boolean | null => {
+    try { lstatSync(socketPath); return false; }
+    catch (error) { return (error as NodeJS.ErrnoException)?.code === 'ENOENT' ? true : null; }
+  };
+  const initiallyMissing = pathIsMissing();
+  if (initiallyMissing !== true) return initiallyMissing === false ? 'appeared' : null;
+  try {
+    const lines = readFileSync('/proc/net/unix', 'utf8').split('\n');
+    if (!/^Num\s+RefCount\s+Protocol\s+Flags\s+Type\s+St\s+Inode\s+Path\s*$/.test(lines.shift() ?? '')) return null;
+    let bound = false;
+    for (const line of lines) {
+      if (!line) continue;
+      // Preserve the entire pathname, including spaces. Any malformed census
+      // leaves the server state unknown instead of granting a fresh launch.
+      const row = /^[\da-f]+:\s+[\da-f]+\s+[\da-f]+\s+[\da-f]+\s+[\da-f]+\s+[\da-f]+\s+\d+(?:\s+(.*))?$/i.exec(line);
+      if (!row) return null;
+      if (row[1] === socketPath) bound = true;
+    }
+    // A concurrent creator may have bound the path after the first lstat.
+    // Re-probe that server normally; its appearance is not permission to use it.
+    const stillMissing = pathIsMissing();
+    if (stillMissing === false) return 'appeared';
+    return stillMissing === true && !bound ? 'absent' : null;
+  } catch { return null; }
+}
+
+/**
+ * TmuxBackend — static tmux session helpers (naming, probes, kill, diagnostics).
+ *
+ * This class used to be a pty-under-tmux `SessionBackend` instance (node-pty
+ * running `tmux new-session` / `attach-session`). That implementation was
+ * superseded by {@link TmuxPipeBackend} (tmux-pipe-backend.ts), which is the only
+ * tmux backend `selectSessionBackend` constructs; the unreachable instance
+ * surface (constructor, spawn / write / sendText / pasteText / attachToExisting
+ * / getAttachInfo …) was removed. What remains is the static helper surface
+ * shared by the daemon, worker, persistent-backend bookkeeping and
+ * TmuxPipeBackend itself.
  *
  * Naming: tmux sessions are named `bmx-<sessionId.slice(0,8)>`.
  */
-export class TmuxBackend implements SessionBackend {
-  private process: pty.IPty | null = null;
-  private readonly sessionName: string;
-  private readonly ownsSession: boolean;
-  private reattaching = false;
-  /** Tmux pane target when in adopt mode (e.g. "0:2.0") — set by attachToExisting.
-   *  When non-null, ALL pane-scoped tmux commands (send-keys / paste-buffer /
-   *  copy-mode / list-panes) must address this pane explicitly; using
-   *  `this.sessionName` would either resolve nothing (the name is synthetic
-   *  in adopt mode) or fall through to whichever pane tmux happens to have
-   *  active, which is exactly the bug we're avoiding. */
-  private adoptedPaneTarget: string | null = null;
-
-  constructor(sessionName: string, opts?: { ownsSession?: boolean }) {
-    this.sessionName = sessionName;
-    this.ownsSession = opts?.ownsSession ?? true;
-  }
-
-  /** Target string to use for pane-scoped tmux commands. In adopt mode this
-   *  is the real pane address ("0:2.0"); otherwise the bmx-* session name. */
-  private get cmdTarget(): string {
-    return this.adoptedPaneTarget ?? this.sessionName;
-  }
-
+export class TmuxBackend {
   // ─── Static helpers ───────────────────────────────────────────────────────
 
   /**
@@ -91,46 +227,221 @@ export class TmuxBackend implements SessionBackend {
     return `bmx-diag-${sessionId.slice(0, 8)}`;
   }
 
-  /** Check if a named tmux session exists. */
-  static hasSession(name: string): boolean {
-    return TmuxBackend.probeSession(name) === 'exists';
+  /**
+   * Check if a named tmux session exists.
+   *
+   * Every static helper takes the server as an optional trailing `socketName`
+   * (`-L <name>`, see tmux-socket.ts). Omitted = the default server, which is
+   * where /adopt targets and every pre-isolation bmx-* session live.
+   */
+  static hasSession(name: string, socketName?: string): boolean {
+    return TmuxBackend.probeSession(name, socketName) === 'exists';
+  }
+
+  static assertInstanceIdentity(name: string, expected: string, socketName?: string): void {
+    // Only an observed cold-start socket appearance permits one extra normal
+    // check. Unknown/timeout failures never trigger a general retry or bypass.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const probe = TmuxBackend.probeSession(name, socketName);
+      if (probe === 'missing') return;
+      let actual = '';
+      try {
+        actual = execFileSync('tmux', [...tmuxSocketArgs(socketName), 'show-environment', '-t', name, 'BOTMUX_CODEX_INSTANCE_BINDING'],
+          { encoding: 'utf8', timeout: 5000, env: tmuxEnv() }).trim();
+      } catch (error) {
+        if (attempt === 0 && probe === 'unknown') {
+          const evidence = coldLinuxTmuxEvidence(error);
+          if (evidence === 'absent') return;
+          if (evidence === 'appeared') continue;
+        }
+        // Unknown/missing identity is not permission to attach or update MCP.
+      }
+      if (actual === `BOTMUX_CODEX_INSTANCE_BINDING=${expected}`) return;
+      break;
+    }
+    throw new Error('Codex instance identity mismatch: existing tmux session preserved; attachment refused');
   }
 
   /**
    * Tri-state existence probe. `tmux has-session` exits 0 when the session
    * exists and exits 1 (clean status, no signal) when the server answered but
-   * the session is absent — INCLUDING "no server running". Both collapse to
-   * 'missing' here. 'missing' is NOT a destructive signal on restore: whether a
-   * single pane died (solo crash) or the whole server is gone (machine reboot),
-   * the CLI transcript on disk is still resumable, so restore keeps the session
-   * active and cold-resumes it on the next message (see restoreActiveSessions).
+   * the session is absent — including "no server running" (a not-running server
+   * provably has no sessions). 'missing' is NOT a destructive signal on restore:
+   * whether a single pane died (solo crash) or the whole server is gone (machine
+   * reboot), the CLI transcript on disk is still resumable, so restore keeps the
+   * session active and cold-resumes it on the next message (see
+   * restoreActiveSessions).
+   *
+   * A clean non-zero exit whose stderr is a CONNECTION-level failure ("error
+   * connecting to <socket>", "lost server", …) is 'unknown', not 'missing': the
+   * client never reached the server, so it proved nothing about this session.
+   * Linux fails unix-socket connect() with instant ECONNREFUSED when the
+   * server's accept backlog overflows — a busy-but-alive shared server briefly
+   * looks exactly like this, and 2026-08-20 that misread made kill-verify /
+   * liveness paths treat dozens of live sessions as gone at once.
    * Anything else — a timeout (signal/killed) or a spawn failure (binary not on
    * PATH → ENOENT, not executable → EACCES; neither carries a numeric exit
-   * status) — means we never got an answer → 'unknown', so a flaky/unavailable
-   * tmux can't be mistaken for a gone session either.
+   * status) — also means we never got an answer → 'unknown'.
    *
    * Uses execFileSync (NOT a shell string): running tmux directly keeps a
    * missing/unrunnable binary as ENOENT/EACCES. A shell would instead surface
    * those as its own clean exits 127/126, which this classifier would wrongly
    * read as 'missing'.
    */
-  static probeSession(name: string): SessionProbe {
+  static probeSession(name: string, socketName?: string): SessionProbe {
+    return TmuxBackend.classifyHasSession(name, false, socketName);
+  }
+
+  /**
+   * Launch-selection variant of {@link probeSession} (reattach vs create), used
+   * by the worker's backend gate. Identical except for ONE shape: "error
+   * connecting to <socket> (No such file or directory)" reads 'missing'. For a
+   * launch that is the only honest answer — there is no reachable pane at that
+   * socket to reattach (`pipe-pane` would hit the same connect error), and the
+   * next `new-session` starts a server there. It is exactly what a clean host
+   * / fresh TMUX_TMPDIR reports before any server exists, and treating it as
+   * 'unknown' would bias every first launch toward a doomed reattach.
+   * Destructive/verification callers (kill-verify, restore, read-isolation)
+   * keep {@link probeSession}'s stricter 'unknown' — this is not a liveness
+   * verdict, only "nothing here can be attached to".
+   */
+  static probeSessionForLaunch(name: string, socketName?: string): SessionProbe {
+    return TmuxBackend.classifyHasSession(name, true, socketName);
+  }
+
+  /**
+   * Strict {@link probeSession}, except that a socket no server has ever
+   * bound (Linux kernel evidence, see coldLinuxTmuxEvidence) reads 'missing'
+   * on the DEFAULT server too. For teardown verification that must sweep
+   * every server a botmux resource may sit on: once managed sessions live on
+   * the dedicated socket, a host that never started a default server would
+   * otherwise answer 'unknown' there forever and block the sweep. A live server
+   * whose socket file was merely unlinked still owns the path and stays
+   * 'unknown'.
+   */
+  static probeSessionForTeardown(name: string, socketName?: string): SessionProbe {
+    return TmuxBackend.classifyHasSession(name, false, socketName, true);
+  }
+
+  private static classifyHasSession(
+    name: string,
+    socketMissingIsMissing: boolean,
+    socketName?: string,
+    coldEvidenceOnDefaultServer = false,
+  ): SessionProbe {
     try {
-      execFileSync('tmux', ['has-session', '-t', name], { stdio: 'ignore', env: tmuxEnv(), timeout: 3000 });
+      execFileSync('tmux', [...tmuxSocketArgs(socketName), 'has-session', '-t', name], {
+        stdio: ['ignore', 'ignore', 'pipe'],
+        env: tmuxEnv(),
+        timeout: 3000,
+      });
       return 'exists';
     } catch (e: any) {
-      if (e && typeof e.status === 'number' && !e.signal) return 'missing';
+      // Deadline first: a timed-out client can surface a clean numeric exit
+      // when its completion races the kill (see isExecTimeoutError) — that is
+      // still "no answer", never an authoritative 'missing'.
+      if (isExecTimeoutError(e)) return 'unknown';
+      if (e && typeof e.status === 'number' && !e.signal) {
+        const stderrText = (e.stderr?.toString?.() ?? '').trim();
+        if (isTmuxSocketMissingErrorText(stderrText)) {
+          if (socketMissingIsMissing) return 'missing';
+          // A dedicated socket has no co-tenant to keep its server up: until
+          // botmux's first session there it simply does not exist, which also
+          // never satisfies the "no tmux process at all" cold-machine test
+          // (the user's own default server is visible). Use the same kernel
+          // evidence as the identity preflight (Linux /proc/net/unix): nothing
+          // bound to that path ⇒ no server ⇒ provably no session. The default
+          // server keeps the historical strict 'unknown' except for teardown
+          // verification (probeSessionForTeardown), which takes the same
+          // evidence there: independent of socketMissingIsMissing, which skips it.
+          // (A missing census, a still-bound unlinked path, or 'appeared' = a
+          // server bound the path after this answer: all stay unknown.)
+          if ((socketName !== undefined || coldEvidenceOnDefaultServer) && coldLinuxTmuxEvidence(e) === 'absent') return 'missing';
+        }
+        if (isTmuxServerLevelErrorText(stderrText)) return 'unknown';
+        return 'missing';
+      }
       return 'unknown';
     }
   }
 
+  /**
+   * {@link probeSessionForLaunch} with a short backoff retry on 'unknown' ONLY.
+   *
+   * `has-session` is ~20ms on a healthy host but still needs a fork+exec; under
+   * heavy load the deadline can expire before tmux is ever scheduled. One
+   * timeout must not become the verdict for a launch decision, so the worker's
+   * backend gate retries it. 'exists' / 'missing' are tmux's authoritative
+   * answers and return immediately (no added latency on a cold start). The
+   * per-attempt deadline stays the base probe's, so the worst case is
+   * bounded at `attempts × 3s` plus the backoff.
+   */
+  static probeSessionWithRetry(
+    name: string,
+    opts: {
+      attempts?: number;
+      baseDelayMs?: number;
+      socketName?: string;
+      /** Test seams. */
+      probe?: (name: string) => SessionProbe;
+      sleep?: (ms: number) => void;
+    } = {},
+  ): SessionProbe {
+    const attempts = Math.max(1, Math.floor(opts.attempts ?? 3));
+    const baseDelayMs = Math.max(0, Math.floor(opts.baseDelayMs ?? 150));
+    const probe = opts.probe ?? ((n: string) => TmuxBackend.probeSessionForLaunch(n, opts.socketName));
+    const sleep = opts.sleep ?? ((ms: number) => {
+      try {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+      } catch { /* SharedArrayBuffer unavailable: retry immediately */ }
+    });
+    let result = probe(name);
+    for (let completed = 1; result === 'unknown' && completed < attempts; completed += 1) {
+      const backoff = baseDelayMs * (2 ** (completed - 1));
+      const jitter = baseDelayMs > 0 ? Math.floor(Math.random() * baseDelayMs) : 0;
+      sleep(backoff + jitter);
+      result = probe(name);
+    }
+    return result;
+  }
+
+  /**
+   * Cold-machine check for the read-isolation pre-spawn gate ONLY (see
+   * resolveReadIsolationPaneProbe). True when the default server's socket file
+   * does not exist ("error connecting to <socket> (No such file or directory)")
+   * AND no tmux process of this user is visible — the state a reboot leaves
+   * (/tmp wiped) before anything has started a server.
+   *
+   * A server that merely exited leaves its socket behind and reads "no server
+   * running" ⇒ probeSession already answers 'missing'. Anything else — a live
+   * reply, timeout, spawn failure, ECONNREFUSED, lost server, any visible tmux
+   * process, a failing `ps` — is false (stay inconclusive).
+   */
+  static serverAbsentOnColdMachine(socketName?: string): boolean {
+    try {
+      execFileSync('tmux', [...tmuxSocketArgs(socketName), 'list-sessions'], {
+        stdio: ['ignore', 'ignore', 'pipe'],
+        env: tmuxEnv(),
+        timeout: 3000,
+      });
+      return false;
+    } catch (e: any) {
+      if (isExecTimeoutError(e)) return false;
+      if (!e || typeof e.status !== 'number' || e.signal) return false;
+      const stderrText = (e.stderr?.toString?.() ?? '').trim();
+      if (!isTmuxSocketMissingErrorText(stderrText)) return false;
+    }
+    // ps AFTER tmux: a server started in between has a visible process.
+    return noTmuxProcessForCurrentUser();
+  }
+
   /** Kill a named tmux session (no-op if it doesn't exist). */
-  static killSession(name: string): void {
+  static killSession(name: string, socketName?: string): void {
     try {
       // Runtime recovery calls this from many workers. Bound the command so a
       // wedged shared server cannot pin every worker forever; restart jitter
       // keeps the bounded attempts from landing simultaneously.
-      execFileSync('tmux', ['kill-session', '-t', name], {
+      execFileSync('tmux', [...tmuxSocketArgs(socketName), 'kill-session', '-t', name], {
         stdio: 'ignore',
         timeout: 3000,
         env: tmuxEnv(),
@@ -138,11 +449,13 @@ export class TmuxBackend implements SessionBackend {
     } catch { /* session doesn't exist */ }
   }
 
-  /** List all botmux tmux sessions (bmx-* prefix). */
-  static listBotmuxSessions(): string[] {
+  /** List all botmux tmux sessions (bmx-* prefix) on one server. */
+  static listBotmuxSessions(socketName?: string): string[] {
     try {
-      const out = execSync("tmux list-sessions -F '#{session_name}' 2>/dev/null", {
+      const out = execFileSync('tmux', [...tmuxSocketArgs(socketName), 'list-sessions', '-F', '#{session_name}'], {
         encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 5000,
         env: tmuxEnv(),
       });
       return out.split('\n').filter(s => s.startsWith('bmx-'));
@@ -184,12 +497,13 @@ export class TmuxBackend implements SessionBackend {
    * browser can still attach to `bmx-*` and see the startup error while daemon
    * auto-restart is paused.
    */
-  static parkDiagnosticSession(name: string, opts: { cwd: string; cols: number; rows: number; contentPath: string }): boolean {
+  static parkDiagnosticSession(name: string, opts: { cwd: string; cols: number; rows: number; contentPath: string; socketName?: string }): boolean {
     try {
-      TmuxBackend.killSession(name);
+      TmuxBackend.killSession(name, opts.socketName);
       const shellSpec = resolveUserShell();
       const shellKind = shellKindForPath(shellSpec.shell);
       execFileSync('tmux', [
+        ...tmuxSocketArgs(opts.socketName),
         'new-session',
         '-d',
         '-s', name,
@@ -207,7 +521,7 @@ export class TmuxBackend implements SessionBackend {
         env: tmuxEnv(),
         timeout: 5000,
       });
-      configureTmuxSessionOptions(name);
+      configureTmuxSessionOptions(name, opts.socketName);
       return true;
     } catch (err) {
       logger.warn(`[tmux:${name}] failed to park diagnostic session: ${err instanceof Error ? err.message : err}`);
@@ -215,124 +529,12 @@ export class TmuxBackend implements SessionBackend {
     }
   }
 
-  // ─── SessionBackend implementation ────────────────────────────────────────
-
-  spawn(bin: string, args: string[], opts: SpawnOpts): void {
-    // Self-heal a server polluted by a pre-upgrade botmux before we touch it
-    // (once per daemon process; no-op on a server this build booted clean).
-    TmuxBackend.scrubServerGlobalEnvOnce();
-    this.reattaching = TmuxBackend.hasSession(this.sessionName);
-    logger.debug(
-      `[tmux:${this.sessionName}] spawn ${this.reattaching ? 'reattach' : 'new'} ` +
-      `bin=${bin} args=${JSON.stringify(args)} cwd=${opts.cwd} ${opts.cols}x${opts.rows}`,
-    );
-    // Strip TMUX/TMUX_PANE from caller env before handing to pty.spawn — if
-    // the daemon was started inside a tmux session, leaving TMUX set would
-    // make this `tmux attach-session`/`new-session` target that parent
-    // session's socket. After the user's terminal tmux dies, every call
-    // here would print `error connecting to <stale-socket>` to the PTY and
-    // flood the daemon log via the leaked-stderr path.
-    const childEnv = tmuxEnv(opts.env);
-
-    if (this.reattaching) {
-      // Re-attach to surviving tmux session (CLI is still running)
-      this.process = pty.spawn('tmux', ['attach-session', '-t', this.sessionName], {
-        name: 'xterm-256color',
-        cols: opts.cols,
-        rows: opts.rows,
-        cwd: opts.cwd,
-        env: childEnv,
-      });
-    } else {
-      // Run the CLI inside a fresh user shell so PATH / NVM_BIN / PNPM_HOME /
-      // mise / fnm / asdf shims set up in the user's rcfiles are loaded the
-      // way `coco` (or any other CLI) would see them if the user opened a
-      // terminal and ran it themselves.
-      //
-      // Shape:
-      //   tmux new-session -- /usr/bin/env DISABLE_AUTO_UPDATE=true
-      //     <shell> <shellFlags> -c <SCRIPT> [POSIX: _] <cwd> KEY=VAL... bin args...
-      //
-      //   - The env(1) prefix makes DISABLE_AUTO_UPDATE visible while the
-      //     shell loads its rcfile, then SCRIPT unsets it before execing the
-      //     CLI. This prevents oh-my-zsh's update prompt without changing the
-      //     final CLI environment or running an unattended update.
-      //   - <shell> + <shellFlags> come from resolveUserShell() and are
-      //     shell-kind-specific (bash needs `-i`; zsh needs `-l -i`;
-      //     fish needs `-i`; POSIX sh uses no flags).
-      //   - SCRIPT is shell-kind-aware:
-      //       * POSIX: `cd -- "$1" && shift && unset <managed> && exec /usr/bin/env "$@"`.
-      //       * fish: `cd -- $argv[1]; set -e argv[1]; set -e <managed>; exec /usr/bin/env $argv`.
-      //     Both return to the session's intended cwd even if the rcfile changed
-      //     directory mid-load, clear inherited tmux server-global botmux keys,
-      //     and inject this pane's KEY=VAL values only after rcfile startup.
-      //   - POSIX shells require `_` as the $0 placeholder before cwd; fish sees
-      //     argv directly and must omit that sentinel. In both contracts, spaces /
-      //     quotes / `$` / newlines in cwd, env values, or args never need shell
-      //     escaping because they travel as argv elements.
-      //   - tmux's own `-e KEY=VAL` is deliberately NOT used: it sets the
-      //     session env (visible to the shell), which means the user's rcfile
-      //     could `unset` or `export` over it before the CLI sees it. env(1)
-      //     injection happens after rcfile load and is authoritative.
-      const shellSpec = resolveUserShell(process.env, opts.launchShell);
-      const envAssignments = buildBotmuxEnvAssignments(opts.env, opts.injectEnv);
-      // Debug knob — when on, the wrapper does NOT `exec` the CLI; it runs the
-      // CLI as a child and then drops into an interactive `$shell -i` so the
-      // user can poke at PATH / NVM / pnpm in the web terminal after exiting
-      // the CLI with Ctrl-C. Worker will still think the CLI is alive (it
-      // can't see the child-vs-exec distinction), so don't send messages
-      // through the bot while in this mode — type into the web terminal directly.
-      const debugKeepShell = process.env.BOTMUX_DEBUG_KEEP_SHELL === '1';
-      // Host-resolve the wrapper bin dir from opts.env (BOTMUX_CORE_ONLY /
-      // SESSION_DATA_DIR are scrubbed inside the pane before the script runs, so it
-      // MUST be baked in host-side — codex P1). opts.env is the authoritative
-      // per-session env the daemon assembled, not the scrubbed pane env.
-      const wrapperBinDir = resolveBotmuxWrapperBinDir(opts.env ?? process.env);
-      const shellKind = shellKindForPath(shellSpec.shell);
-      const script = debugKeepShell
-        ? buildDebugKeepShellScript(shellSpec.shell, wrapperBinDir, shellKind)
-        : shellWrapperScript(wrapperBinDir, shellKind);
-      if (debugKeepShell) {
-        logger.info(
-          `[tmux:${this.sessionName}] BOTMUX_DEBUG_KEEP_SHELL=1 — CLI exit will drop ` +
-          `to interactive ${shellSpec.shell} in the web terminal`,
-        );
-      }
-
-      const tmuxArgs = [
-        'new-session',
-        '-s', this.sessionName,
-        '-x', String(opts.cols),
-        '-y', String(opts.rows),
-        '--',
-        ...shellCommandArgv(shellSpec, script, [
-          opts.cwd,
-          ...envAssignments,
-          bin, ...args,
-        ]),
-      ];
-      this.process = pty.spawn('tmux', tmuxArgs, {
-        name: 'xterm-256color',
-        cols: opts.cols,
-        rows: opts.rows,
-        cwd: opts.cwd,
-        env: childEnv,
-      });
-    }
-
-    // Configure tmux session options.
-    // Runs for BOTH new sessions and reattach — reattach needs this to
-    // backfill options added after the session was originally created.
-    // Setting an already-applied option is idempotent.
-    setTimeout(() => {
-      configureTmuxSessionOptions(this.sessionName);
-    }, 500);
-  }
-
-  /** Whether the last spawn() re-attached to an existing tmux session. */
-  get isReattach(): boolean {
-    return this.reattaching;
-  }
+  // ─── Type-level instance fields ───────────────────────────────────────────
+  //
+  // TmuxBackend is never instantiated. These three optional fields exist only
+  // so worker.ts's `(backend as TmuxBackend | PtyBackend | ZellijBackend | …)`
+  // assignments keep type-checking (a property write on a union requires the
+  // property on every member). Drop them together with those casts.
 
   /** Claude Code session JSONL path — set by worker for claude-code sessions so
    *  the claude-code adapter can verify paste+Enter submissions via file growth. */
@@ -343,227 +545,6 @@ export class TmuxBackend implements SessionBackend {
   /** Working directory the CLI was spawned in — cross-checked against the pid
    *  file's cwd field so a recycled PID can't mislead the resolver. */
   cliCwd?: string;
-
-  write(data: string): boolean {
-    if (!this.process) return false;
-    this.process.write(data);
-    return true;
-  }
-
-  /**
-   * Send text literally to the tmux pane via `tmux send-keys -l`.
-   * Uses execFileSync (no shell) so arbitrary text is safe — no escaping needed.
-   * For multiline text, use pasteText() instead (send-keys -l sends \n as Enter).
-   */
-  sendText(text: string): void {
-    this.exitCopyModeIfNeeded();
-    execFileSync('tmux', ['send-keys', '-t', this.cmdTarget, '-l', '--', text], {
-      stdio: 'ignore',
-      timeout: 5000,
-      env: tmuxEnv(),
-    });
-  }
-
-  /** Send special keys (Enter, Escape, C-c, etc.) to the tmux pane. */
-  sendSpecialKeys(...keys: string[]): void {
-    this.exitCopyModeIfNeeded();
-    execFileSync('tmux', ['send-keys', '-t', this.cmdTarget, ...keys], {
-      stdio: 'ignore',
-      timeout: 5000,
-      env: tmuxEnv(),
-    });
-  }
-
-  /**
-   * Enter copy-mode on the pane (`-e` makes it auto-exit when scrolled back to
-   * the bottom). Lets us use tmux's own scrollback even when the running app
-   * is in the alternate screen buffer (Claude Code, vim, etc.).
-   */
-  enterCopyMode(): void {
-    execFileSync('tmux', ['copy-mode', '-e', '-t', this.cmdTarget], {
-      stdio: 'ignore',
-      timeout: 5000,
-      env: tmuxEnv(),
-    });
-  }
-
-  /** Send a copy-mode X-command (e.g. 'halfpage-up', 'halfpage-down', 'cancel'). */
-  sendCopyModeCommand(xCommand: string): void {
-    execFileSync('tmux', ['send-keys', '-t', this.cmdTarget, '-X', xCommand], {
-      stdio: 'ignore',
-      timeout: 5000,
-      env: tmuxEnv(),
-    });
-  }
-
-  /**
-   * Paste text into the tmux pane via load-buffer + paste-buffer.
-   * The -p flag asks tmux to insert bracketed-paste markers
-   * (\e[200~ … \e[201~) when the application has requested bracketed paste,
-   * so TUI apps (CoCo/Ink, etc.) can detect paste boundaries reliably.
-   * Safe for multiline content (unlike sendText where \n becomes Enter).
-   */
-  pasteText(text: string): void {
-    this.exitCopyModeIfNeeded();
-    const bufferName = `botmux-${randomBytes(8).toString('hex')}`;
-    let loaded = false;
-    try {
-      execFileSync('tmux', ['load-buffer', '-b', bufferName, '-'], {
-        input: text,
-        stdio: ['pipe', 'ignore', 'ignore'],
-        timeout: 5000,
-        env: tmuxEnv(),
-      });
-      loaded = true;
-      execFileSync('tmux', ['paste-buffer', '-b', bufferName, '-t', this.cmdTarget, '-d', '-p'], {
-        stdio: 'ignore',
-        timeout: 5000,
-        env: tmuxEnv(),
-      });
-      loaded = false;
-    } finally {
-      if (loaded) {
-        try {
-          execFileSync('tmux', ['delete-buffer', '-b', bufferName], {
-            stdio: 'ignore',
-            timeout: 1000,
-            env: tmuxEnv(),
-          });
-        } catch { /* best-effort cleanup after a failed paste */ }
-      }
-    }
-  }
-
-  private exitCopyModeIfNeeded(): void {
-    try {
-      const inMode = execFileSync('tmux', ['display-message', '-p', '-t', this.cmdTarget, '#{pane_in_mode}'], {
-        encoding: 'utf-8',
-        stdio: ['ignore', 'pipe', 'ignore'],
-        timeout: 1000,
-        env: tmuxEnv(),
-      }).trim();
-
-      if (inMode === '1') {
-        execFileSync('tmux', ['send-keys', '-t', this.cmdTarget, '-X', 'cancel'], {
-          stdio: 'ignore',
-          timeout: 1000,
-          env: tmuxEnv(),
-        });
-      }
-    } catch {
-      // Pane may be gone or tmux may be restarting; keep the original write path best-effort.
-    }
-  }
-
-  resize(cols: number, rows: number): void {
-    this.process?.resize(cols, rows);
-  }
-
-  /** Must be called AFTER spawn(). Callbacks registered before spawn are silently lost. */
-  onData(cb: (data: string) => void): void {
-    this.process?.onData(cb);
-  }
-
-  /** Must be called AFTER spawn(). Callbacks registered before spawn are silently lost. */
-  onExit(cb: (code: number | null, signal: string | null) => void): void {
-    this.process?.onExit(({ exitCode, signal }) => {
-      cb(exitCode, signal !== undefined ? String(signal) : null);
-    });
-  }
-
-  getChildPid(): number | null {
-    try {
-      // display-message resolves the *exact* target pane (single line out),
-      // unlike list-panes which returns every pane in the target's window
-      // when cmdTarget is a pane address — taking the first line of that
-      // would silently bind to whichever pane tmux happens to list first.
-      const output = execSync(
-        `tmux display-message -p -t ${shellescape(this.cmdTarget)} '#{pane_pid}'`,
-        // Explicit stdio: execSync's default leaks the child's stderr to the
-        // parent's stderr fd. When tmux server is unavailable (transient
-        // restart, killed by user, /tmp wiped), this command writes "error
-        // connecting to /tmp/tmux-UID/default" to stderr, which the daemon's
-        // worker.stderr handler then logs as a worker error every poll cycle.
-        // tmuxEnv() also strips $TMUX so we don't target a dead parent server.
-        { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 3000, env: tmuxEnv() },
-      ).trim();
-      const pid = parseInt(output, 10);
-      return pid > 0 ? pid : null;
-    } catch {
-      return null;
-    }
-  }
-
-  /** Detach only — kills the pty viewer but leaves tmux session alive. */
-  kill(): void {
-    // Unzoom adopted pane before detaching (restore user's original layout)
-    if (this.adoptedPaneTarget) {
-      try {
-        // Only unzoom if the pane is currently zoomed
-        const zoomed = execSync(
-          `tmux display -t ${shellescape(this.adoptedPaneTarget)} -p '#{window_zoomed_flag}'`,
-          { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], env: tmuxEnv() },
-        ).trim();
-        if (zoomed === '1') {
-          execSync(`tmux resize-pane -Z -t ${shellescape(this.adoptedPaneTarget)}`, { stdio: 'ignore', env: tmuxEnv() });
-        }
-      } catch { /* pane may be gone — benign */ }
-      this.adoptedPaneTarget = null;
-    }
-    if (this.process) {
-      try { this.process.kill(); } catch { /* already dead */ }
-      this.process = null;
-    }
-  }
-
-  /** Kill the tmux session permanently. Called on explicit /close. */
-  destroySession(): void {
-    this.kill();
-    if (this.ownsSession) {
-      TmuxBackend.killSession(this.sessionName);
-    }
-  }
-
-  /**
-   * Attach to an existing user tmux pane (not a bmx-* session).
-   * Used by adopt mode — Botmux observes an already-running CLI.
-   *
-   * Zooms the target pane so only it is visible (hides other panes in the window).
-   * The zoom is undone when the backend is killed (detach/disconnect).
-   */
-  attachToExisting(tmuxTarget: string, opts: SpawnOpts): void {
-    this.reattaching = true;
-    this.adoptedPaneTarget = tmuxTarget;
-
-    // Zoom the target pane BEFORE attaching — this makes the pane fill the entire
-    // window, so the PTY output (and web terminal) only shows this one pane.
-    // If the pane is already the only one in the window, zoom is a no-op.
-    //
-    // We intentionally attach to the source session directly rather than
-    // creating a grouped viewer session: in tmux -CC + iTerm2 control mode
-    // the extra session disrupts the integration's window/pane bookkeeping
-    // and tearing it down on disconnect breaks the user's original layout
-    // (iTerm splits one source window's panes into separate native windows).
-    // The downside is the web terminal will follow whichever window the
-    // user's primary -CC client is currently focused on; that stickiness
-    // can be revisited later via `tmux pipe-pane` (out-of-band capture)
-    // without polluting the -CC client.
-    try {
-      execSync(`tmux resize-pane -Z -t ${shellescape(tmuxTarget)}`, { stdio: 'ignore', env: tmuxEnv() });
-    } catch { /* benign */ }
-
-    this.process = pty.spawn('tmux', ['attach-session', '-t', tmuxTarget], {
-      name: 'xterm-256color',
-      cols: opts.cols,
-      rows: opts.rows,
-      cwd: opts.cwd,
-      env: tmuxEnv(opts.env),
-    });
-  }
-
-  getAttachInfo() {
-    return { type: 'tmux' as const, sessionName: this.sessionName };
-  }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -640,6 +621,11 @@ export function buildBotmuxEnvAssignments(
   injectEnv?: Record<string, string>,
 ): string[] {
   const out: string[] = [];
+  // env(1) runs AFTER the login shell's rcfiles, so stripping these only from
+  // the worker/client env is insufficient: rcfiles can reintroduce them.
+  if (env?.BOTMUX_CODEX_INSTANCE_BINDING) {
+    for (const key of ['OPENAI_API_KEY', 'CODEX_API_KEY', 'OPENAI_BASE_URL']) out.push('-u', key);
+  }
   if (env) {
     for (const key of BOTMUX_INJECTED_ENV_KEYS) {
       const val = env[key];
@@ -655,6 +641,35 @@ export function buildBotmuxEnvAssignments(
       if (val === undefined) continue;
       out.push(`${key}=${val}`);
     }
+    // CA bundle: same treatment as proxy vars (see CA_BUNDLE_ENV_KEYS). Emitted
+    // per pane so a value the worker resolved for a sandboxed Codex reaches the
+    // CLI and overrides a stale server-global one, while a user's own value on
+    // their tmux server survives untouched for every other CLI.
+    for (const key of CA_BUNDLE_ENV_KEYS) {
+      const val = env[key];
+      if (val === undefined) continue;
+      out.push(`${key}=${val}`);
+    }
+    // Session scratch must be pane-local. In particular, never rely on the
+    // shared tmux server's ambient TMPDIR: one bot can otherwise write into
+    // another session's scratch tree (or back into a tmpfs-backed /tmp).
+    for (const key of SESSION_TEMP_ENV_KEYS) {
+      const val = env[key];
+      if (val === undefined) continue;
+      out.push(`${key}=${val}`);
+    }
+    // Workflow (v3 goal-mode) identity: BOTMUX_WORKFLOW / BOTMUX_GOAL_* etc.
+    // These are NOT in BOTMUX_INJECTED_ENV_KEYS (they belong to the ephemeral
+    // pool, not general sessions), so like proxy/CA they must be forwarded
+    // explicitly here — otherwise a v3 worker on the tmux backend loses its
+    // whole workflow env and the CLI can't see the goal (the PTY backend passed
+    // the full env, so it never hit this). Emitted only when defined, so
+    // non-workflow panes are unaffected.
+    for (const key of WORKFLOW_WORKER_ENV_KEYS) {
+      const val = env[key];
+      if (val === undefined) continue;
+      out.push(`${key}=${val}`);
+    }
   }
   // Per-bot env (bots.json `env`): appended AFTER the botmux-managed keys so a
   // bot's provider creds win over any same-named leftover, and emitted ONLY
@@ -665,6 +680,7 @@ export function buildBotmuxEnvAssignments(
   // crossed an IPC boundary from the daemon).
   if (injectEnv) {
     for (const [key, val] of Object.entries(sanitizePerBotEnv(injectEnv))) {
+      if (env?.BOTMUX_CODEX_INSTANCE_BINDING && ['CODEX_HOME', 'OPENAI_API_KEY', 'CODEX_API_KEY', 'OPENAI_BASE_URL', 'BOTMUX_CODEX_INSTANCE_BINDING'].includes(key)) continue;
       out.push(`${key}=${val}`);
     }
   }
@@ -823,24 +839,30 @@ function specForKind(shell: string, kind: ShellKind): ShellSpec {
   }
 }
 
-function configureTmuxSessionOptions(sessionName: string): void {
+function configureTmuxSessionOptions(sessionName: string, socketName?: string): void {
   try {
     const t = shellescape(sessionName);
+    const tmux = tmuxCommand(socketName);
     const env = tmuxEnv();
     // status bar ON — see TmuxPipeBackend.applySessionOptions for the rationale:
     // shows the window list to a user who manually `tmux attach`es, and is a
     // client-level overlay that never enters the pane stream the card / web
     // terminal capture, so it has zero effect on them.
-    execSync(`tmux set-option -t ${t} status on`, { stdio: 'ignore', env });
-    execSync(`tmux set-option -t ${t} mouse on`, { stdio: 'ignore', env });
+    execSync(`${tmux} set-option -t ${t} status on`, { stdio: 'ignore', env });
+    execSync(`${tmux} set-option -t ${t} mouse on`, { stdio: 'ignore', env });
     // set-clipboard is a server option — enable OSC 52 passthrough for web copy
-    execSync(`tmux set-option -s set-clipboard on`, { stdio: 'ignore', env });
-    execSync(`tmux set-option -t ${t} history-limit 50000`, { stdio: 'ignore', env });
+    execSync(`${tmux} set-option -s set-clipboard on`, { stdio: 'ignore', env });
+    execSync(`${tmux} set-option -t ${t} history-limit 50000`, { stdio: 'ignore', env });
     // Prevent web terminal clients (smaller viewport) from shrinking the
     // tmux window. If a web client at 80x24 causes tmux to resize the window
     // down, reflowed content shifts buffer positions and historical output
     // leaks into the streaming card.
-    execSync(`tmux set-option -t ${t} window-size largest`, { stdio: 'ignore', env });
+    // window-size largest exists since tmux 3.1; skip on known-older builds.
+    // Unknown version: keep trying (best-effort inside the try/catch).
+    const version = getTmuxVersionCached();
+    if (version === null || tmuxVersionAtLeast(version, 3, 1)) {
+      execSync(`${tmux} set-option -t ${t} window-size largest`, { stdio: 'ignore', env });
+    }
   } catch { /* session may not be ready yet — benign */ }
 }
 

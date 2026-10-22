@@ -37,6 +37,8 @@ export interface PlatformTeamBot {
   appId: string;
   unionId?: string;
   name?: string;
+  /** Platform-attested owner of the machine that hosts this bot. */
+  ownerUnionId?: string;
 }
 
 export interface PlatformTeamSyncTeam {
@@ -46,7 +48,8 @@ export interface PlatformTeamSyncTeam {
   groupChatIds: string[];
   bots: PlatformTeamBot[];
   /** Team members' (people's) union_ids — the human talk-免grant leg: a member
-   *  is trusted to TALK (never operate) inside this team's group chats. */
+   *  is trusted to TALK (never operate) to any bot on the SAME team, in any chat
+   *  they share with it (not scoped to this team's group chats). */
   memberUnionIds: string[];
 }
 
@@ -93,7 +96,15 @@ function sanitizeTeam(raw: unknown): PlatformTeamSyncTeam | null {
       if (!appId) continue;
       const unionId = typeof (b as Record<string, unknown>).unionId === 'string' ? String((b as Record<string, unknown>).unionId).trim() : '';
       const name = typeof (b as Record<string, unknown>).name === 'string' ? String((b as Record<string, unknown>).name) : undefined;
-      bots.push({ appId, unionId: unionId || undefined, name });
+      const ownerUnionId = typeof (b as Record<string, unknown>).ownerUnionId === 'string'
+        ? String((b as Record<string, unknown>).ownerUnionId).trim()
+        : '';
+      bots.push({
+        appId,
+        unionId: unionId || undefined,
+        name,
+        ownerUnionId: /^on_[A-Za-z0-9]+$/.test(ownerUnionId) ? ownerUnionId : undefined,
+      });
     }
   }
   const memberUnionIds = Array.isArray(t.memberUnionIds)
@@ -166,24 +177,65 @@ export function isPlatformTeamBot(dataDir: string, unionId: string | undefined):
   return false;
 }
 
-/** Is `unionId` a HUMAN member of a platform team AND is `chatId` one of that
- *  team's group chats? The talk-免grant leg for people: a teammate speaking in
- *  the team's own group is trusted to TALK without /grant — but scoped to those
- *  groups (not everywhere), and TALK only (operate stays allowedUsers-gated, the
- *  caller must never route this predicate into canOperate). Both conditions must
- *  hold on the SAME team so cross-team leakage is impossible. */
-export function isPlatformTeamMemberChat(
+export type PlatformTeamBotOwnerResolution =
+  | { status: 'resolved'; ownerUnionId: string }
+  | { status: 'missing' | 'conflict' };
+
+/**
+ * Resolve the owner of one authenticated peer bot inside the target bot's
+ * platform-team trust domain.
+ *
+ * `sourceBotUnionId` comes from the Lark event, never message content. A roster
+ * owner is accepted only when source bot, target bot and owner are members of
+ * the same team. Multiple teams may repeat the same pair; conflicting owners
+ * fail closed instead of picking one by order.
+ */
+export function resolvePlatformTeamBotOwner(
   dataDir: string,
-  chatId: string | undefined,
+  targetAppId: string,
+  sourceBotUnionId: string | undefined,
+): PlatformTeamBotOwnerResolution {
+  const target = targetAppId.trim();
+  const source = (sourceBotUnionId ?? '').trim();
+  if (!target.startsWith('cli_') || !source.startsWith('on_')) return { status: 'missing' };
+  const owners = new Set<string>();
+  for (const team of readFile(dataDir)?.teams ?? []) {
+    if (!team.bots.some(bot => bot.appId === target)) continue;
+    for (const bot of team.bots) {
+      if (bot.unionId !== source || !bot.ownerUnionId) continue;
+      if (!team.memberUnionIds.includes(bot.ownerUnionId)) continue;
+      owners.add(bot.ownerUnionId);
+    }
+  }
+  if (owners.size === 1) return { status: 'resolved', ownerUnionId: [...owners][0]! };
+  return { status: owners.size > 1 ? 'conflict' : 'missing' };
+}
+
+/** Is `unionId` a HUMAN member of a platform team that THIS bot (`botAppId`)
+ *  also belongs to? The talk-免grant leg for people: a teammate is trusted to
+ *  TALK to a bot on their own team without /grant, in ANY chat they share —
+ *  not just platform-拉群 groups. The scope anchor is TEAM CO-MEMBERSHIP
+ *  (bot ∈ team.bots ∧ sender ∈ team.memberUnionIds on the SAME team), not the
+ *  chat: this is what lets a手动/原生 invite 群 work at parity with拉群 groups
+ *  (those 群 never enter groupChatIds; keying on the chat left them 要 /grant).
+ *
+ *  Cross-team leakage stays impossible because both predicates must hold on the
+ *  SAME team, and the bot only ever sees teams it is itself opted into (platform
+ *  team-sync is pushed per member machine; a bot not in team T never appears in
+ *  T.bots, so T's members can't reach it here). TALK only — operate stays
+ *  allowedUsers-gated; the caller must never route this predicate into canOperate. */
+export function isPlatformTeamMember(
+  dataDir: string,
+  botAppId: string | undefined,
   unionId: string | undefined,
 ): boolean {
-  const cid = (chatId ?? '').trim();
+  const appId = (botAppId ?? '').trim();
   const uid = (unionId ?? '').trim();
-  if (!cid || !uid) return false;
+  if (!appId || !uid) return false;
   const data = readFile(dataDir);
   if (!data) return false;
   for (const t of data.teams) {
-    if (t.memberUnionIds.includes(uid) && t.groupChatIds.includes(cid)) return true;
+    if (t.memberUnionIds.includes(uid) && t.bots.some((b) => b.appId === appId)) return true;
   }
   return false;
 }

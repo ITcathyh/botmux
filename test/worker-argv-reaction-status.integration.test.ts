@@ -1,8 +1,9 @@
-import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
-import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync, type ChildProcess } from 'node:child_process';
+import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
 const children = new Set<ChildProcess>();
@@ -60,8 +61,59 @@ async function waitForScreenUpdates(
   );
 }
 
-async function waitForLog(child: ChildProcess, logs: string[], needle: string): Promise<void> {
+/** Wait until the screen_update stream has SETTLED on idle: the newest update is
+ *  idle and stays idle across a quiet window.
+ *
+ *  Why this exists instead of `waitForScreenUpdates(..., u => u.status === 'idle')`:
+ *  on an argv-baked first turn the worker legitimately publishes
+ *  `working -> idle -> working -> idle`. The middle idle is the startup-window
+ *  false idle that the worker itself rejects and re-arms (see `src/worker.ts`,
+ *  "re-arming idle detector"), so "an idle has been seen" and "the turn ended
+ *  idle" are different statements. Waiting for the first idle while asserting on
+ *  the LAST update only agrees while every trailing update happens to arrive in
+ *  one IPC batch: locally all three land in the same millisecond, so the poll
+ *  always observes the settled tail and the test passes. Under CI contention that
+ *  batch splits, the poll can wake between the re-armed `working` and the final
+ *  `idle`, and the tail assertion reads `working` -- a CI-only failure with no
+ *  product-side cause. Settling on the tail removes the dependency on delivery
+ *  batching and is strictly stronger: a transient idle is followed by the re-armed
+ *  `working` well inside the quiet window, so it can no longer end the wait. */
+async function waitForSettledIdle(
+  child: ChildProcess,
+  messages: WorkerToDaemon[],
+  logs: string[],
+  quietMs = 500,
+): Promise<Array<Extract<WorkerToDaemon, { type: 'screen_update' }>>> {
   const deadline = Date.now() + 10_000;
+  let idleSince: number | undefined;
+  while (Date.now() < deadline) {
+    const updates = messages.filter(
+      (message): message is Extract<WorkerToDaemon, { type: 'screen_update' }> =>
+        message.type === 'screen_update',
+    );
+    if (updates.at(-1)?.status === 'idle') {
+      idleSince ??= Date.now();
+      if (Date.now() - idleSince >= quietMs) return updates;
+    } else {
+      idleSince = undefined;
+    }
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(`worker exited before the screen settled idle\n${logs.join('')}`);
+    }
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 25));
+  }
+  throw new Error(
+    `timed out waiting for the screen to settle idle: ${JSON.stringify(messages)}\n${logs.join('')}`,
+  );
+}
+
+async function waitForLog(
+  child: ChildProcess,
+  logs: string[],
+  needle: string,
+  timeoutMs = 10_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (logs.some(entry => entry.includes(needle))) return;
     if (child.exitCode !== null || child.signalCode !== null) {
@@ -81,11 +133,29 @@ async function waitForPromptReady(
   while (Date.now() < deadline) {
     if (messages.some(message => message.type === 'prompt_ready')) return;
     if (child.exitCode !== null || child.signalCode !== null) {
-      throw new Error(`worker exited before prompt_ready\n${logs.join('')}`);
+      throw new Error(`worker pid=${child.pid} exited before prompt_ready (code=${child.exitCode}, signal=${child.signalCode})\n${JSON.stringify(messages)}\n${logs.join('')}`);
     }
     await new Promise(resolvePromise => setTimeout(resolvePromise, 25));
   }
   throw new Error(`timed out waiting for prompt_ready: ${JSON.stringify(messages)}\n${logs.join('')}`);
+}
+
+async function waitForMessage<T extends WorkerToDaemon['type']>(
+  child: ChildProcess,
+  messages: WorkerToDaemon[],
+  type: T,
+  logs: string[],
+): Promise<Extract<WorkerToDaemon, { type: T }>> {
+  const deadline = Date.now() + 12_000;
+  while (Date.now() < deadline) {
+    const found = messages.find((m): m is Extract<WorkerToDaemon, { type: T }> => m.type === type);
+    if (found) return found;
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(`worker exited before ${type}\n${logs.join('')}`);
+    }
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 25));
+  }
+  throw new Error(`timed out waiting for ${type}: ${JSON.stringify(messages)}\n${logs.join('')}`);
 }
 
 /** A Pi transcript `message` record, shaped like SessionManager's JSONL. */
@@ -101,7 +171,279 @@ function piTranscriptRecord(role: 'user' | 'assistant', text: string, stopReason
   }) + '\n';
 }
 
+function ompTranscriptRecord(
+  id: string,
+  parentId: string | null,
+  role: 'user' | 'assistant',
+  content: string,
+  stopReason?: string,
+): string {
+  return JSON.stringify({
+    type: 'message',
+    id,
+    parentId,
+    timestamp: new Date().toISOString(),
+    message: {
+      role,
+      content: content ? [{ type: 'text', text: content }] : [],
+      ...(stopReason ? { stopReason } : {}),
+    },
+  }) + '\n';
+}
+
 describe('worker argv reaction status', () => {
+  it('forwards the frozen TraeX backend variant into the actual spawn argv', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-traex-variant-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    mkdirSync(dataDir, { recursive: true });
+
+    const fakeTraex = join(root, 'fake-traex');
+    writeFileSync(fakeTraex, `#!/usr/bin/env node
+process.stdout.write('❯ Ready\n');
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakeTraex, 0o755);
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: 'sid-worker-traex-variant',
+        LARK_APP_ID: 'app_test',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-worker-traex-variant',
+      chatId: 'oc_test',
+      rootMessageId: 'om_root',
+      workingDir: dataDir,
+      cliId: 'traex',
+      cliPathOverride: fakeTraex,
+      modelBackendVariant: 'max',
+      backendType: 'pty',
+      prompt: '',
+      larkAppId: 'app_test',
+      larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+
+    await waitForLog(child, logs, 'model_backend_variant="max"', 30_000);
+    expect(logs.join('')).toContain('Spawning fresh CLI:');
+  }, 40_000);
+
+  it('attaches a spawned OMP bridge and quiet-flushes one trailing final', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-omp-quiet-final-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    const sessionId = 'sid-worker-omp-quiet-final';
+    const transcriptDir = join(root, '.omp', 'agent', 'sessions', 'botmux', sessionId);
+    const transcriptPath = join(transcriptDir, 'session.jsonl');
+    mkdirSync(dataDir, { recursive: true });
+    mkdirSync(transcriptDir, { recursive: true });
+    writeFileSync(transcriptPath, '');
+
+    const fakeOmp = join(root, 'fake-omp');
+    writeFileSync(fakeOmp, `#!/usr/bin/env node
+process.stdout.write('OMP ready\\n');
+process.stdin.on('data', () => {
+  process.stdout.write('\\r\\u001b[2KWorking...');
+  setTimeout(() => process.stdout.write('\\r\\u001b[2KOMP ready\\n'), 3_000);
+});
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakeOmp, 0o755);
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: sessionId,
+        LARK_APP_ID: 'app_test',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => {
+      const message = raw as WorkerToDaemon;
+      messages.push(message);
+      if (message.type === 'error') logs.push(`worker error: ${message.message}\n`);
+    });
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+
+    child.send({
+      type: 'init',
+      sessionId,
+      chatId: 'oc_test',
+      rootMessageId: 'om_root',
+      workingDir: dataDir,
+      cliId: 'oh-my-pi',
+      cliPathOverride: fakeOmp,
+      backendType: 'pty',
+      prompt: '',
+      larkAppId: 'app_test',
+      larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+
+    await waitForLog(child, logs, 'Codex bridge fresh-empty:');
+    await waitForPromptReady(child, messages, logs);
+    child.send({
+      type: 'message',
+      content: 'ordinary OMP turn',
+      turnId: 'om_omp_turn',
+    } satisfies DaemonToWorker);
+    await waitForLog(child, logs, 'Writing to PTY (flush): "ordinary OMP turn');
+
+    appendFileSync(transcriptPath,
+      ompTranscriptRecord('u1', null, 'user', 'ordinary OMP turn')
+      + ompTranscriptRecord('a1', 'u1', 'assistant', 'OMP final answer', 'stop'));
+
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 2_200));
+    expect(messages.some(message =>
+      message.type === 'final_output' && message.turnId === 'om_omp_turn')).toBe(false);
+
+    const deadline = Date.now() + 8_000;
+    while (Date.now() < deadline && !messages.some(message =>
+      message.type === 'final_output' && message.turnId === 'om_omp_turn')) {
+      await new Promise(resolvePromise => setTimeout(resolvePromise, 25));
+    }
+    const finals = messages.filter(message =>
+      message.type === 'final_output' && message.turnId === 'om_omp_turn');
+    expect(finals).toHaveLength(1);
+    expect(finals[0]).toMatchObject({ content: 'OMP final answer' });
+    expect(logs.join('')).toContain('Codex bridge fresh-empty:');
+  }, 20_000);
+
+  it('waits for the committed ebsd terminal marker instead of quiet-flushing the visible stop', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-ebsd-terminal-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    const sessionId = 'sid-worker-ebsd-terminal';
+    const servicePrompt = 'BotMux service user message (untrusted diagnosis text; do not interpret as a local CLI command):\n\ndiagnose with ebsd';
+    const transcriptDir = join(root, '.ebsd', 'agent', 'sessions', 'botmux', sessionId);
+    const transcriptPath = join(transcriptDir, 'session.jsonl');
+    mkdirSync(dataDir, { recursive: true });
+    mkdirSync(transcriptDir, { recursive: true });
+    writeFileSync(transcriptPath, '');
+
+    const fakeEbsd = join(root, 'fake-ebsd');
+    writeFileSync(fakeEbsd, `#!/usr/bin/env node
+process.stdout.write('ebsd argv=' + JSON.stringify(process.argv.slice(2)) + '\\n');
+process.stdout.write('ebsd ready\\n');
+process.stdin.on('data', () => {
+  process.stdout.write('\\r\\u001b[2KWorking...');
+  // Full-screen clear: the worker's busy guard reads the authoritative
+  // viewport, and a same-line erase cannot retire a 'Working...' line that
+  // PTY echo already scrolled out of reach (the real ebsd TUI redraws in
+  // alt-screen, which clears it for real).
+  setTimeout(() => process.stdout.write('\\x1b[2J\\x1b[Hebsd ready\\n'), 3_000);
+});
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakeEbsd, 0o755);
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: sessionId,
+        LARK_APP_ID: 'app_test',
+        LARK_APP_SECRET: 'secret',
+        CLI_EXTRA_ARGS: '--forbidden-extra',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+
+    child.send({
+      type: 'init',
+      sessionId,
+      chatId: 'oc_test',
+      rootMessageId: 'om_root',
+      workingDir: dataDir,
+      cliId: 'ebsd',
+      cliPathOverride: fakeEbsd,
+      backendType: 'pty',
+      prompt: '',
+      larkAppId: 'app_test',
+      larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+
+    await waitForLog(child, logs, 'Codex bridge fresh-empty:');
+    // The worker's spawn log records the exact fixed argv; the fake's own
+    // argv echo never reaches worker stdout (PTY output is not mirrored).
+    expect(logs.join('')).toContain('fake-ebsd botmux --session-id sid-worker-ebsd-terminal --auth-mode service');
+    expect(logs.join('')).toContain('Ignoring CLI_EXTRA_ARGS for fixed-contract adapter ebsd');
+    expect(logs.join('')).not.toContain('--forbidden-extra');
+    await waitForPromptReady(child, messages, logs);
+    // Production wraps ebsd user text in the service-user envelope on the
+    // daemon side (session-manager buildFollowUpContent); the worker passes
+    // the payload through unchanged, so this worker-level test feeds the
+    // already-wrapped form.
+    child.send({
+      type: 'message',
+      content: servicePrompt,
+      turnId: 'om_ebsd_turn',
+    } satisfies DaemonToWorker);
+    await waitForLog(child, logs, 'Writing to PTY (flush): "BotMux service user message');
+
+    appendFileSync(transcriptPath,
+      ompTranscriptRecord('u1', null, 'user', servicePrompt)
+      + ompTranscriptRecord('a1', 'u1', 'assistant', 'visible ebsd answer', 'stop'));
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 5_500));
+    expect(messages.some(message =>
+      message.type === 'final_output' && message.turnId === 'om_ebsd_turn')).toBe(false);
+
+    appendFileSync(transcriptPath, JSON.stringify({
+      type: 'custom',
+      id: 'terminal-1',
+      parentId: 'a1',
+      timestamp: new Date().toISOString(),
+      customType: 'ebsd.botmux.turn_completed.v1',
+      data: {
+        schema_version: 1,
+        outcome: 'completed',
+        answer: 'visible ebsd answer',
+        finalization: 'forced',
+        diagnosis_status: 'completed',
+      },
+    }) + '\n');
+
+    const deadline = Date.now() + 8_000;
+    while (Date.now() < deadline && !messages.some(message =>
+      message.type === 'final_output' && message.turnId === 'om_ebsd_turn')) {
+      await new Promise(resolvePromise => setTimeout(resolvePromise, 25));
+    }
+    const finals = messages.filter(message =>
+      message.type === 'final_output' && message.turnId === 'om_ebsd_turn');
+    expect(finals, logs.join('')).toHaveLength(1);
+    expect(finals[0]).toMatchObject({ content: 'visible ebsd answer' });
+  }, 25_000);
+
   it('keeps an argv-baked Pi turn working until its viewport loses Working...', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-pi-busy-'));
     tempDirs.add(root);
@@ -128,7 +470,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -172,21 +514,180 @@ setInterval(() => {}, 1_000);
 
     appendFileSync(transcriptPath, piTranscriptRecord('assistant', 'final answer', 'stop'));
 
-    await waitForScreenUpdates(
-      child,
-      messages,
-      1,
-      logs,
-      update => update.status === 'idle',
-      'idle screen update',
-    );
-    const updates = messages.filter(
-      (message): message is Extract<WorkerToDaemon, { type: 'screen_update' }> =>
-        message.type === 'screen_update',
-    );
+    const updates = await waitForSettledIdle(child, messages, logs);
     expect(updates[0]?.status).toBe('working');
     expect(updates.at(-1)?.status).toBe('idle');
   }, 20_000);
+
+  it('holds prompt ready while Pi 1.3.0 still animates its `⠴ Working` border line', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-pi13-busy-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    mkdirSync(dataDir, { recursive: true });
+
+    const cliSessionId = 'deadbeef-1234-4678-9abc-def012345679';
+    const piSessionsDir = join(root, '.pi', 'agent', 'sessions', dataDir.replace(/\//g, '--'));
+    mkdirSync(piSessionsDir, { recursive: true });
+    const transcriptPath = join(piSessionsDir, `20261021120000_${cliSessionId}.jsonl`);
+    writeFileSync(transcriptPath, '');
+
+    // Byte shape copied from a real Pi 1.3.0 pane: the editor's top border
+    // carries `<braille frame> Working` with no ellipsis, each part in its own
+    // SGR span, repainted every 80ms until the turn's TUI work ends.
+    const busyStopMarker = join(root, 'busy-stopped');
+    const fakePi = join(root, 'fake-pi');
+    writeFileSync(fakePi, `#!/usr/bin/env node
+const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+let frame = 0;
+const spin = setInterval(() => {
+  process.stdout.write('\\x1b[6;1H\\x1b[2K\\x1b[38;5;104m── \\x1b[39m\\x1b[38;5;104m'
+    + frames[frame++ % frames.length] + '\\x1b[39m \\x1b[38;5;104mWorking\\x1b[39m\\x1b[38;5;104m '
+    + '─'.repeat(40) + '\\x1b[39m');
+}, 80);
+setTimeout(() => {
+  clearInterval(spin);
+  const stoppedAt = String(Date.now());
+  void import('node:fs').then(fs => fs.writeFileSync(${JSON.stringify(busyStopMarker)}, stoppedAt));
+  process.stdout.write('\\x1b[2J\\x1b[H' + '─'.repeat(40) + '\\n');
+}, 6_000);
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakePi, 0o755);
+
+    const messages: WorkerToDaemon[] = [];
+    const promptReadyAt: number[] = [];
+    const logs: string[] = [];
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: 'sid-worker-pi13-busy',
+        LARK_APP_ID: 'app_test',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => {
+      const message = raw as WorkerToDaemon;
+      messages.push(message);
+      if (message.type === 'prompt_ready') promptReadyAt.push(Date.now());
+    });
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-worker-pi13-busy',
+      chatId: 'oc_test',
+      rootMessageId: 'om_root',
+      workingDir: dataDir,
+      cliId: 'pi',
+      cliPathOverride: fakePi,
+      cliSessionId,
+      backendType: 'pty',
+      prompt: 'hello from argv',
+      larkAppId: 'app_test',
+      larkAppSecret: 'secret',
+      turnId: 'om_turn',
+    } satisfies DaemonToWorker);
+
+    await waitForLog(child, logs, 'Codex bridge fresh-empty:');
+    // Real Pi paints its busy line before it can write a final. Under load the
+    // fake's first frame can lag the bridge attach, so wait until the worker's
+    // own screen shows it before ending the turn in the transcript.
+    await waitForScreenUpdates(child, messages, 1, logs, update => /[\u2800-\u28FF] Working/.test(update.content), 'a screen showing the busy line');
+    // The transcript says the turn is over while the TUI is still busy — the
+    // exact window where Pi's transcript final precedes its busy line clearing.
+    appendFileSync(transcriptPath,
+      piTranscriptRecord('user', 'hello from argv')
+      + piTranscriptRecord('assistant', 'final answer', 'stop'));
+    await waitForLog(child, logs, 'authoritative viewport still shows busy marker; deferring prompt ready');
+
+    await waitForPromptReady(child, messages, logs);
+    const busyStoppedAt = Number(readFileSync(busyStopMarker, 'utf8'));
+    expect(promptReadyAt[0]).toBeGreaterThanOrEqual(busyStoppedAt);
+    expect(logs.join('')).not.toContain('Argv-baked first prompt has not visibly started');
+  }, 30_000);
+
+  it('does not fail open to idle at the 90s grace while the PTY is still streaming', async () => {
+    // The argv first-turn gate fails open after 90s without start evidence.
+    // Here Pi animates a busy line busyPattern does not know (a future label
+    // rename — exactly how 1.3.0 broke `Working...`), so the only remaining
+    // signal is that the PTY never goes quiet. Long by necessity: the grace
+    // is a real 90s timer inside the worker process.
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-pi-failopen-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    mkdirSync(dataDir, { recursive: true });
+
+    const busyStopMarker = join(root, 'busy-stopped');
+    const fakePi = join(root, 'fake-pi');
+    writeFileSync(fakePi, `#!/usr/bin/env node
+const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+let frame = 0;
+const spin = setInterval(() => {
+  process.stdout.write('\\x1b[6;1H\\x1b[2K── ' + frames[frame++ % frames.length] + ' Pondering ' + '─'.repeat(40));
+}, 80);
+setTimeout(() => {
+  clearInterval(spin);
+  const stoppedAt = String(Date.now());
+  void import('node:fs').then(fs => fs.writeFileSync(${JSON.stringify(busyStopMarker)}, stoppedAt));
+  process.stdout.write('\\x1b[2J\\x1b[H' + '─'.repeat(40) + '\\n');
+}, 96_000);
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakePi, 0o755);
+
+    const messages: WorkerToDaemon[] = [];
+    const promptReadyAt: number[] = [];
+    const logs: string[] = [];
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: 'sid-worker-pi-failopen',
+        LARK_APP_ID: 'app_test',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => {
+      const message = raw as WorkerToDaemon;
+      messages.push(message);
+      if (message.type === 'prompt_ready') promptReadyAt.push(Date.now());
+    });
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-worker-pi-failopen',
+      chatId: 'oc_test',
+      rootMessageId: 'om_root',
+      workingDir: dataDir,
+      cliId: 'pi',
+      cliPathOverride: fakePi,
+      cliSessionId: 'deadbeef-1234-4678-9abc-def01234567a',
+      backendType: 'pty',
+      prompt: 'hello from argv',
+      larkAppId: 'app_test',
+      larkAppSecret: 'secret',
+      turnId: 'om_turn',
+    } satisfies DaemonToWorker);
+
+    await waitForLog(child, logs, 'holding fail-open until it goes quiet', 100_000);
+    expect(promptReadyAt, logs.join('')).toHaveLength(0);
+
+    await waitForPromptReady(child, messages, logs);
+    const busyStoppedAt = Number(readFileSync(busyStopMarker, 'utf8'));
+    expect(promptReadyAt[0]).toBeGreaterThanOrEqual(busyStoppedAt);
+  }, 130_000);
 
   it('defers a Pi transcript final that lands while the viewport still shows Working...', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-pi-external-busy-'));
@@ -216,7 +717,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -325,7 +826,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -436,7 +937,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -492,19 +993,9 @@ setInterval(() => {}, 1_000);
     await waitForPromptReady(child, messages, logs);
 
     // prompt_ready is sent before the seed's working→idle pair; wait for the
-    // seed's idle to land instead of counting raw updates.
-    await waitForScreenUpdates(
-      child,
-      messages,
-      1,
-      logs,
-      update => update.status === 'idle',
-      'idle screen update',
-    );
-    const updates = messages.filter(
-      (message): message is Extract<WorkerToDaemon, { type: 'screen_update' }> =>
-        message.type === 'screen_update',
-    );
+    // screen to settle idle instead of counting raw updates — the seed's idle is
+    // not necessarily the last update (see waitForSettledIdle).
+    const updates = await waitForSettledIdle(child, messages, logs);
     expect(updates.some(message => message.status === 'working'), JSON.stringify(messages)).toBe(true);
     expect(updates.at(-1)?.status).toBe('idle');
   }, 30_000);
@@ -542,7 +1033,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -629,7 +1120,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -720,7 +1211,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -782,7 +1273,7 @@ setInterval(() => {}, 1_000);
   }, 40_000);
 
   it('never lets an idle escape between the two working edges on a Grok-class first turn', async () => {
-    // Grok arms spawnArgvInitialPromptBusy (argv-baked prompt + injectsReadyHook +
+    // Grok arms spawnArgvInitialPromptBusy (argv-baked prompt +
     // reliableTurnTerminal): its FIRST ready edge is pre-execution — the argv-baked
     // first prompt is still running. markPromptReady() would otherwise publish a
     // generic snapshot (projected idle, since isPromptReady was just set true)
@@ -815,7 +1306,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -888,7 +1379,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
@@ -932,6 +1423,88 @@ setInterval(() => {}, 1_000);
     await waitForPromptReady(child, messages, logs);
   }, 15_000);
 
+  it.skipIf(!tmuxAvailable)('publishes the adopted tmux pane CLI pid and start identity before prompt_ready', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-adopt-attest-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    mkdirSync(dataDir, { recursive: true });
+
+    const fakeCli = join(root, 'fake-cli');
+    writeFileSync(fakeCli, `#!/usr/bin/env node
+process.stdout.write('ready\\n');
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakeCli, 0o755);
+
+    const tmuxSession = `botmux-adopt-attest-${process.pid}-${Date.now()}`;
+    tmuxSessions.add(tmuxSession);
+    execFileSync('tmux', ['new-session', '-d', '-s', tmuxSession, fakeCli]);
+    const panePid = Number(
+      execFileSync('tmux', ['list-panes', '-t', tmuxSession, '-F', '#{pane_pid}']).toString().trim().split('\n')[0],
+    );
+    expect(Number.isInteger(panePid) && panePid > 1).toBe(true);
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: 'sid-worker-adopt-attest',
+        LARK_APP_ID: 'app_test',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-worker-adopt-attest',
+      chatId: 'oc_test',
+      rootMessageId: 'om_root',
+      workingDir: dataDir,
+      cliId: 'pi',
+      backendType: 'tmux',
+      prompt: '',
+      larkAppId: 'app_test',
+      larkAppSecret: 'secret',
+      turnId: 'om_turn',
+      adoptMode: true,
+      adoptTmuxTarget: `${tmuxSession}:0.0`,
+      adoptCliPid: panePid,
+      adoptPaneCols: 160,
+      adoptPaneRows: 50,
+    } satisfies DaemonToWorker);
+
+    const attestation = await waitForMessage(child, messages, 'local_process_attestation', logs);
+    expect(attestation.cliPid, JSON.stringify(attestation)).toBe(panePid);
+    expect(typeof attestation.cliProcStart === 'string' && attestation.cliProcStart.length > 0).toBe(true);
+    expect(attestation.backendType).toBe('tmux');
+
+    // The daemon snapshots the current turn's pre-existing descendants right
+    // after it records this CLI pid, so the attestation must reach it before
+    // the same-turn readiness edge. An observe-only adopt pane never emits
+    // prompt_ready, so `ready` is the readiness signal here.
+    await waitForMessage(child, messages, 'ready', logs);
+    const attestationIndex = messages.findIndex(m => m.type === 'local_process_attestation');
+    const readyIndex = messages.findIndex(m => m.type === 'ready');
+    expect(attestationIndex).toBeGreaterThanOrEqual(0);
+    expect(attestationIndex).toBeLessThan(readyIndex);
+    // Attestation precedes the current turn's origin snapshot refresh: the
+    // daemon records this CLI pid before it snapshots the turn's descendants,
+    // so a managed_turn_origin for the live turn follows the attestation.
+    const originAfterAttestation = messages.findIndex(
+      (m, i) => i > attestationIndex && m.type === 'managed_turn_origin' && m.turnId === 'om_turn',
+    );
+    expect(originAfterAttestation, JSON.stringify(messages)).toBeGreaterThan(attestationIndex);
+  }, 20_000);
+
   it('forces the synthetic working seed before classifying a limited settle', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-argv-reaction-'));
     tempDirs.add(root);
@@ -952,7 +1525,7 @@ setInterval(() => {}, 1_000);
 
     const messages: WorkerToDaemon[] = [];
     const logs: string[] = [];
-    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,

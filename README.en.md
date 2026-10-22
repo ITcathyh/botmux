@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://www.npmjs.com/package/botmux"><img src="https://img.shields.io/npm/v/botmux.svg" alt="npm"></a>
-  <img src="https://img.shields.io/badge/node-%3E%3D22-brightgreen.svg" alt="Node >= 22">
+  <img src="https://img.shields.io/badge/binary-no%20Node%20required-brightgreen.svg" alt="self-contained binary, no Node required">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT"></a>
   <a href="https://github.com/deepcoldy/botmux"><img src="https://img.shields.io/github/stars/deepcoldy/botmux.svg?style=social" alt="Stars"></a>
 </p>
@@ -39,10 +39,31 @@ A daemon watches Lark messages and spawns an isolated session process for each n
 > About 5 minutes: a single Lark QR scan in `botmux setup` creates the app, configures all permissions, and publishes a version in one flow (add `--no-open-platform-auto` to only create the app and skip the permission + publish automation, which you then complete manually; creating the app manually / pasting credentials is a separate option inside setup).
 
 ```bash
-npm install -g botmux        # requires Node >= 22
+curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
 botmux setup                 # one scan to create the app → pick a CLI → pick a working dir (permissions + publish auto-configured)
 botmux start                 # start the daemon (botmux autostart enable for auto-start on boot)
 ```
+
+> botmux ships as a **self-contained single-file binary** with its runtime embedded — **neither installing nor running it needs Node on the machine** (whatever the AI coding CLI you bridge needs is its own matter). It installs to `~/.botmux/bin/botmux` (override with `BOTMUX_INSTALL_DIR`), picks the right binary for your OS/arch, verifies its SHA-256, and adds `~/.botmux/bin` to the startup file your shell actually reads (zsh / bash / fish each get the correct one), so **a new terminal has the command**.
+>
+> Nothing native is compiled during install (no Python / node-gyp / compiler): the PTY is already inside the binary. Supported: linux / macOS × x64 / arm64, with musl builds selected automatically on Alpine and similar. **On Windows, install inside WSL2** — the daemon needs PTY / tmux / Unix signals and does not run on native Windows; WSL2 reports as linux and is a fully supported first-class environment. An unsupported platform, or a binary that cannot run on this host, **fails with an explicit error and leaves your existing install untouched** rather than leaving you with a command that won't start.
+>
+> Stable macOS CLI releases use a consistent Apple Developer ID signature. Replacing the binary during an upgrade therefore preserves the code identity used by macOS file and App Data permissions instead of appearing as a new program for every version. Canary, beta, and RC builds remain ad-hoc signed.
+>
+> To upgrade: **always re-run the curl command above** (this also upgrades npm/pnpm global installs — in-place replacement, no second PATH line), then open a new terminal and run `botmux restart`; on ≥3.18 binary installs `botmux upgrade` is equivalent. To install a pinned version (rollbacks included): `curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | BOTMUX_VERSION=v3.18.8 sh` (the variable must precede the `sh` on the right side of the pipe). ⚠️ **Do not npm-upgrade from releases older than v3.18.0** — crossing the Node-sources → binary form boundary leaves the daemon unable to restart.
+
+<details>
+<summary>Already living in the Node ecosystem? npm works too (same binary)</summary>
+
+```bash
+npm install -g botmux        # requires Node >= 22 to run the install itself
+```
+
+The npm package carries **the same self-contained binary** (only the one matching your os/arch is installed). The package's `bin` points at a shipped sh launcher that the package manager links onto PATH itself, so **npm, pnpm and bun all work without any lifecycle script** (pnpm 10/11 and bun skip dependency postinstalls by default, which used to leave those installs with no `botmux` command at all). The postinstall still points `~/.botmux/bin/botmux` at the same binary and writes PATH. So you still end up with exactly **one** botmux **version** — both entry points exec the same binary — and no more "two Node versions each carrying their own global botmux, fighting each other / no idea which one I just updated".
+
+The only difference is **who installs it**: the npm path needs Node ≥ 22 to run the install itself, the curl path never touches Node; **upgrades always re-run the curl command, no matter how you installed** (npm-upgrading from a pre-v3.18.0 install across that form boundary can leave the daemon unable to come back). Once running, the two are identical — same binary, same commands.
+
+</details>
 
 Then DM the bot, or run `botmux dashboard` to create a group, and start chatting. Full steps (Lark international, manual permission / publish setup after `--no-open-platform-auto`, troubleshooting) are in the **[5-Minute Quickstart](https://deepcoldy.github.io/botmux/en/quickstart)**.
 
@@ -52,7 +73,7 @@ Then DM the bot, or run `botmux dashboard` to create a group, and start chatting
 - **[Multi-bot collaboration](https://deepcoldy.github.io/botmux/en/multi-bot)** — multi-bot @mention routing in one group; different CLIs mean different models and natural diversity — have them critique each other on design reviews, code reviews, tech-stack choices.
 - **[Multi-topic orchestration](https://deepcoldy.github.io/botmux/en/multi-topic)** — hand an orchestrator a big task and it seeds topics in the group, spins up an isolated session per bot to run a pipeline, and the Lark task board shows every subtask's progress at a glance.
 - **[Interactive web terminal](https://deepcoldy.github.io/botmux/en/web-terminal)** — not just viewing output: drive the CLI directly from a browser / phone, with a floating shortcut bar on mobile (Esc, Ctrl+C, arrow keys).
-- **[Adopt & relay sessions](https://deepcoldy.github.io/botmux/en/adopt)** — running halfway in local tmux, `/adopt` it from your phone; `/relay` moves the whole session (same process, same memory) into a team group to continue.
+- **[Adopt & relay sessions](https://deepcoldy.github.io/botmux/en/adopt)** — pick up a running tmux, Zellij, Herdr, or Orca (experimental) session from your phone with `/adopt`; `/relay` moves the whole session (same process, same memory) into a team group to continue.
 - **[Scheduled tasks](https://deepcoldy.github.io/botmux/en/schedule) & [external triggers](https://deepcoldy.github.io/botmux/en/webhook)** — configure recurring tasks in natural language (alert analysis / group summaries); trigger programmatically from external systems via [Webhook](https://deepcoldy.github.io/botmux/en/webhook) or the [task-trigger API](https://deepcoldy.github.io/botmux/en/api-task-trigger).
 - **[On-call mode](https://deepcoldy.github.io/botmux/en/oncall) & [voice summary](https://deepcoldy.github.io/botmux/en/voice)** — pull it into an on-call group and any member's @ triggers a probe in the project dir; once TTS is configured, each card footer gains a 🔊 voice-summary button that makes the model "speak plainly".
 
@@ -60,11 +81,45 @@ More: [Roles & teams](https://deepcoldy.github.io/botmux/en/roles) · [File sand
 
 ## Supported CLIs & Agents
 
+The optional [OpenViking shared-memory example](examples/openviking-memory/README.md) lets every shell-capable coding agent share per-user and per-project memory, searching, reading and saving key conclusions on demand. **Off by default**; opt in by binding a local agent or a single-user Bot through the shared Skill/CLI, with Codex automatic session capture as a separate optional adapter. (The example ships only in the source repository's `examples/`; the npm package does not include `examples/`, so this link does not resolve on the npm page.)
+
 Switch with `cliId` in `bots.json`. **20+ adapters**, spanning local CLIs (process-isolated, reachable via `tmux attach`) and API / cloud agents (e.g. Mira, riff — reached over API / remote, not a local process; mojo is API-driven but executes tools on the bot host by default, set cloud: true for the remote sandbox). Representative ones:
 
-`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `hermes` · `mira` · `riff` (cloud agent) … · `mojo` (API-driven, host execution by default) …
+`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `hermes` · `ebsd` · `mira` · `riff` (cloud agent) … · `mojo` (API-driven, host execution by default) · `remote-runner` ([generic remote runner protocol](docs/remote-runner.md)) · `minimax` ([MiniMax Code / mcode](docs/minimax-code.md), with file/shell tools, native skills and exact session resume; sign in via `mcode login` / `mcode login --region global`, isolate accounts with `MINIMAX_DATA_DIR`) …
+
+The `ebsd` adapter uses a dedicated external service identity and native OMP session storage. Operators must provide the Diag Gateway token and ByteCloud service account through permission-restricted files, never through `bots.json`.
+
+Store only non-secret metadata and credential file paths in `bots.json`:
+
+```json
+{
+  "cliId": "ebsd",
+  "workingDir": "/var/lib/botmux/ebsd-work",
+  "sandbox": true,
+  "env": {
+    "EBSD_BOTMUX_DIAG_ENDPOINT": "https://ebsbot.example",
+    "EBSD_BOTMUX_DIAG_TOKEN_FILE": "/run/secrets/ebsd-botmux/diag-token",
+    "EBSD_BOTMUX_BYTECLOUD_ACCESS_KEY_FILE": "/run/secrets/ebsd-botmux/bytecloud-ak",
+    "EBSD_BOTMUX_BYTECLOUD_SECRET_KEY_FILE": "/run/secrets/ebsd-botmux/bytecloud-sk",
+    "EBSD_BOTMUX_SUBJECT": "botmux-ebsd@prod",
+    "EBSD_BOTMUX_REPOSITORY_ROOT": "/srv/repos"
+  }
+}
+```
+
+The three credential files must be owner-held `0600` regular files, not symlinks. Never put their contents, the AK/SK, or the Gateway token in `bots.json`. Use a dedicated empty `workingDir`; repositories are exposed separately through the read-only `EBSD_BOTMUX_REPOSITORY_ROOT`. Linux hosts need bubblewrap before enabling `sandbox`, and startup fails closed if isolation cannot be established. The Gateway may accept current and previous keys during rotation while the subject remains stable.
 
 The current full set of `cliId`s is authoritative in [`src/adapters/cli/registry.ts`](https://github.com/deepcoldy/botmux/blob/master/src/adapters/cli/registry.ts); per-CLI config and wrapper / gateway setups are in [CLI Adapters](https://deepcoldy.github.io/botmux/en/adapters).
+
+### Session-level CLI selection
+
+Before a session starts, select a registered CLI for that session with `/cli <cliId>`, for example:
+
+```text
+/cli codex
+```
+
+This switches only the bare CLI adapter. It does not inherit the bot's `wrapperCli`, `model`, or `startupCommands`. CLIs that require a `ttadk`, `aiden`, or other wrapper / gateway setup should therefore remain configured as the bot's default wrapper combination. Once the session starts, the CLI selection is frozen and is reused for later messages and restores.
 
 ## Design Philosophy: Bridge the CLI Directly, No SDK Wrapper
 
@@ -81,6 +136,10 @@ The table below compares only **verifiable integration boundaries** — it does 
 | Multi-bot | Multi-bot @mention routing in one group | Depends on the implementation |
 | Direct terminal | Local CLIs can `tmux attach` into the real process | Depends on the implementation |
 
+## Integrating Applications with Their Own Task Workflows
+
+External applications can use experimental [model proxy mode](docs/model-proxy.md) through an authenticated local Chat Completions endpoint. Applications such as [OpenCodeReview (OCR)](https://github.com/alibaba/open-code-review) can connect through a model SDK while retaining control of context, tools, and task workflows. The execution layer implements seven CLI identities; the documentation distinguishes protocol support, native CLI tests, and pending account validation. The underlying [constrained invocation interface](docs/constrained-invocations.md) provides task status, cancellation, deduplication, and process cleanup.
+
 ## Docs · Community · Contributing
 
 - 📖 **Full docs** (commands / config / best practices / troubleshooting): **<https://deepcoldy.github.io/botmux/en/>**
@@ -91,3 +150,7 @@ The table below compares only **verifiable integration boundaries** — it does 
 - 📄 **License**: [MIT](LICENSE)
 
 <p align="center">If it's useful, drop a ⭐ Star → <a href="https://github.com/deepcoldy/botmux">deepcoldy/botmux</a></p>
+
+[Group creation options and defaults](docs/guide/group-creation.md)
+
+Run `bun run build` before compiling a standalone binary: it generates `dist/.runtime-build-id`, which is inlined into the binary rather than read at runtime.

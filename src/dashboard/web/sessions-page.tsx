@@ -1,6 +1,7 @@
 import type React from 'react';
 import {
   Fragment,
+  memo,
   useCallback,
   useEffect,
   useId,
@@ -15,24 +16,27 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent,
   type CSSProperties,
-  type ReactNode,
 } from 'react';
 import { createPortal } from 'react-dom';
 import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from '../../core/close-residual.js';
+import { daemonVersionDiffersFromDisk, stripBotmuxVersionPrefix } from '../../utils/daemon-version-display.js';
 import {
   IDLE_CLEANUP_HOUR_OPTIONS,
+  idleCleanupHoursLabel,
   parseIdleCleanupHours,
-  selectIdleCleanupCandidates,
+  selectCleanupCandidates,
   type IdleCleanupHours,
 } from '../session-cleanup.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useStoreSelector, useT } from './react-hooks.js';
 import { copyText } from './clipboard.js';
 import { FeedGroupPicker } from './feed-group-picker.js';
+import { ModalDialog } from './modal-dialog.js';
+import { FeedGroupAuthOverlay, FeedGroupAuthPrompt, useFeedGroups } from './feed-groups.js';
 import { BotMultiSelect } from './bot-multi-select.js';
+import { SessionHorizontalScrollbar } from './session-horizontal-scrollbar.js';
 import {
   KANBAN_TEAM_STORAGE_KEY,
-  normalizeHiddenTableColumns,
   normalizeSessionsViewMode,
   readStoredBoardOrder,
   readStoredCreateKeepOpen,
@@ -50,6 +54,7 @@ import {
   writeStoredSessionsViewMode,
 } from './preferences.js';
 import { OPEN_CREATE_SESSION_EVENT, consumePendingCreateSession } from './create-session-entry.js';
+import { clearHashQueryParam, hashQueryParam } from './dashboard-routes.js';
 import {
   BOARD_COLUMNS,
   CLI_FILTER_OPTIONS,
@@ -68,6 +73,8 @@ import {
   copySpawnCommand,
   repoBasename,
   restartConfirmMessage,
+  restartErrorMessage,
+  resumeErrorMessage,
   sessionLocationText,
   preferChatFilterLabel,
   sessionLocationTitle,
@@ -113,10 +120,14 @@ import {
 import type { SessionKanbanColumn } from './kanban-model.js';
 import {
   SessionsKanbanView,
+  type SessionsKanbanIcons,
   type SessionsKanbanMove,
   type SessionsKanbanTeam,
   type SessionsKanbanTeamBoardData,
 } from './sessions-kanban.js';
+import { toast } from './toast.js';
+import { confirm } from './confirm-modal.js';
+import { controlCsrfHeaders } from './control-csrf.js';
 
 type SessionRow = Record<string, any> & { sessionId: string; status: string };
 
@@ -148,7 +159,7 @@ type HistoryState = {
   messages: any[];
   ownerOpenId?: string;
   error?: string;
-  stale?: boolean;
+  staleHint?: { running: string; disk: string };
 };
 
 type TerminalState = {
@@ -188,19 +199,17 @@ function imageFileDataUrl(file: File): Promise<string> {
   });
 }
 
+type IdleCleanupCounts = { idle: number; dormant: number };
+
 type IdleCleanupBarProps = {
   busy: boolean;
   hours: IdleCleanupHours;
   status: string;
-  countForHours: (hours: IdleCleanupHours) => number;
+  countForHours: (hours: IdleCleanupHours) => IdleCleanupCounts;
   onRun: (hours: IdleCleanupHours) => Promise<void>;
 };
 
 type IdleCleanupHoursValue = `${IdleCleanupHours}`;
-
-function idleCleanupHoursLabel(hours: IdleCleanupHours): string {
-  return hours === 168 ? '7d' : `${hours}H`;
-}
 
 const idleCleanupThresholdOptions = IDLE_CLEANUP_HOUR_OPTIONS.map(hours => ({
   value: String(hours) as IdleCleanupHoursValue,
@@ -510,28 +519,14 @@ function insightDur(ms?: number): string {
   return `${Math.floor(ms / 60000)}m${Math.round((ms % 60000) / 1000)}s`;
 }
 
-function useDialogVisibility(ref: React.RefObject<HTMLDialogElement | null>, open: boolean): void {
-  useEffect(() => {
-    const dialog = ref.current;
-    if (!dialog) return;
-    if (open) {
-      if (!dialog.open) {
-        try { dialog.showModal(); } catch { /* already opening/unsupported */ }
-      }
-    } else if (dialog.open) {
-      dialog.close();
-    }
-  }, [open, ref]);
-}
-
 function CopyButton(props: { value: string }): React.JSX.Element {
   const [copied, setCopied] = useState(false);
   return (
     <button
       type="button"
       data-copy={props.value}
-      onClick={() => {
-        void copyText(props.value, t('sessions.copy')).then(didCopy => {
+      onClick={(event) => {
+        void copyText(props.value, t('sessions.copy'), event.currentTarget).then(didCopy => {
           if (!didCopy) return;
           setCopied(true);
           window.setTimeout(() => setCopied(false), 800);
@@ -594,87 +589,61 @@ function LocateIconButton(props: { row: any; onLocate: (row: any) => Promise<boo
   );
 }
 
-export function CliFilterGroup(props: { selected: Set<string>; onToggle: (cli: string, checked: boolean) => void }): React.JSX.Element {
-  const checked = CLI_FILTER_OPTIONS.filter(cli => props.selected.has(cli)).length;
-  const detailsRef = useRef<HTMLDetailsElement>(null);
-  const [query, setQuery] = useState('');
-
-  useEffect(() => {
-    const close = () => {
-      if (detailsRef.current?.open) detailsRef.current.open = false;
-    };
-    const onPointerDown = (event: PointerEvent) => {
-      const details = detailsRef.current;
-      if (details?.open && !details.contains(event.target as Node)) close();
-    };
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') close();
-    };
-    document.addEventListener('pointerdown', onPointerDown, true);
-    document.addEventListener('keydown', onKeyDown);
-    return () => {
-      document.removeEventListener('pointerdown', onPointerDown, true);
-      document.removeEventListener('keydown', onKeyDown);
-    };
-  }, []);
-
-  const q = query.trim().toLowerCase();
-  const visible = q ? CLI_FILTER_OPTIONS.filter(cli => cli.toLowerCase().includes(q)) : CLI_FILTER_OPTIONS;
-
+/** 排序下拉：表格列排序之外的统一入口（看板/状态板/话题视图没有表头可点）。
+ *  只写既有 sortKey/sortDir，不引入新数据流。
+ *
+ *  刻意不并入 dashboard-components 的 SortMenu/DropdownMenu：那是「选值」语义
+ *  （再选当前值是 no-op、选后收起、自带外点/Esc 关闭与上下翻转定位），而这里
+ *  是「点同一项 = 翻转升降序」，选中项还要带 ↑/↓ 后缀，菜单项走 menu/menuitem
+ *  role，且选后保持展开。强行并入要给共享版加 4 个互斥开关，且会改变现有行为。 */
+function SessionsSortMenu(props: {
+  sortKey: string;
+  sortDir: 'asc' | 'desc';
+  onSort: (key: string) => void;
+}): React.JSX.Element {
+  const options = [
+    { key: 'lastMessageAt', label: t('sessions.sort.lastMessageAt') },
+    { key: 'spawnedAt', label: t('sessions.sort.spawnedAt') },
+    { key: 'title', label: t('sessions.sort.title') },
+    { key: 'status', label: t('sessions.sort.status') },
+  ];
+  const current = options.find(option => option.key === props.sortKey) ?? options[0];
   return (
-    <details className="filter-cli" ref={detailsRef}>
-      <summary>{t('sessions.cli')} · <b id="cli-filter-count" className={checked === CLI_FILTER_OPTIONS.length ? undefined : 'cli-filter-active'}>
-        {checked === CLI_FILTER_OPTIONS.length ? t('common.all') : `${checked}/${CLI_FILTER_OPTIONS.length}`}
-      </b></summary>
-      <div className="filter-cli-pop" role="group" aria-label={t('sessions.cli')}>
-        <div className="filter-cli-head">
-          <input
-            type="search"
-            className="filter-cli-search"
-            placeholder={t('sessions.cliSearch')}
-            value={query}
-            autoFocus
-            onChange={event => setQuery(event.currentTarget.value)}
-            onClick={event => event.stopPropagation()}
-          />
-          <div className="filter-cli-bulk">
-            <button
-              type="button"
-              onClick={() => { for (const cli of CLI_FILTER_OPTIONS) if (!props.selected.has(cli)) props.onToggle(cli, true); }}
-            >{t('sessions.cliSelectAll')}</button>
-            <button
-              type="button"
-              onClick={() => { for (const cli of CLI_FILTER_OPTIONS) if (props.selected.has(cli)) props.onToggle(cli, false); }}
-            >{t('sessions.cliClear')}</button>
-          </div>
-        </div>
-        <div className="filter-cli-options">
-          {visible.length === 0 ? (
-            <span className="filter-cli-empty">{t('sessions.cliNoMatch')}</span>
-          ) : visible.map(cli => (
-            <label key={cli} className="filter-check">
-              <input
-                type="checkbox"
-                name="cli"
-                value={cli}
-                checked={props.selected.has(cli)}
-                onChange={event => props.onToggle(cli, event.currentTarget.checked)}
-              />
-              <span>{cli}</span>
-            </label>
-          ))}
-        </div>
+    <details className="sessions-sort-menu sect-sort-menu">
+      <summary aria-label={t('sessions.sort')}>
+        <span className="sect-sort-value">
+          {t('sessions.sort')}: {current.label} {props.sortDir === 'asc' ? '↑' : '↓'}
+        </span>
+      </summary>
+      <div className="sect-sort-pop" role="menu">
+        {options.map(option => (
+          <button
+            key={option.key}
+            type="button"
+            role="menuitem"
+            aria-current={option.key === props.sortKey ? 'true' : undefined}
+            onClick={() => props.onSort(option.key)}
+          >
+            {option.label}
+            {option.key === props.sortKey ? (props.sortDir === 'asc' ? ' ↑' : ' ↓') : null}
+          </button>
+        ))}
       </div>
     </details>
   );
 }
 
-function SessionsFilters(props: {
+/** 高级筛选抽屉：来源 / CLI / 群 / 话题类型等低频筛选收进右侧抽屉，
+ *  筛选 state 仍是同一个 FiltersState，只是换了渲染位置。抽屉内一律用原生
+ *  <select> + 内联复选列表（不用浮层），避免被抽屉滚动容器裁剪。 */
+function SessionsFilterDrawer(props: {
+  open: boolean;
   chatOptions: ChatFilterOption[];
   filters: FiltersState;
-  idleCleanup: IdleCleanupBarProps;
   setFilters: (updater: (prev: FiltersState) => FiltersState) => void;
+  onClose: () => void;
 }): React.JSX.Element {
+  const [cliQuery, setCliQuery] = useState('');
   const statusOptions = [
     { value: '', label: t('sessions.anyStatus') },
     ...SESSION_STATUS_OPTIONS.map(status => ({ value: status, label: sessionStatusText(status) })),
@@ -684,16 +653,219 @@ function SessionsFilters(props: {
     { value: 'yes', label: t('sessions.adoptYes') },
     { value: 'no', label: t('sessions.adoptNo') },
   ];
-  const statusLabel = statusOptions.find(option => option.value === props.filters.status)?.label ?? t('sessions.anyStatus');
-  const adoptLabel = adoptOptions.find(option => option.value === props.filters.adopt)?.label ?? t('sessions.adoptAny');
   const chatOptions = [
     { value: '', label: t('sessions.chatAny') },
     ...props.chatOptions,
   ];
-  const chatLabel = chatOptions.find(option => option.value === props.filters.chat)?.label ?? t('sessions.chatAny');
+  const cliQueryNorm = cliQuery.trim().toLowerCase();
+  const visibleClis = cliQueryNorm
+    ? CLI_FILTER_OPTIONS.filter(cli => cli.toLowerCase().includes(cliQueryNorm))
+    : CLI_FILTER_OPTIONS;
+  const reset = () => {
+    writeStoredSessionsShowUnknownChats(windowStorage(), false);
+    props.setFilters(() => ({
+      q: props.filters.q,
+      status: '',
+      adopt: '',
+      chat: '',
+      multiBotTopics: false,
+      botTriggeredTopics: false,
+      showUnknownChats: false,
+      active: true,
+      cli: new Set(CLI_FILTER_OPTIONS),
+    }));
+  };
+  return (
+    <ModalDialog
+      open={props.open}
+      className="sessions-filter-drawer"
+      onClose={props.onClose}
+    >
+      <header>
+        <h3>{t('sessions.filters.title')}</h3>
+        <IconActionButton
+          className="card-act drawer-close-btn"
+          icon={ICON.close}
+          label={t('sessions.dismiss')}
+          onClick={props.onClose}
+        />
+      </header>
+      <div className="sessions-filter-drawer-body">
+        <div className="sessions-filter-field">
+          <span className="sessions-filter-label">{t('sessions.status')}</span>
+          <select
+            value={props.filters.status}
+            onChange={event => props.setFilters(prev => ({ ...prev, status: event.currentTarget.value }))}
+          >
+            {statusOptions.map(option => <option key={option.value || 'any'} value={option.value}>{option.label}</option>)}
+          </select>
+        </div>
+        <div className="sessions-filter-field">
+          <span className="sessions-filter-label">{t('sessions.adopt')}</span>
+          <select
+            value={props.filters.adopt}
+            onChange={event => props.setFilters(prev => ({ ...prev, adopt: event.currentTarget.value }))}
+          >
+            {adoptOptions.map(option => <option key={option.value || 'any'} value={option.value}>{option.label}</option>)}
+          </select>
+        </div>
+        <div className="sessions-filter-field">
+          <span className="sessions-filter-label">{t('sessions.location')}</span>
+          <select
+            value={props.filters.chat}
+            onChange={event => props.setFilters(prev => ({ ...prev, chat: event.currentTarget.value }))}
+          >
+            {chatOptions.map(option => <option key={option.value || 'any'} value={option.value}>{option.label}</option>)}
+          </select>
+        </div>
+        <div className="sessions-filter-field">
+          <span className="sessions-filter-label">{t('sessions.cli')}</span>
+          <div className="sessions-filter-cli">
+            <input
+              type="search"
+              className="sessions-filter-cli-search"
+              placeholder={t('sessions.cliSearch')}
+              value={cliQuery}
+              onChange={event => setCliQuery(event.currentTarget.value)}
+            />
+            <div className="sessions-filter-cli-bulk">
+              <button
+                type="button"
+                onClick={() => props.setFilters(prev => ({ ...prev, cli: new Set(CLI_FILTER_OPTIONS) }))}
+              >
+                {t('sessions.cliSelectAll')}
+              </button>
+              <button
+                type="button"
+                onClick={() => props.setFilters(prev => ({ ...prev, cli: new Set() }))}
+              >
+                {t('sessions.cliClear')}
+              </button>
+            </div>
+            <div className="sessions-filter-cli-list">
+              {visibleClis.length === 0 ? (
+                <span className="filter-cli-empty">{t('sessions.cliNoMatch')}</span>
+              ) : visibleClis.map(cli => (
+                <label key={cli} className="filter-check">
+                  <input
+                    type="checkbox"
+                    name="cli"
+                    value={cli}
+                    checked={props.filters.cli.has(cli)}
+                    onChange={event => {
+                      const checked = event.currentTarget.checked;
+                      props.setFilters(prev => {
+                        const next = new Set(prev.cli);
+                        if (checked) next.add(cli);
+                        else next.delete(cli);
+                        return { ...prev, cli: next };
+                      });
+                    }}
+                  />
+                  <span>{cli}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+        </div>
+        <div className="sessions-filter-toggles">
+          <label className="filter-toggle">
+            <input
+              type="checkbox"
+              name="multiBotTopics"
+              checked={props.filters.multiBotTopics}
+              onChange={event => {
+                const multiBotTopics = event.currentTarget.checked;
+                props.setFilters(prev => ({ ...prev, multiBotTopics }));
+              }}
+            />
+            <span className="filter-toggle-label">{t('sessions.multiBotTopics')}</span>
+            <span className="filter-toggle-switch" aria-hidden="true" />
+          </label>
+          <label className="filter-toggle">
+            <input
+              type="checkbox"
+              name="botTriggeredTopics"
+              checked={props.filters.botTriggeredTopics}
+              onChange={event => {
+                const botTriggeredTopics = event.currentTarget.checked;
+                props.setFilters(prev => ({ ...prev, botTriggeredTopics }));
+              }}
+            />
+            <span className="filter-toggle-label">{t('sessions.botTriggeredTopics')}</span>
+            <span className="filter-toggle-switch" aria-hidden="true" />
+          </label>
+          <label className="filter-toggle">
+            <input
+              type="checkbox"
+              name="showUnknownChats"
+              checked={props.filters.showUnknownChats}
+              onChange={event => {
+                const checked = event.currentTarget.checked;
+                writeStoredSessionsShowUnknownChats(windowStorage(), checked);
+                props.setFilters(prev => ({ ...prev, showUnknownChats: checked }));
+              }}
+            />
+            <span className="filter-toggle-label">{t('sessions.showUnknownChats')}</span>
+            <span className="filter-toggle-switch" aria-hidden="true" />
+          </label>
+          <label className="filter-toggle">
+            <input
+              type="checkbox"
+              name="active"
+              checked={props.filters.active}
+              onChange={event => {
+                const active = event.currentTarget.checked;
+                props.setFilters(prev => ({ ...prev, active }));
+              }}
+            />
+            <span className="filter-toggle-label">{t('sessions.activeOnly')}</span>
+            <span className="filter-toggle-switch" aria-hidden="true" />
+          </label>
+        </div>
+      </div>
+      <footer>
+        <button type="button" className="sessions-filter-clear" onClick={reset}>
+          {t('sessions.filters.clear')}
+        </button>
+        <button type="button" className="primary sessions-filter-done" onClick={props.onClose}>
+          {t('sessions.filters.done')}
+        </button>
+      </footer>
+    </ModalDialog>
+  );
+}
+
+function SessionsFilters(props: {
+  chatOptions: ChatFilterOption[];
+  filters: FiltersState;
+  idleCleanup: IdleCleanupBarProps;
+  setFilters: (updater: (prev: FiltersState) => FiltersState) => void;
+  sortKey: string;
+  sortDir: 'asc' | 'desc';
+  onSort: (key: string) => void;
+}): React.JSX.Element {
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  // 快捷分段视图映射到既有 status 筛选：待处理=stalled（长时间无进展，最需要人看），
+  // 进行中=working，全部=任意。抽屉里的完整状态下拉可覆盖为其它状态，此时分段无激活项。
+  const quickViews = [
+    { value: 'stalled', label: t('sessions.view.need') },
+    { value: 'working', label: t('sessions.view.work') },
+    { value: '', label: t('sessions.view.all') },
+  ] as const;
+  const activeFilterCount = [
+    props.filters.status !== '',
+    props.filters.adopt !== '',
+    props.filters.chat !== '',
+    props.filters.cli.size < CLI_FILTER_OPTIONS.length,
+    props.filters.multiBotTopics,
+    props.filters.botTriggeredTopics,
+    props.filters.showUnknownChats,
+    !props.filters.active,
+  ].filter(Boolean).length;
 
   return (
-    <form id="filters" className="filters dashboard-toolbar sessions-filters" onSubmit={event => event.preventDefault()}>
+    <form id="filters" className="filters dashboard-toolbar sessions-filters sessions-toolbar" onSubmit={event => event.preventDefault()}>
       <input
         type="search"
         name="q"
@@ -704,94 +876,39 @@ function SessionsFilters(props: {
           props.setFilters(prev => ({ ...prev, q }));
         }}
       />
-      <DropdownMenu
-        label={statusLabel}
-        value={props.filters.status}
-        options={statusOptions}
-        onChange={value => props.setFilters(prev => ({ ...prev, status: value }))}
-      />
-      <DropdownMenu
-        label={adoptLabel}
-        value={props.filters.adopt}
-        options={adoptOptions}
-        onChange={value => props.setFilters(prev => ({ ...prev, adopt: value }))}
-      />
-      <DropdownMenu
-        ariaLabel={t('sessions.location')}
-        className="filter-chat-menu"
-        label={chatLabel}
-        value={props.filters.chat}
-        options={chatOptions}
-        searchable
-        searchPlaceholder={t('sessions.chatSearch')}
-        searchEmptyLabel={t('sessions.chatNoMatch')}
-        onChange={value => props.setFilters(prev => ({ ...prev, chat: value }))}
-      />
-      <CliFilterGroup
-        selected={props.filters.cli}
-        onToggle={(cli, checked) => {
-          props.setFilters(prev => {
-            const next = new Set(prev.cli);
-            if (checked) next.add(cli);
-            else next.delete(cli);
-            return { ...prev, cli: next };
-          });
-        }}
-      />
-      <label className="filter-toggle">
-        <input
-          type="checkbox"
-          name="multiBotTopics"
-          checked={props.filters.multiBotTopics}
-          onChange={event => {
-            const multiBotTopics = event.currentTarget.checked;
-            props.setFilters(prev => ({ ...prev, multiBotTopics }));
-          }}
-        />
-        <span className="filter-toggle-label">{t('sessions.multiBotTopics')}</span>
-        <span className="filter-toggle-switch" aria-hidden="true" />
-      </label>
-      <label className="filter-toggle">
-        <input
-          type="checkbox"
-          name="botTriggeredTopics"
-          checked={props.filters.botTriggeredTopics}
-          onChange={event => {
-            const botTriggeredTopics = event.currentTarget.checked;
-            props.setFilters(prev => ({ ...prev, botTriggeredTopics }));
-          }}
-        />
-        <span className="filter-toggle-label">{t('sessions.botTriggeredTopics')}</span>
-        <span className="filter-toggle-switch" aria-hidden="true" />
-      </label>
-      <label className="filter-toggle">
-        <input
-          type="checkbox"
-          name="showUnknownChats"
-          checked={props.filters.showUnknownChats}
-          onChange={event => {
-            const checked = event.currentTarget.checked;
-            writeStoredSessionsShowUnknownChats(windowStorage(), checked);
-            props.setFilters(prev => ({ ...prev, showUnknownChats: checked }));
-          }}
-        />
-        <span className="filter-toggle-label">{t('sessions.showUnknownChats')}</span>
-        <span className="filter-toggle-switch" aria-hidden="true" />
-      </label>
-      <label className="filter-toggle">
-        <input
-          type="checkbox"
-          name="active"
-          checked={props.filters.active}
-          onChange={event => {
-            const active = event.currentTarget.checked;
-            props.setFilters(prev => ({ ...prev, active }));
-          }}
-        />
-        <span className="filter-toggle-label">{t('sessions.activeOnly')}</span>
-        <span className="filter-toggle-switch" aria-hidden="true" />
-      </label>
+      <div className="segmented sessions-quick-view" role="group" aria-label={t('sessions.status')}>
+        {quickViews.map(view => (
+          <button
+            key={view.label}
+            type="button"
+            data-quick={view.value}
+            className={props.filters.status === view.value ? 'active' : undefined}
+            aria-pressed={props.filters.status === view.value}
+            onClick={() => props.setFilters(prev => ({ ...prev, status: view.value }))}
+          >
+            {view.label}
+          </button>
+        ))}
+      </div>
+      <button
+        type="button"
+        className={`sessions-filter-btn${activeFilterCount > 0 ? ' has-active' : ''}`}
+        aria-haspopup="dialog"
+        aria-expanded={drawerOpen}
+        onClick={() => setDrawerOpen(true)}
+      >
+        {t('sessions.filters.title')}
+        {activeFilterCount > 0 ? <span className="sessions-filter-count">{activeFilterCount}</span> : null}
+      </button>
+      <SessionsSortMenu sortKey={props.sortKey} sortDir={props.sortDir} onSort={props.onSort} />
       <IdleCleanupBar {...props.idleCleanup} />
+      <SessionsFilterDrawer
+        open={drawerOpen}
+        chatOptions={props.chatOptions}
+        filters={props.filters}
+        setFilters={props.setFilters}
+        onClose={() => setDrawerOpen(false)}
+      />
     </form>
   );
 }
@@ -837,7 +954,8 @@ function IdleCleanupBar(props: IdleCleanupBarProps): React.JSX.Element {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const buttonRef = useRef<HTMLButtonElement | null>(null);
   const popRef = useRef<HTMLDivElement | null>(null);
-  const count = props.countForHours(draftHours);
+  const counts = props.countForHours(draftHours);
+  const count = counts.idle + counts.dormant;
 
   useEffect(() => {
     if (open) setDraftHours(props.hours);
@@ -931,9 +1049,14 @@ function IdleCleanupBar(props: IdleCleanupBarProps): React.JSX.Element {
             <span className="idle-cleanup-pop-title">{t('sessions.idleCleanupRun')}</span>
             <span id="idle-cleanup-count" className="idle-cleanup-count">
               <span className="idle-cleanup-dot" aria-hidden="true" />
-              {t('sessions.idleCleanupCount', { count })}
+              {t('cleanupDormant.countIdle', { count: counts.idle })}
+              {' · '}
+              {t('cleanupDormant.countDormant', { count: counts.dormant })}
             </span>
           </div>
+          <p style={{ margin: 0, color: 'var(--muted)', fontSize: 12, lineHeight: 1.5 }}>
+            {t('cleanupDormant.semanticsHint')}
+          </p>
           <div className="idle-cleanup-pop-field">
             <span className="idle-cleanup-label">{t('sessions.idleCleanupOlderThan')}</span>
             <div
@@ -984,7 +1107,12 @@ function IdleCleanupBar(props: IdleCleanupBarProps): React.JSX.Element {
   );
 }
 
-function SessionsTable(props: {
+// 列表三视图（表格 / 状态板 / 话题）统一 memo 化。它们此前每次页面渲染都全量重绘，
+// 于是「打开/关闭详情」这种只动抽屉状态的操作也要重排上千行 DOM。memo 生效的前提是
+// 下面传进来的 props 引用稳定——页面侧的 list* 回调就是为此存在的。
+// 注意：memo 会挡住父组件触发的重渲染，而这些视图内部直接调 t()。所以每个视图都要
+// useT() 自己订阅 locale，否则切语言时文案会停在旧语言上。
+function SessionsTableBase(props: {
   rows: any[];
   selected: Set<string>;
   hidden: boolean;
@@ -1001,6 +1129,7 @@ function SessionsTable(props: {
   onSelectAll: (selected: boolean) => void;
   onSort: (key: string) => void;
 }): React.JSX.Element {
+  useT();
   const selectAllRef = useRef<HTMLInputElement | null>(null);
   useLayoutEffect(() => {
     if (selectAllRef.current) selectAllRef.current.indeterminate = props.selectAllIndeterminate;
@@ -1142,6 +1271,8 @@ function SessionsTable(props: {
     </table>
   );
 }
+
+const SessionsTable = memo(SessionsTableBase);
 
 type SessionExchangePreviewValue = ReturnType<typeof sessionExchangePreview>;
 
@@ -1372,6 +1503,8 @@ function BoardCard(props: {
   const signal = boardSignalLabel(row);
   const repo = repoBasename(row.workingDir);
   const exchange = sessionExchangePreview(row);
+  // 状态色条语义与看板卡片一致：需要你 / 进行中 / 待办 / 空闲；已关闭单独一色。
+  const signalKind = deriveSessionBoardColumn(row) ?? (row.status === 'closed' ? 'closed' : 'idle');
   const onCardClick = (event: MouseEvent<HTMLElement>) => {
     const target = event.target as HTMLElement;
     if (target.closest('a, button, input, label')) return;
@@ -1381,6 +1514,7 @@ function BoardCard(props: {
     <article
       className={`session-card${props.selected ? ' selected' : ''}${row.locked ? ' locked' : ''}`}
       data-id={row.sessionId}
+      data-signal={signalKind}
       aria-pressed={props.selected}
       onClick={onCardClick}
     >
@@ -1436,7 +1570,7 @@ function BoardCard(props: {
   );
 }
 
-function BoardView(props: {
+function BoardViewBase(props: {
   rows: any[];
   selected: Set<string>;
   hidden: boolean;
@@ -1457,6 +1591,7 @@ function BoardView(props: {
   onLock: (row: any, locked: boolean, button?: HTMLButtonElement) => void;
   onClose: (row: any, button?: HTMLButtonElement) => void;
 }): React.JSX.Element {
+  useT();
   useEffect(() => {
     if (!props.hidden && !props.animated) props.onAnimated();
   }, [props.animated, props.hidden, props.onAnimated]);
@@ -1555,6 +1690,23 @@ function BoardView(props: {
   );
 }
 
+const BoardView = memo(BoardViewBase);
+
+// 看板卡片的图标集。以前是渲染体里的对象字面量：每次渲染都换一个新引用，
+// 于是每张卡片的 callbacks 都"变了"，React.memo 全部失效。图标本身是常量，
+// 提到模块级即可让 memo 真正命中。
+const KANBAN_ICONS: SessionsKanbanIcons = {
+  details: ICON.details,
+  feishu: ICON.feishu,
+  history: ICON.history,
+  key: ICON.key,
+  lock: ICON.lock,
+  restart: ICON.restart,
+  close: ICON.close,
+  terminal: ICON.terminal,
+  unlock: ICON.unlock,
+};
+
 type TopicGroupsViewProps = {
   rows: SessionRow[];
   relationRows?: SessionRow[];
@@ -1576,7 +1728,8 @@ function topicGroupTitle(group: SessionTopicGroup<SessionRow>): string {
   return group.kind === 'chat' ? t('sessions.topic.wholeChat') : t('sessions.topic.singleSession');
 }
 
-export function TopicGroupsView(props: TopicGroupsViewProps): React.JSX.Element {
+function TopicGroupsViewBase(props: TopicGroupsViewProps): React.JSX.Element {
+  useT();
   const groups = useMemo(() => groupSessionsByTopic(props.rows), [props.rows]);
   const relationGroups = useMemo(
     () => new Map(groupSessionsByTopic(props.relationRows ?? props.rows).map(group => [group.key, group])),
@@ -1653,6 +1806,8 @@ export function TopicGroupsView(props: TopicGroupsViewProps): React.JSX.Element 
   );
 }
 
+export const TopicGroupsView = memo(TopicGroupsViewBase);
+
 function HistoryBubble(props: { message: any; ownerOpenId?: string; groupStart: boolean }): React.JSX.Element {
   const m = props.message;
   const human = m.senderType === 'user';
@@ -1677,8 +1832,6 @@ function HistoryBubble(props: { message: any; ownerOpenId?: string; groupStart: 
 }
 
 function HistoryModal(props: { state: HistoryState | null; onClose: () => void }): React.JSX.Element {
-  const dialogRef = useRef<HTMLDialogElement | null>(null);
-  useDialogVisibility(dialogRef, !!props.state);
   const row = props.state ? store.sessions.get(props.state.sessionId) : null;
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const loaded = !!props.state && !props.state.loading && !props.state.error && props.state.messages.length > 0;
@@ -1689,12 +1842,11 @@ function HistoryModal(props: { state: HistoryState | null; onClose: () => void }
     if (el) el.scrollTop = el.scrollHeight;
   }, [loaded, props.state?.sessionId, props.state?.messages.length]);
   return (
-    <dialog
+    <ModalDialog
       id="history-modal"
       className="history-modal"
-      ref={dialogRef}
+      open={!!props.state}
       onClose={props.onClose}
-      onClick={event => { if (event.target === event.currentTarget) props.onClose(); }}
     >
       {props.state && row ? (
         <>
@@ -1713,7 +1865,9 @@ function HistoryModal(props: { state: HistoryState | null; onClose: () => void }
             {!props.state.loading && props.state.error ? (
               <div className="history-error">
                 {t('sessions.history.fail')}: {props.state.error}
-                {props.state.stale ? <><br /><span>{t('sessions.history.staleHint')}</span></> : null}
+                {props.state.staleHint ? (
+                  <><br /><span>{t('sessions.history.staleHint', props.state.staleHint)}</span></>
+                ) : null}
               </div>
             ) : null}
             {!props.state.loading && !props.state.error && props.state.messages.length === 0 ? (
@@ -1734,11 +1888,11 @@ function HistoryModal(props: { state: HistoryState | null; onClose: () => void }
           </div>
         </>
       ) : null}
-    </dialog>
+    </ModalDialog>
   );
 }
 
-function TerminalNameEditor(props: { row: any; onRename: (row: any, title: string) => void }): React.JSX.Element {
+export function TerminalNameEditor(props: { row: any; onRename: (row: any, title: string) => void }): React.JSX.Element {
   const [editing, setEditing] = useState(false);
   const [value, setValue] = useState('');
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -1749,6 +1903,11 @@ function TerminalNameEditor(props: { row: any; onRename: (row: any, title: strin
     const input = inputRef.current;
     input.focus();
     input.select();
+  }, [editing]);
+
+  useLayoutEffect(() => {
+    if (!editing || !inputRef.current) return;
+    const input = inputRef.current;
     const fit = () => {
       const cs = getComputedStyle(input);
       const span = document.createElement('span');
@@ -1807,20 +1966,17 @@ function TerminalNameEditor(props: { row: any; onRename: (row: any, title: strin
 }
 
 function TerminalModal(props: { state: TerminalState | null; onClose: () => void; onRename: (row: any, title: string) => void }): React.JSX.Element {
-  const dialogRef = useRef<HTMLDialogElement | null>(null);
-  useDialogVisibility(dialogRef, !!props.state);
   const row = props.state ? store.sessions.get(props.state.sessionId) : null;
   const readonlyUrl = row ? terminalHref(row) : null;
   const url = props.state?.url ?? readonlyUrl ?? '';
   const rowCli = row ? sessionCliDisplayName(row) : '';
   const rowRepo = row ? repoBasename(row.workingDir) : '';
   return (
-    <dialog
+    <ModalDialog
       id="term-modal"
       className="term-modal"
-      ref={dialogRef}
+      open={!!props.state}
       onClose={props.onClose}
-      onClick={event => { if (event.target === event.currentTarget) props.onClose(); }}
     >
       {props.state && row ? (
         <>
@@ -1873,7 +2029,7 @@ function TerminalModal(props: { state: TerminalState | null; onClose: () => void
           </div>
         </>
       ) : null}
-    </dialog>
+    </ModalDialog>
   );
 }
 
@@ -1989,17 +2145,17 @@ function Drawer(props: {
   closeSession: (row: any, button?: HTMLButtonElement) => Promise<boolean>;
   setSessionLocked: (row: any, locked: boolean, button?: HTMLButtonElement) => Promise<boolean>;
   startSession: (row: any, button?: HTMLButtonElement) => Promise<boolean>;
+  onTakeover: (row: any, button?: HTMLButtonElement) => void;
 }): React.JSX.Element {
-  const dialogRef = useRef<HTMLDialogElement | null>(null);
-  useDialogVisibility(dialogRef, !!props.row);
   const row = props.row;
   const terminal = row ? terminalHref(row) : null;
+  const closed = !!row && row.status === 'closed';
+  const canTakeover = !!row && !closed && !!terminal;
   return (
-    <dialog
+    <ModalDialog
       id="drawer"
-      ref={dialogRef}
+      open={!!props.row}
       onClose={props.onClose}
-      onClick={event => { if (event.target === event.currentTarget) props.onClose(); }}
     >
       {row ? (
         <article>
@@ -2015,45 +2171,118 @@ function Drawer(props: {
             </span>
             <p><code>{row.sessionId}</code> <CopyButton value={row.sessionId} /></p>
           </header>
-          <p><b>{t('sessions.bot')}:</b> {botDisplayName(row)} · <b>{t('sessions.cli')}:</b> {sessionCliDisplayName(row)}</p>
-          <p><b>{t('sessions.location')}:</b> {sessionLocationText(row)}</p>
-          <p><b>chatId:</b> <code>{row.chatId ?? ''}</code> <CopyButton value={row.chatId ?? ''} /></p>
-          <p><b>rootMessageId:</b> <code>{row.rootMessageId ?? ''}</code> <CopyButton value={row.rootMessageId ?? ''} /></p>
-          {row.threadId ? <p><b>threadId:</b> <code>{row.threadId}</code></p> : null}
-          <p><b>{t('sessions.workingDir')}:</b> {row.workingDir ?? '-'}</p>
-          <div className="actions">
-            <ChatScopeLink row={row} />
-            {!row.feishuChatLink || row.scope !== 'chat' ? <LocateButton row={row} locateSession={props.locateSession} /> : null}
-            <button id="history-drawer-btn" type="button" onClick={() => props.openHistory(row)}>{t('sessions.history.title')}</button>
-            <TerminalControls row={row} url={terminal} />
-            {shouldOpenWritableTerminal() && row.status !== 'closed' ? (
-              <button
-                id="copy-cmd-btn"
-                type="button"
-                data-tip={t('sessions.copyCommandHint')}
-                onClick={event => void copySpawnCommand(row, event.currentTarget)}
-              >
-                {t('sessions.copyCommand')}
-              </button>
-            ) : null}
-            {canRestartSession(row) ? (
-              <button id="restart-btn" type="button" onClick={async event => { if (await props.restartSession(row, event.currentTarget)) props.onClose(); }}>{t('sessions.restart')}</button>
-            ) : null}
-            <button id="lock-btn" type="button" onClick={event => void props.setSessionLocked(row, !row.locked, event.currentTarget)}>{lockActionLabel(row)}</button>
-            {row.queued && row.status !== 'closed' ? (
-              <button id="start-btn" type="button" className="primary" onClick={async event => { if (await props.startSession(row, event.currentTarget)) props.onClose(); }}>{t('sessions.create.start')}</button>
-            ) : null}
-            {row.status === 'closed' ? (
-              <button id="resume-btn" type="button" className="primary" onClick={async event => { if (await props.resumeSession(row, event.currentTarget)) props.onClose(); }}>{t('sessions.resume')}</button>
-            ) : null}
-            {row.status !== 'closed' ? (
-              <button id="close-btn" type="button" className="contrast" onClick={async event => { if (await props.closeSession(row, event.currentTarget)) props.onClose(); }}>{t('sessions.close')}</button>
-            ) : null}
+          <div className="drawer-body">
+            <p><b>{t('sessions.bot')}:</b> {botDisplayName(row)} · <b>{t('sessions.cli')}:</b> {sessionCliDisplayName(row)}</p>
+            <p><b>{t('sessions.location')}:</b> {sessionLocationText(row)}</p>
+            <p><b>chatId:</b> <code>{row.chatId ?? ''}</code> <CopyButton value={row.chatId ?? ''} /></p>
+            <p><b>rootMessageId:</b> <code>{row.rootMessageId ?? ''}</code> <CopyButton value={row.rootMessageId ?? ''} /></p>
+            {row.threadId ? <p><b>threadId:</b> <code>{row.threadId}</code></p> : null}
+            <p><b>{t('sessions.workingDir')}:</b> {row.workingDir ?? '-'}</p>
             <InsightPanel row={row} />
           </div>
+          <footer className="drawer-foot">
+            <div className="drawer-foot-actions">
+              {closed ? (
+                <button
+                  id="resume-btn"
+                  type="button"
+                  className="primary drawer-btn-primary"
+                  onClick={async event => { if (await props.resumeSession(row, event.currentTarget)) props.onClose(); }}
+                >
+                  {t('sessions.resume')}
+                </button>
+              ) : (
+                <>
+                  <button
+                    id="takeover-btn"
+                    type="button"
+                    className="primary drawer-btn-primary"
+                    disabled={!canTakeover}
+                    title={canTakeover ? undefined : t('sessions.openReadonlyTerminal')}
+                    onClick={event => props.onTakeover(row, event.currentTarget)}
+                  >
+                    {t('sessions.takeoverTerminal')}
+                  </button>
+                  {canRestartSession(row) ? (
+                    <button
+                      id="restart-btn"
+                      type="button"
+                      className="drawer-btn-secondary"
+                      onClick={async event => { if (await props.restartSession(row, event.currentTarget)) props.onClose(); }}
+                    >
+                      {t('sessions.restart')}
+                    </button>
+                  ) : null}
+                  <button
+                    id="close-btn"
+                    type="button"
+                    className="drawer-btn-danger"
+                    onClick={async event => { if (await props.closeSession(row, event.currentTarget)) props.onClose(); }}
+                  >
+                    {t('sessions.close')}
+                  </button>
+                </>
+              )}
+            </div>
+            <details className="drawer-more">
+              <summary aria-label={t('sessions.more')}>{t('sessions.more')}</summary>
+              <div className="drawer-more-pop" role="menu">
+                <button
+                  id="history-drawer-btn"
+                  type="button"
+                  role="menuitem"
+                  onClick={() => props.openHistory(row)}
+                >
+                  {t('sessions.history.title')}
+                </button>
+                {shouldOpenWritableTerminal() && !closed ? (
+                  <button
+                    id="copy-cmd-btn"
+                    type="button"
+                    role="menuitem"
+                    data-tip={t('sessions.copyCommandHint')}
+                    onClick={event => void copySpawnCommand(row, event.currentTarget)}
+                  >
+                    {t('sessions.copyCommand')}
+                  </button>
+                ) : null}
+                <button
+                  id="lock-btn"
+                  type="button"
+                  role="menuitem"
+                  onClick={event => void props.setSessionLocked(row, !row.locked, event.currentTarget)}
+                >
+                  {lockActionLabel(row)}
+                </button>
+                {!row.feishuChatLink || row.scope !== 'chat' ? (
+                  <span className="drawer-more-item"><LocateButton row={row} locateSession={props.locateSession} /></span>
+                ) : (
+                  <a
+                    className="drawer-more-item drawer-more-link"
+                    href={row.feishuChatLink}
+                    target="_blank"
+                    rel="noopener"
+                    role="menuitem"
+                  >
+                    {t('sessions.openChat')}
+                  </a>
+                )}
+                {row.queued && !closed ? (
+                  <button
+                    id="start-btn"
+                    type="button"
+                    role="menuitem"
+                    onClick={async event => { if (await props.startSession(row, event.currentTarget)) props.onClose(); }}
+                  >
+                    {t('sessions.create.start')}
+                  </button>
+                ) : null}
+              </div>
+            </details>
+          </footer>
         </article>
       ) : null}
-    </dialog>
+    </ModalDialog>
   );
 }
 
@@ -2107,15 +2336,11 @@ function CreateSessionDialog(props: {
   const [submitting, setSubmitting] = useState(false);
   const [keepOpen, setKeepOpen] = useState(() => readStoredCreateKeepOpen(windowStorage()));
   const [keptSuccess, setKeptSuccess] = useState<any>(null);
-  const [feedGroups, setFeedGroups] = useState<Array<{ groupId: string; name: string }>>([]);
-  const [feedGroupAppId, setFeedGroupAppId] = useState('');
-  const [feedGroupId, setFeedGroupId] = useState('');
-  const [newFeedGroupName, setNewFeedGroupName] = useState('');
-  const [feedGroupError, setFeedGroupError] = useState('');
-  const [feedGroupLoading, setFeedGroupLoading] = useState(false);
-  const [feedGroupAuthSubmitting, setFeedGroupAuthSubmitting] = useState(false);
-  const [feedGroupAuthUrl, setFeedGroupAuthUrl] = useState('');
-  const [feedGroupCallbackUrl, setFeedGroupCallbackUrl] = useState('');
+  const feed = useFeedGroups({
+    enabled: !!state && !state.loading && !state.success,
+    reloadKey: state,
+    onAuthError: (_kind, reason) => toast(reason, { kind: 'error' }),
+  });
   const [mentionTrigger, setMentionTrigger] = useState<MentionTrigger | null>(null);
   const [mentionIndex, setMentionIndex] = useState(0);
   const contentRef = useRef<HTMLTextAreaElement>(null);
@@ -2134,89 +2359,11 @@ function CreateSessionDialog(props: {
     setAdvancedOpen(false);
     setSubmitting(false);
     setKeptSuccess(null);
-    setFeedGroupId('');
-    setNewFeedGroupName('');
-    setFeedGroupError('');
-    setFeedGroupAuthUrl('');
-    setFeedGroupCallbackUrl('');
+    feed.reset();
     setMentionTrigger(null);
     setMentionIndex(0);
     nextImageOrdinalRef.current = 1;
   }, [state]);
-
-  useEffect(() => {
-    if (!feedGroupAuthUrl) return;
-    let alive = true;
-    const timer = window.setInterval(() => {
-      void fetch('/api/feed-groups')
-        .then(async response => {
-          const body = await response.json().catch(() => ({}));
-          if (!response.ok || !body.ok || !alive) return;
-          setFeedGroups(Array.isArray(body.groups) ? body.groups : []);
-          setFeedGroupAppId(typeof body.larkAppId === 'string' ? body.larkAppId : '');
-          setFeedGroupError('');
-          setFeedGroupAuthUrl('');
-          setFeedGroupCallbackUrl('');
-        })
-        .catch(() => { /* remote/manual fallback remains visible */ });
-    }, 1_000);
-    return () => { alive = false; window.clearInterval(timer); };
-  }, [feedGroupAuthUrl]);
-
-  useEffect(() => {
-    if (!state || state.loading || state.success) return;
-    let alive = true;
-    setFeedGroupLoading(true);
-    void fetch('/api/feed-groups')
-      .then(async response => {
-        const body = await response.json().catch(() => ({}));
-        if (!response.ok || !body.ok) throw new Error(body.message ?? body.error ?? `HTTP ${response.status}`);
-        if (!alive) return;
-        setFeedGroups(Array.isArray(body.groups) ? body.groups : []);
-        setFeedGroupAppId(typeof body.larkAppId === 'string' ? body.larkAppId : '');
-        setFeedGroupError('');
-      })
-      .catch(error => { if (alive) setFeedGroupError(error instanceof Error ? error.message : String(error)); })
-      .finally(() => { if (alive) setFeedGroupLoading(false); });
-    return () => { alive = false; };
-  }, [state]);
-
-  const openFeedGroupLogin = async (): Promise<void> => {
-    const query = feedGroupAppId ? `?larkAppId=${encodeURIComponent(feedGroupAppId)}` : '';
-    const response = await fetch(`/api/feed-groups/auth-url${query}`);
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok || !body.authUrl) {
-      alert(body.error ?? `HTTP ${response.status}`);
-      return;
-    }
-    setFeedGroupAuthUrl(String(body.authUrl));
-    setFeedGroupCallbackUrl('');
-  };
-
-  const completeFeedGroupLogin = async (callbackUrl: string): Promise<void> => {
-    setFeedGroupAuthSubmitting(true);
-    try {
-      const response = await fetch('/api/feed-groups/oauth-callback', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ callbackUrl: callbackUrl.trim() }),
-      });
-      const body = await response.json().catch(() => ({}));
-      if (!response.ok || !body.ok) throw new Error(body.message ?? body.error ?? `HTTP ${response.status}`);
-      const groupsResponse = await fetch('/api/feed-groups');
-      const groupsBody = await groupsResponse.json().catch(() => ({}));
-      if (!groupsResponse.ok || !groupsBody.ok) throw new Error(groupsBody.message ?? groupsBody.error ?? `HTTP ${groupsResponse.status}`);
-      setFeedGroups(Array.isArray(groupsBody.groups) ? groupsBody.groups : []);
-      setFeedGroupAppId(typeof groupsBody.larkAppId === 'string' ? groupsBody.larkAppId : '');
-      setFeedGroupError('');
-      setFeedGroupAuthUrl('');
-      setFeedGroupCallbackUrl('');
-    } catch (error) {
-      alert(error instanceof Error ? error.message : String(error));
-    } finally {
-      setFeedGroupAuthSubmitting(false);
-    }
-  };
 
   if (!state) return null;
   if (state.success) {
@@ -2301,21 +2448,21 @@ function CreateSessionDialog(props: {
     const pasteEnd = event.currentTarget.selectionEnd ?? pasteStart;
     const supported = pasted.filter(file => CREATE_IMAGE_TYPES.has(file.type.toLowerCase()));
     if (supported.length !== pasted.length) {
-      alert(t('sessions.create.imageUnsupported'));
+      toast(t('sessions.create.imageUnsupported'), { kind: 'warning' });
       return;
     }
     if (images.length + supported.length > CREATE_IMAGE_MAX_COUNT) {
-      alert(t('sessions.create.imageCountLimit', { n: String(CREATE_IMAGE_MAX_COUNT) }));
+      toast(t('sessions.create.imageCountLimit', { n: String(CREATE_IMAGE_MAX_COUNT) }), { kind: 'warning' });
       return;
     }
     if (supported.some(file => file.size > CREATE_IMAGE_MAX_BYTES)) {
-      alert(t('sessions.create.imageSizeLimit'));
+      toast(t('sessions.create.imageSizeLimit'), { kind: 'warning' });
       return;
     }
     const nextTotal = images.reduce((sum, image) => sum + image.size, 0)
       + supported.reduce((sum, file) => sum + file.size, 0);
     if (nextTotal > CREATE_IMAGE_MAX_TOTAL_BYTES) {
-      alert(t('sessions.create.imageTotalLimit'));
+      toast(t('sessions.create.imageTotalLimit'), { kind: 'warning' });
       return;
     }
     try {
@@ -2348,16 +2495,16 @@ function CreateSessionDialog(props: {
         textarea.setSelectionRange(inserted.caret, inserted.caret);
       });
     } catch {
-      alert(t('sessions.create.imageReadFailed'));
+      toast(t('sessions.create.imageReadFailed'), { kind: 'error' });
     }
   };
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     const text = content.trim();
-    if (!text) { alert(t('sessions.create.errContent')); return; }
-    if (checkedIds.length === 0) { alert(t('sessions.create.errNoBot')); return; }
+    if (!text) { toast(t('sessions.create.errContent'), { kind: 'warning' }); return; }
+    if (checkedIds.length === 0) { toast(t('sessions.create.errNoBot'), { kind: 'warning' }); return; }
     const leadLarkAppId = lead || checkedIds[0] || '';
-    if (mode === 'lead' && (!leadLarkAppId || !checkedIds.includes(leadLarkAppId))) { alert(t('sessions.create.errLead')); return; }
+    if (mode === 'lead' && (!leadLarkAppId || !checkedIds.includes(leadLarkAppId))) { toast(t('sessions.create.errLead'), { kind: 'warning' }); return; }
     setSubmitting(true);
     setKeptSuccess(null);
     try {
@@ -2372,9 +2519,9 @@ function CreateSessionDialog(props: {
           leadLarkAppId: mode === 'lead' ? leadLarkAppId : undefined,
           name: name.trim() || undefined,
           bindWorkingDir: bindWorkingDir.trim() || undefined,
-          feedGroupId: feedGroupId || undefined,
-          newFeedGroupName: newFeedGroupName.trim() || undefined,
-          feedGroupAppId: (feedGroupId || newFeedGroupName.trim()) ? feedGroupAppId : undefined,
+          feedGroupId: feed.selectedId || undefined,
+          newFeedGroupName: feed.newName.trim() || undefined,
+          feedGroupAppId: (feed.selectedId || feed.newName.trim()) ? feed.appId : undefined,
           images: images.map(image => ({
             name: image.name,
             mimeType: image.mimeType,
@@ -2394,9 +2541,9 @@ function CreateSessionDialog(props: {
         } else {
           props.onSuccess(body);
         }
-      } else if (r.status !== 401) alert(`${t('sessions.create.failed')}: ${body?.error ?? r.status}`);
+      } else if (r.status !== 401) toast(`${t('sessions.create.failed')}: ${body?.error ?? r.status}`, { kind: 'error' });
     } catch (e) {
-      alert(`${t('sessions.create.failed')}: ${e}`);
+      toast(`${t('sessions.create.failed')}: ${e}`, { kind: 'error' });
     } finally {
       setSubmitting(false);
     }
@@ -2515,25 +2662,7 @@ function CreateSessionDialog(props: {
           <label><input type="radio" name="mode" value="all" checked={mode === 'all'} onChange={() => setMode('all')} /> {t('sessions.create.modeAll')}</label>
           <small>{t('sessions.create.modeHelp')}</small>
         </fieldset>
-        {feedGroupAuthUrl ? (
-          <div className="feed-group-auth-overlay">
-            <section className="feed-group-auth-card" role="dialog" aria-modal="true" aria-labelledby="session-feed-group-auth-title">
-              <h3 id="session-feed-group-auth-title">授权飞书标签</h3>
-              <p>点击下面的按钮，在飞书页面确认授权。如果 BotMux 与浏览器在同一台电脑，确认后会自动完成授权。如果 BotMux 运行在远程虚拟机上，浏览器会因无法访问本机地址 <code>127.0.0.1:9768</code> 而显示“无法访问”；此时请复制地址栏中的完整链接并粘贴到下方。</p>
-              <button type="button" className="primary feed-group-auth-open" onClick={() => window.open(feedGroupAuthUrl, '_blank', 'noopener')}>跳转飞书授权</button>
-              <label>
-                <span>请把点击授权后的完整链接粘贴在这里</span>
-                <input type="url" value={feedGroupCallbackUrl} placeholder="http://127.0.0.1:9768/callback?code=…&state=…" onChange={event => setFeedGroupCallbackUrl(event.currentTarget.value)} />
-              </label>
-              <div className="actions">
-                <button type="button" onClick={() => { setFeedGroupAuthUrl(''); setFeedGroupCallbackUrl(''); }}>取消</button>
-                <button type="button" className="primary" disabled={!feedGroupCallbackUrl.trim() || feedGroupAuthSubmitting} onClick={() => void completeFeedGroupLogin(feedGroupCallbackUrl)}>
-                  {feedGroupAuthSubmitting ? '正在完成授权…' : '完成授权'}
-                </button>
-              </div>
-            </section>
-          </div>
-        ) : null}
+        <FeedGroupAuthOverlay feed={feed} titleId="session-feed-group-auth-title" />
         <fieldset className="cs-lead-row" hidden={mode !== 'lead'}>
           <legend>{t('sessions.create.lead')}</legend>
           <select name="lead" disabled={leadOptions.length === 0} value={leadOptions.includes(lead) ? lead : ''} onChange={event => setLead(event.currentTarget.value)}>
@@ -2571,23 +2700,15 @@ function CreateSessionDialog(props: {
             <fieldset className="cs-feed-group">
               <legend>飞书标签（可选）</legend>
               <FeedGroupPicker
-                groups={feedGroups}
-                selectedId={feedGroupId}
-                newName={newFeedGroupName}
-                disabled={feedGroupLoading || !!feedGroupError}
-                onChange={(selectedId, newName) => { setFeedGroupId(selectedId); setNewFeedGroupName(newName); }}
+                groups={feed.groups}
+                selectedId={feed.selectedId}
+                newName={feed.newName}
+                disabled={feed.loading || !!feed.error}
+                onChange={feed.select}
               />
               <small>展开后可在第一行输入新标签名称，或选择下方已有标签。</small>
-              {feedGroupLoading ? <small>正在读取飞书标签…</small> : null}
-              {feedGroupError ? (
-                <div className="cs-warn">
-                  <small>{feedGroupError}</small>{' '}
-                  <button type="button" disabled={feedGroupAuthSubmitting} onClick={() => void openFeedGroupLogin()}>
-                    {feedGroupAuthSubmitting ? '正在完成授权…' : '立即授权'}
-                  </button>
-                  <small> 授权后会弹窗提示你粘贴回调地址。</small>
-                </div>
-              ) : null}
+              {feed.loading ? <small>正在读取飞书标签…</small> : null}
+              <FeedGroupAuthPrompt feed={feed} className="cs-warn" />
             </fieldset>
             <label className="cs-advanced-field">
               <span>{t('sessions.create.workingDir')}</span>
@@ -2632,9 +2753,27 @@ function CreateSessionDialog(props: {
   );
 }
 
+/** 首屏骨架屏：首个 /api/sessions 快照到达前不闪「空」。布局模仿状态板四列，
+ *  纯展示，无交互。 */
+function SessionsSkeleton(): React.JSX.Element {
+  return (
+    <div className="sessions-skeleton" aria-busy="true" aria-label={t('sessions.loadingSessions')}>
+      {[0, 1, 2, 3].map(column => (
+        <div key={column} className="sessions-skeleton-col">
+          <div className="skel skel-head" />
+          <div className="skel skel-card" />
+          <div className="skel skel-card skel-card-short" />
+          <div className="skel skel-card" />
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function SessionsPage(): React.JSX.Element {
   useT();
   const storeRows = useStoreSelector(snapshot => [...snapshot.sessions.values()] as SessionRow[]);
+  const bootstrapped = useStoreSelector(snapshot => snapshot.bootstrapped);
   const [revision, setRevision] = useState(0);
   const refresh = useCallback(() => setRevision(v => v + 1), []);
   const [filters, setFilters] = useState<FiltersState>({
@@ -2660,7 +2799,7 @@ function SessionsPage(): React.JSX.Element {
   const [kanbanGroupBy, setKanbanGroupBy] = useState<KanbanGroupBy>(() => readStoredKanbanGroupBy(windowStorage()));
   const viewStageSignature = `${viewMode}:${viewMode === 'kanban' ? kanbanGroupBy : '-'}`;
   const viewStageInitialRef = useRef(true);
-  const [viewStageAnimKey, setViewStageAnimKey] = useState(0);
+  const viewStageRef = useRef<HTMLDivElement | null>(null);
   const [kanbanTeams, setKanbanTeams] = useState<SessionsKanbanTeam[]>([]);
   const [kanbanChatBots, setKanbanChatBots] = useState<ChatBotsMap | null>(null);
   const [kanbanTeamsLoaded, setKanbanTeamsLoaded] = useState(false);
@@ -2678,7 +2817,9 @@ function SessionsPage(): React.JSX.Element {
   const [idleCleanupBusy, setIdleCleanupBusy] = useState(false);
   const [idleCleanupHours, setIdleCleanupHours] = useState<IdleCleanupHours>(24);
   const [idleCleanupStatus, setIdleCleanupStatus] = useState('');
-  const [drawerSessionId, setDrawerSessionId] = useState<string | null>(null);
+  // `#/sessions?session=<id>`（⌘K 全局搜索等跨页入口）直接打开该会话的详情抽屉；
+  // 会话还没进 store 时抽屉先不出，快照到了 rowsById 命中后自然弹出。
+  const [drawerSessionId, setDrawerSessionId] = useState<string | null>(() => hashQueryParam('session'));
   const [historyState, setHistoryState] = useState<HistoryState | null>(null);
   const [termState, setTermState] = useState<TerminalState | null>(null);
   const [kanbanHost, setKanbanHost] = useState<HTMLElement | null>(null);
@@ -2687,12 +2828,31 @@ function SessionsPage(): React.JSX.Element {
   const [createLoading, setCreateLoading] = useState(false);
   const createRequestRef = useRef(0);
 
+  // 视图切换的入场动画。以前靠 `key={viewStageAnimKey}` 换 key 强制 remount 整个
+  // 舞台来重放 CSS animation——那等于每次点「看板/状态板/话题/表格」都把当前视图
+  // 连同全部卡片从零重建一遍，5000+ 会话下单次点击主线程阻塞 4~6.6s。
+  // 现在改成就地重启动画：摘掉 class、读一次 offsetWidth 触发 reflow、再加回去，
+  // DOM 不动，React 也不用重建子树。
+  // 入场 class 只由这里加，JSX 上的 className 保持静态——这正是本做法成立的前提：
+  // React 只在 className 的计算值变化时才写 DOM，值恒为 "sessions-view-stage"，
+  // 所以它不会把我们加上的 class 冲掉，也就不需要再拿一个 state 去驱动它。
   useLayoutEffect(() => {
     if (viewStageInitialRef.current) {
       viewStageInitialRef.current = false;
       return;
     }
-    setViewStageAnimKey(value => value + 1);
+    const stage = viewStageRef.current;
+    if (!stage) return;
+    // The table's local scrollbar is a sibling, excluded from scrollable
+    // overflow. Animate their common host so the stage doesn't retain its own
+    // transform/opacity stacking context beneath the scrollbar after fill:both.
+    // Other views keep the original stage animation (their host is contents).
+    stage.classList.remove('sessions-view-stage-enter');
+    const host = stage.parentElement;
+    host?.classList.remove('sessions-view-stage-enter');
+    const animated = viewMode === 'table' && host ? host : stage;
+    void animated.offsetWidth;
+    animated.classList.add('sessions-view-stage-enter');
   }, [viewStageSignature]);
 
   useEffect(() => {
@@ -2753,13 +2913,29 @@ function SessionsPage(): React.JSX.Element {
 
   const rowsById = useMemo(() => new Map(storeRows.map(row => [row.sessionId, row])), [storeRows, revision]);
   const boardRows = useMemo(() => rows.filter(row => row.status !== 'closed'), [rows]);
+  // 下面这几个派生集合原来都是裸表达式，每次渲染（含每条 SSE session.update）都要
+  // 在数千行上重跑一遍 filter/every/some。全部收进 useMemo：只有真正的输入变了才重算。
   const visibleRows = viewMode === 'table' || viewMode === 'topics' ? rows : boardRows;
-  const selectableRows = visibleRows.filter(row => row.status !== 'closed');
-  const selectedRows = [...selected]
-    .map(id => rowsById.get(id))
-    .filter((row): row is SessionRow => !!row && row.status !== 'closed');
-  const selectAllChecked = selectableRows.length > 0 && selectableRows.every(row => selected.has(row.sessionId));
-  const selectAllIndeterminate = selectableRows.some(row => selected.has(row.sessionId)) && !selectAllChecked;
+  const selectableRows = useMemo(
+    () => visibleRows.filter(row => row.status !== 'closed'),
+    [visibleRows],
+  );
+  const selectedRows = useMemo(
+    () => [...selected]
+      .map(id => rowsById.get(id))
+      .filter((row): row is SessionRow => !!row && row.status !== 'closed'),
+    [rowsById, selected],
+  );
+  const { selectAllChecked, selectAllIndeterminate } = useMemo(() => {
+    let anySelected = false;
+    let allSelected = selectableRows.length > 0;
+    for (const row of selectableRows) {
+      if (selected.has(row.sessionId)) anySelected = true;
+      else allSelected = false;
+      if (anySelected && !allSelected) break;
+    }
+    return { selectAllChecked: allSelected, selectAllIndeterminate: anySelected && !allSelected };
+  }, [selectableRows, selected]);
 
   useEffect(() => {
     setSelected(prev => {
@@ -2803,7 +2979,7 @@ function SessionsPage(): React.JSX.Element {
     return rows;
   }, [kanbanGroupBy, kanbanTeamKey, kanbanTeams, rows, teamChatIdsFor, viewMode]);
   const idleCleanupCandidatesFor = useCallback(
-    (hours: IdleCleanupHours) => selectIdleCleanupCandidates(currentCleanupVisibleRows, hours),
+    (hours: IdleCleanupHours) => selectCleanupCandidates(currentCleanupVisibleRows, hours),
     [currentCleanupVisibleRows],
   );
 
@@ -2887,7 +3063,7 @@ function SessionsPage(): React.JSX.Element {
           else delete board[sessionId];
           return { ...prev, data: { ...prev.data, board } };
         });
-        if (r.status !== 401) alert(`${t('sessions.kanban.moveFail')}: ${body?.error ?? r.status}`);
+        if (r.status !== 401) toast(`${t('sessions.kanban.moveFail')}: ${body?.error ?? r.status}`, { kind: 'error' });
       }
     } catch (e) {
       setTeamBoard(prev => {
@@ -2897,7 +3073,7 @@ function SessionsPage(): React.JSX.Element {
         else delete board[sessionId];
         return { ...prev, data: { ...prev.data, board } };
       });
-      alert(`${t('sessions.kanban.moveFail')}: ${e}`);
+      toast(`${t('sessions.kanban.moveFail')}: ${e}`, { kind: 'error' });
     }
   }, []);
 
@@ -2965,13 +3141,13 @@ function SessionsPage(): React.JSX.Element {
         row.kanbanColumn = prev.column;
         row.kanbanPosition = prev.position;
         refresh();
-        if (r.status !== 401) alert(`${t('sessions.kanban.moveFail')}: ${body?.error ?? r.status}`);
+        if (r.status !== 401) toast(`${t('sessions.kanban.moveFail')}: ${body?.error ?? r.status}`, { kind: 'error' });
       }
     } catch (e) {
       row.kanbanColumn = prev.column;
       row.kanbanPosition = prev.position;
       refresh();
-      alert(`${t('sessions.kanban.moveFail')}: ${e}`);
+      toast(`${t('sessions.kanban.moveFail')}: ${e}`, { kind: 'error' });
     }
   }, [refresh]);
 
@@ -3022,12 +3198,12 @@ function SessionsPage(): React.JSX.Element {
       if (!r.ok || body?.ok === false) {
         row.title = prevTitle;
         refresh();
-        if (r.status !== 401) alert(`${t('sessions.kanban.renameFail')}: ${body?.error ?? r.status}`);
+        if (r.status !== 401) toast(`${t('sessions.kanban.renameFail')}: ${body?.error ?? r.status}`, { kind: 'error' });
       }
     } catch (e) {
       row.title = prevTitle;
       refresh();
-      alert(`${t('sessions.kanban.renameFail')}: ${e}`);
+      toast(`${t('sessions.kanban.renameFail')}: ${e}`, { kind: 'error' });
     }
   }, [refresh]);
 
@@ -3036,37 +3212,43 @@ function SessionsPage(): React.JSX.Element {
     // do NOT imperatively mutate the button here — the board's locate button renders
     // its icon via dangerouslySetInnerHTML and a textContent write permanently wipes it.
     try {
-      const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/locate`, { method: 'POST' });
+      const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/locate`, { method: 'POST', headers: controlCsrfHeaders() });
       const body = await r.json();
       if (body.ok) return true;
-      alert(`Locate failed: ${body.error ?? r.status}`);
+      toast(`Locate failed: ${body.error ?? r.status}`, { kind: 'error' });
       return false;
     } catch (e) {
-      alert(`Locate error: ${e}`);
+      toast(`Locate error: ${e}`, { kind: 'error' });
       return false;
     }
   }, []);
 
   const closeSession = useCallback(async (row: any, closeBtn?: HTMLButtonElement): Promise<boolean> => {
-    if (!confirm(t('sessions.closeConfirm'))) return false;
+    if (!await confirm({ title: '关闭会话', message: t('sessions.closeConfirm'), danger: true })) return false;
     if (closeBtn) closeBtn.disabled = true;
     try {
       const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/close`, { method: 'POST' });
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body?.ok === false) {
-        if (r.status !== 401) alert(`Close failed: ${body?.error ?? r.status}`);
+        if (r.status !== 401) toast(`Close failed: ${body?.error ?? r.status}`, { kind: 'error' });
         return false;
+      }
+      if (body?.archiveError) {
+        const detail = body.archiveError === 'codex_archive_target_unverified'
+          ? t('sessions.codexArchiveTargetUnverified') : body.archiveError === 'codex_archive_target_invalid'
+            ? t('sessions.codexArchiveTargetInvalid') : body.archiveError;
+        toast(t('sessions.codexArchiveFailed', { count: 1, detail }), { kind: 'warning' });
       }
       // Closed locally, but a remote session was left running (its control plane
       // could not be verified). The drawer is about to close, so this is the only
       // moment the operator can be told.
       const residual = parseCloseResidual(body);
       if (residual) {
-        alert(closeResidualIsLocal(residual)
+        toast(closeResidualIsLocal(residual)
           ? `⚠️ Closed locally, but a credentialed host subtree could NOT be proven terminated: `
             + `${describeCloseResidual(residual)}. The remote session WAS cancelled — inspect the local host process.`
           : `⚠️ Closed locally, but the remote session was NOT cancelled: `
-            + `${describeCloseResidual(residual)} — manual cleanup required.`);
+            + `${describeCloseResidual(residual)} — manual cleanup required.`, { kind: 'warning' });
       }
       setSelected(prev => {
         const next = new Set(prev);
@@ -3076,7 +3258,7 @@ function SessionsPage(): React.JSX.Element {
       refresh();
       return true;
     } catch (e) {
-      alert(`Close error: ${e}`);
+      toast(`Close error: ${e}`, { kind: 'error' });
       return false;
     } finally {
       if (closeBtn) closeBtn.disabled = false;
@@ -3099,7 +3281,7 @@ function SessionsPage(): React.JSX.Element {
       if (!r.ok || body?.ok === false) {
         row.locked = prev;
         refresh();
-        if (r.status !== 401) alert(`${t('sessions.lockFailed')}: ${body?.error ?? r.status}`);
+        if (r.status !== 401) toast(`${t('sessions.lockFailed')}: ${body?.error ?? r.status}`, { kind: 'error' });
         return false;
       }
       row.locked = !!body.locked;
@@ -3108,7 +3290,7 @@ function SessionsPage(): React.JSX.Element {
     } catch (e) {
       row.locked = prev;
       refresh();
-      alert(`${t('sessions.lockFailed')}: ${e}`);
+      toast(`${t('sessions.lockFailed')}: ${e}`, { kind: 'error' });
       return false;
     } finally {
       if (btn) btn.disabled = false;
@@ -3117,20 +3299,20 @@ function SessionsPage(): React.JSX.Element {
 
   const restartSession = useCallback(async (row: any, restartBtn?: HTMLButtonElement): Promise<boolean> => {
     if (restartCooldownIds.current.has(row.sessionId)) return false;
-    if (!confirm(restartConfirmMessage(row))) return false;
+    if (!await confirm({ title: '重启会话', message: restartConfirmMessage(row), danger: true })) return false;
     if (restartBtn) restartBtn.disabled = true;
     try {
       const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/restart`, { method: 'POST' });
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body?.ok === false) {
-        if (r.status !== 401) alert(`${t('sessions.restartFailed')}: ${body?.message ?? body?.error ?? r.status}`);
+        if (r.status !== 401) toast(restartErrorMessage(body, r.status), { kind: 'error' });
         return false;
       }
       restartCooldownIds.current.add(row.sessionId);
       window.setTimeout(() => restartCooldownIds.current.delete(row.sessionId), 5000);
       return true;
     } catch (e) {
-      alert(`${t('sessions.restartFailed')}: ${e}`);
+      toast(`${t('sessions.restartFailed')}: ${e}`, { kind: 'error' });
       return false;
     } finally {
       if (restartBtn) restartBtn.disabled = false;
@@ -3143,12 +3325,12 @@ function SessionsPage(): React.JSX.Element {
       const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/resume`, { method: 'POST' });
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body.ok === false) {
-        alert(`${t('sessions.resumeFailed')}: ${body?.error ?? r.status}`);
+        toast(resumeErrorMessage(body?.error ?? r.status, t), { kind: 'error' });
         return false;
       }
       return true;
     } catch (e) {
-      alert(`${t('sessions.resumeFailed')}: ${e}`);
+      toast(`${t('sessions.resumeFailed')}: ${e}`, { kind: 'error' });
       return false;
     } finally {
       if (button) button.disabled = false;
@@ -3161,12 +3343,12 @@ function SessionsPage(): React.JSX.Element {
       const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/start`, { method: 'POST' });
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body.ok === false) {
-        if (r.status !== 401) alert(`${t('sessions.create.startFailed')}: ${body?.error ?? r.status}`);
+        if (r.status !== 401) toast(`${t('sessions.create.startFailed')}: ${body?.error ?? r.status}`, { kind: 'error' });
         return false;
       }
       return true;
     } catch (e) {
-      alert(`${t('sessions.create.startFailed')}: ${e}`);
+      toast(`${t('sessions.create.startFailed')}: ${e}`, { kind: 'error' });
       return false;
     } finally {
       if (button) button.disabled = false;
@@ -3181,8 +3363,25 @@ function SessionsPage(): React.JSX.Element {
         const body = await r.json().catch(() => ({}));
         if (!r.ok || body?.ok === false) {
           const errCode = String(body?.error ?? r.status);
-          const stale = errCode === 'not_found_yet' || errCode === 'not_found';
-          setHistoryState(prev => prev?.sessionId === row.sessionId ? { sessionId: row.sessionId, loading: false, messages: [], error: errCode, stale } : prev);
+          let staleHint: HistoryState['staleHint'];
+          if ((errCode === 'not_found_yet' || errCode === 'not_found') && row.larkAppId) {
+            try {
+              // `diskVersion` is absent when the server cannot tell what is on
+              // disk (compiled binary): then no stale hint, never an inverted one.
+              const status = await fetch('/api/update/status', { cache: 'no-store' }).then(res => res.json()) as {
+                diskVersion?: string;
+                runningDaemons?: Array<{ larkAppId: string; version?: string }>;
+              };
+              const running = status.runningDaemons?.find(d => d.larkAppId === row.larkAppId)?.version;
+              if (daemonVersionDiffersFromDisk(running, status.diskVersion)) {
+                staleHint = {
+                  running: stripBotmuxVersionPrefix(running!),
+                  disk: stripBotmuxVersionPrefix(status.diskVersion!),
+                };
+              }
+            } catch { /* raw not_found only */ }
+          }
+          setHistoryState(prev => prev?.sessionId === row.sessionId ? { sessionId: row.sessionId, loading: false, messages: [], error: errCode, staleHint } : prev);
           return;
         }
         const messages = Array.isArray(body.messages) ? body.messages : [];
@@ -3207,16 +3406,26 @@ function SessionsPage(): React.JSX.Element {
     void openWriteLink(row, button);
   }, []);
 
+  // 抽屉主操作「接管终端」：有权限直接开可写终端，否则退到只读终端弹窗。
+  const takeoverSession = useCallback((row: any, button?: HTMLButtonElement): void => {
+    if (shouldOpenWritableTerminal() && row.status !== 'closed') {
+      void openWriteLink(row, button);
+      return;
+    }
+    openTerminalModal(row);
+  }, [openTerminalModal]);
+
   const runBulkClose = useCallback(async (): Promise<void> => {
     const ids = [...selected];
     if (ids.length === 0) return;
-    if (!confirm(t('sessions.closeBulkConfirm', { count: ids.length }))) return;
+    if (!await confirm({ title: '关闭会话', message: t('sessions.closeBulkConfirm', { count: ids.length }), danger: true })) return;
     setBulkCloseProgress({ done: 0, total: ids.length });
     let done = 0;
     let failed = 0;
     // Counted separately: a residual is NOT a failure (the row closed) but must
     // never be folded into the silent success total.
     const residualIds: string[] = [];
+    const archiveErrors: string[] = [];
     const queue = [...ids];
     async function worker() {
       while (queue.length) {
@@ -3227,6 +3436,7 @@ function SessionsPage(): React.JSX.Element {
           if (!r.ok || body?.ok === false) {
             failed += 1;
           } else {
+            if (body?.archiveError) archiveErrors.push(String(body.archiveError));
             const residual = parseCloseResidual(body);
             if (residual) residualIds.push(describeCloseResidual(residual));
           }
@@ -3242,14 +3452,15 @@ function SessionsPage(): React.JSX.Element {
     setBulkCloseProgress(null);
     setSelected(new Set());
     refresh();
-    if (failed > 0) alert(`Failed: ${failed}/${ids.length}`);
+    if (failed > 0) toast(`Failed: ${failed}/${ids.length}`, { kind: 'error' });
+    if (archiveErrors.length) toast(t('sessions.codexArchiveFailed', { count: archiveErrors.length, detail: archiveErrors.join(', ') }), { kind: 'warning' });
     if (residualIds.length > 0) {
       // Fires even when nothing failed — otherwise an all-residual batch is
       // entirely silent and the operator believes everything is gone. Kind-neutral
       // (a batch can mix a surviving remote session and a local host subtree); each
       // label already states which.
-      alert(`⚠️ ${residualIds.length}/${ids.length} closed locally but left a residual `
-        + `requiring manual cleanup: ${residualIds.join(', ')}`);
+      toast(`⚠️ ${residualIds.length}/${ids.length} closed locally but left a residual `
+        + `requiring manual cleanup: ${residualIds.join(', ')}`, { kind: 'warning' });
     }
   }, [refresh, selected]);
 
@@ -3291,7 +3502,7 @@ function SessionsPage(): React.JSX.Element {
     await Promise.all(Array.from({ length: Math.min(6, targetRows.length) }, () => worker()));
     setBulkLockProgress(null);
     refresh();
-    if (failed > 0) alert(`${t('sessions.lockFailed')}: ${failed}/${targetRows.length}`);
+    if (failed > 0) toast(`${t('sessions.lockFailed')}: ${failed}/${targetRows.length}`, { kind: 'error' });
   }, [refresh, rowsById, selected]);
 
   const addSelectedToMonitorRoom = useCallback((): void => {
@@ -3305,7 +3516,8 @@ function SessionsPage(): React.JSX.Element {
   const runIdleCleanup = useCallback(async (hours: IdleCleanupHours): Promise<void> => {
     const nextHours = parseIdleCleanupHours(hours);
     if (!nextHours) return;
-    const candidates = idleCleanupCandidatesFor(nextHours);
+    const groups = idleCleanupCandidatesFor(nextHours);
+    const candidates = [...groups.idle, ...groups.dormant];
     if (candidates.length === 0) return;
     setIdleCleanupHours(nextHours);
     setIdleCleanupBusy(true);
@@ -3318,7 +3530,7 @@ function SessionsPage(): React.JSX.Element {
       });
       const body = await r.json().catch(() => ({}));
       if (!r.ok) {
-        if (r.status !== 401) alert(`${t('sessions.idleCleanupFailed')}: ${body?.error ?? r.status}`);
+        if (r.status !== 401) toast(`${t('sessions.idleCleanupFailed')}: ${body?.error ?? r.status}`, { kind: 'error' });
         setIdleCleanupStatus('');
         return;
       }
@@ -3333,6 +3545,10 @@ function SessionsPage(): React.JSX.Element {
         closed: Number(body?.closed ?? 0),
         failed: Number(body?.failed ?? 0),
       }));
+      const archiveErrors = (body?.results ?? []).filter((item: any) => item?.archiveError);
+      if (archiveErrors.length) toast(t('sessions.codexArchiveFailed', { count: archiveErrors.length, detail: archiveErrors.map((item: any) => item.archiveError === 'codex_archive_target_unverified'
+        ? t('sessions.codexArchiveTargetUnverified') : item.archiveError === 'codex_archive_target_invalid'
+          ? t('sessions.codexArchiveTargetInvalid') : item.archiveError).join(', ') }), { kind: 'warning' });
       const idleResiduals = (body?.results ?? [])
         .filter((item: any) => item?.ok && item?.residual)
         .map((item: any) => describeCloseResidual(item.residual));
@@ -3341,12 +3557,12 @@ function SessionsPage(): React.JSX.Element {
         // while some rows left a residual (a remote session still running, or a
         // local host subtree not proven terminated) needing manual cleanup.
         // Kind-neutral: a batch can mix both, and each label already says which.
-        alert(`⚠️ ${idleResiduals.length} session(s) closed locally but left a residual `
-          + `requiring manual cleanup: ${idleResiduals.join(', ')}`);
+        toast(`⚠️ ${idleResiduals.length} session(s) closed locally but left a residual `
+          + `requiring manual cleanup: ${idleResiduals.join(', ')}`, { kind: 'warning' });
       }
       refresh();
     } catch (e) {
-      alert(`${t('sessions.idleCleanupFailed')}: ${e}`);
+      toast(`${t('sessions.idleCleanupFailed')}: ${e}`, { kind: 'error' });
       setIdleCleanupStatus('');
     } finally {
       setIdleCleanupBusy(false);
@@ -3359,7 +3575,15 @@ function SessionsPage(): React.JSX.Element {
     setViewMode(next);
     writeStoredSessionsViewMode(windowStorage(), next);
   };
-  const moveColumn = (id: string, delta: number): void => {
+  // 表格表头排序与筛选条排序下拉共用同一套 state 切换逻辑。
+  const handleSort = useCallback((key: string) => {
+    if (sortKey === key) setSortDir(dir => (dir === 'asc' ? 'desc' : 'asc'));
+    else {
+      setSortKey(key);
+      setSortDir(key === 'spawnedAt' || key === 'lastMessageAt' ? 'desc' : 'asc');
+    }
+  }, [sortKey]);
+  const moveColumn = useCallback((id: string, delta: number): void => {
     setBoardOrder(prev => {
       const from = prev.indexOf(id);
       const to = from + delta;
@@ -3370,8 +3594,8 @@ function SessionsPage(): React.JSX.Element {
       writeStoredBoardOrder(windowStorage(), next);
       return next;
     });
-  };
-  const moveColumnTo = (id: string, targetId: string): void => {
+  }, []);
+  const moveColumnTo = useCallback((id: string, targetId: string): void => {
     if (id === targetId) return;
     setBoardOrder(prev => {
       const from = prev.indexOf(id);
@@ -3383,7 +3607,7 @@ function SessionsPage(): React.JSX.Element {
       writeStoredBoardOrder(windowStorage(), next);
       return next;
     });
-  };
+  }, []);
 
   const kanbanState = useMemo(() => ({
     rows,
@@ -3394,6 +3618,98 @@ function SessionsPage(): React.JSX.Element {
     teamBoardData: teamBoard.data,
     teamBoardKey: teamBoard.key,
   }), [kanbanGroupBy, kanbanTeamKey, kanbanTeams, kanbanTeamsLoaded, rows, teamBoard.data, teamBoard.key]);
+
+  // 看板回调必须是稳定引用。以前这十个回调都是 <SessionsKanbanView> 上的内联箭头，
+  // 于是每次页面渲染（含每条 SSE）都生成一整套新函数 → 看板内部 props/display 换新
+  // 引用 → 每张卡片的 memo 全部失效。底层 helper 本身早就是 useCallback 了，这里只是
+  // 把「取 store 里的会话再转调」那层薄包装也固定下来。
+  const kanbanOnClose = useCallback((row: any, button?: HTMLButtonElement) => {
+    const s = store.sessions.get(String(row.sessionId));
+    if (s) void closeSession(s, button);
+  }, [closeSession]);
+  const kanbanOnDetails = useCallback((row: any) => setDrawerSessionId(String(row.sessionId)), []);
+  const kanbanOnNeedTeamBoard = useCallback((team: SessionsKanbanTeam) => { void ensureTeamBoard(team); }, [ensureTeamBoard]);
+  const kanbanOnNeedTeams = useCallback(() => { void loadKanbanTeams(); }, [loadKanbanTeams]);
+  const kanbanOnRename = useCallback((row: any, title: string) => {
+    const s = store.sessions.get(String(row.sessionId));
+    if (s) void persistRename(s, title);
+  }, [persistRename]);
+  const kanbanOnRestart = useCallback((row: any, button: HTMLButtonElement) => {
+    const s = store.sessions.get(String(row.sessionId));
+    if (s) void restartSession(s, button);
+  }, [restartSession]);
+  const kanbanOnTeamScope = useCallback((scope: { chats: number; sessions: number } | null) => {
+    setTeamScopeText(scope ? t('sessions.kanban.teamScope', { chats: scope.chats, sessions: scope.sessions }) : '');
+  }, []);
+  const kanbanOnToggleLock = useCallback((row: any, button: HTMLButtonElement) => {
+    const s = store.sessions.get(String(row.sessionId));
+    if (s) void setSessionLocked(s, !s.locked, button);
+  }, [setSessionLocked]);
+  const kanbanOnToggleSelect = useCallback((row: any) => setSelected(prev => {
+    const id = String(row.sessionId);
+    const next = new Set(prev);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  }), []);
+  // 表格 / 状态板 / 话题三视图的回调同样必须是稳定引用。它们过去都是 JSX 上的内联
+  // 箭头，于是每次页面渲染（含每条 SSE session.update、以及「打开/关闭详情」这种
+  // 只改抽屉状态的操作）都换一套新函数 → 视图 memo 全部失效 → 数千行整体重排。
+  // 这里只包一层薄转调，真正的实现仍是上面那些 useCallback helper。
+  const listOnOpen = useCallback((row: any) => setDrawerSessionId(String(row.sessionId)), []);
+  const listOnToggleSelect = useCallback((row: any) => setSelected(prev => {
+    const id = String(row.sessionId);
+    const next = new Set(prev);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  }), []);
+  const listOnSelect = useCallback((id: string, checked: boolean) => setSelected(prev => {
+    const next = new Set(prev);
+    if (checked) next.add(id); else next.delete(id);
+    return next;
+  }), []);
+  const listOnLocate = useCallback((row: any) => locateSession(row), [locateSession]);
+  const listOnRestart = useCallback((row: any, button?: HTMLButtonElement) => {
+    void restartSession(row, button);
+  }, [restartSession]);
+  const listOnLock = useCallback((row: any, locked: boolean, button?: HTMLButtonElement) => {
+    void setSessionLocked(row, locked, button);
+  }, [setSessionLocked]);
+  const listOnClose = useCallback((row: any, button?: HTMLButtonElement) => {
+    void closeSession(row, button);
+  }, [closeSession]);
+  const boardOnAnimated = useCallback(() => setBoardAnimated(true), []);
+  const tableOnSelectAll = useCallback((checked: boolean) => setSelected(prev => {
+    const next = new Set(prev);
+    for (const row of selectableRows) {
+      if (checked) next.add(row.sessionId);
+      else next.delete(row.sessionId);
+    }
+    return next;
+  }), [selectableRows]);
+  const tableOnResetColumns = useCallback(() => {
+    setHiddenColumns(new Set());
+    writeStoredHiddenTableColumns(windowStorage(), []);
+  }, []);
+  const tableOnToggleColumn = useCallback((colId: string) => {
+    const willHide = !hiddenColumns.has(colId);
+    const next = new Set(hiddenColumns);
+    if (willHide) next.add(colId);
+    else next.delete(colId);
+    // 落盘放在 updater 外：updater 必须是纯函数（StrictMode 下会跑两次）。
+    writeStoredHiddenTableColumns(windowStorage(), Array.from(next));
+    setHiddenColumns(next);
+    // 如果当前排序列被隐藏，回退到默认 lastMessageAt desc
+    if (willHide && colId === sortKey) {
+      setSortKey('lastMessageAt');
+      setSortDir('desc');
+    }
+  }, [hiddenColumns, sortKey]);
+
+  // 这两个开关来自 dashboard 配置，值在一次会话内不变，但函数引用必须固定。
+  const kanbanOnOpenTerminal = dashboardShellAllowsWebTerminal() ? openTerminalModal : undefined;
+  const kanbanOnOpenWritableTerminal = dashboardShellAllowsWebTerminal() && shouldOpenWritableTerminal()
+    ? openWritableTerminal
+    : undefined;
 
   const drawerRow = drawerSessionId ? rowsById.get(drawerSessionId) ?? null : null;
   const kanbanTeamOptions = useMemo(() => {
@@ -3425,34 +3741,6 @@ function SessionsPage(): React.JSX.Element {
       setCreateState({ bots });
     } finally {
       if (createRequestRef.current === requestId) setCreateLoading(false);
-    }
-  }, []);
-
-  // 调试终端：起一个 owner-only 裸 bash（不绑飞书话题），在新标签打开 xterm 页面。
-  // 让用户把「复制复现命令」拿到的命令粘进去改参数复现问题，用完关闭即回收。
-  const openDebugTerminal = useCallback(async (): Promise<void> => {
-    const input = window.prompt(t('sessions.debugTerminalPrompt'), '');
-    if (input === null) return; // 用户取消
-    const workingDir = input.trim();
-    const tab = window.open('about:blank', '_blank');
-    if (tab) tab.opener = null;
-    try {
-      const r = await fetch('/api/debug-terminal', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(workingDir ? { workingDir } : {}),
-      });
-      const body = await r.json().catch(() => ({}));
-      if (!r.ok || body?.ok === false || !body?.url) {
-        tab?.close();
-        if (r.status !== 401) alert(`${t('sessions.debugTerminalFail')}: ${body?.error ?? r.status}`);
-        return;
-      }
-      if (tab) tab.location.href = body.url;
-      else window.open(body.url, '_blank', 'noopener');
-    } catch (e) {
-      tab?.close();
-      alert(`${t('sessions.debugTerminalFail')}: ${e}`);
     }
   }, []);
 
@@ -3547,16 +3835,6 @@ function SessionsPage(): React.JSX.Element {
             </button>
           ) : null}
           {ui.authed ? (
-            <button
-              type="button"
-              className="debug-terminal-btn"
-              title={t('sessions.debugTerminalHint')}
-              onClick={() => void openDebugTerminal()}
-            >
-              {t('sessions.debugTerminal')}
-            </button>
-          ) : null}
-          {ui.authed ? (
             <CreateActionButton
               className="page-primary-action create-session-btn"
               disabled={createLoading}
@@ -3578,11 +3856,17 @@ function SessionsPage(): React.JSX.Element {
         chatOptions={chatOptions}
         filters={filters}
         setFilters={setFilters}
+        sortKey={sortKey}
+        sortDir={sortDir}
+        onSort={handleSort}
         idleCleanup={{
           busy: idleCleanupBusy,
           hours: idleCleanupHours,
           status: idleCleanupStatus,
-          countForHours: hours => idleCleanupCandidatesFor(hours).length,
+          countForHours: (hours) => {
+            const groups = idleCleanupCandidatesFor(hours);
+            return { idle: groups.idle.length, dormant: groups.dormant.length };
+          },
           onRun: runIdleCleanup,
         }}
       />
@@ -3599,159 +3883,117 @@ function SessionsPage(): React.JSX.Element {
         onLock={locked => void runBulkLock(locked)}
       />
 
+      <div className={viewMode === 'table' ? 'sessions-table-scroll-host' : 'sessions-scroll-host-contents'}>
       <div
-        key={viewStageAnimKey}
-        className={`sessions-view-stage${viewStageAnimKey > 0 ? ' sessions-view-stage-enter' : ''}`}
+        ref={viewStageRef}
+        className="sessions-view-stage"
         data-view={viewMode}
         data-kanban-group={kanbanGroupBy}
+        data-local-horizontal-scrollbar={bootstrapped && viewMode === 'table' ? '' : undefined}
       >
+        {!bootstrapped ? <SessionsSkeleton /> : null}
+        {bootstrapped && viewMode === 'table' ? (
         <SessionsTable
           rows={rows}
           selected={selected}
-          hidden={viewMode !== 'table'}
+          hidden={false}
           sortKey={sortKey}
           sortDir={sortDir}
           selectAllChecked={selectAllChecked}
           selectAllIndeterminate={selectAllIndeterminate}
           selectAllDisabled={selectableRows.length === 0}
           hiddenColumns={hiddenColumns}
-          onToggleColumn={(colId) => {
-            const willHide = !hiddenColumns.has(colId);
-            const next = new Set(hiddenColumns);
-            if (willHide) next.add(colId);
-            else next.delete(colId);
-            writeStoredHiddenTableColumns(windowStorage(), Array.from(next));
-            setHiddenColumns(next);
-            // 如果当前排序列被隐藏，回退到默认 lastMessageAt desc
-            if (willHide && colId === sortKey) {
-              setSortKey('lastMessageAt');
-              setSortDir('desc');
-            }
-          }}
-          onResetColumns={() => {
-            setHiddenColumns(new Set());
-            writeStoredHiddenTableColumns(windowStorage(), []);
-          }}
-          onOpen={row => setDrawerSessionId(row.sessionId)}
-          onSelect={(id, checked) => setSelected(prev => {
-            const next = new Set(prev);
-            if (checked) next.add(id);
-            else next.delete(id);
-            return next;
-          })}
-          onSelectAll={checked => setSelected(prev => {
-            const next = new Set(prev);
-            for (const row of selectableRows) {
-              if (checked) next.add(row.sessionId);
-              else next.delete(row.sessionId);
-            }
-            return next;
-          })}
-          onSort={(key) => {
-            if (sortKey === key) setSortDir(sortDir === 'asc' ? 'desc' : 'asc');
-            else {
-              setSortKey(key);
-              setSortDir(key === 'spawnedAt' || key === 'lastMessageAt' ? 'desc' : 'asc');
-            }
-          }}
+          onToggleColumn={tableOnToggleColumn}
+          onResetColumns={tableOnResetColumns}
+          onOpen={listOnOpen}
+          onSelect={listOnSelect}
+          onSelectAll={tableOnSelectAll}
+          onSort={handleSort}
         />
+        ) : null}
 
+        {bootstrapped && viewMode === 'board' ? (
         <BoardView
           rows={boardRows}
           selected={selected}
-          hidden={viewMode !== 'board'}
+          hidden={false}
           order={boardOrder}
           animated={boardAnimated}
           dragColId={dragColId}
           dragOverCol={dragOverCol}
-          onAnimated={() => setBoardAnimated(true)}
+          onAnimated={boardOnAnimated}
           onMoveColumn={moveColumn}
           onMoveColumnTo={moveColumnTo}
           onDragCol={setDragColId}
           onDragOverCol={setDragOverCol}
-          onToggleSelect={row => setSelected(prev => {
-            const next = new Set(prev);
-            if (next.has(row.sessionId)) next.delete(row.sessionId);
-            else next.add(row.sessionId);
-            return next;
-          })}
-          onOpen={row => setDrawerSessionId(row.sessionId)}
+          onToggleSelect={listOnToggleSelect}
+          onOpen={listOnOpen}
           onHistory={openHistoryModal}
-          onLocate={row => locateSession(row)}
-          onRestart={(row, button) => void restartSession(row, button)}
-          onLock={(row, locked, button) => void setSessionLocked(row, locked, button)}
-          onClose={(row, button) => void closeSession(row, button)}
+          onLocate={listOnLocate}
+          onRestart={listOnRestart}
+          onLock={listOnLock}
+          onClose={listOnClose}
         />
+        ) : null}
 
+        {bootstrapped && viewMode === 'topics' ? (
         <TopicGroupsView
           rows={rows}
           relationRows={storeRows}
           selected={selected}
-          hidden={viewMode !== 'topics'}
-          onToggleSelect={row => setSelected(prev => {
-            const next = new Set(prev);
-            if (next.has(row.sessionId)) next.delete(row.sessionId);
-            else next.add(row.sessionId);
-            return next;
-          })}
-          onOpen={row => setDrawerSessionId(row.sessionId)}
+          hidden={false}
+          onToggleSelect={listOnToggleSelect}
+          onOpen={listOnOpen}
           onHistory={openHistoryModal}
-          onLocate={row => locateSession(row)}
-          onRestart={(row, button) => void restartSession(row, button)}
-          onLock={(row, locked, button) => void setSessionLocked(row, locked, button)}
-          onClose={(row, button) => void closeSession(row, button)}
+          onLocate={listOnLocate}
+          onRestart={listOnRestart}
+          onLock={listOnLock}
+          onClose={listOnClose}
         />
+        ) : null}
 
+        {bootstrapped && viewMode === 'kanban' ? (
         <div
           id="sessions-kanban"
           ref={setKanbanHost}
           className={`sessions-kanban${kanbanGroupBy === 'bot' ? ' kanban-mode-bot' : ''}`}
-          hidden={viewMode !== 'kanban'}
         >
-          {viewMode === 'kanban' ? (
-            <SessionsKanbanView
-              host={kanbanHost}
-              {...kanbanState}
-              canRestartSession={canRestartSession}
-              getTeamChatIds={teamChatIdsFor}
-              icons={{
-                details: ICON.details,
-                feishu: ICON.feishu,
-                history: ICON.history,
-                key: ICON.key,
-                lock: ICON.lock,
-                restart: ICON.restart,
-                terminal: ICON.terminal,
-                unlock: ICON.unlock,
-              }}
-              lockActionLabel={lockActionLabel}
-              sessionStatusText={sessionStatusText}
-              onDetails={row => setDrawerSessionId(String(row.sessionId))}
-              onHistory={openHistoryModal}
-              onMoveRows={handleKanbanMoves}
-              onNeedTeamBoard={team => { void ensureTeamBoard(team); }}
-              onNeedTeams={() => { void loadKanbanTeams(); }}
-              onOpenTerminal={dashboardShellAllowsWebTerminal() ? openTerminalModal : undefined}
-              onOpenWritableTerminal={dashboardShellAllowsWebTerminal() && shouldOpenWritableTerminal() ? openWritableTerminal : undefined}
-              onRename={(row, title) => { const s = store.sessions.get(String(row.sessionId)); if (s) void persistRename(s, title); }}
-              onRestart={(row, button) => { const s = store.sessions.get(String(row.sessionId)); if (s) void restartSession(s, button); }}
-              onTeamScope={scope => setTeamScopeText(scope ? t('sessions.kanban.teamScope', { chats: scope.chats, sessions: scope.sessions }) : '')}
-              onToggleLock={(row, button) => { const s = store.sessions.get(String(row.sessionId)); if (s) void setSessionLocked(s, !s.locked, button); }}
-              onToggleSelect={row => setSelected(prev => {
-                const id = String(row.sessionId);
-                const next = new Set(prev);
-                if (next.has(id)) next.delete(id); else next.add(id);
-                return next;
-              })}
-              selectedSessionIds={selected}
-            />
-          ) : null}
+          <SessionsKanbanView
+            host={kanbanHost}
+            {...kanbanState}
+            canRestartSession={canRestartSession}
+            getTeamChatIds={teamChatIdsFor}
+            icons={KANBAN_ICONS}
+            lockActionLabel={lockActionLabel}
+            sessionStatusText={sessionStatusText}
+            onClose={kanbanOnClose}
+            onDetails={kanbanOnDetails}
+            onHistory={openHistoryModal}
+            onMoveRows={handleKanbanMoves}
+            onNeedTeamBoard={kanbanOnNeedTeamBoard}
+            onNeedTeams={kanbanOnNeedTeams}
+            onOpenTerminal={kanbanOnOpenTerminal}
+            onOpenWritableTerminal={kanbanOnOpenWritableTerminal}
+            onRename={kanbanOnRename}
+            onRestart={kanbanOnRestart}
+            onTeamScope={kanbanOnTeamScope}
+            onToggleLock={kanbanOnToggleLock}
+            onToggleSelect={kanbanOnToggleSelect}
+            selectedSessionIds={selected}
+            namesVersion={revision}
+          />
         </div>
+        ) : null}
+      </div>
+      {bootstrapped && viewMode === 'table' ? <SessionHorizontalScrollbar scrollRef={viewStageRef} /> : null}
       </div>
 
       <Drawer
         row={drawerRow}
-        onClose={() => setDrawerSessionId(null)}
+        onClose={() => {
+          setDrawerSessionId(null);
+          clearHashQueryParam('session');
+        }}
         locateSession={locateSession}
         openHistory={openHistoryModal}
         resumeSession={resumeSession}
@@ -3759,6 +4001,7 @@ function SessionsPage(): React.JSX.Element {
         closeSession={closeSession}
         setSessionLocked={setSessionLocked}
         startSession={startSession}
+        onTakeover={takeoverSession}
       />
       <TerminalModal state={termState} onClose={() => setTermState(null)} onRename={persistRename} />
       <HistoryModal state={historyState} onClose={() => setHistoryState(null)} />

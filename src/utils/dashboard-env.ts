@@ -5,9 +5,9 @@
 // single-bot mode, GITHUB_TOKEN, model API keys, whatever the host's tooling
 // wants). index-dashboard.ts used to dotenv-load that file WHOLESALE into
 // process.env, and the dashboard process is the worst place in the fleet for
-// that: it forks debug-terminal shells, `botmux start-bot/stop-bot` children,
-// a global npm/pnpm/bun install (whose lifecycle scripts run with the inherited
-// env), herdr plugin installs, and it starts plugin PM2 services — every one of
+// that: it forks `botmux start-bot/stop-bot` children, a global npm/pnpm/bun
+// install (whose lifecycle scripts run with the inherited env), herdr plugin
+// installs, and it starts plugin PM2 services — every one of
 // those inherited the whole file. A secret that has no consumer in the
 // dashboard must therefore never enter its process.env at all.
 //
@@ -25,8 +25,8 @@ import { DASHBOARD_H5_ENV_PREFIX } from './child-env.js';
 
 /**
  * Keys the dashboard process reads from ~/.botmux/.env, beyond
- * {@link DAEMON_ENV_KEYS} (which is folded in below: every key baked into the
- * shared PM2 env block is by definition a setting the dashboard may resolve,
+ * {@link DAEMON_ENV_KEYS} (which is folded in below: every key pinned into the
+ * shared fleet env is by definition a setting the dashboard may resolve,
  * and a foreground/manual `dist/index-dashboard.js` has only the file).
  *
  * Each entry names its consumer inside the dashboard process, so a future
@@ -45,8 +45,10 @@ import { DASHBOARD_H5_ENV_PREFIX } from './child-env.js';
  *    APP_SECRET below: the dashboard is a real consumer. Not a licence to add
  *    other credentials — a key belongs here only with a named consumer.
  *  - BOTMUX_DASHBOARD_DEV_RELOAD → dashboard.ts dev-reload switch.
+ *  - BOTMUX_TMUX_SOCKET → dashboard/host-terminal.ts: which tmux server holds
+ *    the botmux-managed `bmx-*` sessions it lists and attaches (tmux-socket.ts).
  *  - proxy family → outbound HTTPS from the dashboard itself (npm registry
- *    version/rollback lookups, hd2d asset download) on hosts without direct
+ *    version/rollback lookups, binary self-update download) on hosts without direct
  *    internet. These are forwarded to CLI children by design elsewhere
  *    (PROXY_ENV_KEYS), so allowing them adds no new exposure.
  */
@@ -58,6 +60,7 @@ export const DASHBOARD_ENV_ALLOWLIST = [
   'BOTMUX_SCHEDULE_TIMEZONE',
   'FEISHU_USER_ACCESS_TOKEN',
   'BOTMUX_DASHBOARD_DEV_RELOAD',
+  'BOTMUX_TMUX_SOCKET',
   'http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY',
   'no_proxy', 'NO_PROXY', 'all_proxy', 'ALL_PROXY',
 ] as const;
@@ -83,7 +86,7 @@ export function isDashboardEnvKey(key: string): boolean {
  *
  * Semantics kept identical to the previous wholesale `dotenvConfig({ path })`
  * for allowlisted keys — a value already present in `target` wins, so the
- * deterministic PM2 snapshot (resolveDaemonEnv → DAEMON_ENV_KEYS) still
+ * deterministic fleet snapshot (resolveDaemonEnv → DAEMON_ENV_KEYS) still
  * outranks the file. The difference is everything else in the file: it is
  * parsed into a private object and dropped.
  *

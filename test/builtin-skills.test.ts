@@ -25,6 +25,7 @@ describe('built-in botmux-send skill', () => {
     expect(skill!.content).toContain('只有 `--card-json` / `--card-file` 的卡片输入才按 JSON 解析');
     expect(skill!.content).toContain('JSON.stringify');
     expect(skill!.content).toContain('外层工具协议会自行编码命令字符串');
+    expect(skill!.content).toContain('字面量 `\\n\\n` 还原为段落空行');
     expect(skill!.content).toContain('字面量 `\\n` 反解成换行');
   });
 
@@ -37,6 +38,56 @@ describe('built-in botmux-send skill', () => {
     expect(skill!.content).toContain('--mention <open_id:名字>');
     expect(skill!.content).toContain('--content-file > 位置参数 > stdin');
     expect(skill!.content).toContain('多行正文推荐只放在 heredoc/stdin 中');
+  });
+
+  it('teaches complexity-adaptive layout that matches the schema-v2 renderer', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-send');
+    expect(skill).toBeDefined();
+    expect(skill!.content).toContain('普通回复统一用飞书卡片（schema 2.0）');
+    expect(skill!.content).toContain('单句确认 / 简短状态');
+    expect(skill!.content).toContain('复杂结果 / 方案 / 风险');
+    expect(skill!.content).toContain('独立标题组件（最多提升前 6 个');
+    expect(skill!.content).toContain('下一步 / 需要你确认');
+    expect(skill!.content).toContain('可选排版配方（参考，不是强制模板）');
+    expect(skill!.content).toContain('结果摘要');
+    expect(skill!.content).toContain('进度更新');
+    expect(skill!.content).toContain('方案对比');
+    expect(skill!.content).toContain('风险 / 待确认');
+    expect(skill!.content).toContain('交接说明');
+    expect(skill!.content).toContain('默认使用自由 Markdown');
+    expect(skill!.content).toContain('语义信号');
+    expect(skill!.content).toContain('两个以上方案需要比较');
+    expect(skill!.content).toContain('任务失败或被硬阻塞（需要人介入）');
+    expect(skill!.content).toContain('发送时加 `--attention`');
+    expect(skill!.content).toContain('对不上这五类时继续用自由 Markdown');
+    expect(skill!.content).toContain('仅有可靠数据时附 N%');
+    expect(skill!.content).toContain('可以改名、删减、重排或组合');
+    expect(skill!.content).toContain('不要输出没有内容的占位区块');
+    expect(skill!.content).toContain('配方只影响 Markdown 写法');
+    expect(skill!.content).toContain('使用 `botmux ask`');
+    expect(skill!.content).toContain('不要在普通回复里画不能点击的按钮');
+    expect(skill!.content).not.toContain('纯文本走普通消息');
+  });
+});
+
+describe('built-in botmux-session-rename skill', () => {
+  it('is registered and teaches the self-scoped rename command + naming rules', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-session-rename');
+    expect(skill).toBeDefined();
+    expect(skill!.content).toContain('botmux session rename');
+    // No escape hatch to target another session.
+    expect(skill!.content).toContain('--session-id');
+    // Naming convention + examples + stability rules.
+    expect(skill!.content).toContain('类型｜具体事项');
+    expect(skill!.content).toContain('排障｜支付链路超时');
+    expect(skill!.content).toContain('开发｜权限黑名单');
+    expect(skill!.content).toMatch(/阶段/);
+    // Distinct from the whole-chat rename skill.
+    expect(skill!.content).toContain('botmux-chat-rename');
+    expect(skill!.content).toContain('群名');
+    // Feishu thread titles are not changeable; only the botmux/Dashboard title is.
+    expect(skill!.content).toMatch(/omt|话题/);
+    expect(skill!.content).toContain('Dashboard');
   });
 });
 
@@ -220,6 +271,19 @@ describe('built-in botmux-handoff skill', () => {
     expect(skill!.content).toContain('mentionable');
     expect(skill!.content).toContain('/introduce');
     expect(skill!.content).toContain('botmux send --mention');
+    expect(skill!.content).toContain('单 bot 接力留在当前话题');
+    expect(skill!.content).toContain('botmux dispatch --into');
+    expect(skill!.content).toContain('不要为单个接手者运行不带 `--into` 的 `botmux dispatch`');
+  });
+});
+
+describe('built-in botmux-orchestrate skill', () => {
+  it('keeps a single-specialist handoff in the current topic', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-orchestrate');
+    expect(skill).toBeDefined();
+    expect(skill!.content).toContain('单个专项交给一个 bot');
+    expect(skill!.content).toContain('botmux-handoff');
+    expect(skill!.content).toContain('留在当前话题');
   });
 });
 

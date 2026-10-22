@@ -64,6 +64,9 @@ const mocks = vi.hoisted(() => {
       return session;
     }),
     updateSession: vi.fn(),
+    getSession: vi.fn(),
+    resumeSession: vi.fn(async () => ({ ok: false, error: 'not_found' })),
+    dismissSessionGroup: vi.fn(async () => ({ status: 'confirm', state: 'a'.repeat(64) })),
   };
 });
 
@@ -93,6 +96,7 @@ vi.mock('../src/im/lark/client.js', async () => {
     ...actual,
     replyMessage: mocks.replyMessage,
     sendMessage: mocks.sendMessage,
+    forwardMessage: vi.fn(async () => 'om_forwarded'),
     getChatMode: mocks.getChatMode,
     getChatNameAndMode: mocks.getChatNameAndMode,
     getChatInfo: vi.fn(async () => ({ userCount: 1, botCount: 1 })),
@@ -105,7 +109,7 @@ vi.mock('../src/im/lark/client.js', async () => {
 
 vi.mock('../src/services/session-store.js', async () => {
   const actual = await vi.importActual<any>('../src/services/session-store.js');
-  return { ...actual, createSession: mocks.createSession, updateSession: mocks.updateSession };
+  return { ...actual, createSession: mocks.createSession, updateSession: mocks.updateSession, getSession: mocks.getSession };
 });
 
 vi.mock('../src/im/lark/identity-cache.js', async () => {
@@ -120,8 +124,10 @@ vi.mock('../src/core/worker-pool.js', async () => {
 
 vi.mock('../src/core/session-manager.js', async () => {
   const actual = await vi.importActual<any>('../src/core/session-manager.js');
-  return { ...actual, downloadResources: (...args: any[]) => mocks.downloadResources(...args) };
+  return { ...actual, downloadResources: (...args: any[]) => mocks.downloadResources(...args), resumeSession: mocks.resumeSession };
 });
+
+vi.mock('../src/core/dismiss-command.js', () => ({ dismissSessionGroup: mocks.dismissSessionGroup }));
 
 vi.mock('../src/services/session-group-title.js', async () => {
   const actual = await vi.importActual<any>('../src/services/session-group-title.js');
@@ -135,7 +141,7 @@ import {
   __testOnly_handleNewTopic as handleNewTopic,
 } from '../src/daemon.js';
 import { addChatGrant, chatQuotaKey, removeChatGrant } from '../src/services/grant-store.js';
-import { initSessionGroups, isSessionGroup, getSessionGroup } from '../src/services/session-groups-store.js';
+import { initSessionGroups, isSessionGroup, getSessionGroup, registerSessionGroup } from '../src/services/session-groups-store.js';
 import { canTalk, evaluateTalk, grantCommandRestriction, type RoutingContext } from '../src/im/lark/event-dispatcher.js';
 
 const APP = 'sg_quota_app';
@@ -244,19 +250,23 @@ function createGroupResult(overrides: Record<string, unknown> = {}): any {
     notifyError: null,
     shareLink: null,
     shareLinkError: null,
-    // 出生必须拿到 workingDir 绑定（bot 配了 workingDir → birth 会请求绑定）。
-    // 绑定没落地时的回退是「绑定没落地必须回退」那组用例的被测对象。
+    // 仅显式 sessionGroup.workingDir 会请求绑定（defaultWorkingDir/workingDirs 不再
+    // fallback 成绑定——那会抑制 auto-worktree、跳过选仓库卡）。默认配置下 birth 不看
+    // 这个字段；「绑定没落地必须回退」那组用例会先补上 sessionGroup.workingDir。
     oncallBindings: [{ larkAppId: APP, ok: true, created: true }],
     roleProfileBootstrapMessageId: null,
     roleProfileBootstrapError: null,
     kickoffMessageId: null,
     kickoffError: null,
+    managersAdded: [],
+    managerError: null,
     ...overrides,
   };
 }
 
 beforeEach(async () => {
   vi.clearAllMocks();
+  mocks.getSession.mockReset();
   mkdirSync(mocks.dataDir, { recursive: true });
   const workDir = join(mocks.dataDir, 'workdir');
   mkdirSync(workDir, { recursive: true });
@@ -451,11 +461,19 @@ describe('会话群继承来源授权（堵 oncall 腿的额度与权限绕过�
 });
 
 /**
- * 出生时那条 oncall 绑定承载的是 workingDir。绑定没落地 = 会话群解不出工作目录，
- * 每一轮都会跑错地方；而 birth 过去**一眼都没看** result.oncallBindings。
+ * 显式 sessionGroup.workingDir 会以 oncall 绑定承载。绑定没落地 = 会话群解不出
+ * 这个模板目录，每一轮都会跑错地方；而 birth 过去**一眼都没看** result.oncallBindings。
  * 回退语义与「用户没能被邀请进群」一致：解散半残的群、回落原私聊线程。
+ * （绑定只在显式配置 sessionGroup.workingDir 时才会被请求，这里先补上。）
  */
 describe('会话群出生：workingDir 绑定没落地必须回退', () => {
+  beforeEach(() => {
+    getBot(APP).config.sessionGroup = {
+      ...(getBot(APP).config.sessionGroup ?? {}),
+      workingDir: join(mocks.dataDir, 'workdir'),
+    };
+  });
+
   it('绑定失败 → 不登记会话群，任务回落原私聊（已扣的费不白扣）', async () => {
     mocks.createGroupWithBots.mockResolvedValue(createGroupResult({
       oncallBindings: [{ larkAppId: APP, ok: false, error: 'bots.json write failed' }],
@@ -479,5 +497,43 @@ describe('会话群出生：workingDir 绑定没落地必须回退', () => {
     expect(isSessionGroup(BORN_GROUP)).toBe(false);
     expect(landedTurns()).toHaveLength(1);
     expect(landedTurns()[0][0].chatId).toBe(DM_CHAT);
+  });
+});
+
+/** Dismissal retries must not resurrect the already-closed session before command routing. */
+describe('session-group dismissal ingress', () => {
+  it('starts a fresh session for ordinary messages after the group session closed (no auto-resume)', async () => {
+    registerSessionGroup(BORN_GROUP, { ownerOpenId: OWNER, lastSessionId: 'closed-target' });
+    mocks.getSession.mockReturnValue({ sessionId: 'closed-target', status: 'closed', chatId: BORN_GROUP, scope: 'chat' });
+    const data = dmEvent('continue this task', 'om_continue');
+    data.sender.sender_id.open_id = OWNER;
+    data.message.chat_id = BORN_GROUP;
+    data.message.chat_type = 'group';
+    await handleNewTopic(data, {
+      larkAppId: APP, chatId: BORN_GROUP, messageId: 'om_continue',
+      chatType: 'group', scope: 'chat', anchor: BORN_GROUP,
+    });
+    expect(mocks.resumeSession).not.toHaveBeenCalled();
+    expect(mocks.createSession).toHaveBeenCalled();
+    expect(mocks.dismissSessionGroup).not.toHaveBeenCalled();
+  });
+  it.each([
+    { text: '/dismiss', mention: false },
+    { text: '/dismiss --confirm=' + 'a'.repeat(64), mention: true },
+  ])('routes $text without auto-resume or a phantom session', async ({ text, mention }) => {
+    registerSessionGroup(BORN_GROUP, { ownerOpenId: OWNER, lastSessionId: 'closed-target' });
+    mocks.getSession.mockReturnValue({ sessionId: 'closed-target', status: 'closed', chatId: BORN_GROUP, scope: 'chat' });
+    const data = dmEvent(text, 'om_dismiss', mention);
+    data.sender.sender_id.open_id = OWNER;
+    data.message.chat_id = BORN_GROUP;
+    data.message.chat_type = 'group';
+    await handleNewTopic(data, {
+      larkAppId: APP, chatId: BORN_GROUP, messageId: 'om_dismiss',
+      chatType: 'group', scope: 'chat', anchor: BORN_GROUP,
+    });
+    await vi.waitFor(() => expect(mocks.dismissSessionGroup).toHaveBeenCalledOnce());
+    expect(mocks.resumeSession).not.toHaveBeenCalled();
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
   });
 });

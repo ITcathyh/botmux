@@ -11,7 +11,7 @@
  *                      (`\x1b]777;botmux:<kind>:<base64>\x07`, see
  *                      adapters/cli/runner-control-channel.ts)
  *
- *   dsh side (child `dsh-jsonrpc-agent` process, newline-delimited JSON-RPC):
+ *   dsh side (child `dsh --profile <name>` process, newline-delimited JSON-RPC):
  *     - requests:  initialize / session/prompt / shutdown
  *     - notifications: session.event (full event stream), session.status,
  *                      subagent.started, subagent.finished
@@ -22,75 +22,55 @@
  * assistant/message events and delivered to botmux as a `final` control
  * frame; tool calls render as progress lines.
  *
- * The SDK protocol has no cancel: a wedged turn is reaped by the turn
- * watchdog, which kills the child and exits so botmux restarts the runner
+ * The SDK protocol has no cancel: an explicitly configured turn watchdog
+ * reaps wedged turns, killing the child so botmux restarts the runner
  * (the in-memory session is lost; sessions persist on disk under
  * DSH_SESSION_ROOT but cross-process resume is not wired up yet).
  */
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { parse as parseYaml } from 'yaml';
 import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
+import { larkToolPromptFromEnv } from './core/lark-tool-binding.js';
+import { JsonRpcStdioCore } from './utils/jsonrpc-stdio.js';
+import { errorMessage } from './utils/error-message.js';
+import { createRunnerTerminal } from './runner-common.js';
+import { parseArgs, MAX_TURN_TIMEOUT_MS, type Args } from './dsh-runner-args.js';
+import { appendPendingNotification } from './dsh-runner-pending.js';
 
 const DSH_MARKER = '::botmux-dsh:';
-const DEFAULT_TURN_TIMEOUT_MS = 10 * 60 * 1000;
-// Node's setTimeout delay is a 32-bit signed int of ms; a larger value wraps to
-// ~1ms and warns. Upstream config/IPC/UI already clamp to this bound, but the
-// runner re-validates its own argv so a hand-crafted invocation can't arm an
-// overflowing (effectively ~1ms) turn timeout. Mirrors MAX_TURN_TIMEOUT_MS.
-const MAX_TURN_TIMEOUT_MS = 2_147_483_647;
+const EMPTY_TURN_REPLY = 'DeepSeek Harness 已结束本轮处理，但没有生成最终回复；无法确认任务是否成功，请查看会话执行记录。';
+/**
+ * Total-duration cap for an explicitly armed watchdog, as a multiple of the
+ * configured idle window. The idle timer alone is refreshable forever — a turn
+ * that emits a tool event every cycle would never be reaped — so the hard cap
+ * bounds even chatty turns. A surviving turn must produce at least one
+ * tool/assistant event per idle window, hence the cap is expressed in windows:
+ * 4 windows is the budget for a long but bounded tool chain (e.g. a 10-minute
+ * idle setting caps the turn at 40 minutes). The number is an operations
+ * ceiling, not a protocol constant: operators tighten it by configuring a
+ * smaller idle timeout, which shrinks the hard cap proportionally.
+ */
+const MAX_TURN_DURATION_MULTIPLIER = 4;
+/** Upper bound on notifications buffered while waiting for this turn's inbox
+ *  spliced receipt — see dsh-runner-pending.ts. */
 const HANDSHAKE_TIMEOUT_MS = 30_000;
 const PROMPT_ACK_TIMEOUT_MS = 30_000;
 const SHUTDOWN_GRACE_MS = 2_000;
 const DEFAULT_MODEL = 'deepseek-v4-flash';
 const DEFAULT_MAX_TOKENS = 49152;
 
-/**
- * Vendored default composition, pinned to the dsh protocol version this
- * runner speaks. Mirrors the wheel's runtime/cordis.yml; bump together with
- * the dsh release. Written once per boot so the runtime always gets an
- * explicit config (it refuses to start without one).
- */
-const VENDORED_CONFIG = `# Vendored by botmux dsh-runner. Source: deepseek-harness python/sdk-runtime cordis.yml.
-- id: sdk-jsonrpc-server
-  name: '@deepseek-ai/dsh-sdk-jsonrpc-server'
-- id: agent-core
-  name: '@deepseek-ai/dsh-agent-spine-demo'
-  config:
-    workspaceContext:
-      maxBytes: 65536
-- id: llm-deepseek
-  name: '@deepseek-ai/dsh-llm-deepseek'
-- id: sessions
-  name: '@deepseek-ai/dsh-session-persistence-jsonl'
-  config:
-    root: !!js process.env.DSH_SESSION_ROOT ?? './.sessions'
-- id: session-checkpoints
-  name: '@deepseek-ai/dsh-session-checkpoint-policy'
-- id: subprocess
-  name: '@deepseek-ai/dsh-subprocess-local'
-- id: bash
-  name: '@deepseek-ai/dsh-bash-local'
-  config:
-    cwd: !!js process.env.DSH_CWD ?? process.cwd()
-- id: fs-local
-  name: '@deepseek-ai/dsh-fs-local'
-  config:
-    cwd: !!js process.env.DSH_CWD ?? process.cwd()
-`;
-
-interface Args {
-  sessionId: string;
-  dshBin: string;
-  cwd?: string;
-  botName?: string;
-  botOpenId?: string;
-  locale?: string;
-  model?: string;
-  turnTimeoutMs: number;
-}
+/** Default dsh profile name used when none is specified. The profile lives
+ *  under ~/.dsh/profiles/<name>/ and follows the standard dsh profile layout:
+ *  cordis.yml (empty) + cordis.patch.yml (the full plugin composition). */
+const DEFAULT_DSH_PROFILE = 'botmux';
+const DSH_SDK_JSONRPC_SERVER_PACKAGE = '@deepseek-ai/dsh-sdk-jsonrpc-server';
+const DSH_TOOL_ASK_USER_PACKAGE = '@deepseek-ai/dsh-tool-ask-user';
+const DSH_SDK_JSONRPC_SERVER_DEP = '^0.1.1-rc.1';
+const DSH_TOOL_ASK_USER_DEP = '^0.1.1-rc.1';
 
 interface PendingTurn {
   resolve: () => void;
@@ -99,7 +79,8 @@ interface PendingTurn {
   textBuffer: string;
   usage?: DshUsage;
   toolNames: Map<string, string>;
-  timer: NodeJS.Timeout;
+  timer?: NodeJS.Timeout;
+  hardTimer?: NodeJS.Timeout;
   /** Set from the session/prompt ACK; the turn only owns events at/after
    *  the matching agent/inbox/spliced receipt. */
   messageId?: string;
@@ -119,36 +100,7 @@ interface DshUsage {
 }
 
 const output = new RunnerControlWriter();
-
-function parseArgs(argv: string[]): Args {
-  const out: Args = { sessionId: '', dshBin: '', turnTimeoutMs: DEFAULT_TURN_TIMEOUT_MS };
-  for (let i = 0; i < argv.length; i++) {
-    const key = argv[i];
-    const val = argv[i + 1];
-    if (key === '--session-id' && val !== undefined) { out.sessionId = val; i++; }
-    else if (key === '--dsh-bin' && val !== undefined) { out.dshBin = val; i++; }
-    else if (key === '--cwd' && val !== undefined) { out.cwd = val; i++; }
-    else if (key === '--bot-name' && val !== undefined) { out.botName = val; i++; }
-    else if (key === '--bot-open-id' && val !== undefined) { out.botOpenId = val; i++; }
-    else if (key === '--locale' && val !== undefined) { out.locale = val; i++; }
-    else if (key === '--model' && val !== undefined) { out.model = val; i++; }
-    else if (key === '--turn-timeout-ms' && val !== undefined) {
-      const n = Number(val);
-      // Accept only a positive integer within the arm-able bound; anything else
-      // (≤0, non-integer, over-bound) is ignored → falls back to the default.
-      if (Number.isInteger(n) && n > 0 && n <= MAX_TURN_TIMEOUT_MS) out.turnTimeoutMs = n;
-      i++;
-    }
-  }
-  if (!out.sessionId) throw new Error('--session-id is required');
-  if (!out.dshBin) throw new Error('--dsh-bin is required');
-  return out;
-}
-
-function errorMessage(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  return String(err);
-}
+const { emitMarker, writeLine, prompt } = createRunnerTerminal(output);
 
 function truncate(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max)}…` : text;
@@ -156,6 +108,70 @@ function truncate(text: string, max: number): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function parseYamlDocument(input: string): unknown {
+  return parseYaml(input);
+}
+
+function readJsonRecord(filePath: string): Record<string, unknown> | null {
+  try {
+    const value = JSON.parse(readFileSync(filePath, 'utf8')) as unknown;
+    return isRecord(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function isGeneratedBotmuxProfile(name: string, pkgJson: string, cordisPatchYml: string): boolean {
+  if (name !== DEFAULT_DSH_PROFILE) return false;
+  const pkg = readJsonRecord(pkgJson);
+  if (!pkg || pkg.name !== `dsh-profile-${name}`) return false;
+  try {
+    const patch = readFileSync(cordisPatchYml, 'utf8');
+    return patch.includes('Auto-generated by botmux') && patch.includes('id: sdk-jsonrpc-server');
+  } catch {
+    return false;
+  }
+}
+
+function packageJsonPathFor(packageName: string, profileDir: string): string {
+  return join(profileDir, 'node_modules', ...packageName.split('/'), 'package.json');
+}
+
+function migrateGeneratedBotmuxProfile(name: string, pkgJson: string, cordisPatchYml: string): boolean {
+  if (!isGeneratedBotmuxProfile(name, pkgJson, cordisPatchYml)) return false;
+  let changed = false;
+  const pkg = readJsonRecord(pkgJson);
+  if (pkg) {
+    const deps = isRecord(pkg.dependencies) ? { ...pkg.dependencies } : {};
+    if (deps[DSH_TOOL_ASK_USER_PACKAGE] !== DSH_TOOL_ASK_USER_DEP) {
+      deps[DSH_TOOL_ASK_USER_PACKAGE] = DSH_TOOL_ASK_USER_DEP;
+      pkg.dependencies = deps;
+      writeFileSync(pkgJson, JSON.stringify(pkg, null, 2) + '\n', 'utf8');
+      changed = true;
+    }
+  }
+  const patch = readFileSync(cordisPatchYml, 'utf8');
+  if (!patch.includes('id: tool-ask-user')) {
+    const oldSnippet = [
+      `- insert:`,
+      `    - id: sdk-jsonrpc-server`,
+      `      name: '${DSH_SDK_JSONRPC_SERVER_PACKAGE}'`,
+    ].join('\n');
+    const newSnippet = [
+      `- insert:`,
+      `    - id: tool-ask-user`,
+      `      name: '${DSH_TOOL_ASK_USER_PACKAGE}'`,
+      `    - id: sdk-jsonrpc-server`,
+      `      name: '${DSH_SDK_JSONRPC_SERVER_PACKAGE}'`,
+    ].join('\n');
+    if (patch.includes(oldSnippet)) {
+      writeFileSync(cordisPatchYml, patch.replace(oldSnippet, newSnippet), 'utf8');
+      changed = true;
+    }
+  }
+  return changed;
 }
 
 /** Keep the wire checks aligned with the official dsh SDK client. A successful
@@ -177,33 +193,205 @@ function parsePromptMessageId(result: unknown): string {
   return result.messageId;
 }
 
-function emitMarker(kind: string, payload: unknown): void {
-  output.marker(kind, payload);
+/** Native dsh config resolved from ~/.dsh (profile + settings.yaml + .credentials.yaml).
+ *  The runner spawns `dsh --profile <name>`; the dsh CLI composes the full plugin tree
+ *  from dsh-base bundles + the profile's cordis.patch.yml. */
+interface NativeDshConfig {
+  /** Profile name under ~/.dsh/profiles/ (passed to `dsh --profile`). */
+  profileName: string;
+  /** Provider route for SDK initialize. */
+  provider: string;
+  /** Model for SDK initialize (argv --model > settings.yaml > default). */
+  model: string;
+  /** Credentials injected into the runtime's environment (env wins on conflict). */
+  credentials: Record<string, string>;
 }
 
-function writeLine(text = ''): void {
-  output.line(text);
+function dshHomeDir(): string {
+  const configured = process.env.DSH_HOME?.trim();
+  return configured ? resolve(configured) : join(homedir(), '.dsh');
 }
 
-function prompt(): void {
-  output.display('› ');
-}
-
-/** Resolve the dsh config: an explicit DSH_CORDIS_CONFIG wins, otherwise the
- *  vendored composition is materialized under ~/.botmux/dsh. */
-function resolveConfigPath(): string {
-  const fromEnv = process.env.DSH_CORDIS_CONFIG?.trim();
-  if (fromEnv) {
-    if (!existsSync(fromEnv)) {
-      throw new Error(`DSH_CORDIS_CONFIG does not exist: ${fromEnv}`);
-    }
-    return fromEnv;
-  }
-  const dir = join(homedir(), '.botmux', 'dsh');
+/** Seed a minimal dsh profile under ~/.dsh/profiles/<name> so `dsh --profile <name>`
+ *  can start. dsh judges a profile's existence by its package.json (not the
+ *  directory or cordis.yml), and non-shipped profiles (only "web" / "headless"
+ *  are shipped) are not auto-created by the CLI.
+ *
+ *  We create a minimal skeleton: package.json (dsh-base bundle + SDK deps),
+ *  cordis.yml (empty), and cordis.patch.yml (disable Web GUI + insert the
+ *  JSON-RPC server). For the default botmux profile only, also install and
+ *  insert the model-facing ask_user_question tool, since that is the profile
+ *  where botmux auto-injects its question bridge. dsh-base already provides
+ *  agent, llm, bash, fs, sessions, sandbox, subagent, subprocess, and 50+ other
+ *  plugins — they must NOT be restated here. Community plugins (traex-bridge,
+ *  openviking, genui, etc.) are added by the user with
+ *  `dsh plugin --profile <name> add <pkg>`.
+ *
+ *  After writing the skeleton we call `dsh plugin --profile <name> add` to
+ *  install the dependencies into node_modules — without this, dsh can't load
+ *  the profile. dsh packages are prerelease (0.1.1-rc.x), so the version range
+ *  must be ^0.1.1-rc.1 (plain ^0.1.1 doesn't match prereleases).
+ *
+ *  If the profile already exists, this is a no-op except for a narrow migration
+ *  of the default botmux-generated profile that predated the ask_user_question
+ *  tool row. */
+function ensureProfileDir(name: string, dshBin: string): string {
+  const dir = join(dshHomeDir(), 'profiles', name);
   mkdirSync(dir, { recursive: true });
-  const path = join(dir, 'cordis.yml');
-  writeFileSync(path, VENDORED_CONFIG, 'utf8');
-  return path;
+
+  const pkgJson = join(dir, 'package.json');
+  const isNewSkeleton = !existsSync(pkgJson);
+  const managesAskTool = name === DEFAULT_DSH_PROFILE;
+  if (isNewSkeleton) {
+    const dependencies: Record<string, string> = {
+      [DSH_SDK_JSONRPC_SERVER_PACKAGE]: DSH_SDK_JSONRPC_SERVER_DEP,
+      // dsh-sdk-protocol is a peer dep of sdk-jsonrpc-server; pnpm does not
+      // auto-install peer deps, so we declare it explicitly.
+      '@deepseek-ai/dsh-sdk-protocol': DSH_SDK_JSONRPC_SERVER_DEP,
+    };
+    if (managesAskTool) dependencies[DSH_TOOL_ASK_USER_PACKAGE] = DSH_TOOL_ASK_USER_DEP;
+    const pkg = {
+      name: `dsh-profile-${name}`,
+      private: true,
+      dependencies,
+      dsh: { profile: { bundles: ['@deepseek-ai/dsh-base'] } },
+    };
+    writeFileSync(pkgJson, JSON.stringify(pkg, null, 2) + '\n', 'utf8');
+  }
+
+  const cordisYml = join(dir, 'cordis.yml');
+  if (!existsSync(cordisYml)) {
+    writeFileSync(cordisYml, '# dsh profile root — edit cordis.patch.yml, not this file.\n[]\n', 'utf8');
+  }
+
+  const cordisPatchYml = join(dir, 'cordis.patch.yml');
+  if (!existsSync(cordisPatchYml)) {
+    // Minimal headless SDK profile. dsh-base provides the full plugin tree
+    // (agent, llm-deepseek, llm-pi-ai, tool-bash, tool-fs, sessions, sandbox,
+    // subagent, subprocess, session-checkpoints, etc.). This layer only:
+    //   1. Disables Web GUI plugins (they block loader.await() in headless mode)
+    //   2. Inserts the ask_user_question tool and SDK JSON-RPC server
+    //      (the server is not in dsh-base and has no dsh.bundle).
+    // Community plugins are added by the user with `dsh plugin add`.
+    const insertRows = [
+      ...(managesAskTool ? [
+        `    - id: tool-ask-user`,
+        `      name: '${DSH_TOOL_ASK_USER_PACKAGE}'`,
+      ] : []),
+      `    - id: sdk-jsonrpc-server`,
+      `      name: '${DSH_SDK_JSONRPC_SERVER_PACKAGE}'`,
+    ];
+    const patch = [
+      `# DSH profile: ${name} (headless JSON-RPC server)`,
+      `# Auto-generated by botmux. dsh-base provides the full plugin tree;`,
+      `# this layer only disables the Web GUI and inserts the SDK server.`,
+      `# Add community plugins with: dsh plugin --profile ${name} add <pkg>`,
+      ``,
+      `- id: hmr`,
+      `  disabled: true`,
+      `- id: web`,
+      `  disabled: true`,
+      `- id: web-search-deepseek`,
+      `  disabled: true`,
+      `- id: tool-web`,
+      `  disabled: true`,
+      ``,
+      `- insert:`,
+      ...insertRows,
+      ``,
+    ].join('\n');
+    writeFileSync(cordisPatchYml, patch, 'utf8');
+  }
+
+  migrateGeneratedBotmuxProfile(name, pkgJson, cordisPatchYml);
+  const managesGeneratedAskTool = isGeneratedBotmuxProfile(name, pkgJson, cordisPatchYml);
+
+  // Install profile dependencies. Keyed on installed package presence, not just
+  // node_modules existence — old generated profiles may already have node_modules
+  // from the SDK server but lack the later ask_user_question tool. We warn but
+  // don't throw here: the runner is a subprocess, and the dsh binary will fail
+  // with a clear "Cannot find package" error if installation did not complete.
+  const nodeModules = join(dir, 'node_modules');
+  const missingNodeModules = !existsSync(nodeModules);
+  const missingSdkServer = !existsSync(packageJsonPathFor(DSH_SDK_JSONRPC_SERVER_PACKAGE, dir));
+  const missingAskTool = managesGeneratedAskTool && !existsSync(packageJsonPathFor(DSH_TOOL_ASK_USER_PACKAGE, dir));
+  const packagesToInstall = [
+    ...(missingNodeModules || missingSdkServer ? [`${DSH_SDK_JSONRPC_SERVER_PACKAGE}@next`] : []),
+    ...(missingAskTool ? [`${DSH_TOOL_ASK_USER_PACKAGE}@${DSH_TOOL_ASK_USER_DEP}`] : []),
+  ];
+  if (packagesToInstall.length > 0) {
+    const result = spawnSync(dshBin, [
+      'plugin', '--profile', name, 'add',
+      ...packagesToInstall,
+    ], {
+      stdio: 'pipe',
+      timeout: 120_000,
+    });
+    if (result.status !== 0 || result.error) {
+      const stderr = result.stderr?.toString().trim() || '';
+      process.stderr.write(`[botmux:dsh] install deps failed for profile "${name}" (exit ${result.status ?? 'error'}): ${stderr || result.error?.message || 'unknown error'}\n`);
+      // Don't throw — the runner is a subprocess. The dsh binary will fail
+      // to start with a clear "Cannot find package" error, and the worker
+      // will surface that to the user.
+    }
+  }
+
+  return dir;
+}
+
+/** Load credential references from ~/.dsh/.credentials.yaml as an env map.
+ *  Current DSH writes `{ version: 1, refs: { KEY: value } }`; retain support
+ *  for the pre-release flat `KEY: value` layout used by older installations.
+ *  Missing file → empty (the runtime then falls back to ambient environment). */
+function loadCredentials(): Record<string, string> {
+  const credPath = join(dshHomeDir(), '.credentials.yaml');
+  if (!existsSync(credPath)) return {};
+  const parsed = parseYamlDocument(readFileSync(credPath, 'utf8')) as unknown;
+  const source = isRecord(parsed) && parsed.version === 1 && isRecord(parsed.refs)
+    ? parsed.refs
+    : parsed;
+  const out: Record<string, string> = {};
+  if (isRecord(source)) {
+    for (const [k, v] of Object.entries(source)) {
+      if (typeof v === 'string' && v.length > 0) out[k] = v;
+    }
+  }
+  return out;
+}
+
+/** Resolve the profile name, provider, model, and credentials.
+ *
+ *  Precedence:
+ *  1. --dsh-profile (default "botmux") — profile name under ~/.dsh/profiles/.
+ *  2. Provider & model from ~/.dsh/settings.yaml for the initialize RPC.
+ *  3. Credentials from ~/.dsh/.credentials.yaml. */
+function resolveNativeDshConfig(): NativeDshConfig {
+  const profileName = args.dshProfile?.trim() || DEFAULT_DSH_PROFILE;
+
+  // Ensure the profile directory exists and dependencies are installed.
+  ensureProfileDir(profileName, args.dshBin);
+
+  // Resolve provider & model from ~/.dsh/settings.yaml for the initialize RPC.
+  //    The plugin composition is managed entirely by the profile's cordis.patch.yml.
+  const settingsPath = join(dshHomeDir(), 'settings.yaml');
+  let provider = 'deepseek-official';
+  let settingsModel = '';
+  if (existsSync(settingsPath)) {
+    const settings = parseYamlDocument(readFileSync(settingsPath, 'utf8')) as unknown;
+    const s = isRecord(settings) ? settings : {};
+    const defaultModel = isRecord(s['agent-default-model']) ? s['agent-default-model'] : {};
+    provider = typeof defaultModel.provider === 'string' && defaultModel.provider
+      ? defaultModel.provider
+      : provider;
+    settingsModel = typeof defaultModel.model === 'string' ? defaultModel.model : '';
+  }
+
+  return {
+    profileName,
+    provider,
+    model: args.model?.trim() || settingsModel || DEFAULT_MODEL,
+    credentials: loadCredentials(),
+  };
 }
 
 /** Map dsh's per-model-call usage onto botmux's four-bucket final usage.
@@ -240,38 +428,40 @@ function addUsage(a: DshUsage, b: DshUsage): DshUsage {
 /** Minimal JSON-RPC client over the dsh runtime's stdio transport. */
 class DshJsonRpcClient {
   private child?: ChildProcessWithoutNullStreams;
-  private nextId = 1;
-  private readonly pending = new Map<number, {
-    resolve: (result: unknown) => void;
-    reject: (err: Error) => void;
-    timer: NodeJS.Timeout;
-  }>();
-  private stdoutBuffer = '';
+  private readonly rpc = new JsonRpcStdioCore({
+    mapRpcError: (_method, error) => new Error(`dsh error: ${error.message ?? JSON.stringify(error)}`),
+    onMessage: msg => {
+      if (msg.method) this.onNotification?.(msg.method, msg.params);
+    },
+    onInvalidLine: line => output.error(`[dsh] non-JSON stdout line: ${truncate(line, 200)}`),
+  });
   private exited = false;
   onNotification?: (method: string, params: unknown) => void;
   onExit?: (code: number | null, signal: string | null) => void;
 
   constructor(
     private readonly dshBin: string,
-    private readonly configPath: string,
+    private readonly profileName: string,
     private readonly env: NodeJS.ProcessEnv,
     private readonly cwd: string,
   ) {}
 
   start(): void {
-    this.child = spawn(this.dshBin, [this.configPath], {
+    const dshArgs = ['--profile', this.profileName];
+    if (args.bridgePatch) dshArgs.push(`--patch=${args.bridgePatch}`);
+    this.child = spawn(this.dshBin, dshArgs, {
       env: this.env,
       cwd: this.cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     this.child.stdout.setEncoding('utf8');
-    this.child.stdout.on('data', chunk => this.handleStdout(String(chunk)));
+    this.child.stdout.on('data', chunk => this.rpc.push(String(chunk)));
     this.child.stderr.setEncoding('utf8');
     this.child.stderr.on('data', chunk => output.error(`[dsh] ${String(chunk)}`));
-    this.child.on('error', err => this.failAll(err));
+    this.child.on('error', err => this.rpc.failAll(err));
     this.child.on('exit', (code, signal) => {
       this.exited = true;
-      this.failAll(new Error(`dsh process exited (code=${code}, signal=${signal})`));
+      this.rpc.failAll(new Error(`dsh process exited (code=${code}, signal=${signal})`));
       this.onExit?.(code, signal);
     });
   }
@@ -280,20 +470,18 @@ class DshJsonRpcClient {
     if (!this.child || this.exited) {
       return Promise.reject(new Error('dsh child is not running'));
     }
-    const id = this.nextId++;
+    const id = this.rpc.nextId();
     const payload = JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n';
-    return new Promise<T>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`dsh request '${method}' timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
-      this.pending.set(id, {
-        resolve: result => resolve(result as T),
-        reject,
-        timer,
-      });
-      this.child!.stdin.write(payload);
+    const response = this.rpc.track<T>(id, method, {
+      timeoutMs,
+      onTimeout: (m, ms) => new Error(`dsh request '${m}' timed out after ${ms}ms`),
     });
+    try {
+      this.child.stdin.write(payload);
+    } catch (err) {
+      this.rpc.abort(id, err as Error);
+    }
+    return response;
   }
 
   kill(): void {
@@ -307,45 +495,6 @@ class DshJsonRpcClient {
       await this.request('shutdown', {}, SHUTDOWN_GRACE_MS);
     } catch { /* runtime may exit on its own; SIGTERM below is the backstop */ }
     this.kill();
-  }
-
-  private handleStdout(chunk: string): void {
-    this.stdoutBuffer += chunk;
-    for (;;) {
-      const idx = this.stdoutBuffer.indexOf('\n');
-      if (idx < 0) break;
-      const line = this.stdoutBuffer.slice(0, idx).trim();
-      this.stdoutBuffer = this.stdoutBuffer.slice(idx + 1);
-      if (!line) continue;
-      let msg: { id?: number; result?: unknown; error?: { message?: string }; method?: string; params?: unknown };
-      try {
-        msg = JSON.parse(line);
-      } catch {
-        output.error(`[dsh] non-JSON stdout line: ${truncate(line, 200)}`);
-        continue;
-      }
-      if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
-        const entry = this.pending.get(msg.id);
-        if (!entry) continue;
-        this.pending.delete(msg.id);
-        clearTimeout(entry.timer);
-        if (msg.error) {
-          entry.reject(new Error(`dsh error: ${msg.error.message ?? JSON.stringify(msg.error)}`));
-        } else {
-          entry.resolve(msg.result);
-        }
-      } else if (msg.method) {
-        this.onNotification?.(msg.method, msg.params);
-      }
-    }
-  }
-
-  private failAll(err: Error): void {
-    for (const entry of this.pending.values()) {
-      clearTimeout(entry.timer);
-      entry.reject(err);
-    }
-    this.pending.clear();
   }
 }
 
@@ -383,7 +532,12 @@ function buildPreamble(): string {
     '<botmux_identity>',
     `你是飞书群机器人「${name}」，通过 deepseek-harness 运行。`,
     '- 你的最终回复文本会被自动捕获并发送到群里，不要执行 botmux send 或任何发消息命令。',
+    '- 每轮任务结束时必须给出最终回复，明确成功、失败或待确认；部署成功必须有实际观测依据，未经核实不得宣称成功。',
     `- 工作目录：${cwd}。语言：${locale}。`,
+    ...(() => {
+      const prompt = larkToolPromptFromEnv(locale);
+      return prompt ? [`- ${prompt}`] : [];
+    })(),
     '</botmux_identity>',
     '',
   ].join('\n');
@@ -466,12 +620,17 @@ function handleSessionEvent(turn: PendingTurn, event: unknown): void {
 
 function processTurnNotification(turn: PendingTurn, method: string, p: Record<string, unknown>): void {
   if (method === 'session.event') {
+    const type = (p.event as { type?: unknown } | undefined)?.type;
+    if (type === 'tool/call' || type === 'tool/result' || type === 'assistant/message') {
+      refreshTurnIdleWatchdog(turn);
+    }
     handleSessionEvent(turn, p.event);
     return;
   }
   if (method === 'session.status' && p.status === 'idle' && activeTurn === turn) {
     activeTurn = undefined;
     clearTimeout(turn.timer);
+    clearTimeout(turn.hardTimer);
     lastTurnText = turn.textBuffer;
     lastTurnUsage = turn.usage;
     lastTurnError = turn.turnError;
@@ -489,7 +648,9 @@ function handleNotification(method: string, params: unknown): void {
     // Buffer until the spliced receipt for our messageId: stale notifications
     // from a previous turn (notably a late idle) must not settle this one.
     if (!turn.receiptReceived) {
-      turn.pending.push({ method, params: p });
+      // Bound the buffer (protocol drift: receipt never comes). See
+      // appendPendingNotification for why the oldest entry is dropped.
+      appendPendingNotification(turn.pending, { method, params: p });
       tryClaimReceipt(turn);
       return;
     }
@@ -514,6 +675,24 @@ let lastTurnText = '';
 let lastTurnUsage: DshUsage | undefined;
 let lastTurnError: string | undefined;
 
+function timeoutTurn(turn: PendingTurn, timeoutMs: number, hardLimit: boolean): void {
+  if (activeTurn !== turn) return;
+  activeTurn = undefined;
+  clearTimeout(turn.timer);
+  clearTimeout(turn.hardTimer);
+  turn.reject(new Error(`dsh turn timed out after ${timeoutMs}ms${hardLimit ? ' (hard limit)' : ''}`));
+}
+
+function refreshTurnIdleWatchdog(turn: PendingTurn): void {
+  if (activeTurn !== turn || args.turnTimeoutMs === undefined) return;
+  clearTimeout(turn.timer);
+  const timeoutMs = args.turnTimeoutMs;
+  const timer = setTimeout(() => {
+    if (turn.timer === timer) timeoutTurn(turn, timeoutMs, false);
+  }, timeoutMs);
+  turn.timer = timer;
+}
+
 async function runTurn(content: string): Promise<void> {
   const startedAtMs = Date.now();
   writeLine();
@@ -525,11 +704,7 @@ async function runTurn(content: string): Promise<void> {
   const promptContent = firstTurn ? `${buildPreamble()}${content}` : content;
 
   const turnPromise = new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      if (activeTurn?.timer === timer) activeTurn = undefined;
-      reject(new Error(`dsh turn timed out after ${args.turnTimeoutMs}ms`));
-    }, args.turnTimeoutMs);
-    activeTurn = {
+    const turn: PendingTurn = {
       resolve,
       reject,
       startedAtMs,
@@ -537,8 +712,14 @@ async function runTurn(content: string): Promise<void> {
       toolNames: new Map(),
       pending: [],
       receiptReceived: false,
-      timer,
     };
+    activeTurn = turn;
+    if (args.turnTimeoutMs !== undefined) {
+      const timeoutMs = args.turnTimeoutMs;
+      const hardTimeoutMs = Math.min(MAX_TURN_TIMEOUT_MS, timeoutMs * MAX_TURN_DURATION_MULTIPLIER);
+      turn.timer = setTimeout(() => timeoutTurn(turn, timeoutMs, false), timeoutMs);
+      turn.hardTimer = setTimeout(() => timeoutTurn(turn, hardTimeoutMs, true), hardTimeoutMs);
+    }
   });
 
   try {
@@ -560,6 +741,7 @@ async function runTurn(content: string): Promise<void> {
   } catch (err) {
     if (activeTurn) {
       clearTimeout(activeTurn.timer);
+      clearTimeout(activeTurn.hardTimer);
       activeTurn = undefined;
     }
     throw err;
@@ -568,8 +750,9 @@ async function runTurn(content: string): Promise<void> {
   await turnPromise;
 
   const completedAtMs = Date.now();
-  const finalText = lastTurnText
-    || (lastTurnError ? `dsh 执行出错：${lastTurnError}` : '');
+  const finalText = lastTurnText.trim()
+    ? lastTurnText
+    : lastTurnError ? `dsh 执行出错：${lastTurnError}` : EMPTY_TURN_REPLY;
   const finalUsage = lastTurnUsage;
   emitMarker('final', {
     content: finalText,
@@ -577,7 +760,7 @@ async function runTurn(content: string): Promise<void> {
     startedAtMs,
     completedAtMs,
   });
-  if (!finalText.trim()) writeLine('[dsh] completed without text output.');
+  if (finalText === EMPTY_TURN_REPLY) writeLine('[dsh] completed without text output; sent a diagnostic reply.');
 }
 
 function isFatalRunnerError(err: unknown): boolean {
@@ -656,14 +839,23 @@ function handleInput(data: Buffer): void {
 }
 
 async function main(): Promise<void> {
-  const configPath = resolveConfigPath();
-  const sessionRoot = join(homedir(), '.botmux', 'dsh', 'sessions', args.sessionId);
+  const native = resolveNativeDshConfig();
+  // Sessions live under the native dsh home (~/.dsh/sessions/botmux/<id>),
+  // not ~/.botmux — the adapter binds ~/.dsh into the sandbox.
+  const sessionRoot = join(dshHomeDir(), 'sessions', 'botmux', args.sessionId);
   mkdirSync(sessionRoot, { recursive: true });
 
-  client = new DshJsonRpcClient(args.dshBin, configPath, {
+  // Credentials from ~/.dsh/.credentials.yaml fill gaps; the ambient
+  // environment (bots.json env) wins on conflict, and the runner's
+  // session/cwd always win.
+  client = new DshJsonRpcClient(args.dshBin, native.profileName, {
+    ...native.credentials,
     ...process.env,
     DSH_SESSION_ROOT: sessionRoot,
     DSH_CWD: cwd,
+    ...(args.turnTimeoutMs !== undefined
+      ? { BOTMUX_DSH_ASK_TIMEOUT_MS: String(Math.max(1000, args.turnTimeoutMs - 5000)) }
+      : {}),
   }, cwd);
   client.onNotification = handleNotification;
   client.onExit = (code, signal) => {
@@ -674,16 +866,16 @@ async function main(): Promise<void> {
       const turn = activeTurn;
       activeTurn = undefined;
       clearTimeout(turn.timer);
+      clearTimeout(turn.hardTimer);
       turn.reject(new Error(message));
     }
     setTimeout(() => process.exit(1), 100);
   };
   client.start();
 
-  const model = args.model?.trim() || DEFAULT_MODEL;
   const initializeResult = await client.request<unknown>(
     'initialize',
-    { cwd, provider: 'deepseek-official', model, maxTokens: DEFAULT_MAX_TOKENS },
+    { cwd, provider: native.provider, model: native.model, maxTokens: DEFAULT_MAX_TOKENS },
     HANDSHAKE_TIMEOUT_MS,
   );
   const { serverInfo } = parseInitializeResult(initializeResult);

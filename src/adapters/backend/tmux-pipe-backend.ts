@@ -7,7 +7,7 @@
  *
  * Architecture (no PTY, no attach):
  *   - mkfifo a unique fifo under /tmp
- *   - `tmux pipe-pane -O -t <pane> 'cat > <fifo>'` — tmux replicates every
+ *   - `${this.tmuxCmd} pipe-pane -O -t <pane> 'cat > <fifo>'` — tmux replicates every
  *     byte the pane writes into the fifo (append-only, '-O' overwrites any
  *     existing pipe).
  *   - fs.createReadStream(<fifo>) — we read tmux's verbatim ANSI stream.
@@ -15,7 +15,7 @@
  *     go through `tmux send-keys / paste-buffer -t <pane>` — so the pane's
  *     real address ("0:2.0") is the addressing target, not a synthetic
  *     session name.
- *   - `tmux capture-pane -e -p -t <pane> -S -` returns the current screen
+ *   - `${this.tmuxCmd} capture-pane -e -p -t <pane> -S -` returns the current screen
  *     with ANSI; the worker uses it to seed new web-terminal connections
  *     so they don't start from a blank screen.
  *
@@ -30,14 +30,127 @@ import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import type { SessionBackend, SessionProbe, SpawnOpts } from './types.js';
-import { tmuxEnv } from '../../setup/ensure-tmux.js';
-import { buildBotmuxEnvAssignments, resolveUserShell, shellWrapperScript, shellCommandArgv, shellKindForPath, TmuxBackend } from './tmux-backend.js';
+import { tmuxEnv, getTmuxVersionCached, tmuxVersionAtLeast } from '../../setup/ensure-tmux.js';
+import { stripAnsiForLog, tailChars } from '../../utils/crash-log.js';
+import { inheritBotEnv } from '../../core/env-policy.js';
+import { strictPaneCommand } from './strict-env.js';
+import { buildBotmuxEnvAssignments, resolveUserShell, shellWrapperScript, shellCommandArgv, shellKindForPath, TmuxBackend, isTmuxServerLevelErrorText, isExecTimeoutError } from './tmux-backend.js';
 import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
 import { LivenessGate, ADOPT_LIVENESS_MAX_FAILURES } from './liveness-gate.js';
+import { tmuxCommand, tmuxSocketArgs } from './tmux-socket.js';
 
 function shellescape(s: string): string {
   // Single-quote-escape, replacing internal ' with '\''
   return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
+/** Blocking sleep for the synchronous spawn path (SessionBackend.spawn is sync).
+ *  Atomics.wait is allowed on Node's main thread and burns no CPU — spawn only
+ *  runs during session startup, so briefly blocking the worker is fine. */
+function sleepSyncMs(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/** Retry delays for startup-time tmux commands (new-session / pipe-pane).
+ *  A daemon restore or a post-outage restart herd hammers the shared server
+ *  with connects; first attempts routinely eat an instant ECONNREFUSED
+ *  (accept-backlog overflow). Two spaced retries ride out a several-second
+ *  stall instead of surfacing "会话启动失败" to every chat at once. */
+const STARTUP_TMUX_RETRY_DELAYS_MS = [1000, 3000];
+
+let startupRetrySleepFn: (ms: number) => void = sleepSyncMs;
+
+/** Test seam: the startup retries sleep SYNCHRONOUSLY (Atomics.wait ignores
+ *  fake timers), which would add real seconds to the unit suite. Pass null to
+ *  restore the real sleep. */
+export function setStartupTmuxRetrySleepForTests(fn: ((ms: number) => void) | null): void {
+  startupRetrySleepFn = fn ?? sleepSyncMs;
+}
+
+/** Is a failed startup-time tmux command worth retrying? A clean non-zero exit
+ *  whose stderr is NOT a connection-level error means the server answered and
+ *  rejected deterministically ("can't find pane", "duplicate session", bad
+ *  option) — retrying only delays the same failure. Everything else (connect
+ *  refused/no socket, command timeout, spawn-level EMFILE/EAGAIN) is plausibly
+ *  transient under a stalled/overloaded shared server. */
+function isRetryableStartupTmuxFailure(err: any): boolean {
+  // Deadline first (2026-08-23 regression): a timed-out client can exit
+  // cleanly in the same window the kill fires, so the throw carries a numeric
+  // status + empty stderr alongside ETIMEDOUT. Reading that as "the server
+  // answered and rejected deterministically" turned a new-session that had
+  // actually SUCCEEDED server-side into a fatal, user-visible 会话启动失败
+  // during the post-outage restart storm. A timeout is never deterministic.
+  if (isExecTimeoutError(err)) return true;
+  if (err && typeof err.status === 'number' && !err.signal) {
+    return isTmuxServerLevelErrorText((err.stderr?.toString?.() ?? '').trim());
+  }
+  return true;
+}
+
+/** Evidence about WHY the pane died, collected best-effort after a terminal
+ *  pipe-pane attach failure. All fields null/false when probes are inconclusive
+ *  (server-level outage) — the caller then degrades to the raw error. */
+export interface PipePaneDeathEvidence {
+  paneDead: boolean;
+  paneDeadStatus: string | null;
+  lastScreen: string | null;
+}
+
+const PANE_DEATH_PROBE_TIMEOUT_MS = 1000;
+const PANE_DEATH_SCREEN_TAIL_CHARS = 800;
+
+/** Build the readable startup error for a pane whose CLI process died
+ *  immediately. Pure (no tmux calls) so the wording is unit-testable. */
+export function buildPipePaneStartupError(rawErr: unknown, evidence: PipePaneDeathEvidence): Error {
+  const statusLine = evidence.paneDeadStatus
+    ? `exit status=${evidence.paneDeadStatus}`
+    : '进程已退出（无退出码，可能被信号终止）';
+  const rawFirstLine = (rawErr instanceof Error ? rawErr.message : String(rawErr ?? ''))
+    .split('\n').map(line => line.trim()).find(line => line.length > 0);
+  const lines = [
+    `tmux pane 中的进程启动后立即退出（${statusLine}），这通常是 CLI 本身启动失败，而不是 tmux 未安装。`,
+  ];
+  if (evidence.lastScreen) lines.push(`最后一屏摘要：\n${evidence.lastScreen}`);
+  if (rawFirstLine) lines.push(`原始 pipe-pane 错误：${rawFirstLine}`);
+  return new Error(lines.join('\n'));
+}
+
+/** Best-effort post-mortem after a terminal pipe-pane failure. Runs one
+ *  display-message and one capture-pane, each with a short timeout. Never
+ *  throws and never emits noise: any failure/timeout returns an inconclusive
+ *  evidence ({ paneDead: false }), and the caller keeps the raw error. */
+function collectPipePaneDeathEvidence(paneTarget: string, socketArgs: readonly string[]): PipePaneDeathEvidence {
+  let paneDead = false;
+  let paneDeadStatus: string | null = null;
+  try {
+    const out = String(
+      execFileSync(
+        'tmux',
+        [...socketArgs, 'display-message', '-p', '-t', paneTarget, '#{pane_dead}:#{pane_dead_status}'],
+        { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: PANE_DEATH_PROBE_TIMEOUT_MS, env: tmuxEnv() },
+      ) ?? '',
+    ).trim();
+    const [dead, status] = out.split(':');
+    paneDead = dead === '1';
+    paneDeadStatus = status && status.trim() ? status.trim() : null;
+  } catch {
+    return { paneDead: false, paneDeadStatus: null, lastScreen: null };
+  }
+  let lastScreen: string | null = null;
+  try {
+    const out = String(
+      execFileSync(
+        'tmux',
+        [...socketArgs, 'capture-pane', '-p', '-t', paneTarget],
+        { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: PANE_DEATH_PROBE_TIMEOUT_MS, env: tmuxEnv() },
+      ) ?? '',
+    );
+    const cleaned = stripAnsiForLog(out);
+    lastScreen = cleaned ? tailChars(cleaned, PANE_DEATH_SCREEN_TAIL_CHARS) : null;
+  } catch {
+    lastScreen = null;
+  }
+  return { paneDead, paneDeadStatus, lastScreen };
 }
 
 /** Convert `\n` to `\r\n` while leaving existing `\r\n` alone. Exported for
@@ -149,12 +262,73 @@ export function tmuxLifecycleInitialDelayMs(target: string): number {
   return 1000 + ((hash >>> 0) % 750);
 }
 
+/**
+ * Every backend with a live fifo reader, so process exit can unblock them all.
+ *
+ * A parked fifo read wedges `process.exit()` forever in uv__threadpool_cleanup
+ * (see teardownFifoReader for the full mechanism), and several production exit
+ * paths never call kill(): sendFatalWorkerErrorAndExit(), the
+ * uncaughtException / unhandledRejection handlers, and the
+ * existing-App-Server parent-exit branch all exit directly. Making the fix
+ * depend on every caller remembering to tear down first would leave the
+ * original wedge reachable, so the backend registers itself here and the
+ * process-exit hook below is the backstop. Entries are removed on teardown, so
+ * a normally-closed backend leaves nothing behind.
+ */
+const liveFifoReaders = new Set<TmuxPipeBackend>();
+let fifoExitHookInstalled = false;
+
+function installFifoExitHook(): void {
+  if (fifoExitHookInstalled) return;
+  fifoExitHookInstalled = true;
+  // 'exit' only admits synchronous work — which is exactly what this is: one
+  // write() plus one unlink() per reader. Cannot be an async cleanup.
+  process.on('exit', () => {
+    for (const backend of liveFifoReaders) {
+      try { backend.wakeFifoReaderForExit(); } catch { /* best-effort */ }
+    }
+  });
+}
+
+/** Live fifo readers awaiting the exit-hook wake. Test-only: lets a regression
+ *  assert that a failed spawn deregistered itself, which "the process exited"
+ *  cannot show once the exit hook is in place. */
+export function __testOnly_liveFifoReaderCount(): number {
+  return liveFifoReaders.size;
+}
+
+/** `<server pid> <session id> <created>`: session ids restart at `$0` with
+ *  every new tmux server, so the server pid and creation time are part of it. */
+const SESSION_IDENTITY_FORMAT = '#{pid} #{session_id} #{session_created}';
+
+const RETIRE_KILLED = 'botmux-retired-own-session';
+const RETIRE_KEPT = 'botmux-kept-session';
+
+function parseSessionIdentity(raw: string): string | null {
+  const identity = raw.trim();
+  return /^\d+ \$\d+ \d+$/.test(identity) ? identity : null;
+}
+
 export class TmuxPipeBackend implements SessionBackend {
   readonly supportsRawCommandPasteLine = true;
   /** Real tmux pane address (e.g. "0:2.0") or botmux session name (bmx-*). */
   private readonly paneTarget: string;
+  /** Server this pane lives on (undefined = default server). */
+  readonly socketName: string | undefined;
+  /** Leading argv / shell prefix that address {@link socketName}. */
+  private readonly tmuxArgs: readonly string[];
+  private readonly tmuxCmd: string;
   private readonly fifoPath: string;
   private readStream: fs.ReadStream | null = null;
+  /** Read end of the fifo. Once created, ReadStream alone owns its close. */
+  private fifoFd: number | null = null;
+  /** Write end, opened at spawn() and held for the lifetime of the reader.
+   *  Teardown writes one byte here to unblock the parked read (see
+   *  teardownFifoReader). Acquired UP FRONT on purpose: opening it at teardown
+   *  instead would need the pathname to still exist and a spare fd at the worst
+   *  possible moment — both verified to fail and re-wedge the process (fifo
+   *  already unlinked → ENOENT; fd table exhausted → EMFILE). */
+  private fifoWakeFd: number | null = null;
   /** Streaming UTF-8 decoder. The fifo read emits raw Buffer chunks at libuv's
    *  64KB highWaterMark boundary, which can fall in the middle of a multi-byte
    *  character (CJK = 3 bytes, box-drawing = 3 bytes, emoji = 4 bytes). Decoding
@@ -183,11 +357,32 @@ export class TmuxPipeBackend implements SessionBackend {
    *  spawn failures are classified as unknown and never enter this destructive
    *  counter. (Adopted CLI pid-death stays decisive.) */
   private readonly livenessGate = new LivenessGate(ADOPT_LIVENESS_MAX_FAILURES);
+  /** Consecutive lifecycle probes that did NOT answer 'exists' (missing OR
+   *  unknown). Drives probe-interval backoff only — never a teardown decision:
+   *  during a shared-server outage hundreds of workers re-probing every second
+   *  are themselves part of the connect-storm that keeps the accept backlog
+   *  overflowing. */
+  private probeSetbackStreak = 0;
+  /** Wall-clock start of an unbroken run of CONNECTION-level probe failures
+   *  (see probePaneAddressability serverLevel). Connection failures are
+   *  'unknown' and never trip the liveness gate — but a genuinely dead server
+   *  also produces them forever, and its panes ARE dead. Escalate to pane-exit
+   *  only after the server has been continuously unreachable for
+   *  SERVER_OUTAGE_ESCALATE_MS. Cleared by any server-answered probe; probe
+   *  timeouts leave it untouched (a wedged-but-alive server neither proves nor
+   *  disproves the outage). */
+  private serverUnreachableSince: number | null = null;
+  private static readonly SERVER_OUTAGE_ESCALATE_MS = 60_000;
   private cols = 200;
   private rows = 50;
   private exited = false;
   /** Set after pipe-pane subscription is active so kill() knows to cancel it. */
   private pipeAttached = false;
+  /** Identity of the session THIS spawn() created (`<server pid> <session id>
+   *  <created>`), so a spawn that fails after creating it can retire exactly
+   *  that session — never a same-named one another generation created. The
+   *  server pid matters: session ids restart at `$0` with every new server. */
+  private createdSession: { id: string; identity: string } | null = null;
   private readonly createSession: boolean;
   private readonly ownsSession: boolean;
   private readonly _isReattach: boolean;
@@ -206,14 +401,22 @@ export class TmuxPipeBackend implements SessionBackend {
   cliCwd?: string;
 
   /** Whether this backend re-attached to an existing bmx-* tmux session
-   *  (rather than creating a new detached one). Mirrors TmuxBackend.isReattach
-   *  so the worker can branch on reattach behaviour without a private-cast. */
+   *  (rather than creating a new detached one), so the worker can branch on
+   *  reattach behaviour without a private-cast. */
   get isReattach(): boolean {
     return this._isReattach;
   }
 
-  constructor(paneTarget: string, opts?: { createSession?: boolean; ownsSession?: boolean; isReattach?: boolean; cliPid?: number }) {
+  /**
+   * `socketName` selects the tmux server (`-L <name>`, see tmux-socket.ts).
+   * Omitted = the default server: adopted panes are the user's own and always
+   * live there, as do bmx-* sessions created before the dedicated socket.
+   */
+  constructor(paneTarget: string, opts?: { createSession?: boolean; ownsSession?: boolean; isReattach?: boolean; cliPid?: number; socketName?: string }) {
     this.paneTarget = paneTarget;
+    this.socketName = opts?.socketName;
+    this.tmuxArgs = tmuxSocketArgs(this.socketName);
+    this.tmuxCmd = tmuxCommand(this.socketName);
     this.createSession = opts?.createSession ?? false;
     this.ownsSession = opts?.ownsSession ?? false;
     this._isReattach = opts?.isReattach ?? false;
@@ -227,11 +430,18 @@ export class TmuxPipeBackend implements SessionBackend {
   /** spawn() sets up the pipe-pane subscription + fifo reader. In managed
    *  mode it first creates a detached bmx-* tmux session that runs the CLI. */
   spawn(bin: string, args: string[], opts: SpawnOpts): void {
+    const instanceIdentity = opts.env?.BOTMUX_CODEX_INSTANCE_BINDING;
+    if (this.ownsSession && !this.createSession && instanceIdentity) {
+      // Fence managed reattachment before options or pipe-pane can touch the
+      // existing session. User-owned adopted panes need no Botmux marker.
+      TmuxBackend.assertInstanceIdentity(this.paneTarget, instanceIdentity, this.socketName);
+    }
     // Self-heal a server polluted by a pre-upgrade botmux before we touch it
     // (once per daemon process; no-op on a server this build booted clean).
     // TmuxPipeBackend is the live backend on this path, so the scrub must be
     // triggered here — TmuxBackend is only used for its static helpers.
     TmuxBackend.scrubServerGlobalEnvOnce();
+    if (opts.strictEnv && !this.createSession && !opts.strictEnvReattach) throw new Error('Refusing unverified strict tmux-pipe reattach');
     this.cols = opts.cols;
     this.rows = opts.rows;
 
@@ -242,10 +452,17 @@ export class TmuxPipeBackend implements SessionBackend {
       // been upgraded since the session was originally created, and options
       // like set-clipboard / window-size largest are idempotent to re-apply.
       this.applySessionOptions();
+      this.restoreDetachedOwnedSessionSize();
     }
 
     // Step 1: create the fifo. mkfifo is POSIX; linux/darwin both have it.
-    spawnSync('mkfifo', [this.fifoPath], { stdio: 'ignore' });
+    const fifoCreation = spawnSync('mkfifo', [this.fifoPath], { encoding: 'utf8' });
+    if (fifoCreation.error || fifoCreation.status !== 0) {
+      const detail = fifoCreation.error?.message
+        || String(fifoCreation.stderr || '').trim()
+        || `exit=${fifoCreation.status}, signal=${fifoCreation.signal}`;
+      throw new Error(`Could not create tmux FIFO ${this.fifoPath}: ${detail}. Check temporary storage capacity and free inodes.`);
+    }
 
     // Step 2: open the read end with O_RDWR (no O_NONBLOCK).
     //
@@ -262,7 +479,43 @@ export class TmuxPipeBackend implements SessionBackend {
     // exact bug ate the bridge final_output pipeline on first ship: an
     // strace showed worker only read its IPC fd, never the fifo.)
     const fd = fs.openSync(this.fifoPath, fs.constants.O_RDWR);
-    this.readStream = fs.createReadStream('', { fd, autoClose: false, highWaterMark: 64 * 1024 });
+    this.fifoFd = fd;
+    // Acquire the wake-up write end NOW, while the pathname exists and the fd
+    // table has room. Teardown must never need to allocate anything.
+    // O_NONBLOCK so a full pipe fails with EAGAIN instead of parking here.
+    //
+    // FAIL CLOSED if this fails. Without a wake fd the reader can be unblocked
+    // by nobody — not teardown, not the exit hook — so continuing would build
+    // exactly the unkillable reader this whole fix exists to prevent (verified:
+    // a wake-open failure alone re-wedges the process). This is also the only
+    // moment where bailing is safe: the read stream does not exist yet, so no
+    // read is parked and there is nothing to unblock. The failure modes all
+    // mean the session is doomed anyway — EMFILE will sink the following
+    // execSync(tmux …) too, and ENOENT means the fifo pathname is already gone.
+    try {
+      // Test seam: the fail-closed path below is only reachable when this open
+      // fails, and EMFILE/ENOENT cannot be provoked from a test without
+      // destabilising the whole process. The env var is read on every spawn but
+      // is only ever set by this repo's own test, so production behaviour is
+      // unchanged.
+      if (process.env.BOTMUX_TEST_FORCE_WAKE_OPEN_FAIL === '1') {
+        const injected: NodeJS.ErrnoException = new Error('EMFILE: injected by test');
+        injected.code = 'EMFILE';
+        throw injected;
+      }
+      this.fifoWakeFd = fs.openSync(this.fifoPath, fs.constants.O_WRONLY | fs.constants.O_NONBLOCK);
+    } catch (err) {
+      this.fifoWakeFd = null;
+      try { fs.closeSync(fd); } catch { /* best effort */ }
+      this.fifoFd = null;
+      try { fs.unlinkSync(this.fifoPath); } catch { /* best effort */ }
+      throw err;
+    }
+    this.readStream = fs.createReadStream('', { fd, autoClose: true, highWaterMark: 64 * 1024 });
+    // From here on a parked read can wedge process exit, so make this reader
+    // reachable from the exit hook even if nothing ever calls kill().
+    installFifoExitHook();
+    liveFifoReaders.add(this);
 
     this.readStream.on('data', (chunk) => {
       // StringDecoder reassembles multi-byte chars split across chunk
@@ -287,16 +540,43 @@ export class TmuxPipeBackend implements SessionBackend {
     // Step 3: ask tmux to replicate the pane's bytes into our fifo.
     // -O causes tmux to overwrite any prior pipe-pane subscription.
     // The shell command must redirect to the fifo; tmux runs it via /bin/sh.
-    try {
-      execSync(
-        `tmux pipe-pane -O -t ${shellescape(this.paneTarget)} 'cat > ${shellescape(this.fifoPath)}'`,
-        { stdio: 'ignore', timeout: 5000, env: tmuxEnv() },
-      );
-      this.pipeAttached = true;
-      this.startLifecycleWatcher();
-    } catch (err: any) {
-      this.fireExit(1, null);
-      throw err;
+    // Bounded retries: this exact command failing with an instant clean
+    // connect error during a shared-server stall / restart herd is what turned
+    // the 2026-08-20 outage into user-visible "会话启动失败" across chats.
+    // Retrying is idempotent (-O overwrites any prior subscription); a
+    // deterministic server-answered rejection (pane genuinely gone) is
+    // re-thrown at once instead of delaying the same failure.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        execSync(
+          `${this.tmuxCmd} pipe-pane -O -t ${shellescape(this.paneTarget)} 'cat > ${shellescape(this.fifoPath)}'`,
+          { stdio: ['ignore', 'ignore', 'pipe'], timeout: 5000, env: tmuxEnv() },
+        );
+        this.pipeAttached = true;
+        this.startLifecycleWatcher();
+        break;
+      } catch (err: any) {
+        if (!isRetryableStartupTmuxFailure(err) || attempt >= STARTUP_TMUX_RETRY_DELAYS_MS.length) {
+          // The fifo reader is already live (step 2) with a blocking read parked
+          // on it. Throwing out of spawn() without this leaves that read alive
+          // forever and wedges the process at exit exactly like the bug
+          // teardownFifoReader() exists to prevent — the caller only sees a
+          // failed spawn and has no handle to clean up.
+          this.teardownFifoReader();
+          this.fireExit(1, null);
+          // Best-effort pane post-mortem BEFORE the throw: a pane whose CLI
+          // died instantly is a CLI startup failure, not "tmux missing", and
+          // the raw "Command failed: tmux pipe-pane" card said nothing useful.
+          // An inconclusive probe (server down / timeout) silently keeps err.
+          const evidence = collectPipePaneDeathEvidence(this.paneTarget, this.tmuxArgs);
+          throw evidence.paneDead ? buildPipePaneStartupError(err, evidence) : err;
+        }
+        const detail = (err?.stderr?.toString?.() ?? '').trim() || err?.message || String(err);
+        process.stderr.write(
+          `[tmux-pipe-backend] pipe-pane attach failed (attempt ${attempt + 1}/${STARTUP_TMUX_RETRY_DELAYS_MS.length + 1}); retrying: ${detail}\n`,
+        );
+        startupRetrySleepFn(STARTUP_TMUX_RETRY_DELAYS_MS[attempt]);
+      }
     }
   }
 
@@ -309,7 +589,7 @@ export class TmuxPipeBackend implements SessionBackend {
     if (this.exited) return false;
     this.exitCopyModeIfNeeded();
     return this.guardedSend('send-keys (text)', () => {
-      execFileSync('tmux', ['send-keys', '-t', this.paneTarget, '-l', '--', text], {
+      execFileSync('tmux', [...this.tmuxArgs, 'send-keys', '-t', this.paneTarget, '-l', '--', text], {
         stdio: 'ignore',
         timeout: 5000,
         env: tmuxEnv(),
@@ -321,7 +601,28 @@ export class TmuxPipeBackend implements SessionBackend {
     if (this.exited) return false;
     this.exitCopyModeIfNeeded();
     return this.guardedSend(`send-keys ${keys.join(' ')}`, () => {
-      execFileSync('tmux', ['send-keys', '-t', this.paneTarget, ...keys], {
+      execFileSync('tmux', [...this.tmuxArgs, 'send-keys', '-t', this.paneTarget, ...keys], {
+        stdio: 'ignore',
+        timeout: 5000,
+        env: tmuxEnv(),
+      });
+    });
+  }
+
+  sendLines(lines: string[], softNewlineKey: string): boolean {
+    if (this.exited || lines.length === 0) return false;
+    this.exitCopyModeIfNeeded();
+    const args: string[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      if (i > 0) args.push(';');
+      args.push('send-keys', '-t', this.paneTarget, '-l', '--', lines[i]);
+      if (i < lines.length - 1) {
+        args.push(';');
+        args.push('send-keys', '-t', this.paneTarget, softNewlineKey);
+      }
+    }
+    return this.guardedSend('send-lines', () => {
+      execFileSync('tmux', [...this.tmuxArgs, ...args], {
         stdio: 'ignore',
         timeout: 5000,
         env: tmuxEnv(),
@@ -347,14 +648,14 @@ export class TmuxPipeBackend implements SessionBackend {
     return this.guardedSend('paste-buffer', () => {
       let loaded = false;
       try {
-        execFileSync('tmux', ['load-buffer', '-b', bufferName, '-'], {
+        execFileSync('tmux', [...this.tmuxArgs, 'load-buffer', '-b', bufferName, '-'], {
           input: text,
           stdio: ['pipe', 'ignore', 'ignore'],
           timeout: 5000,
           env: tmuxEnv(),
         });
         loaded = true;
-        execFileSync('tmux', ['paste-buffer', '-b', bufferName, '-t', this.paneTarget, '-d', '-p'], {
+        execFileSync('tmux', [...this.tmuxArgs, 'paste-buffer', '-b', bufferName, '-t', this.paneTarget, '-d', '-p'], {
           stdio: 'ignore',
           timeout: 5000,
           env: tmuxEnv(),
@@ -363,7 +664,7 @@ export class TmuxPipeBackend implements SessionBackend {
       } finally {
         if (loaded) {
           try {
-            execFileSync('tmux', ['delete-buffer', '-b', bufferName], {
+            execFileSync('tmux', [...this.tmuxArgs, 'delete-buffer', '-b', bufferName], {
               stdio: 'ignore',
               timeout: 1000,
               env: tmuxEnv(),
@@ -433,7 +734,7 @@ export class TmuxPipeBackend implements SessionBackend {
     if (this.exited) return;
 
     try {
-      const inMode = execFileSync('tmux', ['display-message', '-p', '-t', this.paneTarget, '#{pane_in_mode}'], {
+      const inMode = execFileSync('tmux', [...this.tmuxArgs, 'display-message', '-p', '-t', this.paneTarget, '#{pane_in_mode}'], {
         encoding: 'utf-8',
         stdio: ['ignore', 'pipe', 'ignore'],
         timeout: 1000,
@@ -441,7 +742,7 @@ export class TmuxPipeBackend implements SessionBackend {
       }).trim();
 
       if (inMode === '1') {
-        execFileSync('tmux', ['send-keys', '-t', this.paneTarget, '-X', 'cancel'], {
+        execFileSync('tmux', [...this.tmuxArgs, 'send-keys', '-t', this.paneTarget, '-X', 'cancel'], {
           stdio: 'ignore',
           timeout: 1000,
           env: tmuxEnv(),
@@ -454,7 +755,7 @@ export class TmuxPipeBackend implements SessionBackend {
 
   enterCopyMode(): void {
     if (this.exited) return;
-    execFileSync('tmux', ['copy-mode', '-e', '-t', this.paneTarget], {
+    execFileSync('tmux', [...this.tmuxArgs, 'copy-mode', '-e', '-t', this.paneTarget], {
       stdio: 'ignore',
       timeout: 5000,
       env: tmuxEnv(),
@@ -463,7 +764,7 @@ export class TmuxPipeBackend implements SessionBackend {
 
   sendCopyModeCommand(xCommand: string): void {
     if (this.exited) return;
-    execFileSync('tmux', ['send-keys', '-t', this.paneTarget, '-X', xCommand], {
+    execFileSync('tmux', [...this.tmuxArgs, 'send-keys', '-t', this.paneTarget, '-X', xCommand], {
       stdio: 'ignore',
       timeout: 5000,
       env: tmuxEnv(),
@@ -474,7 +775,16 @@ export class TmuxPipeBackend implements SessionBackend {
     this.cols = cols;
     this.rows = rows;
     if (this.ownsSession) {
-      execFileSync('tmux', ['resize-window', '-t', this.paneTarget, '-x', String(cols), '-y', String(rows)], {
+      // resize-window landed in tmux 2.9; on older builds (2.8) it fails
+      // silently under stdio:'ignore' and the window keeps its spawn size.
+      // resize-pane works on every version and sets the same geometry here
+      // (we own the pane's only window). Unknown version → keep the old
+      // command so behaviour is unchanged where the probe can't answer.
+      const version = getTmuxVersionCached();
+      const subcommand = version !== null && !tmuxVersionAtLeast(version, 2, 9)
+        ? 'resize-pane'
+        : 'resize-window';
+      execFileSync('tmux', [...this.tmuxArgs, subcommand, '-t', this.paneTarget, '-x', String(cols), '-y', String(rows)], {
         stdio: 'ignore',
         timeout: 5000,
         env: tmuxEnv(),
@@ -498,28 +808,24 @@ export class TmuxPipeBackend implements SessionBackend {
     // turns it off for the target pane.
     if (this.pipeAttached) {
       try {
-        execSync(`tmux pipe-pane -t ${shellescape(this.paneTarget)}`, { stdio: 'ignore', timeout: 3000, env: tmuxEnv() });
+        execSync(`${this.tmuxCmd} pipe-pane -t ${shellescape(this.paneTarget)}`, { stdio: 'ignore', timeout: 3000, env: tmuxEnv() });
       } catch { /* pane may already be gone — benign */ }
       this.pipeAttached = false;
     }
-    if (this.readStream) {
-      try { this.readStream.destroy(); } catch { /* already closed */ }
-      this.readStream = null;
-    }
-    try { fs.unlinkSync(this.fifoPath); } catch { /* already gone */ }
+    this.teardownFifoReader();
   }
 
   destroySession(): void {
     this.kill();
     if (this.ownsSession) {
-      TmuxBackend.killSession(this.paneTarget);
+      TmuxBackend.killSession(this.paneTarget, this.socketName);
     }
   }
 
   getChildPid(): number | null {
     try {
       const out = execSync(
-        `tmux display-message -p -t ${shellescape(this.paneTarget)} '#{pane_pid}'`,
+        `${this.tmuxCmd} display-message -p -t ${shellescape(this.paneTarget)} '#{pane_pid}'`,
         // Explicit stdio: execSync's default leaks the child's stderr to the
         // parent — when tmux server is unavailable this would spam
         // "error connecting to /tmp/tmux-UID/default" into daemon-error.log
@@ -543,6 +849,8 @@ export class TmuxPipeBackend implements SessionBackend {
   private startLifecycleWatcher(): void {
     this.stopLifecycleWatcher();
     this.livenessGate.reset();
+    this.probeSetbackStreak = 0;
+    this.serverUnreachableSince = null;
     const poll = () => {
       if (this.exited) return;
       // The watched CLI pid (adopt mode) is a pure process.kill(pid,0) syscall —
@@ -556,29 +864,68 @@ export class TmuxPipeBackend implements SessionBackend {
         this.handlePaneExit();
         return;
       }
-      this.recordPaneProbe(this.probePaneAddressability(2000));
-      if (!this.exited) this.lifecycleTimer = setTimeout(poll, 1000);
+      const probe = this.probePaneAddressability(2000);
+      this.probeSetbackStreak = probe.state === 'exists' ? 0 : this.probeSetbackStreak + 1;
+      this.recordPaneProbe(probe);
+      if (!this.exited) this.lifecycleTimer = setTimeout(poll, this.nextProbeDelayMs());
     };
     this.lifecycleTimer = setTimeout(poll, tmuxLifecycleInitialDelayMs(this.paneTarget));
   }
 
   /**
-   * Tri-state pane probe. A clean tmux rejection is `missing`; timeout, signal,
-   * EMFILE/ENFILE and spawn failures are `unknown`, because the shared server
-   * never answered. Collapsing those into false caused every worker to destroy
-   * a live bmx-* session when the default server had a short outage.
+   * Probe-interval backoff: 1s while healthy, then 3s / 9s (capped) while probes
+   * keep NOT answering 'exists'. Two purposes:
+   *   - stretches the missing-streak teardown window from ~3s to ~13s+, so a
+   *     short shared-server stall no longer converts into a fleet-wide teardown;
+   *   - sheds probe load exactly when the shared server is struggling — the
+   *     per-second re-probes from every worker are themselves connect-storm fuel
+   *     (each refused connect frees a backlog slot another worker instantly
+   *     takes).
+   * Detection latency for a genuinely dead pane grows to ~13s worst-case, which
+   * is acceptable: writes still fail fast via guardedSend (its own probe fires
+   * teardown immediately when the pane is authoritatively gone), and adopt-mode
+   * pid-death above stays on the ≤ current-interval path.
    */
-  private probePaneAddressability(timeoutMs: number): { state: SessionProbe; reason?: string } {
+  private nextProbeDelayMs(): number {
+    if (this.probeSetbackStreak <= 0) return 1000;
+    return Math.min(1000 * 3 ** this.probeSetbackStreak, 9000);
+  }
+
+  /**
+   * Tri-state pane probe. A clean tmux rejection that the SERVER actually
+   * answered is `missing`; timeout, signal, EMFILE/ENFILE and spawn failures
+   * are `unknown`, because the shared server never answered. Collapsing those
+   * into false caused every worker to destroy a live bmx-* session when the
+   * default server had a short outage.
+   *
+   * CONNECTION-level clean failures ("error connecting to <socket>", "lost
+   * server" — see isTmuxServerLevelErrorText) are `unknown` too, flagged
+   * `serverLevel` so the caller can run the dead-server escalation clock: a
+   * briefly stalled server refuses connects instantly (unix-socket backlog
+   * overflow ⇒ clean ECONNREFUSED), which is indistinguishable from a missing
+   * pane by exit status alone. Misreading it as `missing` mass-tore-down every
+   * live session across all bots at once (2026-08-20 incident).
+   */
+  private probePaneAddressability(timeoutMs: number): { state: SessionProbe; reason?: string; serverLevel?: boolean } {
     try {
       const paneId = execFileSync(
-        'tmux', ['display-message', '-p', '-t', this.paneTarget, '#{pane_id}'],
+        'tmux', [...this.tmuxArgs, 'display-message', '-p', '-t', this.paneTarget, '#{pane_id}'],
         { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: timeoutMs, env: tmuxEnv() },
       ).trim();
       return { state: paneId.length > 0 ? 'exists' : 'missing', reason: paneId.length > 0 ? undefined : 'empty pane id' };
     } catch (err: any) {
+      // Deadline first: a timed-out probe can carry a clean numeric exit when
+      // the client's completion races the kill (isExecTimeoutError). That is
+      // "no answer", never an authoritative 'missing'.
+      if (isExecTimeoutError(err)) {
+        return { state: 'unknown', reason: 'probe deadline (ETIMEDOUT)' };
+      }
       if (err && typeof err.status === 'number' && !err.signal) {
         const stderr = (err.stderr?.toString?.() ?? '').trim();
-        return { state: 'missing', reason: stderr || `tmux display-message exited ${err.status}` };
+        if (isTmuxServerLevelErrorText(stderr)) {
+          return { state: 'unknown', reason: stderr, serverLevel: true };
+        }
+        return { state: 'missing', reason: stderr || `${this.tmuxCmd} display-message exited ${err.status}` };
       }
       const detail = (err?.stderr?.toString?.() ?? '').trim()
         || err?.code
@@ -598,13 +945,30 @@ export class TmuxPipeBackend implements SessionBackend {
    * `missing` confirmation detach the observer. Any success resets.
    * (pid-death is handled decisively in the watcher — see startLifecycleWatcher.)
    */
-  private recordPaneProbe(probe: { state: SessionProbe; reason?: string }): void {
+  private recordPaneProbe(probe: { state: SessionProbe; reason?: string; serverLevel?: boolean }): void {
     if (this.exited) return;
     if (probe.state === 'unknown') {
       // Unknown is not evidence of death. Reset the destructive streak so a
       // timeout cannot combine with later unrelated misses, and rate-limit the
       // diagnostic because every managed worker polls this shared server.
       this.livenessGate.reset();
+      if (probe.serverLevel) {
+        // Connection-level failure: could be a live-but-stalled server (ride it
+        // out) or a genuinely dead one (its panes died with it). Run the
+        // escalation clock — only an UNBROKEN run of connection failures longer
+        // than SERVER_OUTAGE_ESCALATE_MS declares the server (and this pane)
+        // dead. Probe timeouts deliberately don't clear the clock: a wedged
+        // server never produced an answer either way.
+        if (this.serverUnreachableSince === null) {
+          this.serverUnreachableSince = Date.now();
+        } else if (Date.now() - this.serverUnreachableSince >= TmuxPipeBackend.SERVER_OUTAGE_ESCALATE_MS) {
+          process.stderr.write(
+            `[tmux-pipe-backend] tmux server continuously unreachable for ${Math.round((Date.now() - this.serverUnreachableSince) / 1000)}s; declaring ${this.ownsSession ? 'managed' : 'adopted'} pane dead (${probe.reason ?? 'connection error'})\n`,
+          );
+          this.handlePaneExit();
+          return;
+        }
+      }
       const now = Date.now();
       if (now - this.lastUnknownProbeLogAt >= 30_000) {
         this.lastUnknownProbeLogAt = now;
@@ -614,6 +978,10 @@ export class TmuxPipeBackend implements SessionBackend {
       }
       return;
     }
+
+    // Server answered (exists OR authoritative missing) — the outage clock
+    // only measures unbroken connection-level silence.
+    this.serverUnreachableSince = null;
 
     const alive = probe.state === 'exists';
     if (!this.livenessGate.record(alive)) {
@@ -635,17 +1003,146 @@ export class TmuxPipeBackend implements SessionBackend {
       );
       return;
     }
+    // Server-level circuit breaker: destroying worker/session state over a
+    // "missing" verdict is only safe when the SERVER is not merely UNREACHABLE.
+    // The cross-check distinguishes the server's two failure modes:
+    //   - 'unreachable' (connect refused / lost server / timeout / spawn fail):
+    //     the client never reached the server, which may be a live-but-stalled
+    //     shared server — stay attached and let the outage clock run.
+    //   - 'down' ("no server running"): the server answered that it is not
+    //     running. For a SOLE-SESSION socket that happens precisely BECAUSE
+    //     this pane died (its session was the server's last, so the server
+    //     exited) — the pane is authoritatively gone, so fall through to
+    //     teardown. Collapsing 'down' into "not answering" hung a sole-session
+    //     worker forever: the authoritative-missing branch above reset
+    //     serverUnreachableSince every probe, so the 60s escalation never
+    //     accrued and this cross-check blocked teardown on every pass.
+    const reach = TmuxPipeBackend.tmuxServerReachability(3000, this.tmuxArgs);
+    if (reach === 'unreachable') {
+      this.livenessGate.reset();
+      if (this.serverUnreachableSince === null) this.serverUnreachableSince = Date.now();
+      process.stderr.write(
+        `[tmux-pipe-backend] pane reported missing but tmux server is not answering; treating as server outage and staying attached\n`,
+      );
+      return;
+    }
     process.stderr.write(
       `[tmux-pipe-backend] ${this.ownsSession ? 'managed' : 'adopted'} pane gone after ${ADOPT_LIVENESS_MAX_FAILURES} consecutive authoritative misses; detaching observer\n`,
     );
     this.handlePaneExit();
   }
 
+  /** Three-state server reachability cross-check. A running server always has
+   *  at least one session (tmux exits when its last session closes), so a clean
+   *  `list-sessions` success ⇒ 'up'. The two failure modes must NOT be
+   *  collapsed, or the pre-teardown cross-check hangs a sole-session worker:
+   *   - 'down': the server answered that it is not running ("no server
+   *     running"). Authoritative; for a sole-session socket this happens
+   *     because the pane died. Teardown is safe.
+   *   - 'unreachable': connect refused / lost server / timeout / spawn failure
+   *     — the client never got an answer, so the server may be live-but-stalled.
+   *     Stay attached.
+   *  Uses the same connection-level classifier as the pane probe so both agree
+   *  on what "the client never reached the server" looks like. Never
+   *  destructive on its own. */
+  private static tmuxServerReachability(timeoutMs: number, socketArgs: readonly string[]): 'up' | 'down' | 'unreachable' {
+    try {
+      execFileSync('tmux', [...socketArgs, 'list-sessions'], {
+        stdio: ['ignore', 'ignore', 'pipe'],
+        timeout: timeoutMs,
+        env: tmuxEnv(),
+      });
+      return 'up';
+    } catch (err: any) {
+      // Deadline first — same race as probePaneAddressability: a clean exit
+      // status attached to an ETIMEDOUT throw is still "no answer".
+      if (isExecTimeoutError(err)) return 'unreachable';
+      if (err && typeof err.status === 'number' && !err.signal) {
+        const stderr = (err.stderr?.toString?.() ?? '').trim();
+        // Connection-level wording ("error connecting", "lost server") ⇒ the
+        // client never reached the server ⇒ unreachable. Anything else the
+        // server actually answered — "no server running" included ⇒ down.
+        return isTmuxServerLevelErrorText(stderr) ? 'unreachable' : 'down';
+      }
+      // Timeout (signal/killed) or spawn failure (ENOENT/EACCES — no numeric
+      // exit status) ⇒ no answer ever reached us.
+      return 'unreachable';
+    }
+  }
+
   private stopLifecycleWatcher(): void {
     if (this.lifecycleTimer) {
-      clearInterval(this.lifecycleTimer);
+      // Watcher is a chained setTimeout (backoff), not setInterval. Node
+      // aliases the two clears; still call the matching one so a future
+      // runtime that does not cannot leave a probe timer on the loop.
+      clearTimeout(this.lifecycleTimer);
       this.lifecycleTimer = null;
     }
+  }
+
+  /**
+   * Tear down the fifo reader so this process can actually exit.
+   *
+   * `readStream.destroy()` alone is NOT enough, and getting this wrong wedges
+   * the whole worker: libuv services the (deliberately blocking, see spawn())
+   * fifo read from its threadpool, and destroy() only detaches the JS stream —
+   * the threadpool thread stays parked inside the kernel `read()`. Because we
+   * hold the fifo O_RDWR, a writer always exists, so that read never sees EOF
+   * and never returns. `process.exit()` then blocks forever in
+   * uv__threadpool_cleanup joining that thread, with the event loop already
+   * stopped so the process cannot even self-kill on a timer. Observed in
+   * production as every worker of a daemon stuck mid-exit: the daemon still
+   * considered them live and kept delivering turns, so each message came back
+   * as "Worker 未能接收这条消息" (worker.input_delivery_failed) forever.
+   *
+   * The wake-up byte is what unblocks that read. It goes through a SEPARATE
+   * write fd (never our own O_RDWR one) opened back in spawn(): at teardown
+   * nobody is draining the pipe any more, so if tmux left it full a blocking
+   * write would hang exactly like the bug we are fixing (verified). That fd is
+   * acquired UP FRONT rather than here because teardown is precisely when
+   * acquiring one can fail — the fifo may already be unlinked (ENOENT) or the
+   * fd table exhausted (EMFILE), and both were verified to re-wedge the
+   * process while the old code silently swallowed the error. The byte is never
+   * observed by callers: the stream is destroyed first, so nothing reads it and
+   * it dies with the fifo on the unlink below.
+   */
+  /**
+   * Last-resort unblock for the process-exit hook.
+   *
+   * Writes the wake-up byte so the parked threadpool read can return and
+   * uv__threadpool_cleanup can join it, then unlinks the fifo: a named fifo is
+   * a filesystem object and outlives the process, so skipping this would strew
+   * /tmp with botmux-pipe-* on every exit that bypasses teardown. Deliberately
+   * minimal otherwise — no stream teardown, nothing that could block. Safe
+   * after a real teardown (fifoWakeFd is null by then) and safe to call twice.
+   */
+  wakeFifoReaderForExit(): void {
+    if (this.fifoWakeFd === null) return;
+    try { fs.writeSync(this.fifoWakeFd, '\0'); } catch { /* already unblocked */ }
+    try { fs.unlinkSync(this.fifoPath); } catch { /* already gone */ }
+  }
+
+  private teardownFifoReader(): void {
+    liveFifoReaders.delete(this);
+    // destroy() stops delivery now and closes the fd after any in-flight read
+    // finishes. Never closeSync that fd as well: its number can be reused by
+    // the next spawn before the stream's queued close runs (Bun and Node).
+    const stream = this.readStream;
+    this.readStream = null;
+    // 有意保留：fifoFd 已无生产读者（#1394 起 fd 的关闭完全交给 ReadStream），但
+    // test/fixtures/tmux-pipe-exit-fixture.ts 通过类型断言读取它；此处显式读一次以满足 noUnusedLocals。
+    void this.fifoFd;
+    this.fifoFd = null;
+    stream?.destroy();
+    if (this.fifoWakeFd !== null) {
+      // EAGAIN (pipe full) is fine: a full pipe means the read already has data
+      // to return, so it is not parked. Any other error is equally non-fatal —
+      // we are tearing down regardless.
+      try { fs.writeSync(this.fifoWakeFd, '\0'); } catch { /* already unblocked */ }
+      try { fs.closeSync(this.fifoWakeFd); } catch { /* already closed */ }
+      this.fifoWakeFd = null;
+    }
+    try { fs.unlinkSync(this.fifoPath); } catch { /* already gone */ }
   }
 
   private handlePaneExit(): void {
@@ -654,44 +1151,142 @@ export class TmuxPipeBackend implements SessionBackend {
     this.stopLifecycleWatcher();
     if (this.pipeAttached) {
       try {
-        execSync(`tmux pipe-pane -t ${shellescape(this.paneTarget)}`, { stdio: 'ignore', timeout: 3000, env: tmuxEnv() });
+        execSync(`${this.tmuxCmd} pipe-pane -t ${shellescape(this.paneTarget)}`, { stdio: 'ignore', timeout: 3000, env: tmuxEnv() });
       } catch { /* pane may already be gone — benign */ }
       this.pipeAttached = false;
     }
-    if (this.readStream) {
-      try { this.readStream.destroy(); } catch { /* already closed */ }
-      this.readStream = null;
-    }
-    try { fs.unlinkSync(this.fifoPath); } catch { /* already gone */ }
+    this.teardownFifoReader();
     this.fireExit(1, null);
   }
 
   private createDetachedSession(bin: string, args: string[], opts: SpawnOpts): void {
-    const shellSpec = resolveUserShell(process.env, opts.launchShell);
+    const instanceIdentity = opts.env?.BOTMUX_CODEX_INSTANCE_BINDING;
+    // `new-session -e` only exists since tmux 3.2 (3.0/3.1 reject it with
+    // "unknown flag", a deterministic non-retryable launch failure). On older
+    // or unparsable versions the binding is written with set-environment after
+    // a proven-fresh creation instead. Unknown version deliberately takes the
+    // conservative path (never send a flag the server may not understand).
+    const tmuxVersion = getTmuxVersionCached();
+    const newSessionAcceptsE = tmuxVersionAtLeast(tmuxVersion, 3, 2);
+    const shellSpec = opts.strictEnv ? { shell: '/bin/sh', flags: [] } : resolveUserShell(process.env, opts.launchShell);
     const envAssignments = buildBotmuxEnvAssignments(opts.env, opts.injectEnv);
     const script = shellWrapperScript(
       resolveBotmuxWrapperBinDir(opts.env ?? process.env),
       shellKindForPath(shellSpec.shell),
     );
-    execFileSync('tmux', [
+    const argv = [
       'new-session',
       '-d',
+      // Have tmux print the identity of the session THIS command created,
+      // atomically with creating it (see createdSession).
+      '-P', '-F', SESSION_IDENTITY_FORMAT,
       '-s', this.paneTarget,
       '-x', String(opts.cols),
       '-y', String(opts.rows),
+      // On >= 3.2 mark atomically at creation, so a session whose creating
+      // reply was lost to a timeout still carries the binding and can be
+      // adopted via the duplicate path below.
+      ...(instanceIdentity && newSessionAcceptsE ? ['-e', `BOTMUX_CODEX_INSTANCE_BINDING=${instanceIdentity}`] : []),
       '--',
-      ...shellCommandArgv(shellSpec, script, [
+      ...(opts.strictEnv ? strictPaneCommand(bin, args, opts) : shellCommandArgv(shellSpec, script, [
         opts.cwd,
         ...envAssignments,
         bin, ...args,
-      ]),
-    ], {
-      cwd: opts.cwd,
-      stdio: 'ignore',
-      timeout: 5000,
-      env: tmuxEnv(opts.env),
-    });
+      ])),
+    ];
+    // Bounded retries against a stalled shared server (instant clean
+    // ECONNREFUSED under backlog overflow), a command timeout, or a
+    // spawn-level EMFILE/EAGAIN. A server-answered deterministic rejection
+    // (bad option, …) is re-thrown at once. "duplicate session" on a RETRY
+    // means an earlier timed-out attempt actually created the session
+    // server-side → treat as success.
+    let createdIdentity: string | null = null;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const printed = execFileSync('tmux', [...this.tmuxArgs, ...argv], {
+          cwd: opts.cwd,
+          stdio: ['ignore', 'pipe', 'pipe'],
+          timeout: 5000,
+          env: tmuxEnv(opts.strictEnv ? inheritBotEnv(opts.env, { mode: 'strict' }) : opts.env),
+        });
+        createdIdentity = parseSessionIdentity(String(printed ?? ''));
+        break;
+      } catch (err: any) {
+        const stderrText = (err?.stderr?.toString?.() ?? '').trim();
+        if (attempt > 0 && /duplicate session/i.test(stderrText)) {
+          if (opts.strictEnv) throw new Error('Refusing unverified strict tmux-pipe generation after a startup retry');
+          // Either an earlier timed-out attempt of ours or a racing creator made
+          // it — unprovable, so this spawn never claims (or retires) it.
+          break;
+        }
+        if (!isRetryableStartupTmuxFailure(err) || attempt >= STARTUP_TMUX_RETRY_DELAYS_MS.length) {
+          if (opts.strictEnv) throw new Error('Strict tmux pane startup failed (command environment redacted)');
+          throw err;
+        }
+        process.stderr.write(
+          `[tmux-pipe-backend] new-session failed (attempt ${attempt + 1}/${STARTUP_TMUX_RETRY_DELAYS_MS.length + 1}); retrying: ${opts.strictEnv ? 'strict command environment redacted' : stderrText || err?.message || err}\n`,
+        );
+        startupRetrySleepFn(STARTUP_TMUX_RETRY_DELAYS_MS[attempt]);
+      }
+    }
+    // Only the identity tmux printed for the creating command proves
+    // ownership; a by-name lookup could return a racing creator's session.
+    this.createdSession = createdIdentity
+      ? { id: createdIdentity.split(' ')[1]!, identity: createdIdentity }
+      : null;
+    // Pre-3.2 (or unknown) tmux: persist the binding in the session
+    // environment AFTER a proven-fresh creation, since new-session could not
+    // set it atomically. set-environment exists on every supported tmux and
+    // writes only this session's table (never -g). A duplicate (a timed-out
+    // earlier create or a concurrent creator) is never written to — it must
+    // pass assertInstanceIdentity first, otherwise we could stamp our binding
+    // onto another instance's session. If this write fails the assert below
+    // fails too, spawn throws, and the worker retires the session we created.
+    if (this.createdSession && instanceIdentity && !newSessionAcceptsE) {
+      execFileSync('tmux',
+        [...this.tmuxArgs, 'set-environment', '-t', this.paneTarget, 'BOTMUX_CODEX_INSTANCE_BINDING', instanceIdentity],
+        { stdio: ['ignore', 'ignore', 'pipe'], timeout: 5000, env: tmuxEnv() });
+    }
+    // Fence both shapes before changing options or subscribing output: a
+    // duplicate must carry the expected binding; on the fresh path this also
+    // re-reads the marker just written/created (redundant but fail-closed —
+    // only a millisecond-scale server stall right after creation can make it
+    // throw, and the next worker cycle reattaches with the pane preserved).
+    if (instanceIdentity) TmuxBackend.assertInstanceIdentity(this.paneTarget, instanceIdentity, this.socketName);
     this.applySessionOptions();
+  }
+
+  /**
+   * After spawn() threw: kill the tmux session this very spawn() created, if
+   * any. Used by the worker before it rolls back the session's sandbox tree;
+   * the caller re-probes by name to decide (anything but an authoritative
+   * `missing` keeps the tree). Returns whether our own session was killed.
+   *
+   * The identity check and the kill are ONE server-side command (`if-shell -F`
+   * evaluates the condition and runs the kill in the same server's queue): with
+   * a check-then-kill pair, a server that exits in between could be replaced by
+   * one that hands the saved id (`$0`) to an unrelated session, and the kill
+   * would land there. A different server fails the `#{pid}` comparison.
+   */
+  retireSessionCreatedBySpawn(): boolean {
+    const created = this.createdSession;
+    if (!created) return false;
+    const [serverPid, sessionId, createdAt] = created.identity.split(' ');
+    const ours = `#{&&:#{==:#{pid},${serverPid}},#{&&:#{==:#{session_id},${sessionId}},#{==:#{session_created},${createdAt}}}}`;
+    let outcome = '';
+    try {
+      outcome = execFileSync('tmux', [
+        ...this.tmuxArgs,
+        'if-shell', '-F', '-t', sessionId!, ours,
+        `display-message -p ${RETIRE_KILLED} ; kill-session -t '${sessionId}'`,
+        `display-message -p ${RETIRE_KEPT}`,
+      ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000, env: tmuxEnv() });
+    } catch {
+      return false;
+    }
+    if (!outcome.split('\n').includes(RETIRE_KILLED)) return false;
+    this.createdSession = null;
+    return true;
   }
 
   private applySessionOptions(): void {
@@ -707,12 +1302,45 @@ export class TmuxPipeBackend implements SessionBackend {
       // capture-screenshot backend; verified geometry-neutral on the pipe
       // backend (toggling status on a detached session changes neither pane
       // size nor cursor), so it's safe to default ON.
-      execSync(`tmux set-option -t ${t} status on`, { stdio: 'ignore', env });
-      execSync(`tmux set-option -t ${t} mouse on`, { stdio: 'ignore', env });
-      execSync(`tmux set-option -s set-clipboard on`, { stdio: 'ignore', env });
-      execSync(`tmux set-option -t ${t} history-limit 50000`, { stdio: 'ignore', env });
-      execSync(`tmux set-option -t ${t} window-size largest`, { stdio: 'ignore', env });
+      // Bounded: these are cosmetic and best-effort, but without a timeout a
+      // wedged shared server would pin the worker's startup path indefinitely.
+      execSync(`${this.tmuxCmd} set-option -t ${t} status on`, { stdio: 'ignore', env, timeout: 5000 });
+      execSync(`${this.tmuxCmd} set-option -t ${t} mouse on`, { stdio: 'ignore', env, timeout: 5000 });
+      execSync(`${this.tmuxCmd} set-option -s set-clipboard on`, { stdio: 'ignore', env, timeout: 5000 });
+      execSync(`${this.tmuxCmd} set-option -t ${t} history-limit 50000`, { stdio: 'ignore', env, timeout: 5000 });
+      // window-size largest exists since tmux 3.1; older builds reject the
+      // option (and the shared try/catch would then skip nothing else — the
+      // failing line is the last one). Unknown version: keep trying.
+      const version = getTmuxVersionCached();
+      if (version === null || tmuxVersionAtLeast(version, 3, 1)) {
+        execSync(`${this.tmuxCmd} set-option -t ${t} window-size largest`, { stdio: 'ignore', env, timeout: 5000 });
+      }
     } catch { /* session may not be ready yet — benign */ }
+  }
+
+  /**
+   * Repair geometry left behind by an old Web Terminal viewer before this
+   * worker reattaches. A detached owned session has no human client whose
+   * layout we could disrupt, so the worker's configured render dimensions are
+   * authoritative. An attached session is left untouched.
+   */
+  private restoreDetachedOwnedSessionSize(): void {
+    try {
+      const attached = execFileSync(
+        'tmux',
+        [...this.tmuxArgs, 'display-message', '-p', '-t', this.paneTarget, '#{session_attached}'],
+        {
+          encoding: 'utf-8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+          timeout: 2000,
+          env: tmuxEnv(),
+        },
+      ).trim();
+      if (attached === '0') this.resize(this.cols, this.rows);
+    } catch {
+      // Reattach already proved the pane exists. Geometry repair is best-effort
+      // and must not turn a transient tmux control failure into session loss.
+    }
   }
 
   /** Snapshot the full pane history WITH ANSI escapes (`-S - -E -`).
@@ -742,7 +1370,7 @@ export class TmuxPipeBackend implements SessionBackend {
     if (this.exited) return '';
     try {
       const out = execSync(
-        `tmux display-message -p -t ${shellescape(this.paneTarget)} ${shellescape(PANE_MODE_FLAGS_FORMAT)}`,
+        `${this.tmuxCmd} display-message -p -t ${shellescape(this.paneTarget)} ${shellescape(PANE_MODE_FLAGS_FORMAT)}`,
         // Explicit stdio — see getChildPid for why default leaks tmux stderr.
         { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 2000, env: tmuxEnv() },
       );
@@ -754,7 +1382,7 @@ export class TmuxPipeBackend implements SessionBackend {
   }
 
   /** Snapshot ONLY the currently visible pane (no scrollback). Equivalent to
-   *  `tmux capture-pane` with no `-S`/`-E` flags, which defaults to the
+   *  `${this.tmuxCmd} capture-pane` with no `-S`/`-E` flags, which defaults to the
    *  viewport. This is the right input for a transient xterm-headless seed:
    *  the snapshot row count matches the transient terminal's row count, so
    *  no normal-buffer scroll happens and the rendered screenshot lines up
@@ -773,7 +1401,7 @@ export class TmuxPipeBackend implements SessionBackend {
     if (!cursor) return null;
     try {
       const viewport = execFileSync(
-        'tmux', ['capture-pane', '-p', '-t', this.paneTarget],
+        'tmux', [...this.tmuxArgs, 'capture-pane', '-p', '-t', this.paneTarget],
         {
           encoding: 'utf-8',
           stdio: ['ignore', 'pipe', 'ignore'],
@@ -793,7 +1421,7 @@ export class TmuxPipeBackend implements SessionBackend {
     try {
       const altOn = this.isPaneInAltBuffer();
       const raw = execSync(
-        `tmux capture-pane -e -p -t ${shellescape(this.paneTarget)}${bounds ? ' ' + bounds : ''}`,
+        `${this.tmuxCmd} capture-pane -e -p -t ${shellescape(this.paneTarget)}${bounds ? ' ' + bounds : ''}`,
         // Explicit stdio — see getChildPid for why default leaks tmux stderr.
         { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000, maxBuffer: 16 * 1024 * 1024, env: tmuxEnv() },
       );
@@ -824,7 +1452,7 @@ export class TmuxPipeBackend implements SessionBackend {
     if (this.exited) return null;
     try {
       const out = execSync(
-        `tmux display-message -p -t ${shellescape(this.paneTarget)} '#{cursor_x} #{cursor_y}'`,
+        `${this.tmuxCmd} display-message -p -t ${shellescape(this.paneTarget)} '#{cursor_x} #{cursor_y}'`,
         { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 2000, env: tmuxEnv() },
       ).trim();
       const [x, y] = out.split(/\s+/).map(s => parseInt(s, 10));
@@ -842,7 +1470,7 @@ export class TmuxPipeBackend implements SessionBackend {
     if (this.exited) return null;
     try {
       const out = execSync(
-        `tmux display-message -p -t ${shellescape(this.paneTarget)} '#{pane_width} #{pane_height}'`,
+        `${this.tmuxCmd} display-message -p -t ${shellescape(this.paneTarget)} '#{pane_width} #{pane_height}'`,
         { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 2000, env: tmuxEnv() },
       ).trim();
       const [cols, rows] = out.split(/\s+/).map(s => parseInt(s, 10));
@@ -861,7 +1489,7 @@ export class TmuxPipeBackend implements SessionBackend {
   private isPaneInAltBuffer(): boolean {
     try {
       const out = execSync(
-        `tmux display-message -p -t ${shellescape(this.paneTarget)} '#{alternate_on}'`,
+        `${this.tmuxCmd} display-message -p -t ${shellescape(this.paneTarget)} '#{alternate_on}'`,
         // Explicit stdio — see getChildPid for why default leaks tmux stderr.
         { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 2000, env: tmuxEnv() },
       ).trim();

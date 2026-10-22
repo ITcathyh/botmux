@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { extractSkillsInstallCommandSource } from '../../../core/skills/install-command.js';
 import { useT } from '../react-hooks.js';
+import { ModalDialog } from '../modal-dialog.js';
+import { toast } from '../toast.js';
 import type { SkillGraph } from './shared.js';
 import type { InstallSkillCandidate, NativeSkillGroup, SkillRow, SkillsNavIntent, StatusMessage } from './types.js';
 
@@ -57,9 +59,12 @@ interface SkillLibraryTabProps {
   packNames?: Array<{ id: string; name: string }>;
   onShowSkillPacks?: (name: string) => void;
   onShowSkillBots?: (name: string) => void;
+  /** single-skill install finished: show a toast with a "assign to bot" action */
+  onAssignInstalledSkill?: (skillName: string) => void;
 }
 
 export function SkillLibraryTab(props: SkillLibraryTabProps) {
+  const tr = useT();
   const [installedForPack, setInstalledForPack] = useState<string[] | null>(null);
   const installAnchorRef = useRef<HTMLDivElement | null>(null);
   const { navIntent, onNavIntentConsumed } = props;
@@ -79,7 +84,19 @@ export function SkillLibraryTab(props: SkillLibraryTabProps) {
 
   const finishInstall = (installed: string[] | null) => {
     if (!installed || installed.length === 0) return;
-    if (installed.length > 1) setInstalledForPack(installed);
+    if (installed.length > 1) {
+      setInstalledForPack(installed);
+    } else if (props.onAssignInstalledSkill) {
+      const name = installed[0];
+      toast(tr('skills.installSuccess', { skill: name }), {
+        kind: 'success',
+        duration: 5000,
+        action: {
+          label: tr('skills.assignToBot'),
+          onClick: () => props.onAssignInstalledSkill!(name),
+        },
+      });
+    }
   };
 
   return (
@@ -161,14 +178,6 @@ function PostInstallPackDialog(props: {
   const [name, setName] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const dialogRef = useRef<HTMLDialogElement | null>(null);
-
-  useEffect(() => {
-    const dlg = dialogRef.current;
-    if (dlg && !dlg.open) {
-      try { dlg.showModal(); } catch { /* already open */ }
-    }
-  }, []);
 
   const create = async () => {
     if (!id.trim() || !name.trim()) return;
@@ -184,7 +193,7 @@ function PostInstallPackDialog(props: {
   };
 
   return (
-    <dialog className="bd-dialog skills-post-install-pack" ref={dialogRef} onClose={() => !busy && props.onClose()}>
+    <ModalDialog open backdropClose={false} className="bd-dialog skills-post-install-pack" onClose={() => !busy && props.onClose()}>
       <form method="dialog" onSubmit={event => { event.preventDefault(); void create(); }}>
         <h3>{tr('skills.postInstallPackTitle')}</h3>
         <p>{tr('skills.postInstallPackHelp', { count: props.skillNames.length })}</p>
@@ -208,7 +217,7 @@ function PostInstallPackDialog(props: {
           </button>
         </div>
       </form>
-    </dialog>
+    </ModalDialog>
   );
 }
 

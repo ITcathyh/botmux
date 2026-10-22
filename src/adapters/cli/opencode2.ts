@@ -1,8 +1,10 @@
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
+import { wrapBracketedPaste } from './tui-input.js';
 import type { CliAdapter, PtyHandle, ResumableSession } from './types.js';
 import {
   detectOpenCodeSubmit,
+  isOpenCodeSessionBusy,
   isOpenCodeSessionId,
   latestOpenCodeSessionForBotmuxSession,
   listOpenCodeResumableSessions,
@@ -99,11 +101,12 @@ export function createOpenCode2Adapter(pathOverride?: string): CliAdapter {
 
     async writeInput(pty: PtyHandle, content: string) {
       const isSlashCommand = content.startsWith('/');
+      const needsPaste = !isSlashCommand && (content.length > OPENCODE_PASTE_THRESHOLD || content.includes('\n'));
       const baseline = isSlashCommand ? null : snapPartBaseline('v2');
 
       try {
         if (pty.sendText && pty.sendSpecialKeys) {
-          if (!isSlashCommand && pty.pasteText && (content.length > OPENCODE_PASTE_THRESHOLD || content.includes('\n'))) {
+          if (needsPaste && pty.pasteText) {
             pty.pasteText(content);
           } else {
             pty.sendText(content);
@@ -111,7 +114,9 @@ export function createOpenCode2Adapter(pathOverride?: string): CliAdapter {
           await delay(200);
           pty.sendSpecialKeys('Enter');
         } else {
-          pty.write(content);
+          // Raw PTY has no tmux paste-buffer to add these markers. Without
+          // them, long or multiline prompts may be split into key events.
+          pty.write(needsPaste ? wrapBracketedPaste(content) : content);
           await delay(1000);
           pty.write('\r');
         }
@@ -132,6 +137,18 @@ export function createOpenCode2Adapter(pathOverride?: string): CliAdapter {
 
     completionPattern: undefined,
     readyPattern: undefined,
+    // Bubble Tea has no reliable prompt anchor: require 4s of silence before
+    // the FIRST paste so cold start / resume→fresh cannot type into a booting
+    // TUI; later cycles return to the normal 2s window.
+    firstPromptQuiescenceMs: 4_000,
+    busyPattern: undefined,
+    isSessionBusy({ sessionId, cliSessionId }) {
+      const sid = isOpenCodeSessionId(cliSessionId)
+        ? cliSessionId
+        : latestOpenCodeSessionForBotmuxSession(sessionId, 'v2');
+      if (!sid) return false;
+      return isOpenCodeSessionBusy(sid, 'v2');
+    },
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: true,                // V2 TUI 仍渲染在 alternate screen buffer（实测 \x1b[?1049h）
     readOnlyRemoteScroll: true,
@@ -151,5 +168,3 @@ export function createOpenCode2Adapter(pathOverride?: string): CliAdapter {
     // setup 为此 CLI 跳过模型询问（与「模型走配置文件管理」的 CLI 同一语义）。
   };
 }
-
-export const create = createOpenCode2Adapter;

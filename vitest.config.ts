@@ -10,12 +10,9 @@ import { defineConfig } from 'vitest/config';
  *           ONLY this project, so the default test command is fast and needs no
  *           real CLI binaries or browser.
  *
- *   e2e   — *.e2e.ts. Spawns real CLIs (claude/codex/…) and drives the Feishu
- *           web UI via a shared daemon + single logged-in browser session, so
- *           the files MUST run sequentially (fileParallelism: false) to avoid
- *           interfering with each other. Opt-in only — see the `test:*` scripts
- *           in package.json. globalSetup sweeps stale botmux schedule tasks when
- *           BOTMUX_E2E=1 (set by scripts/run-e2e.ts).
+ *   e2e   — CLI-focused *.e2e.ts files. Feishu browser scenarios under
+ *           test/e2e-browser are registered with @midscene/test instead and are
+ *           deliberately excluded from Vitest.
  *
  * Run everything: `vitest run` (both projects). Default `pnpm test` scopes to
  * `--project unit`.
@@ -33,18 +30,21 @@ export default defineConfig({
           // e2e dir out explicitly so a stray *.test.ts there can't sneak in.
           exclude: ['test/e2e-browser/**', '**/*.e2e.ts', 'node_modules/**'],
           testTimeout: 30_000,
-          globalSetup: ['./test/unit-global-setup.ts'],
-          setupFiles: ['./test/unit-setup.ts'],
+          globalSetup: ['./test/unit-global-setup.ts', './test/tmux-fence-global-setup.ts'],
+          setupFiles: ['./test/tmux-fence-setup.ts', './test/unit-setup.ts'],
         },
       },
       {
         test: {
           name: 'e2e',
           include: ['test/**/*.e2e.ts'],
+          exclude: ['test/e2e-browser/**', 'node_modules/**'],
           fileParallelism: false,
           testTimeout: 60_000,
           hookTimeout: 360_000,
-          globalSetup: ['./test/global-setup.ts'],
+          globalSetup: ['./test/global-setup.ts', './test/tmux-fence-global-setup.ts'],
+          // No test may reach the host's tmux servers (test/helpers/tmux-fence.ts).
+          setupFiles: ['./test/tmux-fence-setup.ts'],
         },
       },
     ],

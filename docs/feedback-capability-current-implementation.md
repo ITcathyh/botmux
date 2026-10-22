@@ -1,6 +1,6 @@
 # Botmux 反馈能力：现阶段实现说明
 
-> 文档状态：基于 `feat/skill-feedback` commit `6d5136fa` 与 schema v7 整理
+> 文档状态：基于 `feat/skill-feedback` commit `6d5136fa`、schema v7 与 Completion Proposal v1 整理
 >
 > 对照基线：Botmux 作者反馈能力技术方案 review 稿（revision 7）
 >
@@ -20,8 +20,9 @@
 - Core 统一持久化具备真实 worker terminal 信号且关联到 canonical Lark delivery 的 `turn.completed`；同一 turn 的多条 canonical delivery 通过 correlation discriminator 区分，并分别生成 completion event。
 - 主动 `botmux send --response-kind final` 在真实 worker turn 内关联该 turn 并参与 completion reconcile；脱离 worker turn 的主动发送只有 delivery，没有 terminal/completion event。
 - 已实现强关联 delivery、durable outbox/webhook 和 Dashboard 分析 API/基础页面。
+- 已实现 Completion Proposal v1：Agent 可在标准 final 卡附一个受约束、requester-only、非阻塞的二选一后续；它与反馈独立，不开放任意 card-action。
 
-当前实现已覆盖原方案 M1、M2 和 M3 的主体。仍未实现的主要增强项是：通用 card-action 插件注册表、Agent 交付时的动态反馈选项建议、native assistant message ID、Dashboard webhook secret 写入界面、通用本地事件订阅 API，以及非 Lark 平台适配。
+当前实现已覆盖原方案 M1、M2 和 M3 的主体，并完成路线中的“Agent 受约束建议”。仍未实现的主要增强项是：通用 card-action 插件注册表、Agent 交付时的动态反馈选项建议、native assistant message ID、Dashboard webhook secret 写入界面、通用本地事件订阅 API，以及非 Lark 平台适配。
 
 ## 2. 与作者 review 文档的逐项对照
 
@@ -44,6 +45,7 @@
 | nativeMessageId P1 | 未实现 | 当前使用 turnId + nativeSessionId + dispatchAttempt + contentHash/ref + platformMessageId；没有原生 assistant row ID |
 | 通用 card-action 注册表 | 未实现 | 反馈 handler 已在 core 接入，但分发仍非面向第三方插件的公开注册表 |
 | Agent 动态反馈建议 | 未实现 | 反馈选项来自 team/bot/chat 配置快照，Agent 不能逐回答提交动态模板建议 |
+| Agent 受约束后续建议 | 已实现 | 标准 final 卡可附一个 Core 校验的二选一 Completion Proposal；接受后新建 continuation turn，拒绝不启动 Agent |
 | 本地订阅 API | 部分实现 | 本地事实表和事件表已存在；尚无通用、稳定、面向插件的事件订阅/游标读取协议 |
 
 ## 3. 产品语义与默认配置
@@ -72,11 +74,13 @@ Core 只接受三种语义：
 
 - 总开关默认关闭。
 - `apiOnly` bot 不展示反馈。
-- audience 的鉴权主体固定为 delivery 中保存的 requester subject。正常 final 路径优先使用精确 turn sender；当该身份不可得时，当前实现会退化到已确认的 session owner/footer recipient，因此不是所有路径都能保证等同于“本次消息发送者”。
+- `audience` 默认 `requester`：鉴权主体固定为 delivery 中保存的 requester subject。正常 final 路径优先使用精确 turn sender；当该身份不可得时，当前实现会退化到已确认的 session owner/footer recipient，因此不是所有路径都能保证等同于“本次消息发送者”。
+- `audience: "reviewers"` 用于 bot 触发的自动分析场景（如 Oncall/告警监听，本次 turn 的发送者是另一个 bot、没有单一真人 owner）：改由发送时冻结的 `reviewers` 名单鉴权，名单里任一可信真人身份点击即放行，与是否存在真人 requester 无关。名单可填写 `ou_`、`on_` 或完整邮箱；邮箱会在发卡时解析为当前应用的 `open_id`，回调仍保持零网络鉴权。名单为空时仍展示反馈按钮，但所有点击都会被拒绝。
+- `audience: "everyone"` 允许任意具有平台核验 operator 身份的点击者反馈，不要求 requester，也不需要 `reviewers` 名单。该模式会扩大反馈写入范围，应只用于群成员都可信的场景。
 - `allowReselect` 默认 `false`；只有显式设置 `true` 才允许改选。
 - 说明框默认开启、非必填，默认最大 1000 字。
 - 负向原因默认可为空，由业务配置。
-- 新配置立即影响后续新卡，旧卡继续使用发送时快照。
+- 新配置立即影响后续新卡，旧卡继续使用发送时快照（`reviewers` 名单同样随 delivery 快照冻结）。
 
 ### 3.4 约束
 
@@ -84,6 +88,8 @@ Core 只接受三种语义：
 - 按钮 2–4 个，key 唯一，只允许 `[a-z0-9_-]+`。
 - 负向原因最多 6 个。
 - 说明最大长度 1–2000。
+- `audience` 仅接受 `requester` / `reviewers` / `everyone`。`reviewers` 名单每项必须是 `ou_`（app 内 open_id）、`on_`（跨 app union_id）或完整邮箱，最多 50 项且不重复。邮箱在发送时用当前 bot 凭证解析为 `ou_` 后才写入策略快照。联系人 API 明确判定该邮箱不存在或不可见（definitive miss）时丢弃该项，全部丢弃时保留空名单和反馈按钮，但点击鉴权仍 fail closed；联系人 API 限流 / 5xx / 网络故障（transient）不收敛成空名单：仍在当前配置中的条目沿用 dataDir 下 `feedback-reviewers-cache-<appId>.json` 里上次健康解析的 `ou_`（与 owner allowedUsers 同一条不变量，definitive 失败或已移出配置的条目不复活），冷缓存且全部不可恢复时本次不发反馈控件，避免真人配置正确却被误拒。跨 app 场景应优先使用 `on_`（`ou_` 是 app-scoped、不可跨 app 复制）。
+- `audience: "reviewers"` 允许缺省或清空 `reviewers`，此时按钮可见但没有任何用户能提交反馈；`requester` / `everyone` audience 带非空名单仍会被判为无效策略。
 - 不允许配置任意 Lark card JSON；配置仅包含受约束的领域字段。
 
 ## 4. 分层配置模型
@@ -145,6 +151,40 @@ built-in defaults
 }
 ```
 
+### 4.4 reviewers audience 示例
+
+用于 bot 触发的自动分析（本次 turn 发送者是另一个 bot、没有单一真人 owner），把可反馈人固定为一份可信名单：
+
+```json
+{
+  "feedback": {
+    "enabled": true,
+    "audience": "reviewers",
+    "reviewers": ["on_cross_app_reviewer", "oncall@example.com"],
+    "allowReselect": true
+  }
+}
+```
+
+- 名单项为 `ou_`（app 内 open_id）、`on_`（跨 app union_id）或完整邮箱；跨 app 优先用 `on_`。邮箱在发卡时解析为当前应用的 `ou_`，未解析成功的项不会写入快照。
+- 名单随 delivery 快照冻结：后续改名单只影响新卡，旧卡仍按发送时名单鉴权。
+- `audience` 与 `reviewers` 可分散在不同层（team/bot/chat）提供，合并后按整体校验；`reviewers` audience 缺名单时仍展示按钮，但所有点击都会 fail closed。
+
+### 4.5 everyone audience 示例
+
+用于明确希望群内任意可识别成员都能点击反馈的场景：
+
+```json
+{
+  "feedback": {
+    "enabled": true,
+    "audience": "everyone"
+  }
+}
+```
+
+该模式不校验 requester 或名单，但仍要求回调携带飞书平台核验的 operator 身份；无法验证来源的回调继续 fail closed。
+
 ## 5. 最终卡交互协议
 
 ### 5.1 展示边界
@@ -155,7 +195,7 @@ built-in defaults
 - 自定义卡；
 - 通知、语音、纯视频；
 - doc-comment、VC receiver、HTTP wait/async 等特殊 sink；
-- 无法证明 requester 身份的卡；
+- 无法证明 requester 身份的卡（仅 `requester` audience 需要；`reviewers` 由冻结名单鉴权，`everyone` 由平台 operator 身份鉴权，两者都允许无真人 requester 的 bot 触发会话展示反馈）；
 - `apiOnly` bot；
 - card-off 纯文本模式。
 
@@ -171,7 +211,7 @@ botmux send --response-kind final ...
 ### 5.2 提交流程
 
 1. 用户点击一级按钮。
-2. Core 校验平台消息、app、可信 operator、requester-only 权限和策略快照。
+2. Core 校验平台消息、app、可信 operator、身份鉴权（`requester` 走 requester-only，`reviewers` 走冻结名单，`everyone` 接受任意可验证 operator）和策略快照。
 3. SQLite 事务写入 immutable feedback revision；重复 callback key 幂等返回已有记录。
 4. 积极/推进选择直接返回同卡状态。
 5. 负向选择先同步 ACK，再异步 `message.patch` 原消息，避免复杂 form 在 callback response 中触发 Lark 错误。
@@ -185,6 +225,22 @@ botmux send --response-kind final ...
 - 说明文本受 required/maxLength 校验。
 - 自由文本写入本地事实表，但不会回显到群卡。
 - 原因/说明更新形成新 revision，并通过 `supersedes_feedback_id` 连接上一版。
+
+### 5.4 Completion Proposal v1
+
+Completion Proposal 是完成后的**可选后续授权**，不是评价。卡片顺序固定为“结果 → Proposal → Feedback → footer”；两者状态互不影响：反馈不会启动新任务，Proposal 的接受才会启动独立 continuation turn。
+
+- 调用方通过 `--completion-proposal-file` 提交 `title`、`body`、`acceptLabel`、`dismissLabel` 四个可见字段；Core 拒绝额外字段、敏感内容、绝对路径和隐藏 payload。
+- 只允许标准当前会话 final 卡。精确 requester、origin turn 或可跨重启恢复的 backend 不可证明时，自动降级为正文静态提示。
+- Core 固定 24 小时 TTL；proposal 记录冻结 requester、app、session、chat、anchor、origin turn、可见快照和 hash。
+- 记录复用 Ask 泛化后的 Human Decision 文件存储，不依赖 feedback SQLite；原子写入和单记录锁保证跨进程 first-decision-wins，终态审计保留 7 天后清理。
+- callback 只带固定 action、proposal ID、nonce 和决定；自定义卡片的 reserved discriminator denylist 禁止伪造该 callback。
+- 回调先原子落盘，按 requester-only、nonce、message/app 绑定和 first-decision-wins 校验后同步 ACK；卡片 patch 和 continuation dispatch 在 ACK 后异步执行。
+- dispatch 结果不明时记录 `dispatch_unknown` 且不自动重放，避免有副作用任务重复执行；用户可在话题里明确再次发起。
+- daemon 重启会恢复“已接受但尚未开始 dispatch”的安全窗口；已经进入 `dispatching` 的记录只能收敛为 `dispatch_unknown`，不能猜测重放。
+- continuation envelope 只回放用户看见并接受的快照，把它声明为数据而非指令。Agent 必须重新执行适用 Skill、目标归属、权限和审批检查；Core 不执行 MR、发布或 merge。
+
+该能力是本文路线中的“Agent 受约束建议”，不是“通用 card-action 注册表”。它只能表达一次二选一、接受后开启新 turn 的形状；阻塞问答仍用 Ask，需要源字节重校验或多阶段确认的领域流程仍由专用 handler 负责。
 
 ## 6. SQLite v7 数据模型
 
@@ -363,8 +419,8 @@ API 可过滤 time、team、bot、chat/topic、semantic、verdict、reason、mod
 
 ### 11.2 尚未实现的初稿增强
 
-1. **通用 card-action 注册表**：当前反馈是 core handler，但还未把所有 action 分发抽成公开插件注册机制。
-2. **Agent 动态反馈建议**：尚不支持逐回答由 Agent 建议一套受约束按钮；当前只读 team/bot/chat 配置。
+1. **通用 card-action 注册表**：当前反馈和 Completion Proposal 是 core handler，但还未把所有 action 分发抽成公开插件注册机制。
+2. **Agent 动态反馈建议**：尚不支持逐回答由 Agent 改写评价选项；Completion Proposal 只承载与评价独立的单个可选后续。
 3. **nativeMessageId**：没有原生 assistant message row ID；仍采用 review 认可的 P0 组合锚点。
 4. **Webhook 管理 UI**：没有完整的 destination + write-only secret 管理面。
 5. **本地事件订阅 API**：事实表存在，但没有稳定订阅协议。

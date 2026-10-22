@@ -21,6 +21,10 @@ export interface HookInstallConfig {
    *  rotated auth/provider/proxy settings refresh on every cold spawn; global
    *  hooks and unrelated top-level settings are deliberately not inherited. */
   readonly inheritClaudeEnvFrom?: string;
+  /** Keys never inherited from {@link inheritClaudeEnvFrom} and removed from
+   *  the per-bot env (per-bot credential source: the shared login's provider
+   *  auth must not override the bot's own account). */
+  readonly inheritClaudeEnvExclude?: readonly string[];
   /** 可选：SessionStart 就绪 hook 命令。
    *  - claude-settings：写全局 settings.json
    *  - grok-hooks：写 `~/.grok/hooks/*.json` 的 SessionStart
@@ -106,21 +110,63 @@ function botmuxHookSuffix(hookCommand: string): string {
 }
 
 /**
+ * 判断一条命令字符串是否是「botmux 自己发起的 hook 调用」。
+ *
+ * ⚠️ 旧实现用 `command.includes('cli.js')` 来识别 botmux hook——这在 Node 态成立
+ * （命令是 `"<node>" "<...>/dist/cli.js" <subcommand>`），但**编译态（单文件二进制）**
+ * 下 `renderShellCommand` 写的是打包二进制路径 `"<...>/botmux-linux-x64/botmux" <subcommand>`，
+ * 根本不含 `cli.js`。旧判据因此把已装 hook 误判为「未安装」。
+ *
+ * 后果分两种，别记成「三条一起失效」（实测口径）：
+ *   - `session-ready` / `user-prompt-hook`：**每次安装都追加一条**。而 installHook 在
+ *     read-isolation 路径下**每次冷 spawn 都会跑**（worker.ts `provisionIsolatedBotHome`），
+ *     所以编译态盒子每开一个会话就 +1、无上限；已堆坏的盒子再装一次只会继续涨。
+ *   - ask（`hook <cliId>`）：**通常不叠**——`isBotmuxAskHookGroup` 还有一条
+ *     `e.command === hookCommand` 精确匹配分支，命令字符串不变时由它兜住；只有命令
+ *     形态发生变化（如二进制↔Node 互切）时才会叠加。
+ *
+ * 稳定、与运行时形态无关的信号是 **子命令尾签名**（`hook <cliId>` / `session-ready` /
+ * `user-prompt-hook`），加上调用目标名：Node 态是脚本 `cli.js`，编译态是可执行文件
+ * `botmux`（`botmux-linux-x64/botmux` 的 basename 同为 `botmux`；Windows 上为 `botmux.exe`）。
+ * 两者取其一即视为同一条 botmux hook，无论它指向哪个安装路径、由 node 还是打包二进制执行。
+ *
+ * ⚠️ basename 白名单**故意枚举正式产物名**，不要放宽成 `botmux-*` 前缀匹配：那会把
+ * 第三方同前缀程序（`botmux-helper` / `botmux-wrapper` 等）也当成自己的 hook 删掉。
+ * 生产安装入口通常叫 `botmux`；本地 `bun run use:here --binary` 会指向
+ * `dist-bin/botmux-<plat>-<arch>[-musl]`，因此也需精确覆盖这些构建产物名。
+ */
+function isBotmuxHookCommand(command: string, suffix: string): boolean {
+  const trimmed = command.trimEnd();
+  if (!trimmed.endsWith(suffix)) return false;
+  // 子命令之前紧邻的是调用目标（脚本/可执行名），去掉可能包裹它的尾部引号。
+  const target = trimmed.slice(0, trimmed.length - suffix.length).trimEnd().replace(/["']+$/, '');
+  if (!target) return false;
+  const slash = Math.max(target.lastIndexOf('/'), target.lastIndexOf('\\'));
+  const basename = target.slice(slash + 1);
+  return basename === 'cli.js'
+    || basename === 'botmux'
+    || basename === 'botmux.exe'
+    || /^botmux-linux-(?:x64|arm64)(?:-musl)?$/.test(basename)
+    || /^botmux-darwin-(?:x64|arm64)$/.test(basename)
+    || /^botmux-windows-(?:x64|arm64)(?:\.exe)?$/.test(basename);
+}
+
+/**
  * 判断某个 hook group 是否是 botmux ask hook（用于幂等替换）。
  *
  * 不能只按命令字符串完全相等比对：同一台机器上 dev 源码 checkout 与 npm global
  * 安装的 cli.js 绝对路径不同，命令字符串就不同，会导致两条 botmux hook 同时残留、
  * 同一次 AskUserQuestion 触发两次 → 飞书发出两张卡。
- * 因此结构化识别：命令引用了 botmux 的 `cli.js` 且尾部是相同的 `hook <cliId>` 签名，
- * 即视为 botmux hook，无论它指向哪个安装路径。
+ * 因此结构化识别：命令是 botmux 自己发起的调用（cli.js 脚本或打包二进制 `botmux`）、
+ * 且尾部是相同的 `hook <cliId>` 签名，即视为 botmux hook，无论它指向哪个安装路径、
+ * 由 node 还是打包二进制执行。
  */
 function isBotmuxAskHookGroup(group: ClaudeHookGroup, hookCommand: string): boolean {
   const suffix = botmuxHookSuffix(hookCommand); // e.g. "hook claude-code"
   return group.hooks.some(
     (e) =>
       e.type === 'command' &&
-      (e.command === hookCommand ||
-        (e.command.includes('cli.js') && e.command.trimEnd().endsWith(suffix))),
+      (e.command === hookCommand || isBotmuxHookCommand(e.command, suffix)),
   );
 }
 
@@ -143,8 +189,7 @@ function isBotmuxTraexAskHookEntry(entry: unknown): boolean {
     && typeof entry === 'object'
     && (entry as ClaudeHookEntry).type === 'command'
     && typeof (entry as ClaudeHookEntry).command === 'string'
-    && (entry as ClaudeHookEntry).command.includes('cli.js')
-    && (entry as ClaudeHookEntry).command.trimEnd().endsWith('hook traex');
+    && isBotmuxHookCommand((entry as ClaudeHookEntry).command, 'hook traex');
 }
 
 /**
@@ -192,7 +237,7 @@ export function cleanupTraexAskHooks(configPaths: readonly string[]): void {
 
 /**
  * 判断某 hook group 是否是 botmux SessionStart 就绪 hook（用于幂等替换）。
- * 同 ask hook：结构化识别（命令引用 botmux 的 cli.js 且尾部是 `session-ready`），
+ * 同 ask hook：结构化识别（命令是 botmux 自己发起的调用且尾部是 `session-ready`），
  * 不按完整字符串比对——dev checkout 与 npm global 的 cli.js 绝对路径不同。
  */
 function isBotmuxReadyHookGroup(group: ClaudeHookGroup): boolean {
@@ -201,8 +246,7 @@ function isBotmuxReadyHookGroup(group: ClaudeHookGroup): boolean {
       !!e &&
       e.type === 'command' &&
       typeof e.command === 'string' &&
-      e.command.includes('cli.js') &&
-      e.command.trimEnd().endsWith('session-ready'),
+      isBotmuxHookCommand(e.command, 'session-ready'),
   );
 }
 
@@ -215,7 +259,7 @@ function removeBotmuxReadyHookGroups(hooks: Record<string, ClaudeHookGroup[]>, e
 
 /**
  * 判断某 hook group 是否是 botmux UserPromptSubmit 上下文 hook（用于幂等替换）。
- * 与 ready hook 同策略：结构化识别（命令引用 botmux 的 cli.js 且尾部是
+ * 与 ready hook 同策略：结构化识别（命令是 botmux 自己发起的调用且尾部是
  * `user-prompt-hook`），不按完整字符串比对。
  */
 function isBotmuxPromptHookGroup(group: ClaudeHookGroup): boolean {
@@ -224,8 +268,7 @@ function isBotmuxPromptHookGroup(group: ClaudeHookGroup): boolean {
       !!e &&
       e.type === 'command' &&
       typeof e.command === 'string' &&
-      e.command.includes('cli.js') &&
-      e.command.trimEnd().endsWith('user-prompt-hook'),
+      isBotmuxHookCommand(e.command, 'user-prompt-hook'),
   );
 }
 
@@ -249,18 +292,22 @@ export function hasInstalledSessionReadyHook(hookInstall: HookInstallConfig): bo
   const settings = readJsonFile<ClaudeSettings>(expandHome(hookInstall.configPath));
   const groups = settings?.hooks?.SessionStart;
   return Array.isArray(groups) && groups.some(group =>
-    Array.isArray(group?.hooks) && group.hooks.some(entry =>
+    isBotmuxReadyHookGroup(group)
+    // Preserve the old exact-match fallback for a current command whose
+    // executable basename is newer than the structural whitelist. This keeps
+    // path-switch recognition broad without regressing the simplest case:
+    // the configured command is exactly the one installed in settings.
+    || (Array.isArray(group?.hooks) && group.hooks.some(entry =>
       entry?.type === 'command'
       && entry.command === hookInstall.sessionStartCommand,
-    ),
+    )),
   );
 }
 
 /**
  * Read-only preflight: is the botmux UserPromptSubmit hook present in the
- * settings file the CLI actually reads? 结构化匹配（不像
- * hasInstalledSessionReadyHook 那样按完整字符串相等——dev checkout 与 npm global
- * 的 cli.js 路径不同，精确匹配会把已安装的 hook 误判为未安装）。
+ * settings file the CLI actually reads? 与 SessionStart preflight 一样结构化匹配，
+ * 避免 dev checkout 与 npm global 的 cli.js 绝对路径差异造成误判。
  */
 export function hasInstalledPromptHook(hookInstall: HookInstallConfig): boolean {
   if (!hookInstall.userPromptSubmitCommand) return false;
@@ -311,6 +358,7 @@ function installClaudeSettings(
   sessionStartCommand?: string,
   inheritClaudeEnvFrom?: string,
   userPromptSubmitCommand?: string,
+  inheritClaudeEnvExclude: readonly string[] = [],
 ): void {
   const settings: ClaudeSettings = readJsonFile<ClaudeSettings>(configPath) ?? {};
   let inheritedEnvState: { path: string; content: string } | undefined;
@@ -329,8 +377,10 @@ function installClaudeSettings(
       const localEnv = isRecord(settings.env) ? { ...settings.env } : {};
       for (const key of previousInheritedKeys) delete localEnv[key];
 
-      const sharedEnv = isRecord(source.env) ? source.env : {};
+      const sharedEnv = isRecord(source.env) ? { ...source.env } : {};
+      for (const key of inheritClaudeEnvExclude) delete sharedEnv[key];
       const mergedEnv = { ...localEnv, ...sharedEnv };
+      for (const key of inheritClaudeEnvExclude) delete mergedEnv[key];
       if (Object.keys(mergedEnv).length > 0) settings.env = mergedEnv;
       else delete settings.env;
 
@@ -352,6 +402,17 @@ function installClaudeSettings(
   removeBotmuxAskHookGroups(existingHooks, 'PermissionRequest', hookCommand);
   removeBotmuxAskHookGroups(existingHooks, 'PreToolUse', hookCommand);
   existingHooks['PreToolUse'] = [...(existingHooks['PreToolUse'] ?? []), newGroup];
+
+  // 终端权限确认桥：bypassPermissions 下 Claude 仍会为内置安全检查（如「Dangerous rm
+  // operation on possibly-empty variable path」）弹终端确认框，飞书侧看不到 → 会话
+  // 静默卡死。PermissionRequest 恰在弹框时触发，同一个 `botmux hook` 把它转成飞书
+  // 允许/拒绝卡片。不写 matcher = 所有工具；AskUserQuestion 由 hook 客户端自行分流。
+  // timeout 900s 必须大于 hook 客户端的权限等待上限（cli.ts PERMISSION_MAX_TIMEOUT_MS），
+  // 让客户端先到点给出「拒绝」裁决，而不是被 Claude 杀掉后回落到终端弹框。
+  existingHooks['PermissionRequest'] = [
+    ...(existingHooks['PermissionRequest'] ?? []),
+    { hooks: [{ type: 'command', command: hookCommand, timeout: 900 }] },
+  ];
 
   // SessionStart 就绪 hook（幂等替换旧的 botmux 条目）
   if (sessionStartCommand) {
@@ -417,6 +478,78 @@ function installClaudeSettings(
  *   - stdout 为空（passthrough：daemon 不可达 / 超时 / 非 botmux 会话）→ 不 reply，把问题
  *     留给 OpenCode 原生 picker（botmux web 终端里仍可人工作答）。
  */
+/**
+ * Injected into BOTH generated plugin templates (V1 and V2).
+ *
+ * ⚠️ Emit this wherever `loopbackSafeFetch` is CALLED. It was first added to the
+ * V2 template only, while the V1 fallback call was switched over too — the V1
+ * plugin then died with `ReferenceError: loopbackSafeFetch is not defined` the
+ * moment it took that path. "Changed the call, forgot the definition" is the
+ * classic generated-template defect, so the definition lives in one constant and
+ * is interpolated into every template that uses it.
+ *
+ * Why it exists at all: these plugins run inside OpenCode's **Bun** process, and
+ * Bun's `fetch` auto-uses `$http_proxy` while `no_proxy` is literal-match only
+ * (no CIDR, and `localhost` does not cover `127.0.0.1`). On a corporate dev box a
+ * request to the LOCAL serve is handed to the proxy — the ask reply fails AND the
+ * Basic password from the registration file is sent to the proxy. A generated file
+ * cannot import repo helpers, so this is a minimal inline version; remote,
+ * user-configurable URLs still use the native fetch.
+ */
+const LOOPBACK_SAFE_FETCH_SNIPPET = `
+// 本机 loopback 请求绝不能走全局 fetch。这段代码跑在 OpenCode 的 **Bun** 进程里，
+// 而 Bun 的 fetch 会自动使用 $http_proxy，且 no_proxy 只做字面量匹配（不解析 CIDR，
+// 也不把 localhost 当作覆盖 127.0.0.1）。公司内网开发机普遍 export 这种组合，于是
+// 打本机 serve 的请求被交给公司代理：不只是回答 ask 失败，注册文件里的 Basic 口令
+// 也会随请求发给代理。这里不能 import 仓库里的 helper（本文件是**生成**到插件目录的
+// 独立脚本），所以内联一份最小实现；远端可配置 URL 仍走原生 fetch，只有字面量
+// loopback 才切到 node:http（它完全无视代理 env）。
+function isLiteralLoopback(u) {
+  try {
+    const p = new URL(u);
+    // http: only — this helper is node:http, so claiming an https: URL is
+    // loopback-safe would pick a transport that cannot serve it.
+    if (p.protocol !== "http:") return false;
+    // URL.hostname keeps IPv6 bracketed; node:http wants the bare address.
+    const h = p.hostname.startsWith("[") && p.hostname.endsWith("]")
+      ? p.hostname.slice(1, -1) : p.hostname;
+    return h === "127.0.0.1" || h === "localhost" || h === "::1";
+  } catch { return false; }
+}
+async function loopbackSafeFetch(url, init) {
+  if (!isLiteralLoopback(url)) return fetch(url, init);
+  const http = await import("node:http");
+  const t = new URL(url);
+  return await new Promise((resolve, reject) => {
+    const req = http.request(
+      { host: (() => {
+          const h = t.hostname.startsWith("[") && t.hostname.endsWith("]")
+            ? t.hostname.slice(1, -1) : t.hostname;
+          return h === "localhost" ? "127.0.0.1" : h;
+        })(),
+        port: t.port || 80, path: t.pathname + t.search,
+        method: (init && init.method) || "GET", headers: (init && init.headers) || {} },
+      (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(Buffer.from(c)));
+        res.on("end", () => {
+          const buf = Buffer.concat(chunks);
+          resolve({
+            ok: res.statusCode >= 200 && res.statusCode < 300,
+            status: res.statusCode,
+            text: async () => buf.toString("utf8"),
+            json: async () => JSON.parse(buf.toString("utf8")),
+          });
+        });
+        res.on("error", reject);
+      },
+    );
+    req.on("error", reject);
+    if (init && init.body) req.end(init.body); else req.end();
+  });
+}
+`;
+
 function buildOpenCodePlugin(parts: { cmd: string; args: string[] }): string {
   // 用 argv 形式嵌入（不拼 shell 字符串、不 split）：含空格/引号的路径也不会被拆坏。
   const cmdLit = JSON.stringify(parts.cmd);
@@ -460,6 +593,9 @@ function askBotmux(payload) {
     child.stdout.on("data", (d) => { out += d.toString("utf-8"); });
     child.on("error", () => { clearTimeout(backstop); done(""); });
     child.on("close", (code) => { clearTimeout(backstop); done(code === 0 ? out : ""); });
+    // hook 没读 stdin 就退出（或被杀）时，下面的写入会异步报 EPIPE；没人接就作为
+    // 进程级异常抛出，直接带崩 OpenCode。结果仍由上面的 close 给出（非 0 = 放行）。
+    child.stdin.on("error", () => {});
     try { child.stdin.write(payload); child.stdin.end(); } catch { clearTimeout(backstop); done(""); }
   });
 }
@@ -473,6 +609,7 @@ function safeStr(x) {
   try { return String(JSON.stringify(x)).slice(0, 120); } catch { return String(x); }
 }
 
+${LOOPBACK_SAFE_FETCH_SNIPPET}
 async function postReply(client, serverUrl, id, answers) {
   const body = { answers };
   // 1) 经 client._client（带 directory 头 + 正确传输）。这是 daemon 多实例下唯一可达的路径：
@@ -502,7 +639,7 @@ async function postReply(client, serverUrl, id, answers) {
     } catch {}
     const url = base + "/question/" + id + "/reply";
     dbg("FETCH_POST url=" + url + " headers=" + Object.keys(headers).join(","));
-    const r = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+    const r = await loopbackSafeFetch(url, { method: "POST", headers, body: JSON.stringify(body) });
     let txt = ""; try { txt = await r.text(); } catch {}
     dbg("FETCH_POST_RESULT id=" + id + " status=" + r.status + " body=" + txt.slice(0, 150));
     return r.ok;
@@ -624,6 +761,9 @@ function askBotmux(payload) {
     child.stdout.on("data", (d) => { out += d.toString("utf-8"); });
     child.on("error", () => { clearTimeout(backstop); done(""); });
     child.on("close", (code) => { clearTimeout(backstop); done(code === 0 ? out : ""); });
+    // hook 没读 stdin 就退出（或被杀）时，下面的写入会异步报 EPIPE；没人接就作为
+    // 进程级异常抛出，直接带崩 OpenCode。结果仍由上面的 close 给出（非 0 = 放行）。
+    child.stdin.on("error", () => {});
     try { child.stdin.write(payload); child.stdin.end(); } catch { clearTimeout(backstop); done(""); }
   });
 }
@@ -644,6 +784,7 @@ function readRegistration() {
 
 // 把答案回传给 OpenCode 2.0 解阻塞。必须带 x-opencode-directory 头（多 worktree
 // 路由），带注册文件里的 Basic auth。
+${LOOPBACK_SAFE_FETCH_SNIPPET}
 async function postReply(directory, sessionID, requestID, answers) {
   const reg = readRegistration();
   if (!reg) { dbg("NO_REGISTRATION id=" + requestID); return; }
@@ -656,7 +797,7 @@ async function postReply(directory, sessionID, requestID, answers) {
   const url = base + "/api/session/" + encodeURIComponent(sessionID) + "/question/" + encodeURIComponent(requestID) + "/reply";
   dbg("POST_REPLY id=" + requestID + " url=" + url);
   try {
-    const r = await fetch(url, { method: "POST", headers, body: JSON.stringify({ answers }) });
+    const r = await loopbackSafeFetch(url, { method: "POST", headers, body: JSON.stringify({ answers }) });
     let txt = ""; try { txt = await r.text(); } catch {}
     dbg("REPLY_DONE id=" + requestID + " status=" + r.status + " body=" + txt.slice(0, 150));
     if (!r.ok) dbg("REPLY_NON_OK id=" + requestID + " status=" + r.status + " body=" + txt.slice(0, 150));
@@ -783,6 +924,7 @@ export function installHook(
           hookInstall.sessionStartCommand,
           hookInstall.inheritClaudeEnvFrom,
           hookInstall.userPromptSubmitCommand,
+          hookInstall.inheritClaudeEnvExclude,
         );
         break;
       case 'opencode-plugin':

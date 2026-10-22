@@ -1,10 +1,11 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { type ChildProcess } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach } from 'vitest';
-import { WebSocket } from 'ws';
 import type { DaemonToWorker, WorkerToDaemon } from '../../src/types.js';
+import { WebSocket } from './node-ws.js';
+import { spawnNodeTsScript } from './ts-runner.js';
 
 const children = new Set<ChildProcess>();
 const tempDirs = new Set<string>();
@@ -17,7 +18,7 @@ export const FORGED_INPUT_HEX = Buffer.from(FORGED_INPUT).toString('hex');
 
 type ReadyMessage = Extract<WorkerToDaemon, { type: 'ready' }>;
 type ErrorMessage = Extract<WorkerToDaemon, { type: 'error' }>;
-type TestCliId = 'opencode' | 'opencode2';
+type TestCliId = 'opencode' | 'opencode2' | 'pi';
 
 type WorkerHarness = {
   readonly child: ChildProcess;
@@ -89,7 +90,7 @@ function waitForReady(child: ChildProcess, logs: readonly string[]): Promise<Rea
   });
 }
 
-export async function startOpenCodeWorker(cliId: TestCliId = 'opencode'): Promise<WorkerHarness> {
+export async function startReadOnlyScrollWorker(cliId: TestCliId = 'opencode'): Promise<WorkerHarness> {
   const root = mkdtempSync(join(tmpdir(), 'botmux-readonly-scroll-'));
   tempDirs.add(root);
   const dataDir = join(root, 'session');
@@ -99,7 +100,7 @@ export async function startOpenCodeWorker(cliId: TestCliId = 'opencode'): Promis
   mkdirSync(botmuxDir, { recursive: true });
   writeFileSync(join(botmuxDir, '.dashboard-secret'), 'integration-host-dashboard-secret', { mode: 0o600 });
 
-  const fakeCli = join(root, 'fake-opencode');
+  const fakeCli = join(root, `fake-${cliId}`);
   const inputLog = join(root, 'terminal-input.hex');
   writeFileSync(fakeCli, `#!/usr/bin/env node
 const { appendFileSync } = require('node:fs');
@@ -112,7 +113,7 @@ setInterval(() => {}, 1_000);
 
   const logs: string[] = [];
   const sessionId = `readonly-scroll-${cliId}`;
-  const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+  const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
     cwd: resolve('.'),
     env: {
       ...process.env,

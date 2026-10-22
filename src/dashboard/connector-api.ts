@@ -8,6 +8,10 @@ import {
   type ConnectorDefinition,
 } from '../services/connector-store.js';
 import {
+  CONNECTOR_LIFECYCLE_GROUP_NAME_MAX_LENGTH,
+  isValidConnectorLifecycleGroupNameTemplate,
+} from '../services/connector-lifecycle-group-name.js';
+import {
   createWebhookSecret,
   deleteWebhookSecret,
   generateWebhookSecretPlaintext,
@@ -101,6 +105,49 @@ function normalizeLifecycleExtractors(v: unknown): ConnectorDefinition['lifecycl
   const r = v as Record<string, unknown>;
   if (typeof r.dedupKey !== 'string' || !r.dedupKey.trim()) return null;
   return { dedupKey: r.dedupKey.trim() };
+}
+
+function normalizeLifecycleGroupName(
+  value: unknown,
+  prior: ConnectorDefinition['lifecycleGroupName'] | undefined,
+): { ok: true; value?: ConnectorDefinition['lifecycleGroupName'] } | { ok: false; error: string } {
+  const raw = record(value ?? prior);
+  const mode = typeof raw.mode === 'string' ? raw.mode : prior?.mode ?? 'default';
+  if (!['default', 'fixed', 'template'].includes(mode)) {
+    return { ok: false, error: 'bad_lifecycle_group_name_mode' };
+  }
+  if (mode === 'default') return { ok: true };
+
+  const text = typeof raw.text === 'string' ? raw.text.trim() : prior?.text?.trim() ?? '';
+  if (!text) return { ok: false, error: 'lifecycle_group_name_required' };
+  if (Array.from(text).length > CONNECTOR_LIFECYCLE_GROUP_NAME_MAX_LENGTH) {
+    return { ok: false, error: 'lifecycle_group_name_too_long' };
+  }
+  if (mode === 'template' && !isValidConnectorLifecycleGroupNameTemplate(text)) {
+    return { ok: false, error: 'lifecycle_group_name_template_invalid' };
+  }
+  return { ok: true, value: { mode: mode as 'fixed' | 'template', text } };
+}
+
+/** Inbound idempotency config. Both knobs are optional and the whole object is
+ *  omitted when neither is set, so existing stores stay byte-identical (and
+ *  header/query carriage needs no config at all — it is always honoured). An
+ *  invalid `keyPath` is dropped rather than rejected: the field only ADDS a
+ *  carriage option, so a typo must not make an otherwise-valid connector
+ *  unsavable. Path syntax matches the dedupKey extractor's own grammar. */
+function normalizeIdempotency(v: unknown): ConnectorDefinition['idempotency'] | undefined {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return undefined;
+  const r = v as Record<string, unknown>;
+  const rawPath = typeof r.keyPath === 'string' ? r.keyPath.trim() : '';
+  const pathPattern = /^(?:\$\.)?[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/;
+  const unsafeSegments = new Set(['__proto__', 'prototype', 'constructor']);
+  const keyPath = rawPath && pathPattern.test(rawPath)
+    && (rawPath.startsWith('$.') ? rawPath.slice(2) : rawPath).split('.').every(s => !unsafeSegments.has(s))
+    ? rawPath
+    : undefined;
+  const disabled = r.disabled === true;
+  if (!keyPath && !disabled) return undefined;
+  return { ...(keyPath ? { keyPath } : {}), ...(disabled ? { disabled: true } : {}) };
 }
 
 function normalizeTopicMessage(
@@ -239,6 +286,10 @@ function normalizeConnectorInput(
       ? (prior?.lifecycleExtractors ?? null)
       : normalizeLifecycleExtractors(c.lifecycleExtractors))
     : null;
+  const lifecycleGroupName = targetMode === 'new-group'
+    ? normalizeLifecycleGroupName(c.lifecycleGroupName, prior?.lifecycleGroupName)
+    : null;
+  if (lifecycleGroupName && !lifecycleGroupName.ok) return lifecycleGroupName;
 
   const secretRef =
     opts.secretRef ||
@@ -306,6 +357,13 @@ function normalizeConnectorInput(
       retentionDays: positiveInt(loggingPolicy.retentionDays, prior?.loggingPolicy.retentionDays ?? 14, 1, 365),
     },
     lifecycleExtractors,
+    ...(lifecycleGroupName?.ok && lifecycleGroupName.value ? { lifecycleGroupName: lifecycleGroupName.value } : {}),
+    // Absent in the request → keep whatever the stored connector had (a PATCH
+    // that doesn't mention idempotency must not silently turn it off).
+    ...(() => {
+      const idempotency = c.idempotency === undefined ? prior?.idempotency : normalizeIdempotency(c.idempotency);
+      return idempotency ? { idempotency } : {};
+    })(),
     ...(rateLimitCleared ? {} : rateLimit && Object.keys(rateLimit).length > 0 ? {
       rateLimit: {
         windowSeconds: positiveInt(rateLimit.windowSeconds, prior?.rateLimit?.windowSeconds ?? 60, 1, 86_400),

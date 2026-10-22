@@ -98,6 +98,7 @@ describe('tmuxEnv()', () => {
     for (const leaked of [
       'BOTMUX', 'BOTMUX_SESSION_ID', 'BOTMUX_CHAT_ID', 'BOTMUX_LARK_APP_ID',
       'BOTMUX_MCP_GATEWAY_SOCKET', 'BOTMUX_MCP_GATEWAY_REQUIRED',
+      'BOTMUX_LINK_REF_TURN_MODE', 'BOTMUX_HOST_RELAY_AUTHORIZED',
       'BOTMUX_ROOT_MESSAGE_ID', 'BOTMUX_BOT_INDEX', 'BOTMUX_QUIET_RESTART',
       'SESSION_DATA_DIR', 'IS_SANDBOX', 'CLAUDE_CONFIG_DIR', '__OWNER_OPEN_ID',
       'CODEX_HOME', 'HERMES_HOME', 'HERMES_BOTMUX_SOURCE_HOME',
@@ -126,6 +127,19 @@ describe('tmuxEnv()', () => {
   it('classifies every per-pane and redacted key as tmux-managed', () => {
     for (const key of [...BOTMUX_INJECTED_ENV_KEYS, ...REDACTED_CHILD_ENV_KEYS]) {
       expect(isBotmuxManagedTmuxEnvKey(key), key).toBe(true);
+    }
+  });
+
+  it('strips SSL_CERT_FILE from the tmux CLIENT env but never from the server global env', () => {
+    // Client-side strip: a daemon-side CA bundle must not be seeded into the
+    // shared server's global table. Server-global scrub: must NOT include it,
+    // or daemon startup would delete a CA bundle the user set on their own tmux
+    // server — for every CLI, on every platform (same rule as the proxy keys).
+    expect(isBotmuxManagedTmuxEnvKey('SSL_CERT_FILE')).toBe(true);
+    expect(isBotmuxManagedTmuxServerGlobalEnvKey('SSL_CERT_FILE')).toBe(false);
+    for (const key of PROXY_ENV_KEYS) {
+      expect(isBotmuxManagedTmuxEnvKey(key), key).toBe(true);
+      expect(isBotmuxManagedTmuxServerGlobalEnvKey(key), key).toBe(false);
     }
   });
 

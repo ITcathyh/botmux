@@ -1,15 +1,29 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { type ChildProcess } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import type { Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { spawnTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import {
   RELAY_ORIGIN_CAPABILITY_BASENAME,
   replaceManagedOriginCapabilityFile,
 } from '../src/core/managed-origin-capability.js';
+
+function rmTree(root: string): void {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    try {
+      rmSync(root, { recursive: true, force: true });
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if ((code !== 'ENOTEMPTY' && code !== 'EBUSY') || attempt === 7) throw err;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+    }
+  }
+}
 
 async function listen(server: Server): Promise<number> {
   await new Promise<void>((resolvePromise, rejectPromise) => {
@@ -70,8 +84,7 @@ describe('Riff worker session environment', () => {
     );
     try {
       const childResult = await new Promise<{ status: number | null; stdout: string; stderr: string }>((resolvePromise, rejectPromise) => {
-        const cli = spawn(process.execPath, [
-          '--import', 'tsx', resolve('src/cli.ts'),
+        const cli = spawnTsScript(resolve('src/cli.ts'), [
           'send', 'unclassified Riff progress', '--session-id', 'sid-riff-feedback', '--no-mention',
         ], {
           cwd: resolve('.'),
@@ -88,8 +101,8 @@ describe('Riff worker session environment', () => {
         });
         let stdout = '';
         let stderr = '';
-        cli.stdout.on('data', chunk => { stdout += String(chunk); });
-        cli.stderr.on('data', chunk => { stderr += String(chunk); });
+        cli.stdout?.on('data', chunk => { stdout += String(chunk); });
+        cli.stderr?.on('data', chunk => { stderr += String(chunk); });
         cli.once('error', rejectPromise);
         cli.once('close', status => resolvePromise({ status, stdout, stderr }));
       });
@@ -100,7 +113,7 @@ describe('Riff worker session environment', () => {
       });
     } finally {
       stop();
-      rmSync(root, { recursive: true, force: true });
+      rmTree(root);
     }
   });
 
@@ -174,7 +187,7 @@ describe('Riff worker session environment', () => {
       }]));
 
       const logs: string[] = [];
-      child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      child = spawnTsScript(resolve('src/worker.ts'), [], {
         cwd: resolve('.'),
         env: {
           ...process.env,
@@ -184,6 +197,7 @@ describe('Riff worker session environment', () => {
           BOTMUX_SESSION_ID: 'sid-riff-env',
           LARK_APP_ID: appId,
           LARK_APP_SECRET: 'secret',
+          BOTMUX_WORKFLOW_ENABLED: 'true',
         },
         stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
       });
@@ -219,6 +233,7 @@ describe('Riff worker session environment', () => {
             // resolved value after the merge — otherwise this would desync the
             // pane's CLI-side gate from the daemon's authoritative decision.
             BOTMUX_WORKFLOW_ENABLED: 'false',
+            BOTMUX_REPLY_STYLE: JSON.stringify({ layout: true, theme: 'vivid' }),
           },
         },
         prompt: 'verify remote session environment',
@@ -240,6 +255,12 @@ describe('Riff worker session environment', () => {
           },
           allowReselect: false,
         },
+        replyStyle: {
+          recipes: false,
+          layout: false,
+          theme: 'minimal',
+          layoutTags: { blocked: '请处理' },
+        },
       };
       child.send(init);
 
@@ -253,9 +274,18 @@ describe('Riff worker session environment', () => {
       expect(request.config?.env?.BOTMUX_OWNER_OPEN_ID).toBe('ou_authenticated_owner');
       expect(request.config?.env?.__OWNER_OPEN_ID).toBe('ou_authenticated_owner');
       // The workflow kill-switch is host-resolved and re-frozen after the merge:
-      // the daemon default (no config / no env override) is ON, so the stale
-      // backendConfig.env `false` must NOT survive into the remote pane.
+      // the host is explicitly forced ON (BOTMUX_WORKFLOW_ENABLED=true in the
+      // worker env), so the stale backendConfig.env `false` must NOT survive
+      // into the remote pane.
       expect(request.config?.env?.BOTMUX_WORKFLOW_ENABLED).toBe('true');
+      // replyStyle is another host-normalized spawn snapshot. The raw Riff env
+      // tries to replace it above, but the worker must re-freeze the init value.
+      expect(JSON.parse(request.config?.env?.BOTMUX_REPLY_STYLE)).toEqual({
+        recipes: false,
+        layout: false,
+        theme: 'minimal',
+        layoutTags: { blocked: '请处理' },
+      });
       expect(JSON.parse(request.config?.env?.BOTMUX_FEEDBACK_POLICY)).toMatchObject({
         enabled: true,
         buttons: [{ key: 'yes' }, { key: 'progress' }, { key: 'no' }],
@@ -264,7 +294,7 @@ describe('Riff worker session environment', () => {
       if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
       for (const socket of sockets) socket.destroy();
       await new Promise<void>(resolvePromise => server.close(() => resolvePromise()));
-      rmSync(root, { recursive: true, force: true });
+      rmTree(root);
     }
   }, 25_000);
 });

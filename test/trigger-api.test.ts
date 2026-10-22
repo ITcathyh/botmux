@@ -41,6 +41,10 @@ describe('trigger request contract', () => {
     custom.presentation = { topicMessage: 'Build failed' };
     expect(validateTriggerRequest(custom).ok).toBe(true);
 
+    const titled = request();
+    titled.presentation = { title: 'Headless build' };
+    expect(validateTriggerRequest(titled).ok).toBe(true);
+
     const silent = request();
     silent.presentation = { topicMessage: null };
     expect(validateTriggerRequest(silent).ok).toBe(true);
@@ -50,6 +54,28 @@ describe('trigger request contract', () => {
       bad.presentation = { topicMessage };
       expect(validateTriggerRequest(bad).ok).toBe(false);
     }
+
+    for (const title of ['', 'x'.repeat(201), 42]) {
+      const bad = request() as any;
+      bad.presentation = { title };
+      expect(validateTriggerRequest(bad).ok).toBe(false);
+    }
+  });
+
+  it('accepts headless async turn triggers against an existing session', () => {
+    const req = request();
+    req.source = { type: 'headless', connectorId: 'botmux-headless-cli', requestId: 'hl_123' };
+    req.target = { kind: 'turn', botId: 'app1', sessionId: 'session-1' };
+    req.envelope = {
+      format: 'botmux.headless.v1',
+      sourceName: 'botmux headless',
+      trusted: false,
+      payload: { prompt: 'say hello' },
+      rawText: 'say hello',
+    };
+    req.instruction = 'say hello';
+    req.options = { asyncReturnSessionId: true };
+    expect(validateTriggerRequest(req).ok).toBe(true);
   });
 
   it('allows wait-mode turn triggers without a chatId or sessionId', () => {
@@ -256,11 +282,10 @@ describe('trigger request contract', () => {
     if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
   });
 
-  it('rejects turnIdempotencyKey outside async scope (wait / dryRun / no async mode)', () => {
+  it('rejects turnIdempotencyKey with wait or dryRun', () => {
     const cases: any[] = [
       { asyncReturnSessionId: true, waitForFinalOutput: true, turnIdempotencyKey: 'tk' },
       { asyncReturnSessionId: true, dryRun: true, turnIdempotencyKey: 'tk' },
-      { turnIdempotencyKey: 'tk' }, // no async response mode
     ];
     for (const options of cases) {
       const req = request();
@@ -327,6 +352,49 @@ describe('trigger request contract', () => {
     expect(prompt).toContain('Do not call botmux send');
   });
 
+  // ── sentinel migration (质量①, #808 hard constraint): the nothing-to-send
+  //    sentinel lives SOLELY in <botmux_http_response_mode> now (routing/reminder
+  //    usage_silence is gated off for no-transport). This is a MIGRATION, NOT a
+  //    deletion: async settle depends on the model emitting the literal
+  //    BOTMUX_NOTHING_TO_SEND — isBridgeNothingToSendFinal requires a trailing
+  //    sentinel line → nothingToSendTurns → turn_terminal outputDisposition
+  //    'nothing_to_send', which is the ONLY signal that settles a genuine-empty
+  //    async turn to completed (else it hangs `running` until timeout). If this
+  //    test goes red because the sentinel line was removed "to fix the conflict",
+  //    that reintroduces the #808 hang — restore it, do not delete it.
+  it('carries the nothing-to-send sentinel inside http_response_mode for async turns', () => {
+    const req = request();
+    (req as any).instruction = 'Do the task.';
+    (req.options as any) = { asyncReturnSessionId: true };
+    const prompt = buildUntrustedEventPrompt(req, 'trg_async');
+    expect(prompt).toContain('<botmux_http_response_mode');
+    expect(prompt).toContain('BOTMUX_NOTHING_TO_SEND');
+    // The sentinel must sit INSIDE the response-mode block, not leak elsewhere.
+    const modeStart = prompt.indexOf('<botmux_http_response_mode');
+    const modeEnd = prompt.indexOf('</botmux_http_response_mode>');
+    const sentinelIdx = prompt.indexOf('BOTMUX_NOTHING_TO_SEND');
+    expect(sentinelIdx).toBeGreaterThan(modeStart);
+    expect(sentinelIdx).toBeLessThan(modeEnd);
+  });
+
+  it('carries the sentinel for wait-mode turns too (settle path covers both async + wait)', () => {
+    const req = request();
+    (req as any).instruction = 'Do the task.';
+    (req.options as any) = { waitForFinalOutput: true, timeoutMs: 120_000 };
+    const prompt = buildUntrustedEventPrompt(req, 'trg_wait');
+    expect(prompt).toContain('<botmux_http_response_mode');
+    expect(prompt).toContain('BOTMUX_NOTHING_TO_SEND');
+  });
+
+  it('emits NO sentinel for a plain (non-async/non-wait) webhook — no response-mode block at all', () => {
+    const req = request();
+    (req as any).instruction = 'Do a thing.';
+    (req.options as any) = {};
+    const prompt = buildUntrustedEventPrompt(req, 'trg_plain');
+    expect(prompt).not.toContain('<botmux_http_response_mode');
+    expect(prompt).not.toContain('BOTMUX_NOTHING_TO_SEND');
+  });
+
   it('no response-mode block without wait/async options (plain webhook delivery)', () => {
     const req = request();
     (req as any).instruction = 'Do a thing.';
@@ -364,6 +432,35 @@ describe('trigger request contract', () => {
     expect(prompt).toContain('"trusted": false');
     // Generic sources keep rawText inside the JSON envelope (escaped), unchanged behavior.
     expect(prompt).toContain('"rawText": "line one\\nline two"');
+  });
+
+  it('accepts options.steer on a fresh dryRun=false turn and on an existing-session follow-up', () => {
+    const fresh = request();
+    fresh.options = { asyncReturnSessionId: true, idempotencyKey: 'k-1', steer: true };
+    delete (fresh.target as any).chatId;
+    expect(validateTriggerRequest(fresh).ok).toBe(true);
+
+    const followUp = request();
+    followUp.target = { kind: 'turn', botId: 'app1', sessionId: 'session-1' };
+    followUp.instruction = 'also do X';
+    followUp.options = { asyncReturnSessionId: true, turnIdempotencyKey: 't-1', steer: true };
+    expect(validateTriggerRequest(followUp).ok).toBe(true);
+  });
+
+  it('rejects a non-boolean options.steer', () => {
+    const bad = request() as any;
+    bad.options = { dryRun: true, steer: 'yes' };
+    const v = validateTriggerRequest(bad);
+    expect(v.ok).toBe(false);
+    if (!v.ok) expect(v.body.error).toContain('options.steer');
+  });
+
+  it('rejects options.steer combined with dryRun (no dispatch to steer into)', () => {
+    const bad = request();
+    bad.options = { dryRun: true, steer: true };
+    const v = validateTriggerRequest(bad);
+    expect(v.ok).toBe(false);
+    if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
   });
 });
 
@@ -446,5 +543,36 @@ describe('queryTriggerResult — legacy ok translation for webhook consumers', (
     const res = await queryTriggerResult('app1', 'sess1', { proxyToDaemon });
     expect(res.body.ok).toBe(false);
     expect(res.status).toBe(400);
+  });
+});
+
+
+describe('async group communication contract', () => {
+  it.each(['ui', 'webhook'] as const)('allows authorized messages for %s callers and keeps the sentinel', type => {
+    const req = request();
+    req.source = { ...req.source, type, connectorId: 'generic-caller' };
+    req.target = { kind: 'turn', botId: 'app1', sessionId: 'existing' };
+    req.options = { asyncReturnSessionId: true, allowChatMessages: true };
+    expect(validateTriggerRequest(req).ok).toBe(true);
+    const prompt = buildUntrustedEventPrompt(req, 't');
+    expect(prompt).toContain('may call botmux send for messages authorized by the current request');
+    expect(prompt).toContain('BOTMUX_NOTHING_TO_SEND');
+    expect(prompt).not.toContain('Do not call botmux send; do not post');
+    for (const allowChatMessages of [false, undefined]) {
+      req.options.allowChatMessages = allowChatMessages;
+      expect(buildUntrustedEventPrompt(req, 't')).toContain('Do not call botmux send; do not post');
+    }
+  });
+  it('rejects invalid opt-in shapes', () => {
+    for (const changes of [
+      { options: { asyncReturnSessionId: true, allowChatMessages: 'true' } },
+      { options: { waitForFinalOutput: true, allowChatMessages: true } },
+      { options: { asyncReturnSessionId: true, allowChatMessages: true, steer: true } },
+      { target: { kind: 'turn', chatId: 'oc_real' } },
+      { source: { type: 'headless', requestId: 'headless' } },
+    ]) {
+      const req = { ...request(), target: { kind: 'turn', sessionId: 's' }, options: { asyncReturnSessionId: true, allowChatMessages: true }, ...changes };
+      expect(validateTriggerRequest(req).ok).toBe(false);
+    }
   });
 });

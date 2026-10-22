@@ -6,12 +6,13 @@
  *
  * Run: pnpm vitest run test/worker-dsh-turn.integration.test.ts
  */
-import { spawn, type ChildProcess } from 'node:child_process';
+import { type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { chmodSync, copyFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import { probeHostCredentialIsolationMechanism } from '../src/adapters/backend/sandbox.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
@@ -84,7 +85,11 @@ function waitFor(
 }
 
 describe('dsh worker final_output integration', () => {
-  it('delivers one final_output with correct content/turnId/usage and no OSC leak', async () => {
+  it.each([
+    { scenario: 'happy', timeoutMs: undefined },
+    { scenario: 'progressive', timeoutMs: 300 },
+    { scenario: 'empty', timeoutMs: undefined },
+  ])('delivers one final_output with correct content/turnId after $scenario', async ({ scenario, timeoutMs }) => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-dsh-'));
     tempDirs.add(root);
     const fakeDsh = join(root, 'fake-dsh-server');
@@ -94,11 +99,12 @@ describe('dsh worker final_output integration', () => {
     const sessionId = `dsh-it-${randomBytes(4).toString('hex')}-${process.pid}`;
     const logs: string[] = [];
     const messages: WorkerToDaemon[] = [];
-    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
         HOME: root,
+        DSH_HOME: join(root, '.dsh'),
         NODE_ENV: 'test',
         NODE_OPTIONS: [process.env.NODE_OPTIONS, '--import=tsx'].filter(Boolean).join(' '),
         BOTMUX_TEST_DSH_RUNNER_PATH: resolve('src/dsh-runner.ts'),
@@ -106,7 +112,7 @@ describe('dsh worker final_output integration', () => {
         BOTMUX_SESSION_ID: sessionId,
         LARK_APP_ID: 'app_dsh_it',
         LARK_APP_SECRET: 'secret',
-        FAKE_DSH_SCENARIO: 'happy',
+        FAKE_DSH_SCENARIO: scenario,
       },
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     });
@@ -132,6 +138,7 @@ describe('dsh worker final_output integration', () => {
       larkAppId: 'app_dsh_it',
       larkAppSecret: 'secret',
       turnId: 'om_dsh_it_turn_1',
+      ...(timeoutMs ? { turnTimeoutMs: timeoutMs } : {}),
     };
 
     try {
@@ -143,15 +150,24 @@ describe('dsh worker final_output integration', () => {
         (m): m is Extract<WorkerToDaemon, { type: 'final_output' }> => m.type === 'final_output',
       );
       expect(finals).toHaveLength(1);
-      expect(finals[0].content).toContain('你好，我是 dsh。');
+      if (scenario === 'empty') {
+        expect(finals[0].content).toContain('没有生成最终回复');
+        expect(finals[0].content).toContain('无法确认任务是否成功');
+      } else {
+        expect(finals[0].content).toContain('你好，我是 dsh。');
+      }
       expect(finals[0].turnId).toBe('om_dsh_it_turn_1');
       // Usage comes through the four-bucket shape.
-      expect(finals[0].usage).toEqual({
-        inputTokens: 100,
-        outputTokens: 42,
-        cacheReadTokens: 10,
-        cacheCreateTokens: 0,
-      });
+      if (scenario === 'happy') {
+        expect(finals[0].usage).toEqual({
+          inputTokens: 100,
+          outputTokens: 42,
+          cacheReadTokens: 10,
+          cacheCreateTokens: 0,
+        });
+      } else {
+        expect(finals[0].usage).toBeUndefined();
+      }
 
       // OSC control bytes must not appear in any screen/display payload.
       const screenLeaks = messages
@@ -173,11 +189,12 @@ describe('dsh worker final_output integration', () => {
     const sessionId = `dsh-sb-${randomBytes(4).toString('hex')}-${process.pid}`;
     const logs: string[] = [];
     const messages: WorkerToDaemon[] = [];
-    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
         ...process.env,
         HOME: root,
+        DSH_HOME: join(root, '.dsh'),
         NODE_ENV: 'test',
         NODE_OPTIONS: [process.env.NODE_OPTIONS, '--import=tsx'].filter(Boolean).join(' '),
         BOTMUX_TEST_DSH_RUNNER_PATH: resolve('src/dsh-runner.ts'),
@@ -225,10 +242,12 @@ describe('dsh worker final_output integration', () => {
       expect(finals).toHaveLength(1);
       expect(finals[0].content).toContain('你好，我是 dsh。');
 
-      // The vendored config and session JSONL must land in the REAL HOME,
-      // not in a throwaway tmpfs that dies with the sandbox.
-      expect(existsSync(join(root, '.botmux', 'dsh', 'cordis.yml'))).toBe(true);
-      expect(existsSync(join(root, '.botmux', 'dsh', 'sessions', sessionId))).toBe(true);
+      // The generated composition and session JSONL must land in the REAL
+      // HOME's native dsh dir, not in a throwaway tmpfs that dies with the sandbox.
+      // The runner no longer generates cordis.yml — the dsh --profile CLI
+      // handles composition. It only creates the profile directory.
+      expect(existsSync(join(root, '.dsh', 'profiles', 'botmux'))).toBe(true);
+      expect(existsSync(join(root, '.dsh', 'sessions', 'botmux', sessionId))).toBe(true);
     } finally {
       await stopChild(child);
     }

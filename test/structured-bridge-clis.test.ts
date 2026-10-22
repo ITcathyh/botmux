@@ -3,7 +3,7 @@
  * Keeps the single-source helpers honest without pulling the worker.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdirSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
@@ -12,15 +12,18 @@ import {
   isStructuredBridgeAdoptIdleCli,
   isStructuredBridgeAdoptInputCli,
   isStructuredBridgeLifecycleBlockingCli,
+  supportsZeroPromptStructuredBridge,
+  supportsTranscriptReplyDelivery,
   STRUCTURED_BRIDGE_ALWAYS_CLI_IDS,
   STRUCTURED_BRIDGE_ADOPT_CLI_IDS,
-  STRUCTURED_BRIDGE_LIFECYCLE_BLOCKING_CLI_IDS,
 } from '../src/services/structured-bridge-clis.js';
 import { resolveFileBridgePath } from '../src/services/file-bridge-path.js';
 
 describe('structured-bridge-clis', () => {
-  it('allowlists include grok; hermes stays out of the adopt-forward list', () => {
+  it('always-on includes OMP without widening adopt forwarding', () => {
     expect(STRUCTURED_BRIDGE_ALWAYS_CLI_IDS).toContain('grok');
+    expect(STRUCTURED_BRIDGE_ALWAYS_CLI_IDS).toContain('oh-my-pi');
+    expect(STRUCTURED_BRIDGE_ALWAYS_CLI_IDS).toContain('ebsd');
     expect(STRUCTURED_BRIDGE_ADOPT_CLI_IDS).toContain('grok');
     expect(STRUCTURED_BRIDGE_ADOPT_CLI_IDS).toContain('cursor');
     // hermes is bridge-ALWAYS but must NOT be adopt-forwarded: it has no
@@ -31,16 +34,38 @@ describe('structured-bridge-clis', () => {
     expect(STRUCTURED_BRIDGE_ADOPT_CLI_IDS).not.toContain('hermes');
     expect(isStructuredBridgeAdoptCli('hermes')).toBe(false);
     for (const id of STRUCTURED_BRIDGE_ALWAYS_CLI_IDS) {
-      if (id === 'hermes') continue;
+      if (id === 'hermes' || id === 'oh-my-pi' || id === 'ebsd') continue;
       expect(STRUCTURED_BRIDGE_ADOPT_CLI_IDS).toContain(id);
     }
+    expect(STRUCTURED_BRIDGE_ADOPT_CLI_IDS).not.toContain('oh-my-pi');
+    expect(STRUCTURED_BRIDGE_ADOPT_CLI_IDS).not.toContain('ebsd');
   });
 
-  it('fallback treats cursor as adopt-only', () => {
+  it('fallback treats cursor as adopt-only and antigravity as zero-prompt-only', () => {
     expect(isStructuredBridgeFallbackActive('cursor')).toBe(false);
     expect(isStructuredBridgeFallbackActive('cursor', true)).toBe(true);
+    expect(isStructuredBridgeFallbackActive('cursor', false, true)).toBe(true);
+    expect(isStructuredBridgeFallbackActive('cursor', false, false)).toBe(false);
+    expect(isStructuredBridgeFallbackActive('antigravity')).toBe(false);
+    expect(isStructuredBridgeFallbackActive('antigravity', false, true)).toBe(true);
+    expect(isStructuredBridgeFallbackActive('antigravity', false, false)).toBe(false);
+    // antigravity has no /adopt bridge — adopt must win over the zero-prompt
+    // flag rather than silently routing an adopted pane through the spawn path.
+    expect(isStructuredBridgeFallbackActive('antigravity', true, true)).toBe(false);
+    expect(isStructuredBridgeFallbackActive('antigravity', true, false)).toBe(false);
     expect(isStructuredBridgeFallbackActive('grok')).toBe(true);
     expect(isStructuredBridgeFallbackActive('hermes')).toBe(true);
+  });
+
+  it('exposes the zero-prompt structured capability without widening default transcript delivery', () => {
+    for (const id of ['cursor', 'antigravity']) {
+      expect(supportsZeroPromptStructuredBridge(id)).toBe(true);
+      // Default mode still expects these two to answer via `botmux send`.
+      expect(supportsTranscriptReplyDelivery(id)).toBe(false);
+    }
+    expect(supportsZeroPromptStructuredBridge('codex')).toBe(true);
+    expect(supportsZeroPromptStructuredBridge('claude-code')).toBe(false);
+    expect(supportsTranscriptReplyDelivery('claude-code')).toBe(true);
   });
 
   it('adopt idle/input allowlists match historical worker behaviour', () => {
@@ -57,11 +82,13 @@ describe('structured-bridge-clis', () => {
     // started Pi turn may suppress the screen-ready heuristic (the custom-tool
     // terminate:true gap is accepted — next user turn HOL-drops the head).
     // grok: user_message_chunk → turn_completed with normalized stop reasons.
-    expect(STRUCTURED_BRIDGE_LIFECYCLE_BLOCKING_CLI_IDS).toEqual(['codex', 'pi', 'grok']);
     expect(isStructuredBridgeLifecycleBlockingCli('codex')).toBe(true);
+    expect(isStructuredBridgeLifecycleBlockingCli('traex')).toBe(true);
     expect(isStructuredBridgeLifecycleBlockingCli('pi')).toBe(true);
+    expect(isStructuredBridgeLifecycleBlockingCli('oh-my-pi')).toBe(true);
+    expect(isStructuredBridgeLifecycleBlockingCli('ebsd')).toBe(true);
     expect(isStructuredBridgeLifecycleBlockingCli('grok')).toBe(true);
-    for (const id of ['traex', 'coco', 'hermes', 'mtr', 'cursor']) {
+    for (const id of ['coco', 'hermes', 'mtr', 'cursor', 'antigravity']) {
       expect(isStructuredBridgeLifecycleBlockingCli(id)).toBe(false);
     }
   });
@@ -90,5 +117,50 @@ describe('resolveFileBridgePath (grok)', () => {
     expect(resolveFileBridgePath('grok', { sessionId: sid, cwd })).toBe(updates);
     expect(resolveFileBridgePath('grok', { sessionId: sid })).toBe(updates); // walk
     expect(resolveFileBridgePath('grok', { sessionId: 'bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee', cwd })).toBeUndefined();
+  });
+});
+
+describe('resolveFileBridgePath (oh-my-pi)', () => {
+  let ROOT = join(tmpdir(), `botmux-fbp-omp-${process.pid}`);
+  const ORIGINAL_HOME = process.env.HOME;
+
+  beforeEach(() => {
+    rmSync(ROOT, { recursive: true, force: true });
+    mkdirSync(ROOT, { recursive: true });
+    // The resolvers canonicalize $HOME (macOS /var → /private/var), so both
+    // the fixture layout and the expectations must live in that namespace.
+    ROOT = realpathSync(ROOT);
+    process.env.HOME = ROOT;
+  });
+  afterEach(() => {
+    rmSync(ROOT, { recursive: true, force: true });
+    if (ORIGINAL_HOME === undefined) delete process.env.HOME;
+    else process.env.HOME = ORIGINAL_HOME;
+  });
+
+  it('resolves only the newest transcript inside the exact Botmux session directory', () => {
+    const dir = join(ROOT, '.omp', 'agent', 'sessions', 'botmux', 'sid-omp');
+    const legacyDir = join(ROOT, '.omp', 'agent', 'sessions', '-legacy-project');
+    mkdirSync(dir, { recursive: true });
+    mkdirSync(legacyDir, { recursive: true });
+    const path = join(dir, 'session.jsonl');
+    const legacyPath = join(legacyDir, 'legacy.jsonl');
+    writeFileSync(path, '');
+    writeFileSync(legacyPath, 'legacy history must not be attached');
+    expect(resolveFileBridgePath('oh-my-pi', { sessionId: 'sid-omp' })).toBe(path);
+    expect(resolveFileBridgePath('oh-my-pi', { sessionId: 'sid-omp' })).not.toBe(legacyPath);
+    expect(resolveFileBridgePath('oh-my-pi', { sessionId: 'sibling' })).toBeUndefined();
+  });
+
+  it('resolves ebsd only inside its exact managed session directory', () => {
+    const dir = join(ROOT, '.ebsd', 'agent', 'sessions', 'botmux', 'sid-ebsd');
+    const sibling = join(ROOT, '.ebsd', 'agent', 'sessions', 'botmux', 'other');
+    mkdirSync(dir, { recursive: true });
+    mkdirSync(sibling, { recursive: true });
+    const path = join(dir, 'session.jsonl');
+    writeFileSync(path, '');
+    writeFileSync(join(sibling, 'secret.jsonl'), 'sibling');
+    expect(resolveFileBridgePath('ebsd', { sessionId: 'sid-ebsd' })).toBe(path);
+    expect(resolveFileBridgePath('ebsd', { sessionId: 'missing' })).toBeUndefined();
   });
 });

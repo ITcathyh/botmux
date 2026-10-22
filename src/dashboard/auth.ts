@@ -1,11 +1,14 @@
 import { randomBytes, createHmac, timingSafeEqual } from 'node:crypto';
 import { dirname } from 'node:path';
+
+import { WORKBENCH_DOCK_IMMERSIVE_ENTRY, WORKBENCH_IMMERSIVE_ENTRY } from '../core/workbench-shell.js';
 import {
   readSecureHostFileSync,
   UnsafeHostAuthorityFileError,
   withSecureHostParentSync,
   writeSecureHostFileSync,
 } from '../platform/secure-host-file.js';
+import { isLoopbackPeer } from '../utils/loopback-peers.js';
 
 const NONCE_TTL_MS = 60_000;
 const TS_WINDOW_S = 30;
@@ -45,7 +48,8 @@ export function signCliAuth(secretB64Url: string, bind?: string): HmacAttempt {
 
 /**
  * Verify a CLI rotation HMAC attempt.
- * - Source IP must be loopback (127.0.0.1 / ::1 / IPv4-mapped form).
+ * - Source IP must be loopback (127.0.0.1 / ::1 / IPv4-mapped form, plus any
+ *   BOTMUX_LOOPBACK_PEERS entries — see utils/loopback-peers.ts).
  * - Timestamp must be within ±TS_WINDOW_S seconds of now.
  * - Nonce must not have been seen in the last NONCE_TTL_MS.
  * - HMAC-SHA256(secret, `${ts}:${nonce}` [+ `:${bind}`]) must match `sig`
@@ -58,11 +62,7 @@ export function verifyHmac(
   remoteAddr: string,
   bind?: string,
 ): { ok: boolean; reason?: string } {
-  if (
-    remoteAddr !== '127.0.0.1' &&
-    remoteAddr !== '::1' &&
-    !remoteAddr.endsWith('::ffff:127.0.0.1')
-  ) {
+  if (!isLoopbackPeer(remoteAddr)) {
     return { ok: false, reason: 'remote_not_loopback' };
   }
   const tsNum = Number(attempt.ts);
@@ -461,8 +461,7 @@ export function decideDashboardAuth(opts: {
       // and every probe it runs is the visitor's own browser calling the same
       // gated APIs under the visitor's own (possibly absent) credentials.
       pathname === '/workbench-doctor' ||
-      pathname.startsWith('/assets/') ||
-      pathname.startsWith('/game/')
+      pathname.startsWith('/assets/')
     );
 
   // P2-1：飞书卡片「打开工作台」按钮的短时票据兑换端点。URL 路径里的票据本身
@@ -495,11 +494,12 @@ export function decideDashboardAuth(opts: {
       // The fragment-free Workbench entries are redirects themselves. Sending
       // the cleaned URL back to the same path would bounce between "strip the
       // token" and "redirect again", so resolve them to their real destination
-      // in this one hop.
+      // in this one hop. They are direct entries, so the destination carries the
+      // immersive (chrome-less) marker — see core/workbench-shell.ts.
       redirectTo: pathname === '/workbench'
-        ? '/#/agent-workbench'
+        ? WORKBENCH_IMMERSIVE_ENTRY
         : pathname === '/workbench/dock'
-          ? '/#/agent-workbench-dock'
+          ? WORKBENCH_DOCK_IMMERSIVE_ENTRY
           : pathname || '/',
     };
   }

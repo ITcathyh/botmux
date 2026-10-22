@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { PassThrough } from 'node:stream';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -33,6 +33,7 @@ import {
 } from '../src/core/plugins/mcp/environment.js';
 import { mcpGatewayAuthTokenPath } from '../src/core/plugins/mcp/socket-auth.js';
 import { buildSeatbeltProfile } from '../src/adapters/cli/read-isolation.js';
+import { isBunRuntime, spawnSyncTsScript, tsRunnerPrefix } from './helpers/ts-runner.js';
 
 describe('plugin MCP Gateway', () => {
   let home: string;
@@ -88,9 +89,13 @@ describe('plugin MCP Gateway', () => {
   ): Promise<Client> {
     const env = mcpServeEnvironment(sessionId);
     if (options.dataDir !== undefined) env.SESSION_DATA_DIR = options.dataDir;
+    // Node needs an ABSOLUTE tsx specifier here (not the shared prefix's bare
+    // `tsx`): one case below runs with `cwd` outside the repo, where a bare
+    // specifier cannot be resolved. Bun runs TypeScript natively, so no prefix.
+    const tsxPrefix = isBunRuntime() ? [] : ['--import', import.meta.resolve('tsx')];
     const transport = new StdioClientTransport({
       command: process.execPath,
-      args: ['--import', import.meta.resolve('tsx'), resolve('src/cli.ts'), 'mcp', 'serve'],
+      args: [...tsxPrefix, resolve('src/cli.ts'), 'mcp', 'serve'],
       cwd: options.cwd ?? resolve('.'),
       env,
       stderr: 'pipe',
@@ -200,6 +205,9 @@ describe('plugin MCP Gateway', () => {
             requestUserOpenId: 'ou_trusted',
             requestUserUnionId: 'on_trusted',
             requestLarkAppId: 'cli_trusted',
+            source: 'schedule_creator',
+            taskId: 'task_123',
+            senderType: 'user',
           },
           turnId: 'om_turn',
           dispatchAttempt: 2,
@@ -226,6 +234,9 @@ describe('plugin MCP Gateway', () => {
     expect(text).toContain('"requestUserOpenId":"ou_trusted"');
     expect(text).toContain('"requestUserUnionId":"on_trusted"');
     expect(text).toContain('"requestLarkAppId":"cli_trusted"');
+    expect(text).toContain('"source":"schedule_creator"');
+    expect(text).toContain('"taskId":"task_123"');
+    expect(text).toContain('"senderType":"user"');
     expect(text).toContain('"turnId":"om_turn"');
     expect(text).toContain('"dispatchAttempt":2');
     expect(text).toContain('"customTrace":"keep-me"');
@@ -233,6 +244,166 @@ describe('plugin MCP Gateway', () => {
     expect(text).not.toContain('on_forged');
     expect(text).not.toContain('on_sibling_forged');
 
+    await client.close();
+    await gateway.close();
+  });
+
+  it('delivers local plugin results through the trusted host without exposing downstream rows', async () => {
+    installFixturePlugin('plugin-delivery', 'delivery');
+    const delivered: any[] = [];
+    const gateway = new PluginMcpGateway(
+      ['plugin-delivery'],
+      { ...process.env, BOTMUX_SESSION_ID: 'session-delivery' },
+      {
+        trustedTurnIdentity: () => ({
+          caller: {
+            requestUserOpenId: 'ou_trusted',
+            requestUserUnionId: 'on_trusted',
+            requestLarkAppId: 'cli_trusted',
+            source: 'gateway_meta',
+            senderType: 'user',
+          },
+          turnId: 'om_delivery',
+        }),
+        trustedResultDelivery: async input => {
+          delivered.push(input);
+          return {
+            delivered: true,
+            deliveryId: input.delivery.deliveryId,
+            fileCount: input.delivery.files?.length ?? 0,
+          };
+        },
+      },
+    );
+    const client = new Client({ name: 'gateway-delivery-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+
+    const result = await client.callTool({ name: 'echo', arguments: {} });
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0].pluginId).toBe('plugin-delivery');
+    expect(delivered[0].identity.caller.requestUserUnionId).toBe('on_trusted');
+    expect(delivered[0].delivery.markdown).toBe('分析摘要');
+    expect(delivered[0].delivery.files).toHaveLength(1);
+    const visible = JSON.stringify(result);
+    expect(visible).toContain('delivery_fixture_001');
+    expect(visible).not.toContain('PRIVATE_ROWS_MUST_NOT_REACH_CALLER');
+    expect(visible).not.toContain('private-result-row');
+    expect(visible).not.toContain('messageIds');
+
+    await client.close();
+    await gateway.close();
+  });
+
+  it('pins one trusted identity snapshot across downstream execution and host delivery', async () => {
+    installFixturePlugin('plugin-delivery', 'delivery');
+    const identities = [
+      {
+        caller: {
+          requestUserOpenId: 'ou_a', requestUserUnionId: 'on_a', requestLarkAppId: 'cli_a',
+          source: 'gateway_meta', senderType: 'user' as const,
+        },
+        turnId: 'om_a',
+      },
+      {
+        caller: {
+          requestUserOpenId: 'ou_b', requestUserUnionId: 'on_b', requestLarkAppId: 'cli_b',
+          source: 'gateway_meta', senderType: 'user' as const,
+        },
+        turnId: 'om_b',
+      },
+    ];
+    let reads = 0;
+    let deliveredIdentity: any;
+    const gateway = new PluginMcpGateway(
+      ['plugin-delivery'],
+      { ...process.env, BOTMUX_SESSION_ID: 'session-delivery-snapshot' },
+      {
+        trustedTurnIdentity: () => identities[Math.min(reads++, identities.length - 1)],
+        trustedResultDelivery: async input => {
+          deliveredIdentity = input.identity;
+          return { delivered: true, deliveryId: input.delivery.deliveryId, fileCount: 1 };
+        },
+      },
+    );
+    const client = new Client({ name: 'gateway-delivery-snapshot-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+
+    await client.callTool({ name: 'echo', arguments: {} });
+    expect(reads).toBe(1);
+    expect(deliveredIdentity.turnId).toBe('om_a');
+    expect(deliveredIdentity.caller.requestUserUnionId).toBe('on_a');
+
+    await client.close();
+    await gateway.close();
+  });
+
+  it('fails closed when a plugin asks for host delivery without a trusted human turn', async () => {
+    installFixturePlugin('plugin-delivery', 'delivery');
+    const gateway = new PluginMcpGateway(['plugin-delivery']);
+    const client = new Client({ name: 'gateway-delivery-untrusted-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+    await expect(client.callTool({ name: 'echo', arguments: {} }))
+      .rejects.toThrow(/trusted_human_identity/);
+    await client.close();
+    await gateway.close();
+  });
+
+  it('rejects a bot-authored trusted identity before invoking host delivery', async () => {
+    installFixturePlugin('plugin-delivery', 'delivery');
+    const delivered = vi.fn();
+    const gateway = new PluginMcpGateway(
+      ['plugin-delivery'],
+      { ...process.env, BOTMUX_SESSION_ID: 'session-delivery-bot' },
+      {
+        trustedTurnIdentity: () => ({
+          caller: {
+            requestUserOpenId: 'ou_bot', requestUserUnionId: 'on_bot',
+            requestLarkAppId: 'cli_bot', source: 'gateway_meta', senderType: 'bot',
+          },
+          turnId: 'om_bot',
+        }),
+        trustedResultDelivery: delivered,
+      },
+    );
+    const client = new Client({ name: 'gateway-delivery-bot-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+    await expect(client.callTool({ name: 'echo', arguments: {} }))
+      .rejects.toThrow(/trusted_human_identity/);
+    expect(delivered).not.toHaveBeenCalled();
+    await client.close();
+    await gateway.close();
+  });
+
+  it('rejects host delivery from a non-stdio downstream before invoking the host', async () => {
+    installFixturePlugin('plugin-delivery', 'delivery');
+    const delivered = vi.fn();
+    const gateway = new PluginMcpGateway(
+      ['plugin-delivery'],
+      { ...process.env, BOTMUX_SESSION_ID: 'session-delivery-remote' },
+      {
+        trustedTurnIdentity: () => ({
+          caller: {
+            requestUserOpenId: 'ou_user', requestUserUnionId: 'on_user',
+            requestLarkAppId: 'cli_user', source: 'gateway_meta', senderType: 'user',
+          },
+          turnId: 'om_user',
+        }),
+        trustedResultDelivery: delivered,
+      },
+    );
+    const client = new Client({ name: 'gateway-delivery-remote-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+    await client.listTools();
+    const route = (gateway as any).toolRoutes.get('echo');
+    route.connection.server = { ...route.connection.server, transport: 'streamable-http' };
+    await expect(client.callTool({ name: 'echo', arguments: {} }))
+      .rejects.toThrow(/requires_local_stdio/);
+    expect(delivered).not.toHaveBeenCalled();
     await client.close();
     await gateway.close();
   });
@@ -299,6 +470,9 @@ describe('plugin MCP Gateway', () => {
             requestUserOpenId: 'ou_trusted',
             requestUserUnionId: 'on_trusted',
             requestLarkAppId: 'cli_trusted',
+            source: 'schedule_creator',
+            taskId: 'task_123',
+            senderType: 'user',
           },
           turnId: 'om_trusted',
           dispatchAttempt: 2,
@@ -314,6 +488,11 @@ describe('plugin MCP Gateway', () => {
     expect(trusted.get('x-botmux-trusted-app-id')).toBe('cli_trusted');
     expect(trusted.get('x-botmux-turn-id')).toBe('om_trusted');
     expect(trusted.get('x-botmux-dispatch-attempt')).toBe('2');
+    // Provenance stays on the local `_meta` path only: these headers reach every
+    // HTTP-transport MCP server, so they must not start carrying it.
+    expect(trusted.get('x-botmux-trusted-source')).toBeNull();
+    expect(trusted.get('x-botmux-task-id')).toBeNull();
+    expect(trusted.get('x-botmux-trusted-sender-type')).toBeNull();
   });
 
   it('uses the session MCP runtime snapshot without reading the global plugin registry', async () => {
@@ -450,8 +629,8 @@ describe('plugin MCP Gateway', () => {
     });
     const host = await startSessionMcpGatewayHost({ sessionId, dataDir: customDataDir });
     const transport = new StdioClientTransport({
-      command: process.execPath,
-      args: ['--import', 'tsx', resolve('src/cli.ts'), 'mcp', 'serve'],
+      command: tsRunnerPrefix().command,
+      args: [...tsRunnerPrefix().prefixArgs, resolve('src/cli.ts'), 'mcp', 'serve'],
       cwd: resolve('.'),
       env: {
         ...mcpServeEnvironment(sessionId),
@@ -487,8 +666,8 @@ describe('plugin MCP Gateway', () => {
     });
     const host1 = await startSessionMcpGatewayHost({ sessionId, dataDir: customDataDir });
     const transport = new StdioClientTransport({
-      command: process.execPath,
-      args: ['--import', 'tsx', resolve('src/cli.ts'), 'mcp', 'serve'],
+      command: tsRunnerPrefix().command,
+      args: [...tsRunnerPrefix().prefixArgs, resolve('src/cli.ts'), 'mcp', 'serve'],
       cwd: resolve('.'),
       env: {
         ...mcpServeEnvironment(sessionId),
@@ -559,60 +738,23 @@ describe('plugin MCP Gateway', () => {
     expect(readMcpGatewayLaunchRecord(dataDir, sessionId)).toBeNull();
   });
 
-  // ─── Worker reattach wiring (source lock) ──────────────────────────────────
-  //
-  // spawnCli is not exported (repo convention: source-lock tests, see
-  // resume-fresh-policy.test.ts). These pin the P0 fix: the pane-reattach-safe
-  // branch MUST re-serve the trusted Gateway host at the deterministic path so
-  // the surviving pane's relay can reconnect. Without it (the shipped bug) the
-  // reattach branch only logged, willReattachPersistent stayed true, and the
-  // sole host starter (prepareCliPluginGenerationAndGateway) was gated out by
-  // `if (!willReattachPersistent)` — the relay then reconnected forever to a
-  // socket nothing binds.
-  describe('reattach-safe branch re-serves the Gateway host (source lock)', () => {
+  // 源码结构护栏(K3)：#943 的 P0 修复——persistent pane 复用（reattach-safe）分支必须在同一确定性路径上
+  // 重新起 trusted Gateway host 并写回 launch record，否则 daemon 重启后 pane 里幸存的 relay 永远连不上
+  // socket，所有持久会话里的插件工具调用悬挂。spawnCli 是 worker.ts 闭包内未导出的流程，没有行为 seam；
+  // 重连机制本身由下一条行为用例覆盖。
+  it('re-serves the trusted Gateway host from the pane-reattach branch of the worker', () => {
     const workerSource = readFileSync(resolve('src/worker.ts'), 'utf8');
+    const starterAt = workerSource.indexOf('async function startAndRecordSessionMcpGatewayHost');
+    expect(starterAt).toBeGreaterThan(-1);
+    const starter = workerSource.slice(starterAt, workerSource.indexOf('\n}\n', starterAt));
+    expect(starter).toContain('startSessionMcpGatewayHost(');
+    expect(starter).toContain('writeMcpGatewayLaunchRecord(');
 
-    it('exposes a host-only starter that does NOT refresh the plugin generation', () => {
-      // The starter must be separate from prepareCliPluginGenerationAndGateway
-      // (which calls refreshCliPluginGeneration) so a warm reattach keeps the
-      // CLI's existing catalog untouched while still binding a fresh host.
-      const start = workerSource.indexOf('async function startAndRecordSessionMcpGatewayHost');
-      expect(start).toBeGreaterThan(-1);
-      const block = workerSource.slice(start, start + 800);
-      expect(block).toContain('startSessionMcpGatewayHost(');
-      expect(block).toContain('writeMcpGatewayLaunchRecord(');
-      // Host-only: must NOT re-run the catalog/plugin refresh on this path.
-      expect(block).not.toContain('refreshCliPluginGeneration(');
-      // Both host-start paths (fresh/resumed via prepare*, and the re-served
-      // reattach host) route through this helper, so it MUST keep #917's
-      // per-turn trusted-caller provider wired — otherwise a warm reattach (and
-      // every spawn) would silently stop injecting the host-signed identity.
-      // The worker-level wiring is not otherwise exercised by a runtime test.
-      expect(block).toContain('trustedTurnIdentity: currentGatewayTrustedTurnIdentity');
-    });
-
-    it('starts the replacement host inside the paneRelayReattachSafe branch', () => {
-      const start = workerSource.indexOf('if (paneRelayReattachSafe) {');
-      expect(start).toBeGreaterThan(-1);
-      // Scope strictly to the reattach-safe branch (ends at the legacy
-      // cold-resume `else if`), so a host start anywhere else can't satisfy this.
-      const branchEnd = workerSource.indexOf('} else if (paneProbe === \'exists\') {', start);
-      expect(branchEnd).toBeGreaterThan(start);
-      const branch = workerSource.slice(start, branchEnd);
-      expect(branch).toContain('startAndRecordSessionMcpGatewayHost(');
-      // Only when this fresh worker has no live host yet — never stomp a host an
-      // in-worker restart already brought up.
-      expect(branch).toContain('if (!sessionMcpGatewayHost)');
-    });
-
-    it('re-serving is awaited and guarded by the spawn-generation fence', () => {
-      const start = workerSource.indexOf('if (paneRelayReattachSafe) {');
-      const branchEnd = workerSource.indexOf('} else if (paneProbe === \'exists\') {', start);
-      const branch = workerSource.slice(start, branchEnd);
-      expect(branch).toContain('await startAndRecordSessionMcpGatewayHost(');
-      // A concurrent restart must not let a superseded generation keep running.
-      expect(branch).toContain('if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();');
-    });
+    const branchAt = workerSource.indexOf('if (paneRelayReattachSafe) {');
+    const branchEnd = workerSource.indexOf("} else if (paneProbe === 'exists') {", branchAt);
+    expect(branchAt).toBeGreaterThan(-1);
+    expect(branchEnd).toBeGreaterThan(branchAt);
+    expect(workerSource.slice(branchAt, branchEnd)).toMatch(/await\s+startAndRecordSessionMcpGatewayHost\(/);
   });
 
   it('re-served reattach host binds the same deterministic path a stranded relay reconnects to', async () => {
@@ -632,8 +774,8 @@ describe('plugin MCP Gateway', () => {
     writeMcpGatewayLaunchRecord(dataDir, sessionId, host1.socketPath);
 
     const transport = new StdioClientTransport({
-      command: process.execPath,
-      args: ['--import', 'tsx', resolve('src/cli.ts'), 'mcp', 'serve'],
+      command: tsRunnerPrefix().command,
+      args: [...tsRunnerPrefix().prefixArgs, resolve('src/cli.ts'), 'mcp', 'serve'],
       cwd: resolve('.'),
       env: {
         ...mcpServeEnvironment(sessionId),
@@ -685,9 +827,9 @@ describe('plugin MCP Gateway', () => {
   }, 30_000);
 
   it('fails closed when a managed relay loses its worker-owned socket', () => {
-    const run = spawnSync(
-      process.execPath,
-      ['--import', 'tsx', resolve('src/cli.ts'), 'mcp', 'serve'],
+    const run = spawnSyncTsScript(
+      resolve('src/cli.ts'),
+      ['mcp', 'serve'],
       {
         cwd: resolve('.'),
         env: {
@@ -703,9 +845,9 @@ describe('plugin MCP Gateway', () => {
   });
 
   it('fails closed when a managed relay has a socket but no authentication token', () => {
-    const run = spawnSync(
-      process.execPath,
-      ['--import', 'tsx', resolve('src/cli.ts'), 'mcp', 'serve'],
+    const run = spawnSyncTsScript(
+      resolve('src/cli.ts'),
+      ['mcp', 'serve'],
       {
         cwd: resolve('.'),
         env: {

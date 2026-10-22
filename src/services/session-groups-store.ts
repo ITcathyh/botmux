@@ -10,9 +10,10 @@
  *
  * Registry answers three questions:
  *   1. isSessionGroup(chatId)      — typing / feature gating
- *   2. lastSessionId for a chatId  — same-group resume: a new message in a
- *      session group whose session was /close'd resumes that session instead
- *      of spawning a fresh one (的话题内续聊同款体验).
+ *   2. lastSessionId for a chatId  — the group's current chat-scope resident
+ *      (what /dismiss and AI titling act on). Closing does NOT auto-resume: a
+ *      later message starts a fresh session, which becomes the resident once
+ *      it wins registration; any successful resume re-points it.
  *   3. ownerOpenId                 — the DM user the group was born for.
  *   4. origin* provenance          — WHICH authorization birthed the group, so
  *      the dispatcher can keep charging that same quota/expiry instead of
@@ -32,7 +33,7 @@ import { logger } from '../utils/logger.js';
 export interface SessionGroupEntry {
   /** The DM user this group was born for (open_id in the bot's app scope). */
   ownerOpenId: string;
-  /** Most recent session anchored in this group; same-group resume target. */
+  /** The group's chat-scope resident session (the last one created or resumed here). */
   lastSessionId: string;
   /** Epoch ms the group was created. */
   createdAt: number;
@@ -47,9 +48,11 @@ export interface SessionGroupEntry {
    * being re-judged against the brand-new chat id (which no chatGrant, no
    * quota counter and no expiry has ever seen). Without this, the auto-written
    * oncall binding — created only to carry the working dir — became the group's
-   * talk source: unlimited when no `messageQuota.defaultLimit` is configured,
-   * a FRESH per-group allowance when one is, and `restrictGrantCommands`
-   * silently defeated because the reason was no longer `chatGrant`/`globalGrant`.
+   * talk source: unmetered (the oncall leg never attaches a quotaKey), and
+   * `restrictGrantCommands` silently defeated because the reason was no longer
+   * `chatGrant`/`globalGrant`. (Historically it was ALSO a fresh per-group
+   * allowance whenever `messageQuota.defaultLimit` was set; oncall no longer
+   * reads that field — see event-dispatcher's oncallTalk.)
    *
    * Typed as a plain string (not `TalkReason`) on purpose: importing the type
    * from `im/lark/event-dispatcher` would close an import cycle, since the
@@ -63,6 +66,8 @@ export interface SessionGroupEntry {
   originChatId?: string;
   /** True once the async AI title has been applied to the chat name. */
   titled?: boolean;
+  /** Actual automatic feed group joined by this chat, scoped to ownerOpenId. */
+  feedGroupId?: string;
   /** Failed scheduling rounds (each round contains the service's bounded
    * in-call retry). Persisted so later messages cannot spawn unbounded CLIs. */
   titleAttempts?: number;
@@ -130,6 +135,7 @@ export function registerSessionGroup(chatId: string, entry: Omit<SessionGroupEnt
     originQuotaKey: entry.originQuotaKey,
     originChatId: entry.originChatId,
     titled: entry.titled,
+    feedGroupId: entry.feedGroupId,
     titleAttempts: entry.titleAttempts,
     titleRetryAt: entry.titleRetryAt,
   });
@@ -147,6 +153,14 @@ export function getSessionGroup(chatId: string): SessionGroupEntry | undefined {
   if (!currentAppId) return undefined;
   load();
   return entries.get(chatId);
+}
+
+/** Remember the automatic group only for the user who owns this session group. */
+export function setSessionGroupFeedGroup(chatId: string, ownerOpenId: string, feedGroupId: string): void {
+  const entry = getSessionGroup(chatId);
+  if (!entry || entry.ownerOpenId !== ownerOpenId || entry.feedGroupId === feedGroupId) return;
+  entry.feedGroupId = feedGroupId;
+  persist();
 }
 
 /** Point the registry at the session currently living in this group. */
@@ -187,10 +201,4 @@ export function markSessionGroupTitleFailed(chatId: string, failedAt = Date.now(
 export function removeSessionGroup(chatId: string): void {
   load();
   if (entries.delete(chatId)) persist();
-}
-
-export function listSessionGroups(): Array<{ chatId: string } & SessionGroupEntry> {
-  if (!currentAppId) return [];
-  load();
-  return Array.from(entries.entries()).map(([chatId, v]) => ({ chatId, ...v }));
 }

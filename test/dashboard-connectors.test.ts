@@ -1,10 +1,14 @@
 import { describe, expect, it } from 'vitest';
 
 import {
-  buildConnectorInstructionUpdateBody,
+  additionalConnectorBotIds,
+  buildConnectorLifecycleGroupNameConfig,
+  buildConnectorTargetBody,
   buildConnectorKindOptions,
   buildConnectorTopicMessageConfig,
+  normalizeConnectorBotIds,
   replaceConnectorById,
+  trimConnectorLifecycleGroupNameInput,
 } from '../src/dashboard/web/connectors-page.js';
 
 describe('dashboard connector instruction editing', () => {
@@ -19,30 +23,44 @@ describe('dashboard connector instruction editing', () => {
       },
     ]);
   });
+});
 
-  it('updates only the prompt envelope and leaves secrets untouched', () => {
-    const body = buildConnectorInstructionUpdateBody(
-      { name: 'Prod alerts', promptEnvelope: { sourceName: 'alerts' } },
-      'Summarize severity and notify oncall.',
-    );
-
-    expect(body).toEqual({
-      promptEnvelope: {
-        sourceName: 'alerts',
-        instruction: 'Summarize severity and notify oncall.',
-      },
-    });
-    expect(body).not.toHaveProperty('secret');
-    expect(body).not.toHaveProperty('rotateSecret');
+describe('dashboard connector new-group bot selection', () => {
+  it('normalizes the trigger bot plus selected peer bots for new-group connectors', () => {
+    expect(normalizeConnectorBotIds('app1', ['app2', 'app1', ' app3 ', ''])).toEqual(['app1', 'app2', 'app3']);
+    expect(additionalConnectorBotIds('app1', ['app1', 'app2'])).toEqual(['app2']);
   });
 
-  it('keeps clearing the instruction explicit', () => {
-    expect(buildConnectorInstructionUpdateBody({ name: 'Prod alerts' }, '')).toEqual({
-      promptEnvelope: {
-        sourceName: 'Prod alerts',
-        instruction: '',
-      },
-    });
+  it('stores botIds only for new-group connector targets and clears them otherwise', () => {
+    expect(buildConnectorTargetBody({
+      kind: 'turn',
+      mode: 'new-group',
+      botId: 'app1',
+      additionalBotIds: ['app2'],
+      chatId: '',
+      allowChats: [],
+      workflowId: '',
+    })).toEqual({ kind: 'turn', mode: 'new-group', botId: 'app1', botIds: ['app1', 'app2'] });
+
+    expect(buildConnectorTargetBody({
+      kind: 'turn',
+      mode: 'new-group',
+      botId: 'app1',
+      additionalBotIds: [],
+      chatId: '',
+      allowChats: [],
+      workflowId: '',
+    })).toEqual({ kind: 'turn', mode: 'new-group', botId: 'app1', botIds: ['app1'] });
+
+    expect(buildConnectorTargetBody({
+      kind: 'turn',
+      mode: 'fixed',
+      botId: 'app1',
+      additionalBotIds: ['app2'],
+      chatId: 'oc_fixed',
+      allowChats: [],
+      workflowId: '',
+    })).toEqual({ kind: 'turn', mode: 'fixed', botId: 'app1', chatId: 'oc_fixed', botIds: [] });
   });
 });
 
@@ -107,5 +125,44 @@ describe('dashboard trusted topic templates', () => {
       ok: true,
       value: { mode: 'none' },
     });
+  });
+});
+
+describe('dashboard connector lifecycle group names', () => {
+  it('builds fixed and template group name configs', () => {
+    expect(buildConnectorLifecycleGroupNameConfig('default', 'ignored')).toEqual({
+      ok: true,
+      value: { mode: 'default' },
+    });
+    expect(buildConnectorLifecycleGroupNameConfig('fixed', '  固定处理群  ')).toEqual({
+      ok: true,
+      value: { mode: 'fixed', text: '固定处理群' },
+    });
+    expect(buildConnectorLifecycleGroupNameConfig('template', '告警 {{payload.name}} {{$.payload.id}}')).toEqual({
+      ok: true,
+      value: { mode: 'template', text: '告警 {{payload.name}} {{$.payload.id}}' },
+    });
+  });
+
+  it('requires text for fixed and template group names', () => {
+    expect(buildConnectorLifecycleGroupNameConfig('fixed', '  ')).toEqual({
+      ok: false,
+      error: 'connectors.errGroupName',
+    });
+    expect(buildConnectorLifecycleGroupNameConfig('template', '')).toEqual({
+      ok: false,
+      error: 'connectors.errGroupName',
+    });
+    expect(buildConnectorLifecycleGroupNameConfig('template', '告警 {{alert.*}}')).toEqual({
+      ok: false,
+      error: 'connectors.errGroupNameTemplate',
+    });
+  });
+
+  it('trims group name input by Unicode code point, not UTF-16 code unit', () => {
+    const text = trimConnectorLifecycleGroupNameInput('😀'.repeat(61));
+
+    expect(text).toBe('😀'.repeat(60));
+    expect(Array.from(text)).toHaveLength(60);
   });
 });
